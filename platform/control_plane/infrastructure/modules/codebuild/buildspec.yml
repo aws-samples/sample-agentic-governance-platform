@@ -1,0 +1,593 @@
+# Delivered from S3 (E28/T1), not inline — the old 25600-char CodeBuild inline cap no longer applies.
+# GOTCHA: after editing this file run a root `terraform apply` BEFORE the next push, or the pipeline
+# silently runs the PREVIOUS buildspec (the S3 object re-uploads on apply via `etag = output_md5`).
+version: 0.2
+phases:
+  install:
+    commands:
+      - yum install -y yum-utils unzip jq 2>/dev/null || true
+      - |
+        # E32/T9 — PROVE THIS IMAGE'S AWS CLI KNOWS `agent-registry-control`, THEN SELF-HEAL.
+        #
+        # WHY THIS EXISTS AT ALL. The build phase makes two Registry calls
+        # (`get-registry-record` to read the agent's envelope, `update-registry-record` to write the
+        # provisioned runtime's ARN back). AWS split the Registry APIs onto the `agent-registry`
+        # namespace on 2026-08-06 and E32 repointed both calls at it. The service name is therefore
+        # NEWER THAN THE BUILD IMAGE: `aws/codebuild/amazonlinux2-aarch64-standard:3.0`
+        # (modules/codebuild/main.tf) ships whatever CLI it was baked with, and nothing in this repo
+        # verified that CLI carries the new service model. The backend's offline tests validate the
+        # BACKEND VENV's botocore (tests/test_buildspec_contract.py reads a service model out of the
+        # local `botocore`), which says nothing at all about a self-contained AWS CLI v2 binary in a
+        # CodeBuild container — it bundles its OWN botocore. So this was an unverified, unverifiable
+        # runtime dependency: the only thing that could have discovered it was a live build.
+        #
+        # WHAT A MISS COSTS. An unknown service name fails client-side with `Invalid choice`. On the
+        # READ that aborts the build early and harmlessly. On the WRITE it is the data-loss path the
+        # write's own error text describes: the runtime is already LIVE, its ARN is recorded nowhere,
+        # and the E23 delete cascade (which reclaims by recorded ARN) can never reach it — a
+        # billing, invocable, ungovernable runtime, reported as a failed build with no way back.
+        #
+        # WHY IN `install`, NOT NEXT TO THE FIRST CALL. This runs before ANY AWS mutation, before the
+        # source clone, seconds into the build. A check at the call site would fail after the read
+        # or — worse — leave the write as the first thing to discover the problem, which is exactly
+        # the state above. Failing here cannot leak anything, so this is the only placement where a
+        # missing capability is merely an inconvenience. It applies to every IAC_TYPE, including the
+        # legacy `terraform` branch that makes no Registry call: an image whose CLI cannot reach the
+        # Registry is broken for the platform regardless of which branch this build happens to take,
+        # and the self-heal below makes a hard failure nearly unreachable anyway.
+        #
+        # WHY A CAPABILITY PROBE AND NOT A PINNED VERSION. The requirement is "knows this service",
+        # not "is version X". A pinned version encodes today's answer to that question and then goes
+        # stale silently — the pin would keep passing long after it stopped being the version that
+        # matters, and it would have to be bumped by hand every time AWS ships a namespace. Probing
+        # the capability directly asserts the thing we actually need, and it keeps asserting it. The
+        # upgrade fetches the current AWS CLI v2 precisely because "current" is the only version
+        # guaranteed to carry a service AWS shipped this year.
+        #
+        # HOW THE PROBE WORKS, AND WHY IT ASSERTS THE *POSITIVE* SIGNAL.
+        # The CLI is invoked with the SERVICE AND NO OPERATION. That never reaches the network and
+        # needs no credentials — argument parsing fails first, and WHICH parse error comes back is
+        # the answer:
+        #   * service KNOWN    -> the service name PARSED and the missing operation is what is
+        #                         reported: "the following arguments are required: operation".
+        #   * service UNKNOWN  -> the service name itself is rejected: "argument command: Invalid
+        #                         choice" (both CLI majors; v1 appends the valid list, v2 a
+        #                         "maybe you meant" list).
+        # Both exit non-zero, so the EXIT CODE cannot tell them apart — the discriminator has to be
+        # the TEXT, which is why this is a `grep -qi` and not an `if aws ...`.
+        #
+        # THE MATCH IS ON "arguments are required" — THE HEALTHY SIGNAL — AND DELIBERATELY NOT ON
+        # THE ABSENCE OF "Invalid choice". That inversion is the entire correctness of this guard,
+        # and getting it backwards was a real fail-open bug caught in review: "the unknown-service
+        # text did not appear" is ALSO true of every other failure, so `aws` missing from PATH, an
+        # `ImportError` traceback from a half-installed CLI, empty output, or AWS simply rewording
+        # the unknown-service message would each have printed "aws CLI knows agent-registry-control"
+        # and sailed on — the guard silently becoming a no-op on precisely the image that CANNOT
+        # make the call, while the build log certified the capability. Keying on the healthy string
+        # means the capability is PROVEN or it is not: every unrecognised outcome takes the
+        # upgrade-then-recheck path below, and hard-fails if the recheck still cannot prove it.
+        # Fail closed, never open. Both probes below use this same positive form for the same reason
+        # — a re-probe that matched the negative signal would report a CRASHED post-upgrade CLI as a
+        # successful heal, which is the same bug mirrored onto the branch that decides the build.
+        # `-i` because argparse's wording is lowercase while the CLI capitalises other parts of
+        # these messages; matching case-insensitively keeps this working if that ever changes.
+        #
+        # `aws agent-registry-control help` was the obvious probe and was REJECTED: AWS CLI v2
+        # renders help through a man pager, so on an image without groff/man it exits non-zero for a
+        # service the CLI knows perfectly well. That false negative would fire the upgrade path on a
+        # healthy image and then FAIL THE BUILD when the upgraded CLI could not render help either
+        # — turning a diagnostic into an outage. Parse-error text depends on nothing but the CLI.
+        # `AWS_PAGER=""` guarantees no pager is involved on any code path (a pager in a non-tty
+        # CodeBuild shell can hang or substitute its own exit status), and 2>&1 is required because
+        # argparse writes these errors to stderr.
+        if AWS_PAGER="" aws agent-registry-control 2>&1 | grep -qi "arguments are required"; then
+          echo "aws CLI knows agent-registry-control ($(aws --version 2>&1))"
+        else
+          echo "aws CLI could not prove it knows agent-registry-control ($(aws --version 2>&1)) — upgrading AWS CLI v2"
+          # `--update` is mandatory, not optional: this image already has an AWS CLI v2 at
+          # /usr/local/aws-cli, and the installer REFUSES to proceed over a preexisting install
+          # without it. The failure is soft (`|| echo`) so the authoritative re-probe below decides
+          # the build's fate — a partial/failed download must not be reported as a CLI that works.
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip \
+            && unzip -q -o /tmp/awscliv2.zip -d /tmp/awscliv2 \
+            && /tmp/awscliv2/aws/install --update -i /usr/local/aws-cli -b /usr/local/bin \
+            || echo "WARN: the AWS CLI v2 upgrade did not complete — re-probing to get the real verdict"
+          # The shell caches resolved command paths; without this the old binary keeps being used
+          # even after the installer replaced it, and the re-probe would report a stale answer.
+          hash -r 2>/dev/null || true
+          # The AUTHORITATIVE re-probe, in the same positive form: the capability must be PROVEN
+          # here or the build stops. `!` on the healthy signal (not a match on the failure text) is
+          # what makes an `aws` that now crashes, is missing, or prints nothing fail rather than
+          # pass — the download's exit status is irrelevant, only this verdict counts.
+          if ! AWS_PAGER="" aws agent-registry-control 2>&1 | grep -qi "arguments are required"; then
+            echo "ERROR: this build image's AWS CLI ($(aws --version 2>&1)) does not know the 'agent-registry-control' service, and upgrading to the current AWS CLI v2 did not fix it. The build phase MUST read and write the agent's registry record through that service, and the write-back is what makes a provisioned runtime governable — running on without it would provision a LIVE runtime whose ARN is recorded nowhere, which the delete cascade can never reclaim. Refusing to start. Fix the image (a newer aws/codebuild/* standard image), or confirm the container has egress to awscli.amazonaws.com." >&2
+            exit 1
+          fi
+          echo "aws CLI upgraded ($(aws --version 2>&1)) — agent-registry-control is available"
+        fi
+      - |
+        if ! command -v terraform &>/dev/null; then
+          curl -fsSL https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_arm64.zip -o tf.zip
+          unzip -o tf.zip -d /usr/local/bin && rm tf.zip
+        fi
+      - terraform --version
+      - npm i -g aws-cdk typescript ts-node
+      - cdk --version 2>/dev/null || true
+  pre_build:
+    commands:
+      - |
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        ECR_BASE="${ACCOUNT_ID}.dkr.ecr.${AWS_TARGET_REGION}.amazonaws.com"
+        aws ecr get-login-password --region ${AWS_TARGET_REGION} | docker login --username AWS --password-stdin ${ECR_BASE} 2>/dev/null
+        for img in python:3.11-slim; do
+          docker pull "${ECR_BASE}/cached/${img}" 2>/dev/null && \
+            docker tag "${ECR_BASE}/cached/${img}" "${img}" 2>/dev/null && \
+            echo "Cached ${img}" || true
+        done
+        DOCKER_BUILDKIT=0 docker pull python:3.11-slim 2>/dev/null || true
+      - mkdir -p /tmp/workspace
+      - |
+        if [ -n "$CODECOMMIT_REPO" ] && [ -n "$CODECOMMIT_BRANCH" ]; then
+          if ! command -v git &>/dev/null; then
+            yum install -y git 2>/dev/null || apt-get install -y git 2>/dev/null || true
+          fi
+          git config --global credential.helper '!aws codecommit credential-helper $@'
+          git config --global credential.UseHttpPath true
+          REPO_URL=$(aws codecommit get-repository --repository-name "$CODECOMMIT_REPO" --region ${AWS_TARGET_REGION:-us-east-1} --query 'repositoryMetadata.cloneUrlHttp' --output text)
+          git clone --depth 1 --branch "$CODECOMMIT_BRANCH" "$REPO_URL" /tmp/workspace
+
+          if [ -n "$CODECOMMIT_COMMIT" ]; then
+            cd /tmp/workspace
+            git fetch --depth 1 origin "$CODECOMMIT_COMMIT"
+            git checkout "$CODECOMMIT_COMMIT"
+            cd /tmp
+          fi
+        elif [ -n "$GIT_INFRA_REPO" ] && [ -n "$GIT_INFRA_ORG" ]; then
+          if ! command -v git &>/dev/null; then
+            yum install -y git 2>/dev/null || apt-get install -y git 2>/dev/null || true
+          fi
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$GIT_SECRET_ARN" --query SecretString --output text)
+          TOKEN=$(echo "$SECRET_JSON" | jq -r '.token // empty')
+          HOST=$(echo "${GIT_BASE_URL:-https://github.com}" | sed 's#https://##; s#/api/v3##')
+          git clone --depth 1 "https://x-access-token:${TOKEN}@${HOST}/${GIT_INFRA_ORG}/${GIT_INFRA_REPO}.git" /tmp/workspace
+        elif [ -n "$ARCHIVE_BUCKET" ] && [ -n "$ARCHIVE_KEY" ]; then
+          aws s3 cp s3://$ARCHIVE_BUCKET/$ARCHIVE_KEY /tmp/template.zip
+          unzip -o /tmp/template.zip -d /tmp/workspace
+        else
+          echo "ERROR: No valid source specified (neither CodeCommit nor S3 archive)"
+          exit 1
+        fi
+      - |
+        if [ -n "$TARGET_ROLE_ARN" ] && [ "$IAC_TYPE" != "agentcore_runtime" ]; then
+          CREDS=$(aws sts assume-role --role-arn "$TARGET_ROLE_ARN" --role-session-name "deploy-$DEPLOYMENT_ID" --output json)
+          export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.Credentials.SessionToken')
+        fi
+      - |
+        cat > /tmp/merge_outputs.py << 'PYEOF'
+        import json, sys
+        merged = {}
+        for path in sys.argv[1:]:
+            try:
+                raw = json.load(open(path))
+                for k, v in raw.items():
+                    merged[k] = str(v.get('value','') if isinstance(v, dict) else v)
+            except: pass
+        import os
+        merged['deployment_id'] = os.environ['DEPLOYMENT_ID']
+        merged['status'] = 'success'
+        merged['iac_type'] = os.environ.get('IAC_TYPE', 'terraform')
+        json.dump(merged, open('/tmp/outputs.json', 'w'))
+        PYEOF
+      - |
+        # E28/T4b: the terminal-Deployment-row writer, heredoc'd to a FILE and invoked as
+        # `python3 /tmp/dep.py` (the merge_outputs.py idiom directly above). It must NOT be a
+        # `python3 -c` inline script: inside a YAML block scalar every line of an inline body
+        # carries the block's own indentation at runtime, and `python3 -c` rejects a leading
+        # indent with IndentationError on every interpreter before 3.14 (which added dedenting
+        # for -c). The CodeBuild image here is amazonlinux2-aarch64-standard:3.0, far below 3.14,
+        # so the inline form failed 100% of the time — and because `_dep` is `|| true` with
+        # stderr suppressed, it failed SILENTLY: no terminal row in any build. A heredoc'd file
+        # is immune (the interpreter reads a real file, indentation is whatever the heredoc
+        # wrote), which is why every other python in this buildspec that needs >1 line uses it.
+        #
+        # Written in pre_build so it exists on EVERY code path that can later reach `_dep`,
+        # including the early cross-account-copy failure exit.
+        #
+        # Reads its inputs from the environment (`_dep` passes all six INLINE, because REPO_SK /
+        # AGENT_ID / STAGE / IMAGE_TAG are plain shell assignments, not exports). Writes the
+        # low-level DDB item JSON to the path given as argv[1].
+        #
+        # NOTE `source_sha` is deliberately absent: the buildspec has no commit sha in scope. The
+        # sha lives ONLY on the backend-written `started` row (from the OIDC-proven token), so any
+        # reader collapsing the two rows for one build_id must take source_sha from the `started`
+        # row, never from this one.
+        cat > /tmp/dep.py << 'PYEOF'
+        import json, os, sys, uuid
+        from datetime import datetime, timezone
+        i = 'dep-' + uuid.uuid4().hex[:8]
+        ts = datetime.now(timezone.utc).isoformat()
+        r, s = os.environ['REPO_SK'], os.environ['STAGE']
+        o = os.environ['D_OUT']
+        k = '%s#%s#%s#%s' % (r, s, ts, i[-4:])
+        it = {'pk': 'deployment', 'sk': k, 'id': i, 'repo_id': r, 'agent_id': os.environ['AGENT_ID'],
+              'stage': s, 'seq_key': k, 'image_tag': os.environ['IMAGE_TAG'],
+              'build_id': os.environ.get('CODEBUILD_BUILD_ID') or None, 'outcome': o,
+              'started_at': ts, 'completed_at': ts,
+              'error': 'the runtime build failed' if o == 'failed' else None}
+        json.dump({k2: ({'NULL': True} if v is None else {'S': v}) for k2, v in it.items()},
+                  open(sys.argv[1], 'w'))
+        PYEOF
+  build:
+    commands:
+      - cd /tmp/workspace
+      - |
+        if [ "${ACTION:-deploy}" = "destroy" ] && [ -f "/tmp/workspace/destroy.sh" ]; then
+          chmod +x /tmp/workspace/destroy.sh
+          /tmp/workspace/destroy.sh
+          [ -f /tmp/outputs.json ] || echo '{"deployment_id":"'$DEPLOYMENT_ID'","status":"destroyed"}' > /tmp/outputs.json
+        elif [ -f "/tmp/workspace/deploy.sh" ]; then
+          chmod +x /tmp/workspace/deploy.sh
+          if /tmp/workspace/deploy.sh; then
+            [ -f /tmp/outputs.json ] || echo '{"deployment_id":"'$DEPLOYMENT_ID'","status":"success"}' > /tmp/outputs.json
+          else
+            echo '{"deployment_id":"'$DEPLOYMENT_ID'","status":"failed","error":"deploy.sh exited with non-zero status"}' > /tmp/outputs.json
+            exit 1
+          fi
+        else
+        case "$IAC_TYPE" in
+          terraform)
+            TF_DIR=$(find /tmp/workspace -name "*.tf" -printf '%h\n' | sort -u | head -1)
+            if [ -z "$TF_DIR" ]; then echo "ERROR: No terraform files found"; exit 1; fi
+            cd "$TF_DIR"
+            if ! grep -rq 'backend "s3"' *.tf 2>/dev/null; then
+              printf 'terraform {\n  backend "s3" {}\n}\n' > backend_override.tf
+            fi
+            terraform init -input=false -backend-config="bucket=$STATE_BUCKET" -backend-config="key=deployments/$DEPLOYMENT_ID/terraform.tfstate" -backend-config="region=$AWS_TARGET_REGION" -backend-config="dynamodb_table=$LOCK_TABLE"
+            if [ "${ACTION:-deploy}" = "destroy" ]; then
+              terraform destroy -input=false -auto-approve || exit 1
+              echo '{"deployment_id":"'$DEPLOYMENT_ID'","status":"destroyed"}' > /tmp/outputs.json
+            else
+              terraform plan -input=false -out=tfplan || exit 1
+              terraform apply -input=false -auto-approve tfplan || exit 1
+              terraform output -json > /tmp/tf_outputs.json 2>/dev/null || echo '{}' > /tmp/tf_outputs.json
+              python3 /tmp/merge_outputs.py /tmp/tf_outputs.json
+            fi
+            ;;
+          agentcore_runtime)
+            # E32 FAIL-FAST — FIRST statement in this branch, on purpose. Nothing above it can
+            # create a resource, and everything below it can.
+            #
+            # `AGENT_REGISTRY_ID` is NOT a project-level value any more. AWS mints registry ids and
+            # there is no Terraform resource for the `agent-registry` namespace, so the project
+            # declares the variable EMPTY (modules/codebuild/main.tf) and the real id arrives as a
+            # per-build `environmentVariablesOverride` from `RuntimeBuildService.start_runtime_build`
+            # — the only thing that starts this project from code. Every platform-triggered build,
+            # and every `retry-build` of one (retry replays the original overrides), therefore has it.
+            #
+            # WHY THIS GUARD IS LOAD-BEARING RATHER THAN DEFENSIVE: this buildspec has NO `set -e`
+            # (see the note at the ARN write-back below), so an empty id does NOT abort — it cascades
+            # silently. Traced end to end: `get-registry-record --registry-id ""` fails NON-FATALLY,
+            # `$REC` is empty, and every `jq` read below it yields "" at rc 0 — so `$AGENT_NAME`,
+            # `$MODEL_ID`, `$APP_AUD`, `$APP_ID` are all empty, `terraform apply` RUNS ANYWAY, and an
+            # AgentCore runtime goes LIVE with an empty model id. The `NEW_ENV` guard further down
+            # then fires and reports "LIVE but UNTRACKED" — it DETECTS the worst outcome in this
+            # system (a live, invocable, billing runtime whose ARN is recorded nowhere, which the E23
+            # delete cascade can never reclaim) but by then it cannot PREVENT it, because the apply
+            # has already happened. Refusing here converts that into a build that fails having
+            # provisioned nothing.
+            #
+            # Bare `exit 1`, no `_st`/`_dep`: those helpers are not defined until further down this
+            # branch, and there is nothing to record anyway — no deployment was attempted.
+            if [ -z "$AGENT_REGISTRY_ID" ]; then echo "ERROR: AGENT_REGISTRY_ID is empty, so this build can neither READ the agent's registry record (it needs model_id and the Entra app wiring to provision) nor WRITE the runtime ARN back afterwards. Refusing BEFORE anything is provisioned, because continuing would leave a LIVE runtime that nothing recorded and the delete cascade could never reclaim. The platform supplies this id as a per-build environmentVariablesOverride (RuntimeBuildService.start_runtime_build resolves the registry by NAME and injects it), so start the build through the platform — POST /builds/runtime, or the promote/merge paths — rather than by hand. If you must run 'aws codebuild start-build' directly, pass it yourself alongside IAC_TYPE: --environment-variables-override name=AGENT_REGISTRY_ID,value=<id>,type=PLAINTEXT — get <id> from: aws agent-registry-control list-registries --query \"registries[?name=='agp-agents'].registryId\" --output text" >&2; exit 1; fi
+            AGENT_ID="${IMAGE_TAG%%-*}"
+            # ECR_REPO_ARN scopes exec-role pull (empty=module "*").
+            ECR_REPO_ARN=""
+            [ -n "$ECR_REPO" ] && ECR_REPO_ARN="arn:aws:ecr:${AWS_TARGET_REGION}:${ECR_REPO%%.*}:repository/${ECR_REPO#*/}"
+            # E32: `agent-registry-control` — the Registry's NEW namespace, and the only namespace
+            # this file may name for a registry call. The retired one shuts down 2026-09-17 and
+            # BRAND-NEW ACCOUNTS CANNOT CALL IT AT ALL, so a read there would 4xx before the deploy
+            # even starts. (Only the Registry moved; Gateway/Runtime/Identity/Cedar did not — but
+            # this buildspec makes no such call, so no old-namespace name belongs anywhere in it,
+            # which is what test_buildspec_contract asserts.) `agent-registry:*` is granted to the
+            # CodeBuild role (E32/T7); note the signing name is `agent-registry`, not the CLI name.
+            REC=$(aws agent-registry-control get-registry-record --registry-id "$AGENT_REGISTRY_ID" --record-id "$AGENT_ID" --output json)
+            AGENT_NAME=$(echo "$REC" | jq -r '.name')
+            # E32: the CUSTOM descriptor's leaf was RENAMED `inlineContent` -> `data` (and `data` is
+            # the ONLY member of `custom` on the new model). Reading the old key yields the jq
+            # literal "null", which then makes every `.model_id // ""` below empty — a silent
+            # mis-provision, not an error. Mirrors agent_registry_service's `descriptors.custom.data`.
+            ENV=$(echo "$REC" | jq -r '.descriptors.custom.data')
+            MODEL_ID=$(echo "$ENV" | jq -r '.model_id // ""')
+            APP_AUD=$(echo "$ENV" | jq -r '.entra_app_audience // ""')
+            APP_ID=$(echo "$ENV" | jq -r '.entra_app_id // ""')
+            # E26: Langfuse key SECRET NAME (non-secret) from the envelope; host from LANGFUSE_HOST env.
+            LANGFUSE_SECRET_NAME_VAL=$(echo "$ENV" | jq -r '.langfuse_key_secret_name // ""')
+            TF_DIR=$(find /tmp/workspace -name "*.tf" -printf '%h\n' | sort -u | head -1)
+            [ -z "$TF_DIR" ] && { echo "ERROR: no TF in workspace"; exit 1; }
+            cd "$TF_DIR"
+            grep -rq 'backend "s3"' *.tf 2>/dev/null || printf 'terraform {\n  backend "s3" {}\n}\n' > backend_override.tf
+            # E28/T4b: the `pk = "repository"` FILTER is load-bearing. `agent_id-index` is a GSI over
+            # EVERY row carrying an agent_id, and the append-only deployment partition
+            # (models/deployment.py) carries one too — so after the first deployment this query
+            # returns 2+ items for one agent, and GSI item order is NOT contractual. When a
+            # deployment row sorts first, REPO_SK becomes a composite key like
+            # `repo-abc#dev#2026-...#1027`, which PASSES the `!= "None"` guard below and makes _u /
+            # _st / _tag / _dep all write to a key that does not exist — silently breaking the
+            # PRE-EXISTING cicd_status write-back, nondeterministically. KEYS_ONLY projects pk, so
+            # filtering on it here is free and needs no index change.
+            # COST NOTE (parked; cost/latency, NOT correctness): a FilterExpression is applied AFTER
+            # the read, so this query reads RCU proportional to the agent's ENTIRE deployment
+            # history and the CLI auto-paginates it — growing with every build. Acceptable at
+            # current volumes. The fix, if it ever matters, is a repo-keyed lookup or a sparse
+            # index; it is NOT removing the filter, which is load-bearing above.
+            REPO_SK=$(aws dynamodb query --table-name "$PROJECTS_TABLE_NAME" --index-name agent_id-index --key-condition-expression "agent_id = :a" --filter-expression "pk = :p" --expression-attribute-values "{\":a\":{\"S\":\"$AGENT_ID\"},\":p\":{\"S\":\"repository\"}}" --query 'Items[0].sk.S' --output text)
+            _u() { [ -n "${REPO_SK:-}" ] && [ "$REPO_SK" != "None" ] && aws dynamodb update-item --table-name "$PROJECTS_TABLE_NAME" --key "{\"pk\":{\"S\":\"repository\"},\"sk\":{\"S\":\"$REPO_SK\"}}" --update-expression "SET $1 = :v" --expression-attribute-values "{\":v\":{\"S\":\"$2\"}}" 2>/dev/null || true; }
+            _st() { _u cicd_status "$1"; }
+            # E28A/T6: one branch PER STAGE — dev writes last_dev_image_tag, prod writes
+            # last_promoted_image_tag. Both are "the tag this stage is now SERVING", and this
+            # build is the only writer that knows the apply actually succeeded (the backend
+            # stamps at StartBuild, which proves only that the build was accepted; T6 made it
+            # skip the tag for exactly that reason, leaving prod with no writer at all).
+            # This does NOT reopen the option T6's research rejected. That rejection was about
+            # the promotion AUDIT fields: `last_promoted_by` cannot move here (no Entra oid in
+            # scope) and `last_promoted_at` is the backend's `_promotion_in_flight` clock, so
+            # deferring it would disarm the concurrency guard. The image tag is neither an actor
+            # nor a clock, and this helper already owns the symmetric dev field.
+            # Two independent statements, each keeping the dev shape's `|| true`: a failed
+            # write must never fail a good deploy, and an empty IMAGE_TAG must write nothing.
+            # E28B/T4 (D-B3): each stage also records the DIGEST it is now serving, alongside the
+            # tag and never instead of it. The tag stays because it is what every existing surface
+            # renders and what a rollback validates against; the digest is added because it is the
+            # only value a production approval can honestly attest to. Same shape as the tag
+            # writes — stage-gated, non-empty-guarded, `|| true` — so a failed write cannot fail a
+            # good deploy, and an empty digest (the legacy tag-only path) writes nothing rather
+            # than persisting a "" that a reader would treat as a real digest.
+            _tag() { [ "$STAGE" = "dev" ] && [ -n "$IMAGE_TAG" ] && _u last_dev_image_tag "$IMAGE_TAG" || true; [ "$STAGE" = "prod" ] && [ -n "$IMAGE_TAG" ] && _u last_promoted_image_tag "$IMAGE_TAG" || true; [ "$STAGE" = "dev" ] && [ -n "${IMAGE_DIGEST:-}" ] && _u last_dev_digest "$IMAGE_DIGEST" || true; [ "$STAGE" = "prod" ] && [ -n "${IMAGE_DIGEST:-}" ] && _u last_promoted_digest "$IMAGE_DIGEST" || true; }
+            # E28/T4b (D7): append the TERMINAL Deployment row. $1 = succeeded|failed.
+            # The backend appends a `started` row when a build is REQUESTED; only the build itself
+            # knows the outcome, so this is the one writer of a terminal row. Contract C1 —
+            # pk="deployment", sk="{repo_id}#{stage}#{started_at}#{id[-4:]}". This shape MUST stay
+            # byte-compatible with `deployment_seq_key()`/`append_deployment` in backend
+            # project_service.py: a row written under any other key shape lands where
+            # `list_deployments` does not look, i.e. history silently reads empty.
+            # REPO_SK *is* the repo_id (the repository partition keys sk=repo.id) — guarded for the
+            # literal "None" exactly like _u, since an unresolved query returns that string.
+            # No actor/actor_kind: a build has no human actor and inventing one would forge
+            # attribution (C1 keeps a GitHub login and an Entra oid distinct on purpose).
+            # Best-effort (|| true): a failed history write must never fail a good deploy.
+            # The item is minted by PYTHON3, not shell: the sk suffix is `id[-4:]` and the timestamp
+            # is a Python `datetime.isoformat()`, and both are contract-critical. Shell got each
+            # wrong when first written (`${ID##*-}` yields 8 chars not 4; `date +%6N` is not
+            # portable and emitted a literal "6N"), and either bug writes the row where
+            # `list_deployments` cannot see it. python3 is already a hard dependency of this
+            # buildspec (merge_outputs.py, the post_build DDB write).
+            # E28/T4b: append the terminal Deployment row. $1 = succeeded|failed.
+            # Invokes /tmp/dep.py (heredoc'd in pre_build) as a FILE, never `python3 -c` — an inline
+            # body inside a YAML block scalar carries this block's indentation at runtime, which
+            # `python3 -c` rejects with IndentationError on every interpreter before 3.14. See the
+            # pre_build heredoc for the full reasoning.
+            # EVERY name the script reads is passed INLINE: AGENT_ID (:258) and REPO_SK (:274) are
+            # plain shell assignments — the file's only `export`s are the 3 AWS credential lines
+            # (:64-66) — so a bare invocation inherits NONE of them and dies on KeyError. Do NOT
+            # drop these assignments.
+            # The item path is mktemp'd (a fixed /tmp/dep.json would be shared across the retries
+            # and the failure paths that can both call this within one build).
+            _dep() { [ -n "${REPO_SK:-}" ] && [ "$REPO_SK" != "None" ] && [ -n "$IMAGE_TAG" ] && { D_ITEM=$(mktemp /tmp/dep-item.XXXXXX.json) && D_OUT="$1" REPO_SK="$REPO_SK" AGENT_ID="$AGENT_ID" STAGE="$STAGE" IMAGE_TAG="$IMAGE_TAG" CODEBUILD_BUILD_ID="${CODEBUILD_BUILD_ID:-}" python3 /tmp/dep.py "$D_ITEM" && { aws dynamodb put-item --table-name "$PROJECTS_TABLE_NAME" --item "file://$D_ITEM" 2>/dev/null && echo "[dep] recorded $1 deployment row for $REPO_SK/$STAGE" || echo "WARN: [dep] deployment history write failed for $REPO_SK/$STAGE (build unaffected)"; } || echo "WARN: [dep] could not build the deployment row for $REPO_SK/$STAGE (build unaffected)"; rm -f "$D_ITEM"; } || true; }
+            # E28B/T4 (D-B3) — RESOLVE THE IMAGE REFERENCE. A digest, when we have one.
+            # `container_image_uri` used to be `$ECR_REPO:$IMAGE_TAG` — a MUTABLE tag. The tenant
+            # ECR repo is mutable and this image build is not reproducible (a floating
+            # python:3.11-slim base, ranged deps, no lockfile), so the bytes behind one tag can
+            # differ between the moment an OWNER approves and the moment prod deploys. A digest
+            # names the bytes themselves, so "the image dev tested" and "the image prod runs"
+            # become the same thing by construction instead of by inference.
+            # IMAGE_DIGEST is threaded in from the backend (runtime_build_service.py) — for prod it
+            # is the digest recorded on the APPROVED candidate. It is deliberately NOT re-derived
+            # from the tag here: `describe-images --image-ids imageTag=...` would return whatever
+            # the tag points at NOW, which is exactly the window the digest exists to close.
+            # `describe-images` is used only for its honest job below — proving the digest EXISTS in
+            # the registry we are about to deploy from (the CodeBuild role holds ecr:*).
+            # Empty is a legitimate state, not a fault: a rollback validates its target from
+            # tag-keyed Deployment rows that carry no digest, and a pre-E28B agent repo POSTs no
+            # digest at all. Those deploy by tag exactly as before.
+            # Validate the SHAPE first, before this value reaches a docker reference or a tfvar.
+            # Anchored to sha256 + exactly 64 lowercase hex: a malformed digest must fail the build
+            # LOUDLY rather than produce `<repo>@garbage`, which surfaces much later as an opaque
+            # ImagePull error against a runtime the platform already recorded as deployed. The
+            # failure is RECORDED (_st/_dep) so the badge and the history agree, rather than
+            # vanishing as a bare exit. Anchoring also keeps a shell metacharacter out of the
+            # reference this value is interpolated into.
+            _bad_digest() { echo "ERROR: $1 is not a well-formed image digest (expected sha256: followed by 64 lowercase hex chars), refusing to deploy an image this build cannot name."; _st failed; _dep failed; exit 1; }
+            if [ -n "${IMAGE_DIGEST:-}" ]; then echo "$IMAGE_DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' || _bad_digest IMAGE_DIGEST; fi
+            # CROSS-ACCOUNT PROMOTE: copy the approved bytes into the target account's registry.
+            # Runs BEFORE the tfvars are written, because on this path the digest that must be
+            # DEPLOYED is the one in the TARGET repo, and it does not exist until this copy runs.
+            if [ "${SOURCE_ECR_REQUIRED:-}" = "true" ]; then
+              if [ -z "$SOURCE_ECR_REPO" ] || [ "$SOURCE_ECR_REPO" = "$ECR_REPO" ]; then echo "ERROR: x-acct promote: no dev img"; _st failed; _dep failed; exit 1; fi
+              _lg() { C=$(aws sts assume-role --role-arn "$1" --role-session-name cp --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text); AWS_ACCESS_KEY_ID=$(echo "$C"|cut -f1) AWS_SECRET_ACCESS_KEY=$(echo "$C"|cut -f2) AWS_SESSION_TOKEN=$(echo "$C"|cut -f3) aws ecr get-login-password --region "$2"|docker login -u AWS --password-stdin "${3%%/*}"; }
+              _lg "$SOURCE_DEPLOY_ROLE_ARN" "$SOURCE_REGION" "$SOURCE_ECR_REPO"; _lg "$TARGET_ROLE_ARN" "$AWS_TARGET_REGION" "$ECR_REPO"
+              # E28B/T4 — PULL BY DIGEST when we have one. Pulling `$SOURCE_ECR_REPO:$IMAGE_TAG`
+              # is a MUTABLE read on the promotion path: between the approval and this copy the
+              # dev tag may point at different bytes, so the tag-based pull can copy an image the
+              # OWNER never approved. The digest pull guarantees the approved bytes.
+              SRC_REF="$SOURCE_ECR_REPO:$IMAGE_TAG"
+              [ -n "${IMAGE_DIGEST:-}" ] && SRC_REF="$SOURCE_ECR_REPO@$IMAGE_DIGEST"
+              docker pull "$SRC_REF" && docker tag "$SRC_REF" "$ECR_REPO:$IMAGE_TAG" && docker push "$ECR_REPO:$IMAGE_TAG" || { _st failed; _dep failed; exit 1; }
+              # RE-RESOLVE the digest in the TARGET repo. A pull/tag/push through the docker daemon
+              # can re-serialize the manifest, so the source digest need NOT exist in the target
+              # registry — and a digest-pinned deploy would then fail to resolve, on the
+              # cross-account path only. This is `describe-images` doing its honest job: reading
+              # back bytes we JUST wrote, not re-reading an approvable tag. The tag is safe to key
+              # this lookup on because we pushed it moments ago in this same build, into a registry
+              # only the platform writes.
+              # THE READ-BACK MUST RUN IN THE TARGET ACCOUNT, and neither half of that is automatic.
+              # 1) CREDENTIALS. This branch runs under the AMBIENT CodeBuild (tooling-account) role:
+              #    the pre_build assume-role at the top of this file is gated on
+              #    `IAC_TYPE != "agentcore_runtime"`, so it never fires here, and `_lg`'s creds are
+              #    an INLINE ENV PREFIX — verified in a real shell to apply to its ONE command and
+              #    be UNSET immediately after. `docker push` above still works only because
+              #    `docker login` persists to ~/.docker/config.json, which is exactly what hides
+              #    this. So the call needs creds of its own; `_with_target` supplies them for the
+              #    whole command via a subshell (an `export` inside `( … )` cannot leak out and
+              #    disturb the terraform apply that follows).
+              # 2) --registry-id. Without it the CLI queries the CALLER's registry. The tooling
+              #    account owns a SAME-NAMED repo (`modules/agent_ecr` → `<prefix>-agent-images`),
+              #    so the usual outcome is RepositoryNotFound → a failed promote, and the worse one
+              #    is a same-tag HIT resolving a FOREIGN digest that gets pinned onto $ECR_REPO and
+              #    fails at ImagePull after the platform recorded a successful deploy.
+              # The account id is derived from $ECR_REPO's own host (never hardcoded).
+              _with_target() { ( C=$(aws sts assume-role --role-arn "$TARGET_ROLE_ARN" --role-session-name cpread --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text) || exit 1; export AWS_ACCESS_KEY_ID=$(echo "$C"|cut -f1); export AWS_SECRET_ACCESS_KEY=$(echo "$C"|cut -f2); export AWS_SESSION_TOKEN=$(echo "$C"|cut -f3); "$@" ); }
+              if [ -n "${IMAGE_DIGEST:-}" ]; then
+                TARGET_DIGEST=$(_with_target aws ecr describe-images --registry-id "${ECR_REPO%%.*}" --repository-name "${ECR_REPO#*/}" --region "$AWS_TARGET_REGION" --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)
+                # `|| true` keeps a CLI/assume-role fault from aborting unrecorded; the shape check
+                # is what actually decides. `describe-images` prints the literal "None" for a
+                # missing image, which is neither empty nor a digest — the anchored pattern rejects
+                # it, so a failed read-back FAILS THE BUILD rather than deploying an unnamed image.
+                echo "$TARGET_DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$' || _bad_digest "the digest resolved in the target registry ('$TARGET_DIGEST')"
+                IMAGE_DIGEST="$TARGET_DIGEST"
+              fi
+            fi
+            # The reference terraform actually deploys: a digest when we have one, else the
+            # pre-E28B tag. Computed AFTER the cross-account copy so it names the target digest.
+            IMAGE_REF="$ECR_REPO:$IMAGE_TAG"
+            [ -n "${IMAGE_DIGEST:-}" ] && IMAGE_REF="$ECR_REPO@$IMAGE_DIGEST"
+            cat > deploy.auto.tfvars <<TFVARS
+        agent_name="$AGENT_NAME"
+        stage="$STAGE"
+        model_id="$MODEL_ID"
+        container_image_uri="$IMAGE_REF"
+        aws_region="$AWS_TARGET_REGION"
+        deploy_role_arn="$TARGET_ROLE_ARN"
+        ecr_repo_arn="$ECR_REPO_ARN"
+        tenant_id="$ENTRA_TENANT_ID"
+        entra_app_audience="$APP_AUD"
+        entra_app_id="$APP_ID"
+        langfuse_host="${LANGFUSE_HOST:-}"
+        langfuse_secret_name="$LANGFUSE_SECRET_NAME_VAL"
+        TFVARS
+            # E28A/T1b — DRIFT GUARD. Refuse to deploy a STALE runtime module.
+            # THE MODULE IN THE AGP REPO IS NOT THE MODULE THAT RUNS. runtime_build_service.py
+            # sends GIT_INFRA_ORG/GIT_INFRA_REPO, the install phase git-clones the per-org
+            # `agp-runtime-infra` repo into /tmp/workspace, and this branch applies whatever .tf it
+            # finds there. The S3 module zip is consumed only by a create-once rollout, so every
+            # terraform edit in the AGP repo is INERT until the module is rolled out to the org.
+            # Without this guard that is SILENT: terraform treats a tfvar with no matching
+            # `variable` block as a WARNING ("Value for undeclared variable"), so `stage="$STAGE"`
+            # above would be DISCARDED, the resource names would stay account-global, and the build
+            # would go GREEN having fixed nothing — while a prod promote still dies on
+            # `EntityAlreadyExists` (finding #9). This is exactly how finding #11 hid for a whole
+            # epic: the langfuse tfvars were dropped the same way, unnoticed.
+            # `stage` is the right sentinel because it is UNCONDITIONAL — it is passed on every
+            # runtime build, so the check needs no "if it was configured" branch, and a root that
+            # declares it necessarily came from a post-T1b rollout (which also carries the langfuse
+            # vars, so this subsumes #11's own drift).
+            # Matches a real `variable "stage"` BLOCK HEADER, anchored at line start: a bare
+            # `grep stage *.tf` would be satisfied by a COMMENT mentioning the word or by a
+            # `locals { stage = ... }`, i.e. by precisely the half-updated module this exists to
+            # catch. Runs BEFORE `terraform init` — a check after `apply` would fire only once a
+            # stale module had already created (or refused to create) account-global resources —
+            # and after the helpers above are defined, so the failure is RECORDED (`_st failed`,
+            # `_dep failed`) rather than vanishing as a bare exit.
+            # NOTE for whoever hits this: the fix is a module rollout (root `terraform apply` to
+            # re-stage the zip, THEN the rollout with overwrite=true). `overwrite=true` is safe
+            # only while no org-side hand edits exist — true today (agp-runtime-infra has two bot
+            # commits and nothing else); a customer-edited infra repo needs an update path first.
+            if ! grep -qE '^[[:space:]]*variable[[:space:]]+"stage"' *.tf 2>/dev/null; then echo "ERROR: STALE RUNTIME MODULE — the cloned $GIT_INFRA_ORG/$GIT_INFRA_REPO declares no 'stage' variable, so stage-scoped resource names (E28A/T1b) would be silently ignored and a prod deploy would collide with dev on an account-global name. Roll the runtime module out to the org (terraform apply, then the template rollout with overwrite=true) and retry."; _st failed; _dep failed; exit 1; fi
+            # E28/T2 (D5): the state key is STAGE-SCOPED. Without the $STAGE segment every stage
+            # shares one state file and one agent_arn — a prod apply mutates the dev runtime.
+            # Must stay byte-identical to `runtime_state_key()` in backend project_service.py
+            # (that side deletes/inspects; a drift leaks state silently). STATE_BUCKET is a
+            # single control-plane bucket and is deliberately NOT per-stage.
+            terraform init -input=false -backend-config="bucket=$STATE_BUCKET" -backend-config="key=agentcore-runtime/$AGENT_ID/$STAGE/terraform.tfstate" -backend-config="region=$AWS_TARGET_REGION" -backend-config="dynamodb_table=$LOCK_TABLE"
+            terraform plan -input=false -out=tfplan && terraform apply -input=false -auto-approve tfplan || { echo "apply failed"; RT_FAIL=1; }
+            if [ "${RT_FAIL:-0}" = "1" ]; then _st failed; _dep failed; exit 1; fi
+            RUNTIME_ARN=$(terraform output -raw agent_runtime_arn)
+            # E28A/T1b (C-A2): write the ARN into the PER-STAGE MAP *and* keep the scalar.
+            # Stage-scoped resource names make two runtimes co-exist, so one scalar field cannot
+            # name both — whichever stage deployed LAST would silently own it, and the E23 delete
+            # cascade would then leak the other (a live, billing, unreachable runtime).
+            # The DUAL write is mandatory, not belt-and-braces. The reader
+            # (models/agent.py::resolve_runtime_arns) de-dupes the scalar against the map so the
+            # duplicate costs nothing, while `Agent.is_agentcore` is still `bool(agent_arn)` and
+            # gates POST /agents/{id}/reprovision + the E6 provisioning gate — dropping the scalar
+            # turns every agent non-agentcore. It also keeps a rollback to pre-E28A code able to
+            # find a runtime at all.
+            # `jq` CREATES `.agent_arns` on assignment, so this is safe on a legacy envelope that
+            # has no map; a missing map is a legacy record, never an error.
+            # This buildspec has NO `set -e`, so every step below is guarded EXPLICITLY. T1b is
+            # what makes that load-bearing: the rename forces replacement, so the stored ARN is
+            # GUARANTEED stale at this point. An unrecorded ARN leaves a live, invocable, billing
+            # runtime the E23 cascade can never reclaim (it deletes by recorded ARN) — reported as
+            # a successful deploy. A failed step must therefore FAIL THE BUILD, the way the
+            # terraform-apply guard above does, not fall through to `_st deployed`.
+            if [ -z "$RUNTIME_ARN" ]; then echo "ERROR: terraform produced no agent_runtime_arn — a runtime may be LIVE and UNTRACKED (nothing recorded it, so the delete cascade cannot reclaim it). Reconcile by hand, then retry."; _st failed; _dep failed; exit 1; fi
+            NEW_ENV=$(echo "$ENV" | jq -c --arg arn "$RUNTIME_ARN" --arg s "$STAGE" '.agent_arns[$s]=$arn | .agent_arn=$arn | .identity_status="provisioned"') || NEW_ENV=""
+            # Refuse to send an empty or non-JSON envelope. `data` is a FULL REPLACE, so an
+            # empty $NEW_ENV does not merely skip the ARN — `jq -Rs .` renders it as "\n" and ERASES
+            # the whole envelope (model_id, entra_app_id/audience, langfuse_key_secret_name,
+            # identity_status and the ARN map). Reproduced live: a legacy record whose agent_arns is
+            # a STRING makes the jq above exit 5 with empty stdout. `jq -e .` rejects empty, null
+            # and malformed input, so this covers a truncated envelope too.
+            if ! echo "$NEW_ENV" | jq -e . > /dev/null 2>&1; then echo "ERROR: could not build the registry envelope for $RUNTIME_ARN — NOT writing, because an empty data blob would ERASE the agent record. The runtime is LIVE but UNTRACKED; reconcile by hand."; _st failed; _dep failed; exit 1; fi
+            # E32: `agent-registry-control` + the new PATCH shape. This is the ARN write-back that
+            # makes a provisioned runtime GOVERNABLE, so a namespace/shape mismatch here is the
+            # data-loss path the error text below describes — not a cosmetic drift.
+            # `descriptors` is THREE `optionalValue` levels deep, one per struct on the path:
+            # UpdatedDescriptors -> custom (UpdatedCustomDescriptor) -> data (UpdatedDescriptorData).
+            # The retired namespace's leaf was a bare string, so the pre-E32 two-level shape fails
+            # PARAM VALIDATION client-side ("Invalid type for parameter ...custom.optionalValue.data,
+            # valid types: dict"). Mirrors _wrap_update_descriptors_custom in agent_registry_service.
+            aws agent-registry-control update-registry-record --registry-id "$AGENT_REGISTRY_ID" --record-id "$AGENT_ID" --descriptors "{\"optionalValue\":{\"custom\":{\"optionalValue\":{\"data\":{\"optionalValue\":$(echo "$NEW_ENV" | jq -Rs .)}}}}}" || { echo "ERROR: runtime $RUNTIME_ARN is LIVE but its ARN was NOT recorded (update-registry-record failed) — it is UNTRACKED and the delete cascade cannot reclaim it. Retry the build; reconcile by hand if it persists."; _st failed; _dep failed; exit 1; }
+            _tag; _st deployed; _dep succeeded
+            terraform output -json > /tmp/tf_outputs.json 2>/dev/null || echo '{}' > /tmp/tf_outputs.json
+            python3 /tmp/merge_outputs.py /tmp/tf_outputs.json
+            ;;
+          *)
+            echo "Unsupported IAC_TYPE: $IAC_TYPE" && exit 1
+            ;;
+        esac
+        fi
+      - aws s3 cp /tmp/outputs.json s3://$STATE_BUCKET/$DEPLOYMENT_ID/outputs.json
+  post_build:
+    commands:
+      # E36/T9: purge the per-build scratch clone token. `GIT_SECRET_ARN` is a StartBuild
+      # override written by the control plane (runtime_build_service._write_scratch_token), and
+      # it holds a READY bearer token — a verbatim PAT, or a ~1h GitHub App installation token.
+      # Nothing else ever deleted it, so one secret accumulated per build, forever, billing
+      # monthly. This is the reclaim point for every build that STARTED: post_build runs on the
+      # success path AND after a failed build phase, so both are covered.
+      #
+      # THE ORDERING IS LOAD-BEARING: this is the FIRST post_build command on purpose. A failing
+      # command aborts the rest of its phase, and `cat /tmp/outputs.json` below fails whenever the
+      # build phase died before writing that file — exactly the failed-deploy case where the token
+      # most needs reclaiming. Placed after it, the purge would silently never run.
+      #
+      # WARN-not-fail (this file's convention; there is no `set -e`): a deploy must NEVER be
+      # reported failed because cleanup failed. Guarded on non-empty because only the git-clone
+      # source path sets the var — a CodeCommit/S3-archive build has no scratch secret. Force
+      # delete: the default 30-day recovery window would keep the token readable that whole time.
+      # `backend/scripts/sweep_runtime_build_tokens.py` is the operator backstop for a WARN here
+      # (and for a build killed before post_build ran at all).
+      - |
+        if [ -n "$GIT_SECRET_ARN" ]; then
+          aws secretsmanager delete-secret --secret-id "$GIT_SECRET_ARN" --force-delete-without-recovery > /dev/null || echo "WARN: could not purge the scratch clone token $GIT_SECRET_ARN — it still holds a live git token; sweep it with backend/scripts/sweep_runtime_build_tokens.py"
+        fi
+      - cat /tmp/outputs.json
+      - |
+        python3 -c "
+        import boto3, json, os
+        dt = os.environ.get('DEPLOYMENTS_TABLE')
+        with open('/tmp/outputs.json') as f:
+            outputs = json.load(f)
+        outputs.pop('deployment_id', None)
+        outputs.pop('status', None)
+        if dt and outputs:
+            table = boto3.resource('dynamodb', region_name=os.environ['AWS_TARGET_REGION']).Table(dt)
+            table.update_item(
+                Key={'pk': f'DEPLOY#{os.environ[\"DEPLOYMENT_ID\"]}', 'sk': 'META'},
+                UpdateExpression='SET outputs = :o',
+                ExpressionAttributeValues={':o': outputs}
+            )
+            print(f'Stored {len(outputs)} outputs to DynamoDB')
+        " || echo "WARN: DDB outputs write failed"

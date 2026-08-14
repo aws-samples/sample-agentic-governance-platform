@@ -1,0 +1,67 @@
+# AWS Configuration
+aws_region = "us-east-1"
+environment = "dev"
+
+# Project Configuration
+app_name     = "control-plane"
+project_name = "agp"
+
+# VPC Configuration (Optional - leave empty to create new VPC)
+# If using existing VPC, provide these values:
+# vpc_id             = "vpc-xxxxx"
+# public_subnet_ids  = ["subnet-xxxxx", "subnet-yyyyy"]
+# private_subnet_ids = ["subnet-aaaaa", "subnet-bbbbb"]
+
+# VPC Configuration (For new VPC creation)
+vpc_cidr           = "10.0.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# Domain Configuration (Optional)
+domain_name    = "agp-platform.example.com"
+hosted_zone_id = "" # Leave empty if not using custom domain
+
+# ECS Configuration
+ecs_task_cpu       = 512
+ecs_task_memory    = 1024
+ecs_desired_count  = 2
+ecs_min_capacity   = 1
+ecs_max_capacity   = 4
+container_image    = "" # Will use ECR repository URL
+
+# S3 Configuration
+project_archive_retention_days = 7
+
+# Tags
+tags = {
+  Project   = "agp"
+  Component = "control-plane"
+  ManagedBy = "terraform"
+}
+
+owner       = "platform-team"
+cost_center = "ai-platform"
+
+# NOTE: no GitHub settings here, on purpose. This stack deploys zero GitHub
+# artifacts — the account-global Actions OIDC provider and the ECR-push roles are
+# created by the PLATFORM when an operator connects a GitHub org in the UI. Nothing
+# to set on a fresh account, and an account that never connects GitHub never gets a
+# GitHub dependency.
+
+# AWS Agent Registry (the `agent-registry` namespace, E32)
+#
+# NOTHING TO SET, AND NO REGISTRY ID TO PASTE. Terraform CREATES both registries (module
+# "agent_registry" in main.tf). The pre-E32 instruction that used to sit here (run
+# ensure_agent_registry.py / ensure_mcp_registry.py by hand, paste the printed registryIds,
+# re-apply) is obsolete: those two scripts were merged into one backend/scripts/ensure_registry.py,
+# and Terraform is what runs it now. The `agent_registry_id` / `mcp_registry_id` variables that
+# outlived that flow as an adoption override are gone too, and so is every other place the id used
+# to travel through this stack — the BACKEND resolves it from the registry NAME at first use, so
+# there is nothing here that can disagree with what exists in AWS. What the registries are CALLED
+# and where they live is still operator input — `agent_registry_name` / `mcp_registry_name` /
+# `agent_registry_region` / `mcp_registry_region` — but their defaults are what the backend
+# expects, so this file sets none of them.
+#
+# ONE APPLY IS ENOUGH. This used to need `terraform apply` TWICE, because a script-backed module's
+# local-exec cannot return a value and the id was read back during the plan walk: apply #1 rendered
+# empty ids and left the registry-backed routes inert, apply #2 filled them in. Keying everything
+# on the NAME (static, known at plan time) removed that entirely.

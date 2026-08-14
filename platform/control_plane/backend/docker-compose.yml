@@ -1,0 +1,67 @@
+# Local control-plane backend on :8000.
+#
+#   cp .env.example .env      # then fill it in
+#   docker compose up --build
+#
+# The `.env` step is not decoration. The image deliberately does NOT COPY `.env` (that would bake
+# secrets into a layer), so without the `env_file` below `Settings` runs on defaults: real Entra
+# JWT validation against an EMPTY tenant, so every `/api/v1/*` route rejects you, and an empty
+# bucket name, so `/health` is permanently `degraded`. For local API work set `USE_DEV_AUTH=true`
+# in `.env`. Do NOT set `DEBUG=true` — it flips `global_exception_handler` back to echoing
+# `str(exc)` to the caller, which is exactly the disclosure class E34/T9 closed.
+#
+# `context` is the REPO ROOT (four levels up), not this directory: the Dockerfile COPYs
+# `platform/control_plane/backend/src/` and `platform/control_plane/agent-templates/` as paths
+# relative to the build context, and the agent-templates dir is a SIBLING of backend/ — so a
+# `context: .` here could never resolve either path. With `context: .` this file did not build
+# at all (E34/T9).
+#
+# Volume paths stay relative to THIS file's directory, which is why `./src` is still correct.
+services:
+  backend:
+    build:
+      context: ../../..
+      dockerfile: platform/control_plane/backend/Dockerfile
+    # `required: false` (Compose spec >= 2.24) so a missing `.env` still boots — you get the
+    # defaults described above rather than an error.
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8000:8000"
+    environment:
+      # These take precedence over `.env`, and exist so a one-off shell override works. Only
+      # settings that `core/config.py` actually declares: the former APPLICATION_CATALOG_TABLE /
+      # DEPLOYMENT_METADATA_TABLE / FRONTEND_BUCKET / ENVIRONMENT entries were removed (E34/T9),
+      # since none is a `Settings` field and none is read anywhere in `src/`, so `extra =
+      # "ignore"` silently swallowed them — they read like live configuration while doing nothing.
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - PROJECT_ARCHIVES_BUCKET=${PROJECT_ARCHIVES_BUCKET:-}
+    volumes:
+      # Source mount, so an edit does not need a rebuild — but note the container's CMD carries
+      # no `--reload`, so it does need `docker compose restart backend`.
+      - ./src:/app/src
+      # Read-only host credentials under the non-root user's home (E34/T9 moved the image off
+      # root, so /root/.aws is no longer where boto3 looks).
+      #
+      # LINUX-HOST CAVEAT: this works as-is on Docker Desktop (macOS/Windows), which remaps
+      # bind-mount ownership to the container uid. A native-Linux host or CI preserves the host
+      # modes, and `~/.aws/credentials` and the SSO token cache are 0600 owned by YOUR uid — so
+      # uid 10001 gets EACCES, boto3 finds no credentials, and `/health` sits at `degraded`.
+      # Remedy: drop this mount and pass credentials as env instead —
+      # `aws configure export-credentials --format env` and put AWS_ACCESS_KEY_ID /
+      # AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN in `.env`. (Running the container as your own
+      # uid via `user:` also reads the files, but then `/app` — owned by uid 10001 — is no longer
+      # writable, which breaks the SQLite fallback.)
+      - ~/.aws:/home/appuser/.aws:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  default:
+    name: control-plane-network

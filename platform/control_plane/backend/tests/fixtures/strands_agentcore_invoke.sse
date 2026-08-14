@@ -1,0 +1,21 @@
+# CAPTURED WIRE BODY — do not hand-edit. See regeneration note below.
+# produced by: agent-templates/strands-agentcore @ commit 6471a10b-dirty
+# regenerate:  uv run --project platform/control_plane/agent-templates/strands-agentcore \
+#                python platform/control_plane/backend/tests/fixtures/generate_strands_agentcore_fixtures.py
+#              (offline; the agent is stubbed. The commit above is stamped automatically.)
+# A '-dirty' suffix means the template tree had uncommitted changes when this was captured,
+# so the named commit alone does not reproduce these bytes. Regenerating after the template
+# change is committed normalizes the stamp.
+# A SUCCESSFUL tool-using run: the handler drained over the template's own
+# _STRANDS_EVENTS stub (tests/test_agent.py) and SSE-encoded chunk by chunk exactly as
+# AgentCore's _convert_to_sse does. Content chunks, then the terminal text-bearing
+# message. The textless toolUse/toolResult messages and the {'result': AgentResult}
+# tail are absent because the handler does not forward them.
+data: {"type": "content", "data": "The answer is "}
+
+data: {"type": "content", "data": "2"}
+
+data: {"type": "content", "data": " 😊"}
+
+data: {"message": {"role": "assistant", "content": [{"text": "The answer is 2 😊"}]}}
+

@@ -1,0 +1,206 @@
+name: build
+
+# Build-only CI for the agent scaffold.
+# This workflow ONLY lints, tests, builds, and pushes the container image, then tells the
+# platform to deploy that exact image. It contains NO terraform and creates NO runtime —
+# the platform owns all infra provisioning, ECR/IAM setup, deploy, and registration.
+#
+# ONE branch, ONE path (E28B): quality → build → push image → resolve digest → POST to AGP.
+#   - push to the repo's trunk → build + `POST /builds/runtime` (dev deploy)
+#   - pull_request             → quality only
+#   - any other branch         → nothing runs; open a PR into the trunk to get CI on it
+# The `push` list is deliberately narrow: there is exactly ONE dev runtime per agent, so if
+# every feature branch deployed, N branches would race to overwrite the same deployment,
+# last-push-wins. The trunk is the single branch that owns that runtime. The branch name
+# here is this repository's own default, not a platform constant — a repo whose trunk is
+# named otherwise edits this one line and nothing else.
+#
+# CI has no prod path at all. A prod deploy is an AGP action: a project OWNER approves a
+# recorded digest, and AGP copies those exact bytes into the prod account. The platform
+# refuses a prod deploy asked for over the GitHub OIDC audience.
+#
+# `concurrency` is load-bearing, not hygiene. The platform build runs `terraform apply`
+# against ONE state per agent, and a live test saw two builds start 11 seconds apart, race
+# that state lock, and leave the loser failed while the winner deployed a stale image — with
+# the platform's own record claiming success. Keying the group on the ref makes a second push
+# QUEUE instead of race. `cancel-in-progress: false` because a deploy already in flight must
+# be allowed to FINISH: killing it halfway abandons the lock and half-applies the runtime.
+#
+# What AGP is told is the image DIGEST, not just the tag. A tag is mutable and can be
+# overwritten between the build that tested it and the deploy that ships it; a digest names
+# the exact bytes. The digest is read from the push itself, and the build FAILS if it cannot
+# be resolved — never report a successful deploy for an image you could not name.
+#
+# `[skip ci]` still works: GitHub honours it natively on `push`, and nothing here reaches
+# around the commit message (there is no `workflow_dispatch` and no message-blind trigger).
+#
+# `environment: dev` below is a DEPLOYMENT LABEL, not where the CI vars come from — and that
+# changed in E28B, so do not "restore" the old reading. AGP used to create `dev`/`prod` GitHub
+# Environments and write the per-stage vars under them; both creates were deleted (an Environment
+# is a GitHub-only concept, and each create was another write to a fresh repo). `AWS_REGION` /
+# `AWS_ECR_PUSH_ROLE_ARN` / `ECR_REPOSITORY` are now REPOSITORY-level variables, and they still
+# resolve here because a lookup checks the environment first and FALLS BACK to the repository set —
+# so `vars.ECR_REPOSITORY` resolves with no environment defined at all.
+#
+# Keep the line anyway: it declares this job as a dev deployment (visible in the Actions UI and
+# available to a repo that later adds its own protection rules), and removing it would be a
+# behaviour change, not a cleanup. What it must never again imply is that AGP provisions it.
+#
+# The credential these vars carry is the DEV account's, deliberately: the image is pushed to the
+# DEV registry, and GitHub is never trusted with the production account (see README).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # Per-ref: two pushes to the trunk serialize rather than racing the agent's single
+  # terraform state lock. Never cancel — see the header.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Lint, test, audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          # Upgrade the runner's ambient build tooling BEFORE install so pip-audit
+          # (which audits the whole environment) doesn't hard-fail on a setuptools/pip
+          # CVE the agent never declares. Pins forward past PYSEC-2026-3447.
+          pip install --upgrade 'setuptools>=83.0.0'
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check src tests
+
+      - name: Test (pytest)
+        run: pytest tests/ -v
+
+      - name: Dependency audit (pip-audit)
+        run: pip-audit
+
+  build:
+    name: Build and push image (dev)
+    needs: quality
+    if: github.event_name == 'push'
+    # Push builds+deploys DEV only; the dev environment's vars.* resolve first.
+    environment: dev
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_tag: ${{ steps.image.outputs.tag }}
+      image_digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (ECR-push OIDC role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve content-addressed tag (git tree sha)
+        id: image
+        run: |
+          TREE_SHA=$(git rev-parse HEAD^{tree})
+          echo "tag=${{ vars.AGENT_ID }}-${TREE_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image (linux/arm64)
+        run: |
+          docker buildx build --platform linux/arm64 \
+            --provenance=false \
+            -t "${{ vars.ECR_REPOSITORY }}:${{ steps.image.outputs.tag }}" \
+            --metadata-file metadata.json \
+            --push .
+
+      - name: Resolve the pushed image digest
+        id: digest
+        run: |
+          # The digest is taken from the PUSH ITSELF (buildx's own metadata), not from a
+          # later registry lookup. Two reasons, both load-bearing:
+          #   1. It names the exact bytes THIS run uploaded. A read-back of the tag can
+          #      already have been overwritten by a concurrent push, which is the whole
+          #      class of bug the digest exists to close.
+          #   2. It needs no ECR read grant. The ECR-push OIDC role has `ecr:BatchGetImage`
+          #      but NOT `ecr:DescribeImages`, so a `describe-images` call here would 403 on
+          #      every run.
+          DIGEST=$(jq -r '.["containerimage.digest"] // empty' metadata.json)
+          # Empty and malformed collapse into the same refusal on purpose: anything that is
+          # not a sha256 reference means this build cannot name what it pushed, and
+          # reporting a deploy for an unnamed image is how a stale runtime gets recorded as
+          # a success. Fail loudly instead.
+          case "${DIGEST}" in
+            sha256:*) ;;
+            *)
+              echo "::error::Could not resolve the digest of the image just pushed (got '${DIGEST}'). Refusing to report a deploy for an image this build cannot name."
+              exit 1
+              ;;
+          esac
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  trigger:
+    name: Trigger platform runtime build (dev)
+    needs: build
+    if: github.event_name == 'push'
+    # A push NEVER deploys production — stage is always dev, in the dev tenant account.
+    environment: dev
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Mint OIDC token and POST to AGP build-trigger
+        uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.image_digest }}
+        with:
+          script: |
+            const token = await core.getIDToken('agp-runtime-build');
+            // The digest is what AGP deploys and what it records for a later promotion; the
+            // tag rides along as a human-readable label and for pre-digest readers.
+            const body = {
+              agent_id: '${{ vars.AGENT_ID }}',
+              image_tag: process.env.IMAGE_TAG,
+              image_digest: process.env.IMAGE_DIGEST,
+              ecr_repo: '${{ vars.ECR_REPOSITORY }}',
+              connection_id: '${{ vars.CONNECTION_ID }}',
+              stage: 'dev',
+            };
+            if (!/^sha256:[0-9a-f]{64}$/.test(body.image_digest || '')) {
+              core.setFailed(`Refusing to POST an unusable image digest: ${body.image_digest}`);
+              return;
+            }
+            const resp = await fetch('${{ vars.AGP_API_URL }}/builds/runtime', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(body),
+            });
+            const text = await resp.text();
+            core.info(`AGP responded ${resp.status}: ${text}`);
+            if (!resp.ok) {
+              core.setFailed(`AGP build-trigger failed (${resp.status}): ${text}`);
+            }

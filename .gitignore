@@ -1,0 +1,78 @@
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfstate.d/
+**/*.tfvars
+**/*.auto.tfvars.json
+**/.terraform.tfstate.lock.info
+**/tfplan*
+**/*.tfplan
+**/*.plan
+**/deployment_package/
+**/deployment_package.zip
+platform/control_plane/infrastructure/modules/*/.lambda/
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+.logs/
+*.log
+**/*.log
+
+# Environment
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+platform/control_plane/backend/uv.lock
+
+# AgentCore
+.bedrock_agentcore.yaml
+.bedrock_agentcore/
+
+# Docker build artifacts
+docker/**/*.tar.gz
+docker/**/*.zip
+docker/**/build/
+docker/**/dist/
+
+# Node.js
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+**/*.tsbuildinfo
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Backup files
+*.bak
+
+# Generated / account-specific files
+**/deploy.zip
+platform/control_plane/backend/scripts/use_cases_gateways.txt
+platform/control_plane/infrastructure/modules/agent_registry/.registry_arn
+
+# Internal development directories — never commit these
+docs/superpowers/
+.superpowers/
+.claude/
+**/.claude/
+.omc/
+**/.omc/
+CLAUDE.md
+**/CLAUDE.md

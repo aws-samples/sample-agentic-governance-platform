@@ -1,0 +1,14 @@
+# CAPTURED WIRE BODY — do not hand-edit. See regeneration note below.
+# produced by: agent-templates/strands-agentcore @ commit 6471a10b-dirty
+# regenerate:  uv run --project platform/control_plane/agent-templates/strands-agentcore \
+#                python platform/control_plane/backend/tests/fixtures/generate_strands_agentcore_fixtures.py
+#              (offline; the agent is stubbed. The commit above is stamped automatically.)
+# A '-dirty' suffix means the template tree had uncommitted changes when this was captured,
+# so the named commit alone does not reproduce these bytes. Regenerating after the template
+# change is committed normalizes the stamp.
+# A run that completes a tool cycle and THEN fails (Bedrock throttling mid-run).
+# There is NO terminal message: the textless toolUse/toolResult messages were filtered
+# out by the handler, so the only line on the wire is the error event. A parser that
+# kept textless messages would extract the stale toolResult blob and hide this error.
+data: {"type": "error", "data": "ThrottlingException: rate exceeded"}
+

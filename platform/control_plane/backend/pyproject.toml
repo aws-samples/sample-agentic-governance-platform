@@ -1,0 +1,30 @@
+# Project metadata and pytest configuration for the AGP control-plane backend.
+#
+# This service ships as a CONTAINER IMAGE, not as a distributable wheel: `Dockerfile`
+# installs `requirements.txt` and copies `src/` in with `PYTHONPATH=/app/src`. There is
+# deliberately no `[build-system]` table and no dependency list here — nothing builds or
+# pip-installs this directory as a package, and `requirements.txt` /
+# `requirements-dev.txt` stay the single source of truth for pinned versions.
+
+[project]
+name = "agp-control-plane-backend"
+version = "1.0.0"
+description = "Agentic Governance Platform — control-plane API (FastAPI)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+
+[tool.pytest.ini_options]
+# `src/` is NOT a package: imports inside the backend are written `from core.config
+# import settings`, so `src` has to be on `sys.path` before the first test import. That
+# is what the `PYTHONPATH=src` prefix has always done by hand — and a bare
+# `python -m pytest` used to die with `ModuleNotFoundError: No module named 'api'`
+# during collection. This setting removes that trap; the env var is still correct (and
+# is what `run_dev.sh` and the Dockerfile set for the app itself), just no longer
+# required to run the suite.
+#
+# Nothing else is configured on purpose. `testpaths`/`rootdir` would silently change
+# what gets collected, and the suite's collection is a contract: 3492 passed / 6 skipped
+# out of 3498 collected as of the close of E36 (adding this file did not change what gets
+# collected, and nothing configured here ever may).
+pythonpath = ["src"]

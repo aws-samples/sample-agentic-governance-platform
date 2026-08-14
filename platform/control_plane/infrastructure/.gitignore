@@ -1,0 +1,9 @@
+.build/
+
+# E32: the agent_registry module's capture file. THE MODULE NO LONGER WRITES OR READS IT — the
+# registry id is not passed through Terraform at all any more (the backend resolves it from the
+# registry NAME, which is what made `terraform apply` single-pass from zero; see
+# modules/agent_registry/main.tf). This entry is retained so a working directory left over from
+# an earlier apply keeps its stale artifact out of git; it can be deleted, along with any such
+# file, once no old working directories remain.
+modules/agent_registry/.terraform-registry-*.json

@@ -1,0 +1,8 @@
+# Development dependency: the test runner.
+#
+# The tests are fully offline — the Azure CLI subprocess is mocked and an
+# in-memory fake session is injected into the Graph client — so `pytest` alone is
+# enough. Install alongside requirements.txt:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+pytest==9.1.1
