@@ -1,0 +1,38 @@
+# Control Plane Backend Dependencies
+
+# Web Framework
+fastapi==0.141.1
+# Pinned deliberately. starlette 1.3.1 clears the E28D residual advisories (GHSA-82w8-qh3p-5jfq
+# form-limit DoS, GHSA-wqp7-x3pw-xc5r StaticFiles UNC, plus the mediums/lows behind them);
+# fastapi 0.141.1 no longer caps starlette below 1.x, which is what unblocked the bump. The
+# route-introspection tests that blocked it under 0.49.x now walk fastapi's _IncludedRouter
+# wrappers (tests/conftest.py::app_route_paths). Keep both pinned so a fresh `pip install`
+# cannot drift the runtime off the versions the suite was proven against.
+starlette==1.3.1
+uvicorn[standard]==0.27.0
+python-multipart==0.0.31
+
+# Database
+sqlalchemy==2.0.35
+# psycopg2-binary==2.9.9  # Optional for PostgreSQL; SQLite works without it
+
+# AWS Services
+boto3>=1.43.66
+botocore>=1.43.66
+
+# HTTP clients (outbound — Microsoft Graph / OBO / AgentCore invoke; requests is used by
+# langfuse_provisioning.py and was previously only available transitively via dev-only deps,
+# which would have crashed the runtime image on the Langfuse provisioning path)
+httpx==0.26.0
+requests==2.34.2
+
+# Authentication
+PyJWT[crypto]==2.13.0
+python-dotenv==1.2.2
+
+# Validation
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# NOTE: test + lint tooling lives in requirements-dev.txt so it never ships in the
+# runtime container image. `backend/Dockerfile` installs THIS file only.

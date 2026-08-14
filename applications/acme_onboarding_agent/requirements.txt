@@ -1,0 +1,14 @@
+# Acme reference agent — its OWN dependencies (Epic 7, Task T-REF-AGENT).
+#
+# This is a SEPARATE deployable: these deps are NOT in the control-plane backend image
+# (research Decision 7). The agent imports only these + the Python stdlib (os, logging)
+# and boto3 (transitively available in the AgentCore runtime base image).
+#
+# Lower bounds match the repo's Strands+AgentCore template idiom
+# (platform/control_plane/templates/agent-scaffold-strands/pyproject.toml).
+# The [otel] extra is REQUIRED for Langfuse observability: without it, Strands'
+# setup_otlp_exporter() silently fails to import the OTLP exporter and NO traces export
+# (research 2026-06-05-langfuse-strands-agent-observability §6 / §0.6).
+strands-agents[otel]>=1.38.0,<2.0
+bedrock-agentcore>=1.9.0,<2.0
+mcp>=1.0.0

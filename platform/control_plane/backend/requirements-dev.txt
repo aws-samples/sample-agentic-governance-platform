@@ -1,0 +1,12 @@
+# Control Plane Backend — DEV/TEST dependencies
+#
+# Not installed into the runtime container (backend/Dockerfile installs
+# requirements.txt only). Install locally with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+# Testing
+pytest==7.4.4
+pytest-asyncio==0.23.3
+moto==5.0.0

@@ -1,0 +1,7 @@
+# Runtime dependency for the Entra setup script.
+#
+# `requests` is the ONLY third-party runtime dependency: the script talks to the
+# Microsoft Graph REST API directly and gets its access token from the Azure CLI
+# via subprocess, so nothing else is needed. Pinned so a run months from now
+# behaves exactly like the run that was tested.
+requests==2.34.2

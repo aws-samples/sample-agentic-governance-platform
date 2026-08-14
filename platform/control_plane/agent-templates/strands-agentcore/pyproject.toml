@@ -1,0 +1,75 @@
+[project]
+name = "strands-agentcore-agent"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    # The `[otel]` EXTRA is load-bearing, not decoration. Bare `strands-agents` ships
+    # opentelemetry-api/-sdk but NOT the OTLP *exporter*, and `src/main.py`'s
+    # `StrandsTelemetry().setup_otlp_exporter()` imports
+    # `opentelemetry.exporter.otlp.proto.http.trace_exporter` — so on a bare install that call is a
+    # ModuleNotFoundError at MODULE IMPORT, i.e. the container never reaches `app.run()`. It stayed
+    # latent only because LANGFUSE_SECRET_NAME did not reach runtimes before E28C; the moment it
+    # did, every materialized agent with a provisioned key crash-looped at startup.
+    # Taken as the extra rather than a direct `opentelemetry-exporter-otlp-proto-http` pin of our
+    # own: the extra resolves the exporter from the SAME upstream constraint strands already puts
+    # on opentelemetry-api/-sdk (<2.0.0,>=1.30.0), so exporter and SDK cannot drift apart across a
+    # strands bump. A hand-written floor here would be a second, independent range to keep in sync —
+    # and an out-of-lockstep otel trio breaks at import, in the runtime, not in CI.
+    "strands-agents[otel]>=1.38.0,<2.0",
+    "bedrock-agentcore>=1.9.0,<2.0",
+    # E26/T10: read the per-agent Langfuse project key from AWS Secrets Manager at import.
+    # (bedrock-agentcore already pulls in botocore/boto3, but declare it so the SM read is explicit.)
+    "boto3>=1.34.0",
+    # `src/main.py` imports `mcp.client.streamable_http.streamablehttp_client` at module top to talk
+    # to the granted MCP gateways. Declared DIRECTLY even though strands-agents currently pulls
+    # `mcp` in transitively: this template imports it itself, and an undeclared import that only
+    # resolves through someone else's dependency tree breaks at MODULE IMPORT — i.e. in the
+    # runtime, not in CI — the first time that upstream drops or re-scopes it. Same floor the
+    # hand-written reference agents pin.
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+# ruff is CAPPED, not just floored. `ruff>=0.6` floated to 0.16.1 and broke the lint job in every
+# repo materialized from this template at once: ruff's DEFAULT rule set widened (S110, BLE001 and
+# a stricter I001 are 0.16 defaults, and the old `noqa: E402` became an unused-directive error).
+# A linter that selects its own rules from whatever shipped that week is not a gate, it is a
+# lottery — and this file ships verbatim into customer repositories, so the blast radius is theirs.
+# Pin the minor, and pair it with the explicit [tool.ruff.lint] select below.
+dev = ["pytest>=8.0", "ruff>=0.16,<0.17", "pip-audit>=2.7"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+# This file's prose comments run wide deliberately (they explain AgentCore/OTEL traps at the line
+# they apply to). 110 keeps E501 meaningful without reflowing every explanation.
+line-length = 110
+
+[tool.ruff.lint]
+# SELECT EXPLICITLY. With no `select`, ruff lints against its own evolving defaults, so a new
+# release silently changes the gate under a repo nobody touched — which is exactly how every
+# materialized repo's first build broke. This list is what the template is written to satisfy;
+# a maintainer who wants more can extend it deliberately.
+# E/F = pycodestyle + pyflakes (the classic core), I = isort, B = bugbear, S = bandit security
+# (kept: this ships into customer agents), BLE = blind-except, RUF = ruff's own.
+# NOTE `BLE` is its own selector — BLE001 comes from flake8-blind-EXCEPT, NOT from `B`
+# (flake8-bugbear). Selecting only `B` leaves it off, which then makes its `noqa` an unused
+# directive; the two are different linters despite the similar prefix.
+# BLE stays SELECTED and the two DELIBERATE blind excepts carry an explicit `noqa: BLE001` each
+# (telemetry setup + the span flush — neither may ever fail the agent). Dropping the rule would
+# have been the easier edit and the wrong one: it would also hide the next blind catch, which
+# may not be deliberate.
+select = ["E", "F", "I", "B", "S", "BLE", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert with `assert` (S101) and may hardcode dummy credentials (S105/S106).
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.pytest.ini_options]
+# The tests import via the `src.` package prefix (e.g. `from src.config import Config`),
+# matching how the app runs at runtime (`python -m src.main` in the Dockerfile). Bare
+# `pytest` (as CI's build.yml runs it) does NOT put cwd on sys.path, so `src` won't
+# resolve without this. Adding the repo root makes `src` importable as a package.
+pythonpath = ["."]

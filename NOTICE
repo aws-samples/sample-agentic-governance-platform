@@ -1,0 +1,215 @@
+Agentic Governance Platform
+Copyright 2026 Agentic Governance Platform contributors
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full license text.
+
+Portions of this software were originally developed by Amazon Web Services,
+Inc. (https://aws.amazon.com/) and are used under the Apache License 2.0.
+
+================================================================================
+THIRD-PARTY DEPENDENCIES
+================================================================================
+
+This project uses the following third-party libraries. Dev-only tooling (test
+runners, linters, type definitions) is not listed; neither are transitive
+dependencies, which carry their own notices in their own distributions.
+
+--------------------------------------------------------------------------------
+Python — control-plane backend
+--------------------------------------------------------------------------------
+
+FastAPI (https://fastapi.tiangolo.com/)
+  License: MIT License
+  Copyright (c) 2018 Sebastián Ramírez
+
+Starlette (https://www.starlette.io/)
+  License: BSD 3-Clause License
+  Copyright (c) 2018, Encode OSS Ltd.
+
+Uvicorn (https://www.uvicorn.org/)
+  License: BSD 3-Clause License
+  Copyright (c) 2017-present, Encode OSS Ltd.
+
+python-multipart (https://github.com/Kludex/python-multipart)
+  License: Apache License 2.0
+  Copyright 2012, Andrew Dunham
+
+SQLAlchemy (https://www.sqlalchemy.org/)
+  License: MIT License
+  Copyright 2005-2024 SQLAlchemy authors and contributors
+
+Boto3 (https://github.com/boto/boto3)
+  License: Apache License 2.0
+  Copyright 2013-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+Botocore (https://github.com/boto/botocore)
+  License: Apache License 2.0
+  Copyright 2012-2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+HTTPX (https://www.python-httpx.org/)
+  License: BSD 3-Clause License
+  Copyright (c) 2019, Encode OSS Ltd.
+
+Requests (https://requests.readthedocs.io/)
+  License: Apache License 2.0
+  Copyright 2019 Kenneth Reitz
+
+PyJWT (https://github.com/jpadilla/pyjwt)
+  License: MIT License
+  Copyright (c) 2015-2022 José Padilla
+
+cryptography (https://github.com/pyca/cryptography)
+  License: Apache License 2.0 OR BSD 3-Clause License (dual-licensed)
+  Copyright (c) Individual contributors
+  Included via the PyJWT [crypto] extra.
+
+python-dotenv (https://github.com/theskumar/python-dotenv)
+  License: BSD 3-Clause License
+  Copyright (c) 2014, Saurabh Kumar (python-dotenv), 2013, Ted Tieken
+  (django-dotenv-rw), 2013, Jacob Kaplan-Moss (django-dotenv)
+
+Pydantic (https://docs.pydantic.dev/)
+  License: MIT License
+  Copyright (c) 2017 to present Pydantic Services Inc. and individual
+  contributors
+
+pydantic-settings (https://docs.pydantic.dev/latest/concepts/pydantic_settings/)
+  License: MIT License
+  Copyright (c) 2022 Samuel Colvin and other contributors
+
+--------------------------------------------------------------------------------
+Python — agent runtimes and agent scaffolds
+--------------------------------------------------------------------------------
+
+Strands Agents SDK (https://github.com/strands-agents/sdk-python)
+  License: Apache License 2.0
+  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+Amazon Bedrock AgentCore SDK for Python
+(https://github.com/aws/bedrock-agentcore-sdk-python)
+  License: Apache License 2.0
+  Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+MCP Python SDK (https://github.com/modelcontextprotocol/python-sdk)
+  License: MIT License
+  Copyright (c) 2024 Anthropic, PBC
+
+--------------------------------------------------------------------------------
+JavaScript / TypeScript — control-plane frontend
+--------------------------------------------------------------------------------
+
+React, React DOM, react-is (https://react.dev/)
+  License: MIT License
+  Copyright (c) Meta Platforms, Inc. and affiliates
+
+React Router (https://reactrouter.com/)
+  License: MIT License
+  Copyright (c) React Training LLC 2015-2019
+  Copyright (c) Remix Software Inc. 2020-2021
+  Copyright (c) Shopify Inc. 2022-2023
+
+Recharts (https://recharts.org/)
+  License: MIT License
+  Copyright (c) 2015-present recharts
+
+React Flow / @xyflow/react (https://reactflow.dev/)
+  License: MIT License
+  Copyright (c) 2019-2025 webkid GmbH
+
+dagre (https://github.com/dagrejs/dagre)
+  License: MIT License
+  Copyright (c) 2012-2014 Chris Pettitt
+
+Axios (https://axios-http.com/)
+  License: MIT License
+  Copyright (c) 2014-present Matt Zabriskie & Collaborators
+
+Microsoft Authentication Library for JavaScript — @azure/msal-browser and
+@azure/msal-react
+(https://github.com/AzureAD/microsoft-authentication-library-for-js)
+  License: MIT License
+  Copyright (c) Microsoft Corporation. All rights reserved.
+
+Tailwind CSS (https://tailwindcss.com/)
+  License: MIT License
+  Copyright (c) Tailwind Labs, Inc.
+  Build-time dependency whose generated CSS is distributed in the frontend
+  bundle.
+
+Vite (https://vite.dev/)
+  License: MIT License
+  Copyright (c) 2019-present, VoidZero Inc. and Vite contributors
+  Build tool; listed because it produces the distributed frontend bundle.
+
+--------------------------------------------------------------------------------
+Container images — self-hosted observability stack
+--------------------------------------------------------------------------------
+
+These are third-party products, not source dependencies of this project. The
+platform's Terraform mirrors the following upstream images into the deployment's
+own private Amazon ECR repositories during `terraform apply`, so an operator who
+applies this infrastructure is redistributing them into their own account.
+
+Langfuse — langfuse/langfuse and langfuse/langfuse-worker
+(https://langfuse.com/)
+  License: distributed under its own license terms; the platform mirrors its
+  container images into the deployment's private ECR. Langfuse ships both
+  open-source and enterprise-tier components, so consult the upstream project
+  for the terms that apply to the image version deployed.
+
+ClickHouse — clickhouse/clickhouse-server (https://clickhouse.com/)
+  License: distributed under its own license terms; the platform mirrors its
+  container images into the deployment's private ECR.
+
+================================================================================
+AWS SERVICES
+================================================================================
+
+This project provisions and calls the following AWS services:
+
+Application and data plane
+- Amazon DynamoDB
+- Amazon Elastic Container Service (Amazon ECS) on AWS Fargate
+- Amazon Elastic Container Registry (Amazon ECR)
+- Amazon Simple Storage Service (Amazon S3)
+- Amazon CloudFront, including Lambda@Edge functions on AWS Lambda
+- Amazon API Gateway (HTTP APIs)
+- Elastic Load Balancing (Application Load Balancer)
+- Amazon Virtual Private Cloud (Amazon VPC)
+- AWS Cloud Map
+- Amazon Route 53
+- AWS Certificate Manager
+- Application Auto Scaling
+
+Agents, security, and operations
+- Amazon Bedrock
+- Amazon Bedrock AgentCore
+- AWS Agent Registry (the agent-registry service namespace, split out of
+  Amazon Bedrock AgentCore)
+- AWS Secrets Manager
+- AWS Identity and Access Management (IAM)
+- AWS Security Token Service (AWS STS)
+- AWS CodeBuild
+- Amazon CloudWatch (logs, metrics, alarms, dashboards)
+
+Self-hosted observability stack
+- Amazon Aurora PostgreSQL (Amazon RDS)
+- Amazon ElastiCache
+- Amazon Elastic File System (Amazon EFS)
+
+Use of these services is subject to the AWS Customer Agreement
+(https://aws.amazon.com/agreement/) and the AWS Service Terms
+(https://aws.amazon.com/service-terms/).
+
+================================================================================
+AI/ML MODELS
+================================================================================
+
+This project uses foundation models available through Amazon Bedrock,
+including models from Anthropic (Claude). Use of these models is subject
+to the applicable model provider's terms of use and Amazon Bedrock's
+service terms.
+
+AI-generated outputs from this system are advisory in nature and should be
+reviewed by qualified personnel before being acted upon.
