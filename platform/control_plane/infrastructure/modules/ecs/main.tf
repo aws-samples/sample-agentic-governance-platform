@@ -1163,9 +1163,14 @@ resource "aws_iam_role_policy" "ecs_task_bedrock_agentcore" {
         # `role/AmazonBedrockAgentCoreSDKRuntime-<region>-<hash>` (note the SDK infix
         # and NO service-role path). The PassedToService condition ensures either can
         # only be passed to AgentCore.
+        # The THIRD pattern is the gateway twin (E7 registration): UpdateGateway is the
+        # same full-replace shape — the backend replays the gateway's service roleArn when
+        # it flips the inbound authorizer to CUSTOM_JWT — and the demo-gateway bootstrap
+        # scripts (scripts/bootstrap_demo_*.py) name those roles `agp-*-gateway-role`.
         Resource = [
           "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/service-role/AmazonBedrockAgentCoreRuntime*",
           "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/AmazonBedrockAgentCoreSDKRuntime*",
+          "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/agp-*-gateway-role",
         ]
         Condition = {
           StringEquals = {
