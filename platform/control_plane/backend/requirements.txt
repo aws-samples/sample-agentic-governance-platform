@@ -27,7 +27,7 @@ httpx==0.26.0
 requests==2.34.2
 
 # Authentication
-PyJWT[crypto]==2.13.0
+PyJWT[crypto]==2.15.0
 python-dotenv==1.2.2
 
 # Validation
