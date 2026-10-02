@@ -14,7 +14,7 @@
     "@azure/msal-browser": "^5.11.0",
     "@azure/msal-react": "^5.4.2",
     "@xyflow/react": "^12.11.0",
-    "axios": "^1.13.6",
+    "axios": "^1.20.0",
     "dagre": "^0.8.5",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
