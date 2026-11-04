@@ -26,7 +26,7 @@ dependencies = [
     # resolves through someone else's dependency tree breaks at MODULE IMPORT — i.e. in the
     # runtime, not in CI — the first time that upstream drops or re-scopes it. Same floor the
     # hand-written reference agents pin.
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
 ]
 
 [project.optional-dependencies]
