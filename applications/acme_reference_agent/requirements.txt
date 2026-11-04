@@ -13,4 +13,4 @@
 # persona agents already carry it; this file was the outlier.
 strands-agents[otel]>=1.38.0,<2.0
 bedrock-agentcore>=1.9.0,<2.0
-mcp>=1.0.0
+mcp>=1.0.0,<2
