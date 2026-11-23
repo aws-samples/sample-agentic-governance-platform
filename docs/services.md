@@ -116,6 +116,18 @@ creates it for them. Both sides of that contract are in
   hostnames, over HTTPS.
 - **The backend has no image until you push one**, so a fresh deploy shows zero running API
   containers. That is the expected first state, not a failure.
+- **Every governed agent gets a tracing project, even one nothing delivers to.** The platform
+  provisions a Langfuse project and a key pair for each governed agent, on every platform. What is
+  conditional is *delivery*: the OTLP environment is wired onto the runtime only where AGP owns that
+  runtime and auto-delivery applies — an AWS agent, unless its operator chose manual. A Databricks
+  agent, or an AWS agent set to manual, gets the project and the key and wires the connection itself.
+  There is no silently empty project.
+- **The backend task assumes tenant roles too, not just the build.** At tenant connect — and on a
+  re-probe — the control-plane API task attempts an `sts:AssumeRole` against each stage's deploy and
+  push role to check it can reach them, so STS is now exercised from the platform's own API task and
+  not only from a build. Its task role carries `sts:AssumeRole` on `*`, because the tenant role set
+  is unknown by definition; a probe that fails therefore reflects tenant-side trust, not a missing
+  grant on AGP's side.
 - **The machine you deploy from is part of the picture.** It copies the tracing images into your
   account and creates the two registries itself, so it needs a working container engine with access
   to Docker Hub *and* a working backend Python environment. Missing either one fails the install

@@ -1,68 +1,68 @@
-"""Pydantic models for per-project roles (E27/T1) — the project→principal→role edge.
+"""Pydantic models for per-project roles: the project to principal to role edge.
 
-Plain ``BaseModel``s — the ``tenant``/``project`` idiom. A **project role** grants one
-Entra principal (a user OR a group, by object id) authority over ONE project:
-``VIEWER`` < ``MAINTAINER`` < ``OWNER``. It is checked IN ADDITION to tenant
-visibility, never instead of it — a foreign-tenant project is invisible before any
-role logic runs.
+A project role grants one Entra principal (a user or a group, by object id) authority over one project:
+``VIEWER`` < ``MAINTAINER`` < ``OWNER``. It is checked in addition to tenant visibility, never instead
+of it; a foreign-tenant project is invisible before any role logic runs.
 
-:class:`ProjectRole` is an ``IntEnum`` so the resolver can compare with ``>=`` (an
-OWNER satisfies a MAINTAINER requirement). The int is an implementation detail: the
-API and DDB both store the lowercase *name* via :func:`role_name`, so a future
-reordering of the enum cannot silently re-interpret stored rows.
+``ProjectRole`` is an ``IntEnum`` so the resolver can compare with ``>=`` (an owner satisfies a
+maintainer requirement). The int is an implementation detail: the API and DynamoDB store the lowercase
+name through ``role_name``, so a future reordering cannot re-interpret stored rows. ``ROLE_NAMES`` maps
+the wire name to the role and is the allow-list the service validates a granted role against;
+``PRINCIPAL_TYPES`` names the Entra principal kinds a role may be granted to, a group grant covering
+its members.
 
-Persistence + validation orchestration live in ``project_role_service`` — no boto3,
-no I/O here (pure models).
+Persistence and validation orchestration live in ``project_role_service``; no boto3, no I/O here.
 """
 
 from __future__ import annotations
 
 from enum import IntEnum
 
-from pydantic import BaseModel
+from pydantic import Field, PrivateAttr
+
+from models.base import WireModel
 
 
 class ProjectRole(IntEnum):
-    """Per-project authority. Ordered — comparisons are meaningful (``>=``)."""
+    """Per-project authority; ordered, so ``>=`` is meaningful."""
 
     VIEWER = 0
     MAINTAINER = 1
     OWNER = 2
 
 
-# Wire name → role. Also the allow-list the service validates a granted role against.
 ROLE_NAMES: dict[str, ProjectRole] = {
     "viewer": ProjectRole.VIEWER,
     "maintainer": ProjectRole.MAINTAINER,
     "owner": ProjectRole.OWNER,
 }
 
-# The Entra principal kinds a role may be granted to (a group grant covers its members).
 PRINCIPAL_TYPES: set[str] = {"user", "group"}
 
 
 def role_name(role: ProjectRole) -> str:
-    """Wire form — the API and DDB store the lowercase name, never the int."""
+    """The wire form: the API and DynamoDB store the lowercase name, never the int."""
     return role.name.lower()
 
 
-class ProjectRoleRecord(BaseModel):
-    """Read-model — one project→principal→role edge. Carries only metadata, no credential."""
+class ProjectRoleRecord(WireModel):
+    """Read model: one project to principal to role edge. Metadata only, no credential."""
 
     project_id: str
-    principal_id: str  # Entra oid (user OR group object id)
-    principal_type: str  # "user" | "group"
-    principal_display: str  # display name at grant time (best-effort, for UI)
-    role: str  # one of ROLE_NAMES keys
-    granted_by: str  # principal.oid or principal.email — never a body value
-    granted_at: str  # ISO8601
+    principal_id: str = Field(description="The Entra oid of a user or a group")
+    principal_type: str = Field(description="user or group")
+    principal_display: str = Field(description="The display name at grant time; best-effort, for the UI")
+    role: str = Field(description="One of the ROLE_NAMES keys")
+    granted_by: str = Field(description="principal.oid or principal.email; never a body value")
+    granted_at: str = Field(description="ISO-8601")
+    _row_version: int | None = PrivateAttr(default=None)
 
 
-class ProjectRoleCreate(BaseModel):
-    """Write-only input — the POST /projects/{id}/roles body. ``granted_by`` is NOT here:
-    the grantor comes from the validated ``Principal``, never from the request body."""
+class ProjectRoleCreate(WireModel):
+    """Write-only input: the ``POST /projects/{id}/roles`` body. ``granted_by`` is not here: the grantor
+    comes from the validated ``Principal``, never from the request body."""
 
     principal_id: str
-    principal_type: str  # "user" | "group"
+    principal_type: str = Field(description="user or group")
     principal_display: str = ""
-    role: str  # one of ROLE_NAMES keys
+    role: str = Field(description="One of the ROLE_NAMES keys")

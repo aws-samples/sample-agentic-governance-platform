@@ -1,72 +1,48 @@
-"""
-Health check API routes
+"""Health and ping routes, registered without ``API_PREFIX`` and without authentication.
+
+A failed probe puts a fixed literal in the body and the exception in the log; nothing from the
+exception reaches the anonymous caller (``tests/test_health_no_internal_disclosure.py``). The one
+``S3Service`` is built on first use; tests patch ``_s3_service``.
 """
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from datetime import datetime
 import logging
+from datetime import datetime
+from typing import Literal, Optional
 
-from core.database import get_db
+from fastapi import APIRouter
+
+from models.health import HealthChecks, HealthResponse, PingResponse
 from services.s3_service import S3Service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["health"])
 
+_s3: Optional[S3Service] = None
 
-@router.get("/health")
-async def health_check(db: Session = Depends(get_db)):
-    """
-    Health check endpoint
 
-    Checks:
-    - API is running
-    - Database is accessible
-    - S3 is accessible
+def _s3_service() -> S3Service:
+    global _s3
+    if _s3 is None:
+        _s3 = S3Service()
+    return _s3
 
-    Returns:
-        Health status
-    """
-    status_checks = {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "checks": {}
-    }
 
-    # Check database connectivity
+@router.get("/health", response_model=HealthResponse)
+async def health_check():
+    """The API's own status plus an S3 probe."""
+    status: Literal["healthy", "degraded"] = "healthy"
     try:
-        db.execute(text("SELECT 1"))
-        status_checks["checks"]["database"] = "connected"
-    except Exception:
-        # exc_info, not the message: the detail belongs in CloudWatch, never in the body below.
-        logger.warning("Database health check failed", exc_info=True)
-        status_checks["status"] = "unhealthy"
-        status_checks["checks"]["database"] = "error: database probe failed"
-
-    # Check S3 accessibility
-    try:
-        s3_service = S3Service()
-        if s3_service.check_bucket_accessible():
-            status_checks["checks"]["s3"] = "accessible"
+        if _s3_service().check_bucket_accessible():
+            s3 = "accessible"
         else:
-            status_checks["status"] = "degraded"
-            status_checks["checks"]["s3"] = "not accessible"
+            status, s3 = "degraded", "not accessible"
     except Exception:
-        logger.warning("S3 health check failed", exc_info=True)
-        status_checks["status"] = "degraded"
-        status_checks["checks"]["s3"] = "error: s3 probe failed"
-
-    return status_checks
+        logger.exception("S3 health check failed")
+        status, s3 = "degraded", "error: s3 probe failed"
+    return HealthResponse(status=status, timestamp=datetime.utcnow().isoformat(), checks=HealthChecks(s3=s3))
 
 
-@router.get("/ping")
+@router.get("/ping", response_model=PingResponse)
 async def ping():
-    """
-    Simple ping endpoint
-
-    Returns:
-        Pong response
-    """
-    return {"ping": "pong", "timestamp": datetime.utcnow().isoformat()}
+    return PingResponse(ping="pong", timestamp=datetime.utcnow().isoformat())

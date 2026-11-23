@@ -1,4 +1,4 @@
-"""Guard: the deleted auth decoys must not come back (E36/T14).
+"""Guard: the deleted auth decoys must not come back.
 
 Four things in this backend used to *look* like the authentication path without being on it, and
 each one cost a reader real time before it was recognised as dead:
@@ -28,8 +28,12 @@ COMMENT naming what went and why (`main.py`'s stripped-middleware and `/test`/`/
 a text-substring guard would fire on the tombstone that documents the fix — which would teach the
 next reader to delete the explanation in order to go green.
 
-The dev bypass that IS live — `USE_DEV_AUTH` / `DEBUG` in `core/rbac.py` — is deliberately NOT
-touched by this file. Deleting `dev_auth.py` did not remove it; see `test_rbac_entra.py`.
+The dev bypass that IS live — `USE_DEV_AUTH` in the local shape, `Settings.dev_auth_honoured` read by
+`core/rbac.py` — is deliberately NOT touched by this file. Deleting `dev_auth.py` did not remove it; see
+`test_rbac_entra.py` and `test_dev_auth_switch.py`.
+
+Both spellings of each dead module are checked because `src` is on the path, so `core.dev_auth` and
+a bare `dev_auth` would both resolve.
 """
 
 from __future__ import annotations
@@ -42,20 +46,13 @@ import pytest
 _SRC = Path(__file__).resolve().parents[1] / "src"
 _MAIN_PY = _SRC / "main.py"
 
-# Every module deleted in E36/T14, by path relative to `src/`.
 _DELETED_MODULES = ("core/auth.py", "core/dev_auth.py", "core/security_entra_facade.py")
 
-# The importable names those files occupied. Both spellings are listed because `src` is on the path,
-# so `core.dev_auth` and a bare `dev_auth` would both resolve.
 _DEAD_MODULE_NAMES = frozenset(
     {"auth", "dev_auth", "security_entra_facade"}
     | {f"core.{name}" for name in ("auth", "dev_auth", "security_entra_facade")}
 )
 
-
-# The ASGI primitives the deleted middleware class needed. Matched by terminal name, so the ban
-# holds whether they arrive from `starlette.types`, `starlette.middleware.base`, or FastAPI's
-# re-export of the same objects.
 _ASGI_PRIMITIVES = frozenset({"ASGIApp", "Receive", "Scope", "Send", "BaseHTTPMiddleware"})
 
 
@@ -64,7 +61,8 @@ def _imported_modules(tree: ast.Module) -> set[str]:
 
     `from . import x` / relative imports carry `level > 0` and no dotted name to compare; this
     backend imports absolutely everywhere (`from core.config import settings`), so they are
-    reported as-is and simply never match the dead names.
+    reported as-is and simply never match the dead names. `from core import auth` is reported as
+    ``core.auth`` too: there the module is the package and the symbol the file.
     """
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -72,7 +70,6 @@ def _imported_modules(tree: ast.Module) -> set[str]:
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module)
-            # `from core import auth` — the module is the package, the symbol is the file.
             names.update(f"{node.module}.{alias.name}" for alias in node.names)
     return names
 
@@ -104,7 +101,7 @@ def _is_middleware_shaped(node: ast.ClassDef) -> bool:
 
     The deleted `StripPathPrefixMiddleware` was a BARE ASGI class — no base class at all, an
     `__init__` taking the wrapped `app`, and `async def __call__(self, scope, receive, send)`. The
-    `__call__`-shape test is the load-bearing one, because this file's whole premise is that a decoy
+    `__call__`-shape test is the one that matters, because this file's whole premise is that a decoy
     can come back under any spelling; the name suffix and the `dispatch` hook (the only reason to
     subclass `BaseHTTPMiddleware`) cover the two likelier re-additions.
 
@@ -148,7 +145,7 @@ def test_no_source_file_imports_the_deleted_auth_modules():
         for path in _SRC.rglob("*.py")
         if _imported_modules(ast.parse(path.read_text())) & _DEAD_MODULE_NAMES
     )
-    assert offenders == [], f"these files import a module deleted in E36/T14: {offenders}"
+    assert offenders == [], f"these files import a deleted auth module: {offenders}"
 
 
 def test_main_adds_exactly_one_middleware_and_declares_no_asgi_class():
@@ -170,14 +167,10 @@ def test_main_adds_exactly_one_middleware_and_declares_no_asgi_class():
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "add_middleware"
     ]
-    assert added == ["CORSMiddleware"], (
-        f"main.py should add exactly one middleware (CORS); found {added}"
-    )
+    assert added == ["CORSMiddleware"], f"main.py should add exactly one middleware (CORS); found {added}"
 
     shaped = [
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and _is_middleware_shaped(node)
+        node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and _is_middleware_shaped(node)
     ]
     assert shaped == [], (
         "main.py declares a middleware-shaped class — dead unless it is also passed to "
@@ -196,7 +189,5 @@ def test_starlette_low_level_imports_are_gone_from_main():
     """
     imported = _imported_modules(ast.parse(_MAIN_PY.read_text()))
 
-    offenders = sorted(
-        name for name in imported if name.rsplit(".", 1)[-1] in _ASGI_PRIMITIVES
-    )
+    offenders = sorted(name for name in imported if name.rsplit(".", 1)[-1] in _ASGI_PRIMITIVES)
     assert offenders == [], f"main.py imports ASGI primitives again: {offenders}"

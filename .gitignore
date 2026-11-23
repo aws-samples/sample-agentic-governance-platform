@@ -76,3 +76,14 @@ docs/superpowers/
 **/.omc/
 CLAUDE.md
 **/CLAUDE.md
+
+!platform/control_plane/infrastructure/.terraform.lock.hcl
+
+# Your own environment's deploy configuration stays local
+platform/control_plane/infrastructure/backend.*.config
+platform/control_plane/infrastructure/image.env
+platform/control_plane/infrastructure/ecr.env
+platform/control_plane/infrastructure/deploy.env
+platform/control_plane/infrastructure/plan.out
+platform/control_plane/infrastructure/plan.json
+platform/control_plane/infrastructure/plan-summary.json

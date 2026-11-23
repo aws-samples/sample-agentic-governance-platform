@@ -1,23 +1,20 @@
-// E29/T8 — the registration wizard's decisions, tested as pure functions.
-//
-// Two rules this file holds itself to, both inherited from the epic's Global Constraints:
-//
-//   • The app-URL guard is a SECURITY BOUNDARY on a governed record, so every hostile input is
-//     EXECUTED against the real function. Nothing is asserted from reading the pattern — that is
-//     how a regex that looks right and is not gets shipped.
-//   • Nothing here renders. The wizard binds and renders; every decision lives in the model, and
-//     that is what makes this file able to test the decisions at all.
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { ApiFailure, type ErrorCode } from '../../api/failure';
 import type { DiscoveredAgent } from '../../api/client';
+import { stripComments } from '../../rawSource';
 import {
+  AGENT_CREATE_REFUSAL_CODES,
   ALREADY_REGISTERED_REASON,
   DISCOVERY_EMPTY_COPY,
   EMPTY_DRAFT,
   MISSING_HANDLE_REASON,
+  PLATFORM_READONLY_HINT,
   SERVING_ENDPOINT_WARNING,
   agentPlatformFor,
   buildPayload,
   canSubmit,
+  classifyAgentCreateRefusal,
+  createBlockedReason,
   defaultDiscoveryStage,
   discoveredRowState,
   discoveryStageNames,
@@ -28,15 +25,20 @@ import {
   isValidDatabricksAppUrl,
   manualHandleError,
   manualHandleField,
+  platformStepWarning,
+  platformSupportsAutoTraceDelivery,
   resolvePlatform,
   runtimeKindFor,
   selectedRow,
-  shouldAcceptDiscovery,
+  supportsAutoTraceDelivery,
   tenantPlatformLabel,
   type Draft,
 } from './agentRegistrationWizardModel';
+import { INVENTORY_ONLY_NOTE, isInventoryOnly } from './platformLabels';
+import wizardRaw from './AgentRegistrationWizard.tsx?raw';
 
-// A workspace-shaped fake host, per the epic's fakes rule (obvious test values only).
+const wizardSrc = stripComments(wizardRaw);
+
 const APP_URL = 'https://claims-triage-1234.aws.databricksapps.com';
 const ARN = 'arn:aws:bedrock-agentcore:eu-central-1:0:runtime/claims-triage';
 
@@ -56,9 +58,7 @@ function draft(over: Partial<Draft> = {}): Draft {
   return { ...EMPTY_DRAFT, name: 'claims-triage', tenant_id: 't-1', ...over };
 }
 
-// ---------------------------------------------------------------------------
-// Platform inference
-// ---------------------------------------------------------------------------
+afterEach(() => vi.restoreAllMocks());
 
 describe('inferPlatform', () => {
   it('reads the platform off the tenant', () => {
@@ -66,10 +66,7 @@ describe('inferPlatform', () => {
     expect(inferPlatform({ id: 't', name: 'T', platform: 'aws' })).toBe('aws');
   });
 
-  // The backend's own zero-migration rule (`hydrate_tenant_item` defaults an absent platform to
-  // "aws"), and the shape a non-admin's `UserTenant` membership actually has — it carries no
-  // platform key at all.
-  it('defaults an absent platform to aws, and never to databricks', () => {
+  it('defaults an absent platform to aws, never to databricks: the backend hydrates a platform-less record as aws, and a non-admin membership off /users/me carries no platform key', () => {
     expect(inferPlatform({ id: 't', name: 'T' })).toBe('aws');
     expect(inferPlatform(null)).toBe('aws');
     expect(inferPlatform(undefined)).toBe('aws');
@@ -77,18 +74,12 @@ describe('inferPlatform', () => {
 });
 
 describe('resolvePlatform — the discovery response outranks the directory', () => {
-  // THE CRITICAL. `canDiscover` is `isAdmin`, but `useTenantDirectory` is fail-silent and returns
-  // null while loading / after a failed fetch — so an admin can be looking at real Databricks
-  // rows while the tenant record in hand is a `/users/me` membership carrying no platform key.
-  // Inferring `aws` there posted the app URL into `agent_arn` with `platform: 'aws_bedrock'`,
-  // which `agent_identity_service` later feeds to `rsplit('/', 1)`.
-  it('trusts the response platform over a tenant whose platform is ABSENT', () => {
-    const membership = { id: 't-1', name: 'T', stages: { s: {} as never } }; // no `platform`
-    expect(inferPlatform(membership)).toBe('aws'); // the weaker source, for contrast
+  it('trusts the response platform over a tenant whose platform is absent: the directory is fail-silent, so an admin can be discovering while holding a /users/me membership with no platform key', () => {
+    const membership = { id: 't-1', name: 'T', stages: { s: {} as never } };
+    expect(inferPlatform(membership)).toBe('aws');
     expect(resolvePlatform(membership, 'databricks')).toBe('databricks');
   });
 
-  // The response read the tenant RECORD; the directory copy can be stale in either direction.
   it('trusts the response platform over a STALE tenant platform, both ways', () => {
     const staleAws = { id: 't', name: 'T', platform: 'aws' as const };
     const staleDb = { id: 't', name: 'T', platform: 'databricks' as const };
@@ -96,8 +87,6 @@ describe('resolvePlatform — the discovery response outranks the directory', ()
     expect(resolvePlatform(staleDb, 'aws')).toBe('aws');
   });
 
-  // Manual-entry-only flows (no discovery response: non-admin, or a failed//not-yet-run fetch)
-  // fall back to the inference, which keeps its safe AWS default.
   it('falls back to the tenant inference when there is no discovery response', () => {
     expect(resolvePlatform({ id: 't', name: 'T', platform: 'databricks' }, null)).toBe('databricks');
     expect(resolvePlatform({ id: 't', name: 'T' }, null)).toBe('aws');
@@ -105,69 +94,18 @@ describe('resolvePlatform — the discovery response outranks the directory', ()
     expect(resolvePlatform(null, null)).toBe('aws');
   });
 
-  // End-to-end on the payload: this is the shape the CRITICAL actually broke.
-  it('builds a Databricks body from a discovered platform even when the tenant record lacks one', () => {
+  it('builds a Databricks body from a discovered platform even when the tenant record lacks one, so an app URL never lands in the ARN-parsed agent_arn', () => {
     const membership = { id: 't-1', name: 'T', stages: { s: {} as never } };
     const platform = resolvePlatform(membership, 'databricks');
     const body = buildPayload(draft({ selected_handle: APP_URL }), platform, row());
     expect(body.platform).toBe('databricks');
     expect(body.runtime_handle).toBe(APP_URL);
-    // The regression: a Databricks app URL must never land in the ARN-parsed field.
     expect(body.agent_arn).toBeUndefined();
   });
 });
 
-describe('shouldAcceptDiscovery — stale responses are discarded', () => {
-  it('accepts a response whose scope is still the one on screen', () => {
-    expect(
-      shouldAcceptDiscovery({ tenantId: 't-1', stage: 'dev' }, { tenantId: 't-1', stage: 'dev' }),
-    ).toBe(true);
-  });
-
-  // THE RACE. Request A (Databricks tenant) is in flight, the operator switches to tenant B,
-  // B resolves first, then A resolves — unguarded, A's rows and platform paint over B's form and
-  // `buildPayload` posts B's tenant id with A's handle.
-  it('rejects a response for a tenant the operator has already left', () => {
-    expect(
-      shouldAcceptDiscovery({ tenantId: 't-A', stage: 'dev' }, { tenantId: 't-B', stage: 'dev' }),
-    ).toBe(false);
-  });
-
-  // The quieter half of the same race, within ONE tenant: right platform, wrong workspace's
-  // handles, and nothing on screen looks wrong.
-  it('rejects a response for a stage the operator has already left', () => {
-    expect(
-      shouldAcceptDiscovery({ tenantId: 't-1', stage: 'dev' }, { tenantId: 't-1', stage: 'prod' }),
-    ).toBe(false);
-  });
-
-  // A stageless tenant makes no request, so `null` is never a snapshot — but it IS reachable as
-  // the CURRENT scope (the reset effect sets it before the in-flight promise settles).
-  it('rejects when the form no longer has a stage at all', () => {
-    expect(
-      shouldAcceptDiscovery({ tenantId: 't-1', stage: 'dev' }, { tenantId: 't-1', stage: null }),
-    ).toBe(false);
-  });
-
-  // Identity, not a counter: navigating away and back to the same scope must still accept the
-  // answer, because the answer is about that scope. A generation counter would discard it.
-  it('accepts a response when the operator returned to the same scope', () => {
-    const snapshot = { tenantId: 't-1', stage: 'dev' };
-    expect(shouldAcceptDiscovery(snapshot, { tenantId: 't-2', stage: 'dev' })).toBe(false);
-    expect(shouldAcceptDiscovery(snapshot, { tenantId: 't-1', stage: 'dev' })).toBe(true);
-  });
-
-  it('requires BOTH halves to match', () => {
-    const snapshot = { tenantId: 't-1', stage: 'dev' };
-    expect(shouldAcceptDiscovery(snapshot, { tenantId: 't-2', stage: 'prod' })).toBe(false);
-  });
-});
-
 describe('agentPlatformFor', () => {
-  // The two vocabularies. `aws` is NOT a valid agent platform, and `aws_bedrock` specifically is
-  // what `Agent.is_agentcore` requires — any other spelling produces an agent the AgentCore
-  // provisioning gate silently skips.
-  it('maps the tenant platform onto the agent registry enum', () => {
+  it('maps the tenant platform onto the agent registry enum: aws becomes aws_bedrock, the value is_agentcore requires', () => {
     expect(agentPlatformFor('aws')).toBe('aws_bedrock');
     expect(agentPlatformFor('databricks')).toBe('databricks');
   });
@@ -180,9 +118,13 @@ describe('tenantPlatformLabel', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Stage selection — no hardcoded stage names (C5)
-// ---------------------------------------------------------------------------
+describe('PLATFORM_READONLY_HINT — why the platform field cannot be edited', () => {
+  it('says the platform is set by the tenant and inherited by its agents', () => {
+    expect(PLATFORM_READONLY_HINT).toBe(
+      'Set by the tenant — a tenant’s platform is fixed when it is created, so its agents inherit it.',
+    );
+  });
+});
 
 describe('discoveryStageNames', () => {
   it('returns the tenant’s own stage names, sorted', () => {
@@ -194,9 +136,7 @@ describe('discoveryStageNames', () => {
     expect(discoveryStageNames(t)).toEqual(['canary', 'dev', 'prod']);
   });
 
-  // A single-stage tenant is a legitimate record (E28/T6 removed the dev/prod guarantee), and a
-  // tenant with none must not be papered over with an invented name.
-  it('handles a one-stage tenant and a stageless one', () => {
+  it('handles a one-stage tenant and a stageless one without inventing a stage name', () => {
     expect(discoveryStageNames({ id: 't', name: 'T', stages: { only: {} as never } })).toEqual([
       'only',
     ]);
@@ -212,17 +152,11 @@ describe('defaultDiscoveryStage', () => {
     expect(defaultDiscoveryStage(t)).toBe('aaa');
   });
 
-  // null means "do not make the request". The route makes `stage` required with no default for
-  // exactly this reason: an invented stage either 400s or silently discovers the wrong workspace.
-  it('is null when there is no stage to discover on', () => {
+  it('is null when there is no stage to discover on: null means make no request, since an invented stage would 400 or discover the wrong workspace', () => {
     expect(defaultDiscoveryStage({ id: 't', name: 'T', stages: {} })).toBeNull();
     expect(defaultDiscoveryStage(null)).toBeNull();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Discovery state — the honest-empty rule
-// ---------------------------------------------------------------------------
 
 describe('discoveryState', () => {
   const tenant = { id: 't', name: 'T', platform: 'databricks' as const, stages: { s: {} as never } };
@@ -239,12 +173,8 @@ describe('discoveryState', () => {
     expect(discoveryState({ ...base, tenant: null })).toEqual({ kind: 'no-tenant' });
   });
 
-  // Discovery is ADMIN-gated; agent creation is OPERATOR-gated. A non-admin operator is an
-  // ordinary case, not a failure — and must never be shown a discovery error for it.
   it('reports a caller who may not discover as not-permitted, never as an error', () => {
     expect(discoveryState({ ...base, canDiscover: false })).toEqual({ kind: 'not-permitted' });
-    // Even with a stage and rows in hand, permission outranks them: no request should have been
-    // made at all.
     expect(
       discoveryState({ ...base, canDiscover: false, rows: [row()], loading: true }).kind,
     ).toBe('not-permitted');
@@ -258,16 +188,13 @@ describe('discoveryState', () => {
     expect(discoveryState({ ...base, loading: true })).toEqual({ kind: 'loading' });
   });
 
-  // THE POINT OF THE WHOLE UNION: a 502 and a genuinely-empty platform both arrive as no rows.
-  it('keeps a failure distinct from an empty platform', () => {
+  it('keeps a failure distinct from an empty platform: a 502 and a genuinely empty platform both arrive as no rows', () => {
     expect(
       discoveryState({ ...base, error: 'platform discovery failed (workspace_unreachable)' }),
     ).toEqual({ kind: 'error', message: 'platform discovery failed (workspace_unreachable)' });
     expect(discoveryState(base)).toEqual({ kind: 'empty' });
   });
 
-  // Not-yet-asked is not an answer. A null row list with no error and nothing in flight must not
-  // render as "the platform reports no agents" — nobody has looked yet.
   it('treats a request that has not been made as loading, never as empty', () => {
     expect(discoveryState({ ...base, rows: null })).toEqual({ kind: 'loading' });
   });
@@ -277,29 +204,21 @@ describe('discoveryState', () => {
     expect(discoveryState({ ...base, rows })).toEqual({ kind: 'list', rows });
   });
 
-  // An error outranks rows: stale rows from a previous stage must not be presented as this
-  // stage's answer.
   it('prefers an error over rows left from an earlier fetch', () => {
     expect(discoveryState({ ...base, error: 'boom', rows: [row()] }).kind).toBe('error');
   });
 
-  it('says what each empty state means, in words that do not claim a failure', () => {
+  it('says what each empty state means: the empty copy states the platform answered, the permission copy offers manual entry', () => {
     expect(Object.keys(DISCOVERY_EMPTY_COPY).sort()).toEqual([
       'empty',
       'no-stages',
       'no-tenant',
       'not-permitted',
     ]);
-    // The empty copy must state that the platform ANSWERED — that is the whole distinction.
     expect(DISCOVERY_EMPTY_COPY.empty).toMatch(/answered/);
-    // The permission copy must offer the way forward (manual entry), not merely refuse.
     expect(DISCOVERY_EMPTY_COPY['not-permitted']).toMatch(/manually/);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Row selectability
-// ---------------------------------------------------------------------------
 
 describe('discoveredRowState', () => {
   it('enables an ungoverned row with a handle', () => {
@@ -318,10 +237,7 @@ describe('discoveredRowState', () => {
     });
   });
 
-  // `runtime_handle` IS the binding pin — a blank one would produce an agent no invoke path can
-  // reach. Disabled with a reason rather than filtered out, so a real ungoverned agent is never
-  // hidden from the operator who came looking for it.
-  it('disables a row the platform reported with no handle', () => {
+  it('disables a row the platform reported with no handle, with a reason rather than hiding it: runtime_handle is the binding pin', () => {
     for (const handle of ['', '   ']) {
       expect(discoveredRowState(row({ runtime_handle: handle }))).toEqual({
         disabled: true,
@@ -338,10 +254,7 @@ describe('discoveredRowState', () => {
     }
   });
 
-  // FINAL REVIEW (item 4). Registering a serving endpoint was permitted while provisioning
-  // refuses it (`databricks_identity_service` raises for any `runtime_kind != "app"`), so the
-  // operator's FIRST signal was a failed provision on a record they had already created.
-  describe('a serving endpoint is forewarned, not refused', () => {
+  describe('a serving endpoint is forewarned, not refused: provisioning refuses any runtime_kind other than app, so the warning lands before the record exists', () => {
     it('warns at selection time', () => {
       expect(discoveredRowState(row({ kind: 'serving_endpoint' }))).toEqual({
         disabled: false,
@@ -350,21 +263,15 @@ describe('discoveredRowState', () => {
       });
     });
 
-    // NOT disabled: the epic's scope boundary says serving-endpoint agents "discover + register
-    // only", so registering one for inventory is a SUPPORTED act. Blocking it would refuse a
-    // legitimate use; the warning is what makes it an informed one.
-    it('stays selectable', () => {
+    it('stays selectable: registering one for inventory is a supported act', () => {
       expect(discoveredRowState(row({ kind: 'serving_endpoint' })).disabled).toBe(false);
     });
 
-    // The warning says what is missing, so the operator is not merely told "unsupported".
     it('names what a registered serving endpoint does not get', () => {
       expect(SERVING_ENDPOINT_WARNING).toMatch(/inventory/);
       expect(SERVING_ENDPOINT_WARNING).toMatch(/failed/);
     });
 
-    // A REFUSAL still wins over a caveat: an already-registered serving endpoint is not
-    // selectable, and a row that cannot be picked must not advertise advice about picking it.
     it('yields to a reason when the row is also disabled', () => {
       expect(
         discoveredRowState(row({ kind: 'serving_endpoint', already_registered: true })),
@@ -379,23 +286,16 @@ describe('discoveredRowState', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// The app-URL guard — HOSTILE INPUTS, EXECUTED
-// ---------------------------------------------------------------------------
-
 describe('isValidDatabricksAppUrl — accepted', () => {
   it('accepts a real Databricks Apps URL', () => {
     expect(isValidDatabricksAppUrl(APP_URL)).toBe(true);
   });
 
-  // Both are accepted by the BACKEND validator (it lowercases the host before the suffix test,
-  // and never looks at the port), so accepting them here is agreement, not laxity: a client-side
-  // check stricter than the server's refuses registrations the platform would happily serve.
-  it('accepts an uppercase host (the URL parser normalises it)', () => {
+  it('accepts an uppercase host: the URL parser normalises it, as the backend lowercases before its suffix test', () => {
     expect(isValidDatabricksAppUrl('https://Claims-Triage.AWS.DatabricksApps.COM')).toBe(true);
   });
 
-  it('accepts an explicit port', () => {
+  it('accepts an explicit port, which the backend never inspects', () => {
     expect(isValidDatabricksAppUrl('https://claims.aws.databricksapps.com:443')).toBe(true);
   });
 
@@ -405,9 +305,7 @@ describe('isValidDatabricksAppUrl — accepted', () => {
     );
   });
 
-  // Surrounding whitespace is STRIPPED, matching the backend's `.strip()` — the two parsers must
-  // agree on what the input is before they can agree on whether it is allowed.
-  it('accepts a value with surrounding whitespace, including a trailing newline', () => {
+  it('accepts a value with surrounding whitespace, including a trailing newline: stripped first, as the backend strips', () => {
     expect(isValidDatabricksAppUrl(`  ${APP_URL}  `)).toBe(true);
     expect(isValidDatabricksAppUrl(`${APP_URL}\n`)).toBe(true);
     expect(isValidDatabricksAppUrl(`\t${APP_URL}\r\n`)).toBe(true);
@@ -419,10 +317,7 @@ describe('isValidDatabricksAppUrl — REFUSED (each one is a real attack)', () =
     expect(isValidDatabricksAppUrl('http://claims-triage-1234.aws.databricksapps.com')).toBe(false);
   });
 
-  // THE SUFFIX LOOKALIKE. `endsWith('databricksapps.com')` accepts this; the leading dot is what
-  // refuses it. Registering it would attach a live Databricks bearer token to a host the customer
-  // does not own.
-  it('refuses the suffix lookalike evil-databricksapps.com', () => {
+  it('refuses the suffix lookalike evil-databricksapps.com, which a plain endsWith("databricksapps.com") would accept and hand a bearer token to', () => {
     expect(isValidDatabricksAppUrl('https://evil-databricksapps.com')).toBe(false);
     expect(isValidDatabricksAppUrl('https://notdatabricksapps.com')).toBe(false);
     expect(isValidDatabricksAppUrl('https://x.evil-databricksapps.com/app')).toBe(false);
@@ -432,9 +327,7 @@ describe('isValidDatabricksAppUrl — REFUSED (each one is a real attack)', () =
     expect(isValidDatabricksAppUrl('https://databricksapps.com')).toBe(false);
   });
 
-  // The classic allowlist bypass: the trusted-looking part is a USERNAME; the hostname is
-  // attacker.example.
-  it('refuses userinfo', () => {
+  it('refuses userinfo: the trusted-looking part is a username and the hostname is attacker.example', () => {
     expect(
       isValidDatabricksAppUrl('https://claims.aws.databricksapps.com@attacker.example'),
     ).toBe(false);
@@ -443,15 +336,12 @@ describe('isValidDatabricksAppUrl — REFUSED (each one is a real attack)', () =
     ).toBe(false);
   });
 
-  // A trailing dot is a DISTINCT DNS name that does not end in the dotted suffix.
-  it('refuses a trailing dot on the host', () => {
+  it('refuses a trailing dot on the host, a distinct DNS name outside the dotted suffix', () => {
     expect(isValidDatabricksAppUrl('https://claims.aws.databricksapps.com.')).toBe(false);
     expect(isValidDatabricksAppUrl('https://claims.aws.databricksapps.com./app')).toBe(false);
   });
 
-  // Interior whitespace / control characters: the injection rides in the PATH while the host
-  // passes every other check.
-  it('refuses embedded spaces and embedded newlines', () => {
+  it('refuses embedded spaces and embedded newlines: the injection rides in the path while the host passes every other check', () => {
     expect(isValidDatabricksAppUrl('https://claims.aws.databricksapps.com/a b')).toBe(false);
     expect(
       isValidDatabricksAppUrl('https://claims.aws.databricksapps.com\njavascript:alert(1)'),
@@ -476,7 +366,6 @@ describe('isValidDatabricksAppUrl — REFUSED (each one is a real attack)', () =
     }
   });
 
-  // The suffix must be a real host suffix, not a substring anywhere in the URL.
   it('refuses the suffix appearing outside the host', () => {
     expect(isValidDatabricksAppUrl('https://attacker.example/.databricksapps.com')).toBe(false);
     expect(isValidDatabricksAppUrl('https://attacker.example?x=.databricksapps.com')).toBe(false);
@@ -484,43 +373,16 @@ describe('isValidDatabricksAppUrl — REFUSED (each one is a real attack)', () =
   });
 });
 
-// ---------------------------------------------------------------------------
-// FE/BE PARITY — measured, and pinned only where measurement supports it
-//
-// The property WORTH having is directional: this validator should not be STRICTER than the
-// backend's `_validate_databricks_app_url`, because a stricter client refuses registrations the
-// platform would happily serve and the operator has no way around it. A looser one merely defers
-// an exotic refusal to the enforcement point, which still refuses, before any token is minted.
-//
-// THAT PROPERTY IS NOT ABSOLUTE, and this file says so rather than asserting a tidier claim than
-// the measurements support (an earlier version claimed "always looser, never stricter" — falsified
-// below by `STRICTER_THAN_BACKEND`). Every verdict here was produced by EXECUTING both
-// implementations over these exact inputs — the backend's as `urlparse` + the `.host` access that
-// forces httpx's IDNA encode. Re-measure if either side changes; do not reason from the source.
-// ---------------------------------------------------------------------------
-
-// Inputs BOTH sides accept. A failure here means this validator has become stricter than the
-// platform's on a value that should register cleanly.
-//
-// The two CJK-dot rows are accepted by the backend for a reason worth stating exactly, because the
-// obvious explanation is wrong: `urlparse` does NOT normalise U+FF0E/U+3002 — it returns the host
-// VERBATIM (measured: `'claims．aws.databricksapps.com'`), which does not end in the ASCII dotted
-// suffix. They survive the backend's suffix check only because... they don't: the suffix check sees
-// the raw host and the LAST label still reads `.databricksapps.com` in ASCII, since only the dot
-// BEFORE `aws` is fullwidth. It is httpx's downstream IDNA encode that maps the fullwidth dot to
-// '.' — which is why the request that finally goes out is aimed at the normalised host. FE reaches
-// the same verdict earlier, via WHATWG `URL`'s own normalisation.
 const ACCEPTED_BY_BACKEND_TOO = [
   'https://claims-triage-1234.aws.databricksapps.com',
-  'https://Claims-Triage.AWS.DatabricksApps.COM', // host normalises; BE lowercases
-  'https://claims.aws.databricksapps.com:443', // BE never inspects the port
+  'https://Claims-Triage.AWS.DatabricksApps.COM',
+  'https://claims.aws.databricksapps.com:443',
   'https://claims.aws.databricksapps.com/api/v1/agent?x=1',
-  'https://claims.ß.aws.databricksapps.com', // a legitimate IDN label, encodes fine
-  'https://claims．aws.databricksapps.com', // U+FF0E before `aws`; ASCII suffix intact
-  'https://claims。aws.databricksapps.com', // U+3002, same shape
+  'https://claims.ß.aws.databricksapps.com',
+  'https://claims．aws.databricksapps.com',
+  'https://claims。aws.databricksapps.com',
 ];
 
-// Inputs BOTH sides refuse — the security boundary proper, agreed on by two implementations.
 const REFUSED_BY_BOTH = [
   'http://claims.aws.databricksapps.com',
   'https://evil-databricksapps.com',
@@ -528,47 +390,23 @@ const REFUSED_BY_BOTH = [
   'https://claims.aws.databricksapps.com@attacker.example',
   'https://claims.aws.databricksapps.com.',
   'https://claims.aws.databricksapps.com\njavascript:alert(1)',
-  'https://xn--.aws.databricksapps.com', // empty A-label: even WHATWG URL throws
+  'https://xn--.aws.databricksapps.com',
 ];
 
-// LOOSER than the backend: accepted here, REFUSED there. Five, from TWO distinct root causes.
-//
-// Cause 1 — httpx's IDNA encode, which WHATWG `URL` does not run (the first four). Cause 2 — the
-// two sides check DIFFERENT STRINGS: the backend tests its suffix against the raw `urlparse` host,
-// while FE tests the WHATWG-NORMALISED one. So a host whose `.databricksapps.com` labels are
-// themselves written with fullwidth dots is `evil.example．databricksapps．com` verbatim to the
-// backend (suffix check FAILS — measured) and `evil.example.databricksapps.com` after WHATWG
-// normalisation (suffix check passes here). Note the direction: this is a host the backend REFUSES
-// and FE accepts, so nothing hostile gets through the enforcement point.
-//
-// Listed rather than fixed, deliberately: matching exactly would mean reimplementing IDNA in the
-// browser (or a new dependency, which the epic forbids), and a hand-rolled approximation is how a
-// client check silently becomes STRICTER than the server on some legitimate international host.
-// Asserting them as `true` means a future tightening BREAKS THIS TEST — which is the point:
-// closing one becomes a deliberate act with a visible diff, not a silent behaviour change.
 const KNOWN_LOOSER_THAN_BACKEND = [
-  'https://xn--evil.aws.databricksapps.com', // invalid punycode A-label
-  'https://claims­.aws.databricksapps.com', // U+00AD soft hyphen — invisible, URL strips it
-  'https://cla​ims.aws.databricksapps.com', // U+200B zero-width space — likewise
-  'https:///claims.aws.databricksapps.com', // triple slash — empty authority
-  'https://evil.example．databricksapps．com', // cause 2: raw vs normalised host (see above)
+  'https://xn--evil.aws.databricksapps.com',
+  'https://claims­.aws.databricksapps.com',
+  'https://cla​ims.aws.databricksapps.com',
+  'https:///claims.aws.databricksapps.com',
+  'https://evil.example．databricksapps．com',
 ];
 
-// STRICTER than the backend — the falsifying case, kept as a first-class set rather than a caveat
-// in prose. FE refuses it; the backend ACCEPTS it (measured `BE=True`) and httpx percent-encodes
-// the space when it builds the request (`/pa th` → `/pa%20th`).
-//
-// It is a real, if small, usability cost: an operator who pastes an app URL with a space in the
-// PATH is refused here on a value the platform would have served. Accepted knowingly — the same
-// interior-whitespace rule is what refuses CR/LF and the `\njavascript:` injection above, and
-// loosening it to allow only U+0020-in-path would trade a clear rule for a subtle one on the
-// field that decides where a bearer token is sent. Pinned so the trade-off stays visible.
 const STRICTER_THAN_BACKEND = [
-  'https://claims.aws.databricksapps.com/pa th', // space in the PATH; BE accepts, we refuse
+  'https://claims.aws.databricksapps.com/pa th',
 ];
 
-describe('isValidDatabricksAppUrl — FE/BE parity, as measured', () => {
-  it('accepts everything the backend accepts, except the documented stricter case', () => {
+describe('isValidDatabricksAppUrl — FE/BE parity, measured by executing both implementations; looser than the backend is tolerated, stricter only where pinned', () => {
+  it('accepts everything the backend accepts: an uppercase host, a port, a path and query, an IDN label, and a fullwidth dot before "aws" that leaves the ASCII suffix intact', () => {
     for (const url of ACCEPTED_BY_BACKEND_TOO) {
       expect(isValidDatabricksAppUrl(url), url).toBe(true);
     }
@@ -580,29 +418,21 @@ describe('isValidDatabricksAppUrl — FE/BE parity, as measured', () => {
     }
   });
 
-  it('documents the five looser cases, so tightening one is deliberate', () => {
+  it('documents the five looser cases (an invalid punycode A-label, a soft hyphen and a zero-width space the URL parser strips, an empty authority, fullwidth dots inside the suffix labels), so tightening one is deliberate', () => {
     for (const url of KNOWN_LOOSER_THAN_BACKEND) {
       expect(isValidDatabricksAppUrl(url), url).toBe(true);
     }
-    // Pinned as a set: a sixth divergence must be MEASURED and added here rather than discovered
-    // in production. The count is a claim about what has been measured, not about what exists —
-    // the earlier version of this pin asserted exhaustiveness and a fifth case falsified it.
     expect(KNOWN_LOOSER_THAN_BACKEND).toHaveLength(5);
   });
 
-  it('is STRICTER on exactly one measured input, and says so', () => {
+  it('is stricter on exactly one measured input, a space in the path the backend would percent-encode, and says so', () => {
     for (const url of STRICTER_THAN_BACKEND) {
       expect(isValidDatabricksAppUrl(url), url).toBe(false);
     }
     expect(STRICTER_THAN_BACKEND).toHaveLength(1);
   });
 
-  // The looser cases are only acceptable because the backend still refuses them. That is a fact
-  // about the BACKEND, so it is stated here as the assumption this whole trade-off rests on —
-  // `test_invoke_route.py` is where it is enforced.
-  it('relies on the backend refusing the looser inputs at invoke time', () => {
-    // No set may claim an input twice: a value cannot be both agreed-on and divergent, and an
-    // overlap would mean one of these tables is stale.
+  it('relies on the backend refusing the looser inputs at invoke time; no input appears in two tables', () => {
     const all = [
       ...ACCEPTED_BY_BACKEND_TOO,
       ...REFUSED_BY_BOTH,
@@ -613,19 +443,13 @@ describe('isValidDatabricksAppUrl — FE/BE parity, as measured', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Manual entry
-// ---------------------------------------------------------------------------
-
 describe('isValidAgentArn — the AWS fence', () => {
-  // Byte-identical to the pre-E29 behaviour of the wizard's Agent ARN field: free text,
-  // non-empty. Tightening it inside the Databricks change would put an unrelated risk in this
-  // diff.
-  it('accepts any non-empty value and refuses a blank one', () => {
+  it('accepts a well-formed ARN and refuses blank, free-text, or a bad region: the backend’s write-time region check, mirrored so a 422 is caught before submit', () => {
     expect(isValidAgentArn(ARN)).toBe(true);
-    expect(isValidAgentArn('anything')).toBe(true);
     expect(isValidAgentArn('')).toBe(false);
     expect(isValidAgentArn('   ')).toBe(false);
+    expect(isValidAgentArn('anything')).toBe(false);
+    expect(isValidAgentArn('arn:aws:bedrock-agentcore:not-a-region:0:runtime/x')).toBe(false);
   });
 });
 
@@ -636,19 +460,28 @@ describe('manualHandleField', () => {
     expect(f.label).toBe('Agent ARN');
   });
 
-  it('gives a Databricks tenant an app-URL field', () => {
+  it('gives a Databricks tenant an app-URL field whose hint names the databricksapps.com rule the validator enforces', () => {
     const f = manualHandleField('databricks');
     expect(f.key).toBe('runtime_handle');
     expect(f.label).toBe('App URL');
-    // The hint must state the rule the validator enforces, not a vaguer one.
     expect(f.hint).toMatch(/databricksapps\.com/);
+  });
+
+  it('renders the raw word and refuses the create on either path before submit for a tenant platform outside the union, without throwing', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    expect(manualHandleField('azure' as never).hint).toContain('"azure"');
+    const manual = draft({ handle_source: 'manual', agent_arn: ARN });
+    expect(createBlockedReason(manual, 'azure' as never)).toContain('"azure"');
+    expect(canSubmit(manual, 'azure' as never)).toBe(false);
+    const discovery = draft({ handle_source: 'discovery', selected_handle: ARN });
+    expect(createBlockedReason(discovery, 'azure' as never)).toBe(createBlockedReason(manual, 'azure' as never));
+    expect(canSubmit(discovery, 'azure' as never)).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });
 
 describe('isManualHandleValid / manualHandleError', () => {
-  // A metadata-only registration is a real supported record (~18 exist), so an empty handle must
-  // not block submit on either branch.
-  it('treats an empty handle as valid on both platforms', () => {
+  it('treats an empty handle as valid on both platforms: a metadata-only registration is a supported record', () => {
     expect(isManualHandleValid('aws', '')).toBe(true);
     expect(isManualHandleValid('databricks', '  ')).toBe(true);
     expect(manualHandleError('databricks', '')).toBeNull();
@@ -657,9 +490,8 @@ describe('isManualHandleValid / manualHandleError', () => {
   it('applies the app-URL rule only on the Databricks branch', () => {
     expect(isManualHandleValid('databricks', 'https://evil-databricksapps.com')).toBe(false);
     expect(isManualHandleValid('databricks', APP_URL)).toBe(true);
-    // The same hostile string on an AWS tenant is just free text in an ARN field — the AWS
-    // branch's rule is unchanged from pre-E29.
-    expect(isManualHandleValid('aws', 'https://evil-databricksapps.com')).toBe(true);
+    expect(isManualHandleValid('aws', 'https://evil-databricksapps.com')).toBe(false);
+    expect(isManualHandleValid('aws', ARN)).toBe(true);
   });
 
   it('names the rule in the error message', () => {
@@ -669,10 +501,6 @@ describe('isManualHandleValid / manualHandleError', () => {
     expect(manualHandleError('aws', '')).toBeNull();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Selection + submit gate
-// ---------------------------------------------------------------------------
 
 describe('selectedRow', () => {
   const rows = [row({ name: 'a', runtime_handle: 'https://a.aws.databricksapps.com' }), row()];
@@ -692,14 +520,12 @@ describe('selectedRow', () => {
 });
 
 describe('runtimeKindFor', () => {
-  it('carries only C-4’s two Databricks kinds', () => {
+  it('carries only the two Databricks kinds, app and serving_endpoint', () => {
     expect(runtimeKindFor('app')).toBe('app');
     expect(runtimeKindFor('serving_endpoint')).toBe('serving_endpoint');
   });
 
-  // `runtime_kind` is a two-value Databricks field. Writing `agentcore_runtime` into it would
-  // make `is_databricks_governed` reason about a record that is not one.
-  it('drops agentcore_runtime and anything unrecognised', () => {
+  it('drops agentcore_runtime and anything unrecognised: runtime_kind is a two-value Databricks field', () => {
     expect(runtimeKindFor('agentcore_runtime')).toBeUndefined();
     expect(runtimeKindFor('')).toBeUndefined();
     expect(runtimeKindFor('something_new')).toBeUndefined();
@@ -717,34 +543,48 @@ describe('canSubmit', () => {
     const bad = draft({ handle_source: 'manual', runtime_handle: 'https://evil-databricksapps.com' });
     expect(canSubmit(bad, 'databricks')).toBe(false);
     expect(canSubmit({ ...bad, runtime_handle: APP_URL }, 'databricks')).toBe(true);
-    // Empty is fine — a metadata-only registration.
     expect(canSubmit({ ...bad, runtime_handle: '' }, 'databricks')).toBe(true);
   });
 
-  it('does not gate the discovery path on a manual field', () => {
-    // A leftover hostile value in the manual box must not block a discovery selection, and must
-    // not travel either (see buildPayload).
+  it('does not gate the discovery path on a leftover manual value, which must not travel either', () => {
     const d = draft({ handle_source: 'discovery', runtime_handle: 'https://evil-databricksapps.com' });
     expect(canSubmit(d, 'databricks')).toBe(true);
   });
 });
 
-// ---------------------------------------------------------------------------
-// buildPayload — the mapping this module exists for
-// ---------------------------------------------------------------------------
+describe('createBlockedReason — why canSubmit answers false, so Create is never silently disabled', () => {
+  it('is null exactly when canSubmit is true', () => {
+    expect(createBlockedReason(draft(), 'aws')).toBeNull();
+    expect(canSubmit(draft(), 'aws')).toBe(true);
+  });
+
+  it('names the missing name/tenant, checked in canSubmit\'s own order', () => {
+    expect(createBlockedReason(draft({ name: '   ' }), 'aws')).toBe('A name is required.');
+    expect(createBlockedReason(draft({ tenant_id: '' }), 'aws')).toBe('A tenant is required.');
+  });
+
+  it('names the malformed manual ARN with the same message the field itself shows', () => {
+    const bad = draft({ handle_source: 'manual', agent_arn: 'not-an-arn' });
+    expect(createBlockedReason(bad, 'aws')).toBe(manualHandleError('aws', 'not-an-arn'));
+    expect(canSubmit(bad, 'aws')).toBe(false);
+  });
+
+  it('names the malformed manual app URL on the Databricks branch', () => {
+    const bad = draft({ handle_source: 'manual', runtime_handle: 'https://evil-databricksapps.com' });
+    expect(createBlockedReason(bad, 'databricks')).toBe(
+      manualHandleError('databricks', 'https://evil-databricksapps.com'),
+    );
+  });
+});
 
 describe('buildPayload — Databricks', () => {
-  it('maps a selected discovery row onto the C-4 create body', () => {
+  it('maps a selected discovery row onto the create body: runtime_handle and kind from the row, auth_type forced to entra, no agent_arn', () => {
     const d = draft({ selected_handle: APP_URL });
     const body = buildPayload(d, 'databricks', row());
     expect(body.platform).toBe('databricks');
     expect(body.runtime_handle).toBe(APP_URL);
     expect(body.runtime_kind).toBe('app');
-    // FORCED, not defaulted: `is_databricks_governed` requires ENTRA before any identity work
-    // happens, so `none` here is a record that looks governed and provisions nothing.
     expect(body.auth_type).toBe('entra');
-    // `agent_arn` is parsed as a Bedrock ARN by the delete cascade and the status probe — a URL
-    // must never land there.
     expect(body.agent_arn).toBeUndefined();
   });
 
@@ -757,19 +597,17 @@ describe('buildPayload — Databricks', () => {
     expect(body.runtime_kind).toBe('serving_endpoint');
   });
 
-  it('uses the manual app URL when discovery was not used', () => {
+  it('uses the manual app URL when discovery was not used, with kind app, the only kind manual entry can mean', () => {
     const body = buildPayload(
       draft({ handle_source: 'manual', runtime_handle: APP_URL }),
       'databricks',
       null,
     );
     expect(body.runtime_handle).toBe(APP_URL);
-    // Manual entry asks for an App URL by name, so `app` is the only kind it can mean.
     expect(body.runtime_kind).toBe('app');
     expect(body.auth_type).toBe('entra');
   });
 
-  // A stale manual value from before the operator switched to the discovery list must not travel.
   it('never sends the manual value when a discovery row is selected', () => {
     const body = buildPayload(
       draft({ selected_handle: APP_URL, runtime_handle: 'https://evil-databricksapps.com' }),
@@ -779,21 +617,14 @@ describe('buildPayload — Databricks', () => {
     expect(body.runtime_handle).toBe(APP_URL);
   });
 
-  it('sends no handle at all when nothing was selected or typed', () => {
+  it('sends no handle at all when nothing was selected or typed, and leaves auth_type as the operator set it', () => {
     const body = buildPayload(draft(), 'databricks', null);
     expect(body.runtime_handle).toBeUndefined();
     expect(body.runtime_kind).toBeUndefined();
-    // Nothing to govern yet, so the auth type is left as the operator set it.
     expect(body.auth_type).toBe('none');
   });
 
-  // These four are the tenant probe's / the provisioning service's to write. The invoke path
-  // re-reads `binding_mode` from the TENANT precisely because the agent's copy is client-settable
-  // — sending one here would let a caller pick the weaker credential path on a federation tenant.
-  it('never sends a service-written or probe-computed field', () => {
-    // Through `unknown`, because the point of the assertion is to look for keys the type does
-    // NOT declare — a direct cast is a type error precisely because `AgentCreate` has no index
-    // signature, which is the property being relied on here.
+  it('never sends a service-written or probe-computed field: binding_mode, databricks_sp_id, databricks_sp_secret_arn, oauth2_app_client_id', () => {
     const body = buildPayload(draft({ selected_handle: APP_URL }), 'databricks', row()) as unknown as Record<
       string,
       unknown
@@ -810,7 +641,7 @@ describe('buildPayload — Databricks', () => {
 });
 
 describe('buildPayload — AgentCore (the AWS fence)', () => {
-  it('maps a manual ARN onto the pre-E29 shape', () => {
+  it('maps a manual ARN onto the AgentCore shape: platform aws_bedrock, agent_arn, auth_type as the operator chose, no runtime fields', () => {
     const body = buildPayload(
       draft({ handle_source: 'manual', agent_arn: ARN, auth_type: 'entra' }),
       'aws',
@@ -818,8 +649,6 @@ describe('buildPayload — AgentCore (the AWS fence)', () => {
     );
     expect(body.platform).toBe('aws_bedrock');
     expect(body.agent_arn).toBe(ARN);
-    // `auth_type` stays the operator's choice on this branch — an AgentCore agent legitimately
-    // has three auth shapes and `is_agentcore` gates on Entra having been picked deliberately.
     expect(body.auth_type).toBe('entra');
     expect(body.runtime_handle).toBeUndefined();
     expect(body.runtime_kind).toBeUndefined();
@@ -840,7 +669,7 @@ describe('buildPayload — AgentCore (the AWS fence)', () => {
 });
 
 describe('buildPayload — shared field handling', () => {
-  it('omits blank optionals so the backend applies its own defaults', () => {
+  it('omits blank optionals so the backend applies its own defaults; tenant_id and origin always travel', () => {
     const body = buildPayload(draft(), 'aws', null);
     expect(body.purpose).toBeUndefined();
     expect(body.sponsor_email).toBeUndefined();
@@ -850,7 +679,6 @@ describe('buildPayload — shared field handling', () => {
     expect(body.data_classification).toBeUndefined();
     expect(body.framework).toBeUndefined();
     expect(body.endpoint_url).toBeUndefined();
-    // Always sent.
     expect(body.tenant_id).toBe('t-1');
     expect(body.origin).toBe('Registered');
   });
@@ -866,9 +694,107 @@ describe('buildPayload — shared field handling', () => {
     expect(body.business_unit).toBe('Claims');
   });
 
-  // The platform is the tenant's, always — there is no draft key that can contradict it.
   it('takes the platform from the tenant on every path', () => {
     expect(buildPayload(draft(), 'databricks', null).platform).toBe('databricks');
     expect(buildPayload(draft(), 'aws', null).platform).toBe('aws_bedrock');
+  });
+});
+
+describe('supportsAutoTraceDelivery — the mirror of the backend’s trace_auto_delivery declaration, exhaustive over both tenant platforms', () => {
+  it('is true for aws, false for databricks', () => {
+    expect(supportsAutoTraceDelivery('aws')).toBe(true);
+    expect(supportsAutoTraceDelivery('databricks')).toBe(false);
+  });
+});
+
+describe('platformSupportsAutoTraceDelivery — reached from the wider Platform enum', () => {
+  it('is true only for aws_bedrock', () => {
+    expect(platformSupportsAutoTraceDelivery('aws_bedrock')).toBe(true);
+    expect(platformSupportsAutoTraceDelivery('databricks')).toBe(false);
+  });
+
+  it('is false for every inventory-only platform', () => {
+    for (const p of ['azure', 'salesforce', 'sap', 'google', 'on_prem', 'other'] as const) {
+      expect(platformSupportsAutoTraceDelivery(p)).toBe(false);
+    }
+  });
+});
+
+describe('buildPayload — trace_delivery', () => {
+  it('ships auto as the draft default, the value the backend resolves an absent key to', () => {
+    expect(EMPTY_DRAFT.trace_delivery).toBe('auto');
+  });
+
+  it('omits the key on the default auto choice (aws): absent means auto on the wire', () => {
+    expect(buildPayload(draft({ trace_delivery: 'auto' }), 'aws', null).trace_delivery).toBeUndefined();
+  });
+
+  it('sends "manual" only when the operator opted out on an auto-capable platform (aws)', () => {
+    expect(buildPayload(draft({ trace_delivery: 'manual' }), 'aws', null).trace_delivery).toBe('manual');
+  });
+
+  it('never sends the key on a non-auto-capable platform, even when set to manual', () => {
+    expect(
+      buildPayload(draft({ trace_delivery: 'manual' }), 'databricks', row()).trace_delivery,
+    ).toBeUndefined();
+  });
+});
+
+describe('platformStepWarning', () => {
+  it('warns on neither tenant platform today, because both map onto governable labels; the gate is what a third tenant platform has to pass', () => {
+    expect(platformStepWarning('aws')).toBeNull();
+    expect(platformStepWarning('databricks')).toBeNull();
+  });
+
+  it('is compile-linked to the one governance predicate, not to a second literal list', () => {
+    for (const tp of ['aws', 'databricks'] as const) {
+      const expected = isInventoryOnly(agentPlatformFor(tp)) ? INVENTORY_ONLY_NOTE : null;
+      expect(platformStepWarning(tp), tp).toBe(expected);
+    }
+  });
+
+  it('would carry the contract copy verbatim, as a warning distinct from a refusal', () => {
+    expect(INVENTORY_ONLY_NOTE).toBe(
+      'Registry entry only — AGP cannot govern or invoke agents on this platform',
+    );
+    expect(SERVING_ENDPOINT_WARNING).not.toBe(INVENTORY_ONLY_NOTE);
+  });
+});
+
+describe('classifyAgentCreateRefusal: the wizard returns to the name step for the registry\'s name_taken code alone', () => {
+  function failure(status: number, code: ErrorCode | null = null, detail?: string): ApiFailure {
+    return new ApiFailure(status, code, detail, detail ?? `Request failed with status code ${status}`);
+  }
+
+  it('a 409 agent.name_taken is name_taken', () => {
+    expect(classifyAgentCreateRefusal(failure(409, 'agent.name_taken', 'An agent named x already exists'))).toBe('name_taken');
+  });
+
+  it('a 409 with another code is not: eval.running ("already running"), the MCP registry\'s name_taken, a tenant\'s, or a route-decided 409 with no code', () => {
+    expect(classifyAgentCreateRefusal(failure(409, 'eval.running', 'An evaluation is already running for this agent'))).toBeNull();
+    expect(classifyAgentCreateRefusal(failure(409, 'mcp_server.name_taken', 'An MCP server named x already exists'))).toBeNull();
+    expect(classifyAgentCreateRefusal(failure(409, 'tenant.name_taken', 'tenant name already exists'))).toBeNull();
+    expect(classifyAgentCreateRefusal(failure(409))).toBeNull();
+  });
+
+  it('a registry 503 whose message says "exists", a tenant 403 and a network failure are not', () => {
+    expect(classifyAgentCreateRefusal(failure(503, 'registry.not_configured', 'No registry exists for this tenant'))).toBeNull();
+    expect(classifyAgentCreateRefusal(failure(403, null, 'tenant not permitted'))).toBeNull();
+    expect(classifyAgentCreateRefusal(failure(0))).toBeNull();
+  });
+
+  it('the sentence alone classifies nothing: a 500 reading "already taken" is a plain error', () => {
+    expect(classifyAgentCreateRefusal(failure(500, null, 'That name is already taken'))).toBeNull();
+  });
+
+  it('the table is typed on the generated codes, so a renamed kind fails tsc where the table names it', () => {
+    expectTypeOf(AGENT_CREATE_REFUSAL_CODES).toExtend<Record<'name_taken', readonly ErrorCode[]>>();
+  });
+});
+
+describe('the wizard\'s create handler', () => {
+  it('returns to the name step on the code and shows every other refusal where it stands', () => {
+    expect(wizardSrc).toMatch(/isApiFailure\(err\) && classifyAgentCreateRefusal\(err\) === 'name_taken'/);
+    expect(wizardSrc).not.toMatch(/already\|exist\|taken/);
   });
 });

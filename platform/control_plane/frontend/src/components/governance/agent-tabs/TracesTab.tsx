@@ -1,31 +1,25 @@
-// TracesTab — the per-agent "Traces" tab of AgentDetail (Epic 26 / Task 9).
-//
-// A paged table of this agent's recent Langfuse traces (timestamp, name,
-// latency, cost, user). Rows drill down to the trace in the deployed Langfuse UI
-// when a host is derivable from the observability settings; otherwise the row is
-// a plain detail row (no dead link). Every Optional field the backend TraceRow
-// emits (timestamp/name/latency_ms/user_id) renders as "—" via the pure
-// mapTraceRows helper — no null.toFixed() crash. VIEWER-readable; the backend
-// enforces tenant scope (a foreign agent 404s). Table chrome mirrors the FinOps /
-// dashboard idiom: uppercase-tracked headers, tabular-nums cells, hover rows.
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { observabilityApi } from '../../../api/client';
-import type { TraceRow } from '../../../types';
-import { mapTraceRows, deriveTraceUrl, totalPages } from './agentObservability';
+import { useLoad } from '../../../api/useLoad';
+import type { Agent, AgentRepositoryView, TraceRow } from '../../../api/client';
+import { mapTraceRows, deriveTraceUrl, totalPages, tracesEmptyState } from './agentObservability';
 import { ObsEmptyCard } from './ObsEmptyCard';
 
 const CARD = 'bg-white/70 backdrop-blur rounded-xl border border-slate-200/60 shadow-sm';
 const PAGE_SIZE = 20;
+const NO_ROWS: TraceRow[] = [];
 
-export default function TracesTab({ agentId }: { agentId: string }) {
+export default function TracesTab({
+  agent,
+  repo,
+}: {
+  agent: Agent;
+  /** undefined = the repository lookup is still running; null = the agent has none. */
+  repo: AgentRepositoryView | null | undefined;
+}) {
+  const agentId = agent.id;
   const [page, setPage] = useState(1);
-  const [rows, setRows] = useState<TraceRow[]>([]);
-  const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  // Best-effort Langfuse host for the per-row deep link. A failure here never
-  // blocks the table — rows just fall back to a detail affordance (deriveTraceUrl
-  // returns null for a null host).
   const [langfuseHost, setLangfuseHost] = useState<string | null>(null);
 
   useEffect(() => {
@@ -33,21 +27,19 @@ export default function TracesTab({ agentId }: { agentId: string }) {
     observabilityApi
       .getSettings()
       .then((s) => { if (!cancelled) setLangfuseHost(s.langfuse_host); })
-      .catch(() => { /* no host → detail-only rows */ });
+      .catch(() => {});
     return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError('');
-    observabilityApi
-      .getAgentTraces(agentId, { page, limit: PAGE_SIZE })
-      .then((res) => { if (!cancelled) { setRows(res.data); setTotal(res.total); } })
-      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load traces'); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [agentId, page]);
+  const { state } = useLoad(
+    () => observabilityApi.getAgentTraces(agentId, { page, limit: PAGE_SIZE }),
+    [agentId, page],
+    'Failed to load traces',
+  );
+  const rows = state.data?.data ?? NO_ROWS;
+  const total = state.data?.total ?? 0;
+  const loading = state.kind === 'loading';
+  const error = state.kind === 'error' ? state.message : '';
 
   const display = useMemo(() => mapTraceRows(rows), [rows]);
   const pages = totalPages(total, PAGE_SIZE);
@@ -56,13 +48,25 @@ export default function TracesTab({ agentId }: { agentId: string }) {
     return <ObsEmptyCard title="Couldn't load traces" body={error} tone="amber" />;
   }
 
-  // Empty-state: only when the first page came back empty (not mid-pagination).
   if (!loading && rows.length === 0 && page === 1) {
+    const empty = tracesEmptyState(agent, repo);
     return (
-      <ObsEmptyCard
-        title="No traces recorded yet"
-        body="This agent has no Langfuse traces. Once it's provisioned and invoked, each run will appear here with its latency, cost and calling user — newest first."
-      />
+      <div className="space-y-3">
+        <ObsEmptyCard title={empty.title} body={empty.body} />
+        {empty.opsLink && (
+          <div>
+            <Link
+              to={empty.opsLink.to}
+              className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700 transition-colors"
+            >
+              Open Observability for {empty.opsLink.name} in Operations
+              <svg viewBox="0 0 20 20" fill="none" className="h-3 w-3" aria-hidden="true">
+                <path d="M7 4h9v9M16 4l-9 9M4 8v8h8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </Link>
+          </div>
+        )}
+      </div>
     );
   }
 
@@ -126,7 +130,6 @@ export default function TracesTab({ agentId }: { agentId: string }) {
         </table>
       </div>
 
-      {/* Pager — only when there's more than one page. */}
       {pages > 1 && (
         <div className="flex items-center justify-between mt-4 pt-3 border-t border-slate-100">
           <div className="text-xs text-slate-400 tabular-nums">

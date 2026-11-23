@@ -1,0 +1,101 @@
+name: deploy
+
+# Deploy-only CI for an MCP SERVER built from Ops (E40 — AgentCore Gateway, preview).
+#
+# Copied from the harness template's workflow; the only contract difference is the id it sends:
+# `mcp_server_id` (this repo's MCP record), not `agent_id`. Nothing is built. `gateway.yaml` and
+# the OpenAPI spec ARE the artifact, so a trunk push mints a GitHub OIDC token and
+# `POST /builds/runtime`; AGP applies the gateway Terraform module at the commit this run names.
+#
+# One branch, one path: a push to the trunk deploys dev; any other branch runs nothing. There is
+# exactly ONE dev gateway per MCP server (state `agentcore-gateway/{mcp_server_id}/{stage}`), so
+# feature branches deploying would race it. CI has no prod path.
+#
+# Serialization is AGP's: it answers 409 while a build for this MCP server+stage is in flight and
+# the script polls on that 409. `concurrency` only stops two trigger jobs for one ref polling at
+# once; `cancel-in-progress: false` so an in-flight apply is never abandoned mid-lock.
+#
+# `AGP_API_URL` / `MCP_SERVER_ID` / `CONNECTION_ID` are REPOSITORY variables AGP writes at
+# materialize time; `environment: dev` is a deployment label they fall back through.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  # Per-ref: two pushes to the trunk serialize rather than racing this MCP server's single
+  # terraform state lock. Never cancel — see the header.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    name: Trigger platform gateway deploy (dev)
+    # A push NEVER deploys production — stage is always dev, in the dev tenant account.
+    environment: dev
+    runs-on: ubuntu-latest
+    permissions:
+      # `id-token: write` is the only credential this workflow needs: it mints the GitHub OIDC
+      # token AGP verifies. No AWS role is assumed here — there is no registry to push to, and
+      # the platform (not the repo) holds the deploy credential.
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mint OIDC token and POST to AGP build-trigger
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Same body shape as the container template's — one contract, two build kinds.
+            // The COMMIT SHA takes the `image_tag` slot: for a config build it is the
+            // deployment version, the thing AGP records and a later promotion attests to,
+            // exactly as an image tag is for a container build. `image_digest` and `ecr_repo`
+            // are empty because no image exists; the platform resolves the build kind and the
+            // IaC type from the MCP repo's template chain and never from this body.
+            const body = {
+              mcp_server_id: '${{ vars.MCP_SERVER_ID }}',
+              image_tag: '${{ github.sha }}',
+              image_digest: '',
+              ecr_repo: '',
+              connection_id: '${{ vars.CONNECTION_ID }}',
+              stage: 'dev',
+            };
+            // LIVEFIX (E30 dev deploy): AGP answers 409 (not 202) while a build for this
+            // MCP server+stage is already running — see builds.py's start_runtime_build route. Poll
+            // on that 409 instead of failing the job, so a second push genuinely WAITS for the
+            // first apply to finish rather than racing its terraform state lock. Bounded so a
+            // stuck prior build fails this job eventually instead of hanging forever.
+            const maxWaitMs = 20 * 60 * 1000;
+            const pollMs = 20 * 1000;
+            const started = Date.now();
+            let resp;
+            let text;
+            while (true) {
+              // Minted INSIDE the loop, not once before it: OIDC tokens expire ~5 min in,
+              // the backend checks expiry with 60s leeway (security_github_oidc.py), and
+              // this poll can legitimately run up to maxWaitMs (20 min) — a token fetched
+              // before the loop would be stale and 401 on any wait past ~4 min.
+              const token = await core.getIDToken('agp-runtime-build');
+              resp = await fetch('${{ vars.AGP_API_URL }}/builds/runtime', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
+              });
+              text = await resp.text();
+              if (resp.status !== 409) break;
+              if (Date.now() - started > maxWaitMs) {
+                core.setFailed(`AGP still reports a build in progress for this MCP server+stage after ${maxWaitMs / 1000}s: ${text}`);
+                return;
+              }
+              core.info(`AGP reports a build already in progress for this MCP server+stage (409) — waiting ${pollMs / 1000}s and retrying...`);
+              await new Promise((r) => setTimeout(r, pollMs));
+            }
+            core.info(`AGP responded ${resp.status}: ${text}`);
+            if (!resp.ok) {
+              core.setFailed(`AGP deploy-trigger failed (${resp.status}): ${text}`);
+            }

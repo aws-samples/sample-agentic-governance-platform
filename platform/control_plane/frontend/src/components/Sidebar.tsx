@@ -1,52 +1,40 @@
 import { Link, useLocation } from 'react-router-dom';
 import { useRef, useEffect, useState, type ReactNode } from 'react';
-import { useAuth } from '../auth/AuthContext';
-import { useUser } from '../contexts/UserContext';
+import { useAuth } from '../auth/useAuth';
+import { useUser } from '../contexts/useUser';
 import { GOVERNANCE_NAV, visibleNavItems } from './governance/agentsNav';
-import { emailAlias, initialsFor } from './governance/agentUi';
+import { emailAlias } from './governance/agentBadges';
+import { initialsFor } from './shared/initials';
 import { tenantNames } from './governance/tenantUi';
 import { OPERATIONS_NAV } from './operations/operationsNav';
 import { sectionFromPath, SECTION_THEME } from './operations/operationsTheme';
 import { SoonTag } from './shared/comingSoon';
+import { COMING_SOON_TITLE } from './shared/comingSoonCopy';
 import { marketplaceApi } from '../api/client';
+import { safeLocalStorage } from '../api/safeLocalStorage';
 import { getUiFlavor, setUiFlavor } from '../ui/uiPreference';
+import { GITHUB_CONNECTION_SECTION_ID, ROLE_LEVEL_ADMIN } from './operations/settingsSections';
 
 export default function Sidebar() {
   const location = useLocation();
   const { signOut, user } = useAuth();
   const { user: currentUser } = useUser();
 
-  // Section is derived purely from the URL (Epic 17) — no new state. It selects
-  // the theme (governance light/blue vs operations dark/emerald) and the nav config.
   const section = sectionFromPath(location.pathname);
   const theme = SECTION_THEME[section];
   const nav = section === 'operations' ? OPERATIONS_NAV : GOVERNANCE_NAV;
 
-  // Matches MarketplaceAdmin's gate so the nav link and the page agree exactly.
-  const isAdmin = (currentUser?.role_level ?? 0) >= 2;
+  const isAdmin = (currentUser?.role_level ?? 0) >= ROLE_LEVEL_ADMIN;
 
-  // Footer identity (always shown, not gated behind the dropdown). Prefer the
-  // real Entra `name` claim, else the email alias (dev-auth, or when `name`
-  // is absent). During the brief load race where `currentUser` is still null
-  // (auth `user` is opaque and carries no typed email), emailAlias(undefined)
-  // yields "Unassigned" — never a crash, never the old static "Account".
   const displayName = currentUser?.name?.trim() || emailAlias(currentUser?.email);
   const displayRole = currentUser?.role ?? '';
-  // The caller's tenant memberships (E24) — '' when none, which hides the line.
   const displayTenants = tenantNames(currentUser?.tenants ?? []);
   const [profileOpen, setProfileOpen] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
 
-  // Which UI flavor the footer control shows as active (Epic 31E). Seeded from the
-  // persisted preference; local state only so the highlight repaints on click —
-  // uiPreference.ts owns persistence, nothing else in the app reads this value.
+  // Rationale: frontend/README.md "The UI is Classic, and that is deliberate" (parked Cloudscape arm)
   const [uiFlavor, setUiFlavorState] = useState(getUiFlavor);
 
-  // Admin-only, fail-silent pending-approvals count for the /admin nav badge.
-  // NEVER blocks/delays render and NEVER throws: only attempted when isAdmin,
-  // fetched once on mount; on any error or while loading it stays null (no
-  // badge). Mirrors the MarketplaceAdmin effect idiom (cancelled unmount guard,
-  // .catch swallows → null). Non-admins make no request.
   const [pendingApprovals, setPendingApprovals] = useState<number | null>(null);
   useEffect(() => {
     if (!isAdmin) return;
@@ -56,56 +44,54 @@ export default function Sidebar() {
       .then((m) => {
         if (!cancelled) setPendingApprovals(m.pending);
       })
-      .catch(() => {
-        /* fail-silent: badge stays absent */
-      });
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, [isAdmin]);
 
-  // governance-mode group collapse state — string-keyed by section id.
   const [governanceExpanded, setGovernanceExpanded] = useState<Record<string, boolean>>(() => {
     const defaults: Record<string, boolean> = {};
     for (const sec of GOVERNANCE_NAV) {
-      if (sec.collapsible) defaults[sec.id] = true; // groups start expanded
+      if (sec.collapsible) defaults[sec.id] = true;
     }
+    const raw = safeLocalStorage.getItem('sidebar.governance.expanded');
+    if (!raw) return defaults;
     try {
-      const raw = localStorage.getItem('sidebar.governance.expanded');
-      if (raw) return { ...defaults, ...JSON.parse(raw) };
-    } catch { /* noop */ }
-    return defaults;
+      return { ...defaults, ...JSON.parse(raw) };
+    } catch {
+      return defaults;
+    }
   });
   useEffect(() => {
-    try { localStorage.setItem('sidebar.governance.expanded', JSON.stringify(governanceExpanded)); } catch { /* noop */ }
+    safeLocalStorage.setItem('sidebar.governance.expanded', JSON.stringify(governanceExpanded));
   }, [governanceExpanded]);
 
   const toggleGovernanceSection = (id: string) => {
     setGovernanceExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  // operations-mode group collapse state — own localStorage key, mirrors the
-  // governance initializer exactly (groups start expanded; merge persisted over defaults).
   const [operationsExpanded, setOperationsExpanded] = useState<Record<string, boolean>>(() => {
     const defaults: Record<string, boolean> = {};
     for (const sec of OPERATIONS_NAV) {
-      if (sec.collapsible) defaults[sec.id] = true; // groups start expanded
+      if (sec.collapsible) defaults[sec.id] = true;
     }
+    const raw = safeLocalStorage.getItem('sidebar.operations.expanded');
+    if (!raw) return defaults;
     try {
-      const raw = localStorage.getItem('sidebar.operations.expanded');
-      if (raw) return { ...defaults, ...JSON.parse(raw) };
-    } catch { /* noop */ }
-    return defaults;
+      return { ...defaults, ...JSON.parse(raw) };
+    } catch {
+      return defaults;
+    }
   });
   useEffect(() => {
-    try { localStorage.setItem('sidebar.operations.expanded', JSON.stringify(operationsExpanded)); } catch { /* noop */ }
+    safeLocalStorage.setItem('sidebar.operations.expanded', JSON.stringify(operationsExpanded));
   }, [operationsExpanded]);
 
   const toggleOperationsSection = (id: string) => {
     setOperationsExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  // Active collapse pair, picked by section.
   const expanded = section === 'operations' ? operationsExpanded : governanceExpanded;
   const toggleSection = section === 'operations' ? toggleOperationsSection : toggleGovernanceSection;
 
@@ -113,8 +99,6 @@ export default function Sidebar() {
 
   const isActive = (path: string) => location.pathname === path;
   const isActivePrefix = (path: string) => location.pathname.startsWith(path);
-  // Section landing pages match exactly so they don't stay active on sub-pages
-  // (Overview's `/ops` would otherwise highlight on every `/ops/*` route).
   const isSectionRoot = (to: string) => to === '/' || to === '/ops';
 
   useEffect(() => {
@@ -127,9 +111,6 @@ export default function Sidebar() {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // `comingSoon` renders the shared SoonTag after the label (E31F) — expanded only:
-  // the icon rail has no room for it and the row's `title` already reads the label.
-  // Tone follows the chrome this sidebar is painted in: operations is the dark aside.
   const navLink = (to: string, label: string, icon: string, active: boolean, badge?: ReactNode, comingSoon?: boolean) => (
     <Link
       to={to}
@@ -158,7 +139,6 @@ export default function Sidebar() {
       <aside className={`flex-shrink-0 h-screen sticky top-0 flex flex-col ${theme.asideClassName} z-10 transition-all duration-300 relative ${isCollapsed ? 'w-16' : 'w-60'}`} style={{
         background: theme.asideBackground,
       }}>
-        {/* Collapse button */}
         <button
           onClick={() => setIsCollapsed(!isCollapsed)}
           className={`absolute z-20 h-10 flex items-center justify-center group border-l ${theme.collapseBorder} transition-all duration-300 ${isCollapsed ? 'top-20 -right-6 rounded-r-lg shadow-md' : 'top-5 right-0'}`}
@@ -175,9 +155,6 @@ export default function Sidebar() {
           </svg>
         </button>
 
-        {/* Logo — full text wordmark when expanded, a compact "AGP" glyph in the collapsed rail.
-            pt-6/pb-2 nudges the logo down for visual centering while keeping the
-            container's total height equal to the old py-4 (so the nav below is unmoved). */}
         <div className={`px-5 pt-6 pb-2 border-b ${theme.logoBorder} flex items-center ${isCollapsed ? 'justify-center' : 'justify-start'}`}>
           <Link to={section === 'operations' ? '/ops' : '/'} className="flex items-center gap-2.5" aria-label={theme.logoTitle}>
             <span className={`flex-shrink-0 h-8 w-8 rounded-lg ${theme.logoBadge} flex items-center justify-center text-[11px] font-bold tracking-tight`}>
@@ -191,15 +168,9 @@ export default function Sidebar() {
           </Link>
         </div>
 
-        {/* Navigation */}
         <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-1">
-          {/* === section IA (governance or operations, rendered from nav config) === */}
           {nav.map((sec, i) => {
                 const isOpen = !sec.collapsible || expanded[sec.id];
-                // Thin top divider when this section's zone differs from the one
-                // above (collapsible flag flips). With the locked E15 order this
-                // fires at Inventory (after Home), Marketplace (after Operations),
-                // and Resources (after Admin) — bounding the standalone zones.
                 const prev = nav[i - 1];
                 const showDivider = i > 0 && prev.collapsible !== sec.collapsible;
                 return (
@@ -224,11 +195,7 @@ export default function Sidebar() {
                         <div className={`px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider ${theme.groupHeader}`}>{sec.label}</div>
                       )
                     )}
-                    {/* Items: always shown in the icon rail (isCollapsed) or when the group is open. */}
                     {(isCollapsed || isOpen) && visibleNavItems(sec.items, isAdmin).map((item) => {
-                      // Fail-silent pending-approvals pill on the Admin row only.
-                      // Absent unless we have a positive count (null/0 → no pill).
-                      // Keys off the governance '/admin' route — never matches '/ops/admin'.
                       const adminBadge =
                         item.to === '/admin' && pendingApprovals && pendingApprovals > 0 ? (
                           <span className="ml-auto inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700">
@@ -247,7 +214,6 @@ export default function Sidebar() {
               })}
         </nav>
 
-        {/* Section switch (Epic 17) — distinct affordance, just above the user box */}
         <div className={`px-3 pt-2 pb-1 border-t ${theme.divider}`}>
           <Link
             to={theme.switchTo}
@@ -261,12 +227,6 @@ export default function Sidebar() {
           </Link>
         </div>
 
-        {/* Interface switch (Epic 31E) — its own zone between the section switch and
-            the user box. Hidden in the icon rail (no room for a two-up control), and
-            styled only from `theme.*` so it reads correctly in BOTH sections
-            (governance light / operations dark). Today Classic is the only shipping
-            arm: clicking it just re-persists the preference — no route change, no
-            reload — and Cloudscape is a disabled placeholder for the parked tree. */}
         {!isCollapsed && (
           <div className={`px-3 pt-2 pb-2 border-t ${theme.divider}`}>
             <div className={`px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider ${theme.groupHeader}`}>
@@ -292,13 +252,12 @@ export default function Sidebar() {
                 className={`flex flex-col items-center justify-center px-2 py-1.5 rounded-lg border border-dashed ${theme.divider} ${theme.userSub} text-xs font-medium opacity-70 cursor-not-allowed`}
               >
                 <span className="truncate">Cloudscape</span>
-                <span className="text-[9px] font-normal uppercase tracking-wide">coming soon</span>
+                <span className="text-[9px] font-normal uppercase tracking-wide">{COMING_SOON_TITLE}</span>
               </button>
             </div>
           </div>
         )}
 
-        {/* User section */}
         {user && (
           <div className={`border-t ${theme.userBorder} px-3 py-3`} ref={profileRef}>
             <button onClick={() => setProfileOpen(!profileOpen)}
@@ -328,18 +287,7 @@ export default function Sidebar() {
                     <div className="text-xs text-slate-500 capitalize mt-0.5">Role: {currentUser.role}</div>
                   </div>
                 )}
-                {/* Per-user GitHub link (E27B). This dropdown is the only place the
-                    logged-in human is rendered as themselves, which is the right altitude
-                    for an action that only affects their OWN identity — so the entry STAYS.
-                    E28/T8 only changes where it goes: the GitHub link is now the first
-                    General section of /ops/settings, which is where a user looks for their
-                    own settings. Deep-linked to the section anchor so this door opens on the
-                    same thing it always did, one scroll position deeper — the fragment is
-                    `settingsSections.ts`'s section id, and Settings resolves the owning tab
-                    from it. Keeping the standalone /ops/github-link route as well is
-                    deliberate: two doors to one surface is fine, a dead one is not. Closes
-                    the dropdown on navigate so it doesn't hang open over the page it left. */}
-                <Link to="/ops/settings#github-connection" onClick={() => setProfileOpen(false)}
+                <Link to={`/ops/settings#${GITHUB_CONNECTION_SECTION_ID}`} onClick={() => setProfileOpen(false)}
                   className="w-full flex items-center px-4 py-2 text-sm text-slate-700 hover:bg-slate-50 gap-2.5">
                   <svg className="w-4 h-4 text-slate-400" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                     <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.009-.868-.014-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.203 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.749 0 .268.18.58.688.482A10.02 10.02 0 0022 12.017C22 6.484 17.522 2 12 2z" />

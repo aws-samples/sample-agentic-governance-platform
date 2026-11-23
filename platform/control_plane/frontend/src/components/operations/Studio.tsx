@@ -1,728 +1,600 @@
-// Studio — the Operations Build & Run centerpiece (Epic 18, Task 5).
-//
-// The user types a plain-language use case, picks a build kind (Agent | LLM
-// Workflow), and hits Synthesize. The platform then *performs* the build in
-// staged beats driven by a `phase` state machine:
-//
-//   idle → searching → graph → running → done
-//
-//   • searching (~700ms): "Searching registry…" then reveal the matched skill +
-//     MCP chips pulled from the SynthPlan.
-//   • graph: render the plan as an @xyflow/react node-link flow, laid out
-//     left→right with the SAME dagre pattern the Governance Graph uses
-//     (governance/graph/layout.ts). Every llm/router node carries a per-node
-//     model <select> (options = MODELS).
-//   • running: light the nodes one-by-one (sequential setTimeout), then surface
-//     tokens/run + $/run from the plan.
-//   • done: reveal the Readiness panel — the deploy gate.
-//
-// The Readiness panel renders initialReadiness(): ok items show an emerald check;
-// warn items show an amber badge + an inline action that flips them to ok via the
-// pure resolveItem/runEval helpers. Deploy stays disabled until isDeployReady().
-// On Deploy we PROMOTE_AGENT into the shared demo store and route to Deployments.
-//
-// All pure logic (synthesize / readiness gate) is Task 4 (studioLogic.ts); the
-// seed data + store are Task 3; the page frame + tokens are Task 1. This file is
-// only the React composition + the staged interaction on top of those.
-//
-// House style: emerald-on-glass Ops tokens (opsUi.ts), inline-SVG glyphs (no icon
-// lib), Tailwind v4 utility strings, 2-space indent — matching the other Ops pages.
+import { useEffect, useRef, useState, type JSX } from 'react';
 
-import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from 'react';
-import { useNavigate } from 'react-router-dom';
 import {
-  ReactFlow,
-  ReactFlowProvider,
-  Background,
-  Handle,
-  Position,
-  useReactFlow,
-  type Node,
-  type Edge,
-  type NodeProps,
-} from '@xyflow/react';
-import dagre from 'dagre';
-import '@xyflow/react/dist/style.css';
-
-import { ComingSoonBanner } from '../shared/comingSoon';
+  agentOpsApi,
+  agentsApi,
+  connectionsApi,
+  githubTemplatesApi,
+  mcpServersApi,
+  projectsApi,
+  pullRequestsApi,
+  type Connection,
+} from '../../api/client';
+import { safeLocalStorage } from '../../api/safeLocalStorage';
+import { draftComposition, submitProposal } from '../../api/studio';
+import { useUser } from '../../contexts/useUser';
+import { findTenantAccount } from '../governance/tenantUi';
+import { useTenantDirectory } from '../governance/useTenantDirectory';
 import OpsPage from './OpsPage';
-import { OPS_CARD, OPS_BADGE, OPS_PRIMARY_BTN } from './opsUi';
-import { MODELS } from './demoData';
-import { useDemoStore } from './demoStore';
+import { OPS_CARD, OPS_PRIMARY_BTN } from './opsUi';
+import { effectiveRole, mayMaintainProject } from './projectRoles';
+import { CreateProjectModal } from './Projects.tsx';
+import { AddComponent, AiBox, BlockCard, DraftingSkeleton, RepoTree, UnusedFiles } from './StudioCompose.tsx';
+import { Spinner } from './StudioForms.tsx';
+import RunView from './StudioRunView.tsx';
+import { tenantPlatformOf } from './templateChain.ts';
 import {
-  synthesize,
-  initialReadiness,
-  resolveItem,
-  runEval,
-  isDeployReady,
-  EVAL_THRESHOLD,
-  type SynthPlan,
-  type SynthNode,
-  type NodeType,
-  type BuildKind,
-  type ReadinessItem,
-  type ReadinessKey,
-} from './studioLogic';
+  assignFile,
+  authNoneSummary,
+  blockFiles,
+  blockName,
+  blockers,
+  compositionLabel,
+  fromDraft,
+  newBlock,
+  pickTemplates,
+  registryFrom,
+  removeBlock,
+  wiredNames,
+  type Attachment,
+  type Block,
+  type BlockKind,
+  type RegistryMcp,
+  type RepoFile,
+  type StudioTemplates,
+} from './studioModel';
+import {
+  POLL_MS,
+  apply,
+  clearRun,
+  findSavedRun,
+  isPoll,
+  nextAction,
+  planRun,
+  runAction,
+  saveRun,
+  type RunItem,
+  type RunState,
+  type StudioRunApi,
+} from './studioRun';
+import { LABEL, SECONDARY_BTN } from './studioStyles';
 
-// ───────────────────────────── constants ─────────────────────────────
-
-const DEFAULT_USE_CASE = 'Triage incoming claims emails and route to the right adjuster';
-const PROMOTED_AGENT_NAME = 'Claims Triage Agent';
-const PROMOTED_ACCOUNT = 'aws://9001-0002-0003';
-
-// Phase machine that drives the whole synthesis spectacle.
-type Phase = 'idle' | 'searching' | 'graph' | 'running' | 'done';
-
-// Per-beat timings (ms). Kept here so the staged reveal reads at a glance.
-const SEARCHING_MS = 700; // registry scan before the chips land
-const GRAPH_TO_RUN_MS = 650; // graph settles, then the run kicks off
-const NODE_LIGHT_MS = 360; // gap between each node lighting up
-const RUN_TO_DONE_MS = 600; // metrics linger, then readiness reveals
-const EVAL_PASS_SCORE = 92; // the score the re-run lands on (≥ EVAL_THRESHOLD)
-
-// dagre layout footprint — mirrors governance/graph/layout.ts (180×60 boxes, LR).
-const NODE_WIDTH = 184;
-const NODE_HEIGHT = 64;
-const NODE_SEP = 36;
-const RANK_SEP = 96;
-
-// ───────────────────────────── flow node data + layout ─────────────────────────────
-// We carry the plan node + a couple of render flags through React Flow's node
-// `data`. The dagre pass below mirrors the governance idiom: LR ranking, dagre
-// returns CENTER coords so we shift to React Flow's TOP-LEFT origin.
-
-type StudioNodeData = {
-  node: SynthNode;
-  lit: boolean;
-  // per-node model selection lives on the page; the node only needs the value +
-  // a setter so the <select> is controlled. Undefined for non-model nodes.
-  model?: string;
-  onModelChange?: (value: string) => void;
-};
-type StudioFlowNode = Node<StudioNodeData>;
-
-/** Map a SynthPlan → React Flow nodes/edges (positions filled by `layoutFlow`). */
-function toFlow(
-  plan: SynthPlan,
-  litIds: Set<string>,
-  models: Record<string, string>,
-  onModelChange: (nodeId: string, value: string) => void,
-): { nodes: StudioFlowNode[]; edges: Edge[] } {
-  const nodes: StudioFlowNode[] = plan.nodes.map((node) => {
-    const isModelNode = node.type === 'llm' || node.type === 'router';
-    return {
-      id: node.id,
-      type: 'studio',
-      position: { x: 0, y: 0 },
-      data: {
-        node,
-        lit: litIds.has(node.id),
-        model: isModelNode ? (models[node.id] ?? node.model ?? MODELS[0].label) : undefined,
-        onModelChange: isModelNode ? (value: string) => onModelChange(node.id, value) : undefined,
-      },
-    };
-  });
-
-  const edges: Edge[] = plan.edges.map((e) => {
-    const lit = litIds.has(e.from) && litIds.has(e.to);
-    return {
-      id: `${e.from}->${e.to}`,
-      source: e.from,
-      target: e.to,
-      animated: lit,
-      style: {
-        stroke: lit ? '#059669' : '#cbd5e1', // emerald-600 lit / slate-300 idle
-        strokeWidth: lit ? 2 : 1.5,
-        transition: 'stroke 0.3s ease, stroke-width 0.3s ease',
-      },
-    };
-  });
-
-  return { nodes, edges };
+type Step = 'project' | 'compose' | 'review';
+type Mode = 'ai' | 'manual';
+interface ProjectOption {
+  id: string;
+  name: string;
+}
+interface ProjectContext {
+  projectId: string;
+  org: string;
+  templates: StudioTemplates;
+  existingRepos: string[];
 }
 
-/** Run dagre LR — same pattern as governance/graph/layout.ts. */
-function layoutFlow(nodes: StudioFlowNode[], edges: Edge[]): StudioFlowNode[] {
-  const g = new dagre.graphlib.Graph();
-  g.setGraph({ rankdir: 'LR', nodesep: NODE_SEP, ranksep: RANK_SEP });
-  g.setDefaultEdgeLabel(() => ({}));
-
-  for (const node of nodes) g.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
-  for (const edge of edges) g.setEdge(edge.source, edge.target);
-
-  dagre.layout(g);
-
-  return nodes.map((node) => {
-    const { x, y } = g.node(node.id);
-    return { ...node, position: { x: x - NODE_WIDTH / 2, y: y - NODE_HEIGHT / 2 } };
-  });
-}
-
-// ───────────────────────────── inline glyphs (no icon lib) ─────────────────────────────
-
-function CheckGlyph({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={2.2} aria-hidden="true" className={className}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M3.5 8.5 6.5 11.5 12.5 5" />
-    </svg>
-  );
-}
-
-function SparkGlyph({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
-      <path d="M10 1.5l1.6 4.4 4.4 1.6-4.4 1.6L10 13.5 8.4 9.1 4 7.5l4.4-1.6L10 1.5Zm6 9.5l.8 2.2 2.2.8-2.2.8L16 17l-.8-2.2-2.2-.8 2.2-.8.8-2.2Z" />
-    </svg>
-  );
-}
-
-// Per-node-type glyph + accent tint. The type — not the instance — drives color,
-// echoing the governance graph's per-type-accent approach but in the Ops emerald
-// family (skills/mcp/router keep their own restrained hues so the chain reads).
-function NodeGlyph({ type, className }: { type: NodeType; className?: string }) {
-  switch (type) {
-    case 'input':
-      return (
-        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
-          <path d="M3 4.5A1.5 1.5 0 0 1 4.5 3h11A1.5 1.5 0 0 1 17 4.5v11A1.5 1.5 0 0 1 15.5 17h-11A1.5 1.5 0 0 1 3 15.5v-11Zm2 1.2 5 3.4 5-3.4V5.2H5v.5Zm10 1.9-5 3.4-5-3.4v6.3h10V7.6Z" />
-        </svg>
-      );
-    case 'output':
-      return (
-        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
-          <path d="M10 1.8a8.2 8.2 0 1 0 0 16.4 8.2 8.2 0 0 0 0-16.4Zm-1 11.7-3.2-3.2 1.3-1.3L9 10.8l4-4 1.3 1.3L9 13.5Z" />
-        </svg>
-      );
-    case 'mcp':
-      return (
-        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
-          <path d="M4 3h12a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Zm0 9h12a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1Zm2-7.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z" />
-        </svg>
-      );
-    case 'router':
-      return (
-        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
-          <path d="M6 3a2.5 2.5 0 0 0-.5 4.95V9a3 3 0 0 0 3 3h1v1.05a2.5 2.5 0 1 0 1.5 0V12h1a3 3 0 0 0 3-3V7.95A2.5 2.5 0 1 0 14 3a2.5 2.5 0 0 0-.5 4.95V9a1.5 1.5 0 0 1-1.5 1.5h-4A1.5 1.5 0 0 1 6.5 9V7.95A2.5 2.5 0 0 0 6 3Z" />
-        </svg>
-      );
-    case 'llm':
-      return (
-        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
-          <path d="M9 1.5a1 1 0 0 1 2 0V3h1.5A3.5 3.5 0 0 1 16 6.5v6A3.5 3.5 0 0 1 12.5 16h-5A3.5 3.5 0 0 1 4 12.5v-6A3.5 3.5 0 0 1 7.5 3H9V1.5ZM7.5 7a1.25 1.25 0 1 0 0 2.5 1.25 1.25 0 0 0 0-2.5Zm5 0a1.25 1.25 0 1 0 0 2.5 1.25 1.25 0 0 0 0-2.5ZM7 12a.75.75 0 0 0 0 1.5h6a.75.75 0 0 0 0-1.5H7Z" />
-        </svg>
-      );
-    case 'skill':
-    default:
-      return (
-        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className={className}>
-          <path d="M10 1.8 12.4 7l5.6.5-4.3 3.7 1.3 5.5L10 13.9 4.9 16.7l1.3-5.5L1.9 7.5 7.6 7 10 1.8Z" />
-        </svg>
-      );
-  }
-}
-
-const NODE_TINT: Record<NodeType, { chip: string; rail: string; label: string }> = {
-  input: { chip: 'bg-slate-100 text-slate-600', rail: 'bg-slate-400', label: 'Input' },
-  skill: { chip: 'bg-teal-50 text-teal-600', rail: 'bg-teal-500', label: 'Skill' },
-  mcp: { chip: 'bg-violet-50 text-violet-600', rail: 'bg-violet-500', label: 'MCP' },
-  llm: { chip: 'bg-emerald-50 text-emerald-600', rail: 'bg-emerald-500', label: 'LLM' },
-  router: { chip: 'bg-emerald-50 text-emerald-600', rail: 'bg-emerald-500', label: 'Router' },
-  output: { chip: 'bg-slate-100 text-slate-600', rail: 'bg-slate-400', label: 'Output' },
+const LIVE_RUN_API: StudioRunApi = {
+  createRepo: (p, body) => projectsApi.addRepo(p, body),
+  repoStatus: (p, r) => projectsApi.getRepoStatus(p, r),
+  retryRepo: (p, r) => projectsApi.retryRepo(p, r),
+  propose: (p, r, body) => submitProposal(p, r, body),
+  pullRequests: (r) => pullRequestsApi.list(r),
+  deployments: (p, r) => projectsApi.repoDeployments(p, r),
+  runtimeStatus: (agentId) => agentOpsApi.runtime(agentId),
+  submitAgent: (id) => agentsApi.submit(id),
+  submitMcp: (id) => mcpServersApi.submit(id),
 };
 
-// ───────────────────────────── custom flow node ─────────────────────────────
-// A small rounded card mirroring the governance node footprint (184×64 to match
-// the dagre box). It lights up — emerald ring + brightened chip — when `lit`, and
-// model nodes carry an inline per-node <select>. Handles are invisible edge
-// anchors (read-only flow, like the governance nodes).
-
-const FLOW_HANDLE = '!w-1 !h-1 !min-w-0 !border-0 !bg-transparent';
-
-function StudioNode({ data }: NodeProps<StudioFlowNode>): JSX.Element {
-  const { node, lit, model, onModelChange } = data;
-  const tint = NODE_TINT[node.type];
-  const isModelNode = node.type === 'llm' || node.type === 'router';
-
+function ProjectStep(props: {
+  projects: ProjectOption[];
+  value: string;
+  resolving: boolean;
+  error: string | null;
+  onPick: (id: string) => void;
+  onCreate: () => void;
+}): JSX.Element {
   return (
-    <div
-      title={node.label}
-      className={`group/node relative flex items-center gap-2.5 w-[184px] h-[64px] px-3 rounded-2xl border bg-white shadow-sm overflow-hidden transition-all duration-300 ${
-        lit ? 'border-emerald-400 ring-2 ring-emerald-300/60 shadow-md' : 'border-slate-200'
-      }`}
-    >
-      <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-1 transition-colors ${lit ? 'bg-emerald-500' : tint.rail}`} />
-      <span
-        aria-hidden="true"
-        className={`shrink-0 h-8 w-8 rounded-lg flex items-center justify-center transition-colors ${
-          lit ? 'bg-emerald-100 text-emerald-700' : tint.chip
-        }`}
-      >
-        <NodeGlyph type={node.type} className="h-4.5 w-4.5" />
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="text-[13px] font-semibold text-slate-900 leading-tight truncate">{node.label}</div>
-        {isModelNode && onModelChange ? (
-          <select
-            value={model}
-            onChange={(e) => onModelChange(e.target.value)}
-            aria-label={`Model for ${node.label}`}
-            className="nodrag mt-0.5 w-full max-w-[136px] bg-transparent text-[11px] text-slate-500 font-medium leading-tight focus:outline-none focus:text-emerald-700 cursor-pointer"
-          >
-            {MODELS.map((m) => (
-              <option key={m.id} value={m.label}>
-                {m.label}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <div className="text-[11px] text-slate-400 leading-tight">{tint.label}</div>
-        )}
+    <div className="max-w-xl">
+      <h3 className="text-sm font-semibold text-slate-800">Which project is this for?</h3>
+      <p className="text-xs text-slate-500 mt-0.5 mb-4">
+        Every component you compose lands in this project: its repositories, its secrets, its owners.
+      </p>
+      <label htmlFor="studio-project" className={LABEL}>
+        Project
+      </label>
+      <div className="flex flex-col sm:flex-row gap-2 mt-1">
+        <select
+          id="studio-project"
+          value={props.value}
+          disabled={props.resolving}
+          onChange={(e) => props.onPick(e.target.value)}
+          className="flex-1 px-3 py-2 text-sm rounded-lg border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500/40 disabled:opacity-60"
+        >
+          <option value="">Select a project</option>
+          {props.projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <button type="button" onClick={props.onCreate} className={`${SECONDARY_BTN} inline-flex items-center justify-center gap-1.5`}>
+          <span aria-hidden="true" className="text-base leading-none">+</span> Create project
+        </button>
       </div>
-      <Handle type="target" position={Position.Left} isConnectable={false} className={FLOW_HANDLE} />
-      <Handle type="source" position={Position.Right} isConnectable={false} className={FLOW_HANDLE} />
+      {props.resolving && (
+        <p className="text-xs text-slate-500 mt-2 flex items-center gap-2" aria-live="polite">
+          <Spinner className="w-3.5 h-3.5 text-emerald-600" /> Checking the project and its templates…
+        </p>
+      )}
+      {props.error && (
+        <p role="alert" className="text-xs text-rose-700 mt-2">
+          {props.error}
+        </p>
+      )}
     </div>
   );
 }
 
-const nodeTypes = { studio: StudioNode };
+const STEPS: { key: Step; label: string }[] = [
+  { key: 'project', label: 'Project' },
+  { key: 'compose', label: 'Compose' },
+  { key: 'review', label: 'Review and create' },
+];
 
-// Re-frame the canvas whenever the layout identity changes (re-synthesis). Lives
-// inside <ReactFlowProvider> so it can grab the instance — the FitViewOnReset idiom
-// from GovernanceGraph.tsx, keyed on a nonce.
-function FitOnChange({ nonce }: { nonce: number }): null {
-  const { fitView } = useReactFlow();
-  useEffect(() => {
-    // rAF lets React Flow measure the freshly-mounted nodes before we frame them.
-    const id = requestAnimationFrame(() => fitView({ padding: 0.18, duration: 300 }));
-    return () => cancelAnimationFrame(id);
-  }, [nonce, fitView]);
-  return null;
-}
-
-// ───────────────────────────── the page ─────────────────────────────
+const repoPath = (i: RunItem): string => {
+  try {
+    return i.repoUrl ? new URL(i.repoUrl).pathname.replace(/^\/|\.git$/g, '') : i.name;
+  } catch {
+    return i.name;
+  }
+};
 
 export default function Studio(): JSX.Element {
-  const navigate = useNavigate();
-  const { dispatch } = useDemoStore();
+  const { user } = useUser();
+  const tenantDirectory = useTenantDirectory((user?.role_level ?? 0) >= 2);
+  const [saved] = useState<RunState | null>(() => findSavedRun(safeLocalStorage));
+  const [projects, setProjects] = useState<ProjectOption[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [registry, setRegistry] = useState<RegistryMcp[]>([]);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [projectId, setProjectId] = useState('');
+  const [ctx, setCtx] = useState<ProjectContext | null>(null);
+  const [resolving, setResolving] = useState(false);
+  const [projectError, setProjectError] = useState<string | null>(null);
+  const [step, setStep] = useState<Step>('project');
+  const [mode, setMode] = useState<Mode>('ai');
+  const [useCase, setUseCase] = useState('');
+  const [files, setFiles] = useState<Attachment[]>([]);
+  const [drafting, setDrafting] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [blocks, setBlocks] = useState<Block[]>([]);
+  const [unused, setUnused] = useState<Attachment[]>([]);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [preview, setPreview] = useState('');
+  const [run, setRun] = useState<RunState | null>(saved);
+  const keysRef = useRef<Record<string, string>>({});
+  const runRef = useRef<RunState | null>(saved);
+  const pickSeq = useRef(0);
+  const topRef = useRef<HTMLDivElement>(null);
+  const manualRef = useRef<HTMLButtonElement>(null);
 
-  // --- inputs -------------------------------------------------------------
-  const [useCase, setUseCase] = useState(DEFAULT_USE_CASE);
-  const [kind, setKind] = useState<BuildKind>('agent');
-
-  // --- synthesis state ----------------------------------------------------
-  const [phase, setPhase] = useState<Phase>('idle');
-  const [plan, setPlan] = useState<SynthPlan | null>(null);
-  const [litIds, setLitIds] = useState<Set<string>>(new Set());
-  // per-node model overrides keyed by node id (controlled <select> on llm/router).
-  const [nodeModels, setNodeModels] = useState<Record<string, string>>({});
-  const [fitNonce, setFitNonce] = useState(0);
-
-  // --- readiness gate -----------------------------------------------------
-  const [readiness, setReadiness] = useState<ReadinessItem[]>(initialReadiness);
-  const [evalRunning, setEvalRunning] = useState(false);
-
-  // Every pending timer lives here so we can cancel them on unmount OR whenever a
-  // fresh synthesis / input change resets the flow (no stale beats firing late).
-  const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
-  const clearTimers = useCallback(() => {
-    timers.current.forEach(clearTimeout);
-    timers.current = [];
+  useEffect(() => {
+    let cancelled = false;
+    projectsApi
+      .list()
+      .then((rows) => !cancelled && setProjects(rows.map((p) => ({ id: p.id, name: p.name }))))
+      .catch((e: unknown) => !cancelled && setProjectError(e instanceof Error ? e.message : 'Failed to load projects.'));
+    connectionsApi
+      .list()
+      .then((rows) => !cancelled && setConnections(rows))
+      .catch(() => undefined);
+    mcpServersApi
+      .list()
+      .then((rows) => !cancelled && setRegistry(registryFrom(rows)))
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
   }, []);
-  const schedule = useCallback((fn: () => void, ms: number) => {
-    timers.current.push(setTimeout(fn, ms));
-  }, []);
-  useEffect(() => clearTimers, [clearTimers]);
 
-  // Reset the whole flow back to idle. Editing the use case or flipping the kind
-  // after a synthesis must reset so the graph/readiness reflect the live selection.
-  const resetFlow = useCallback(() => {
-    clearTimers();
-    setPhase('idle');
-    setPlan(null);
-    setLitIds(new Set());
-    setNodeModels({});
-    setReadiness(initialReadiness());
-    setEvalRunning(false);
-  }, [clearTimers]);
-
-  const onUseCaseChange = (value: string) => {
-    setUseCase(value);
-    if (phase !== 'idle') resetFlow();
-  };
-  const onKindChange = (next: BuildKind) => {
-    if (next === kind) return;
-    setKind(next);
-    if (phase !== 'idle') resetFlow();
-  };
-
-  // --- the staged synthesis -----------------------------------------------
-  const onSynthesize = useCallback(() => {
-    clearTimers();
-    const nextPlan = synthesize(useCase, kind);
-    // seed per-node model selects from the plan's node.model (Claude Opus 4.8).
-    const seededModels: Record<string, string> = {};
-    for (const n of nextPlan.nodes) {
-      if ((n.type === 'llm' || n.type === 'router') && n.model) seededModels[n.id] = n.model;
-    }
-
-    setPlan(nextPlan);
-    setNodeModels(seededModels);
-    setReadiness(initialReadiness());
-    setEvalRunning(false);
-    setLitIds(new Set());
-    setPhase('searching');
-
-    // searching → graph (chips have landed; render the workflow)
-    schedule(() => {
-      setPhase('graph');
-      setFitNonce((n) => n + 1);
-    }, SEARCHING_MS);
-
-    // graph → running (kick off the node-by-node light-up)
-    schedule(() => {
-      setPhase('running');
-      // light nodes sequentially in plan order.
-      nextPlan.nodes.forEach((n, i) => {
-        schedule(() => {
-          setLitIds((prev) => {
-            const next = new Set(prev);
-            next.add(n.id);
-            return next;
-          });
-        }, i * NODE_LIGHT_MS);
-      });
-      // running → done after the last node lights + the metrics linger.
-      const runTail = nextPlan.nodes.length * NODE_LIGHT_MS + RUN_TO_DONE_MS;
-      schedule(() => setPhase('done'), runTail);
-    }, SEARCHING_MS + GRAPH_TO_RUN_MS);
-  }, [useCase, kind, clearTimers, schedule]);
-
-  // --- readiness actions --------------------------------------------------
-  const onResolveItem = (key: ReadinessKey) => {
-    if (key === 'eval') {
-      // animate the eval 78→92 over a short beat, then commit the pass.
-      setEvalRunning(true);
-      schedule(() => {
-        setReadiness((prev) => runEval(prev, EVAL_PASS_SCORE));
-        setEvalRunning(false);
-      }, 900);
-      return;
-    }
-    setReadiness((prev) => resolveItem(prev, key));
-  };
-
-  const deployReady = isDeployReady(readiness);
-
-  const onDeploy = () => {
-    if (!plan || !deployReady) return;
-    dispatch({
-      type: 'PROMOTE_AGENT',
-      agent: {
-        name: PROMOTED_AGENT_NAME,
-        useCase,
-        kind,
-        model: plan.model,
-        account: PROMOTED_ACCOUNT,
-        costPerRun: plan.costPerRun,
+  useEffect(() => {
+    runRef.current = run;
+    if (!run) return;
+    const action = nextAction(run);
+    if (action.type === 'stopped' || action.type === 'done') return;
+    const t = setTimeout(
+      async () => {
+        const result = await runAction(run, action, LIVE_RUN_API, keysRef.current);
+        if (runRef.current !== run) return;
+        const next = apply(run, result);
+        runRef.current = next;
+        saveRun(safeLocalStorage, next);
+        setRun(next);
       },
+      isPoll(action) ? POLL_MS : 0,
+    );
+    return () => clearTimeout(t);
+  }, [run]);
+
+  useEffect(() => {
+    if (draftError && !drafting) manualRef.current?.focus();
+  }, [draftError, drafting]);
+
+  const projectName = projects.find((p) => p.id === projectId)?.name ?? '';
+  const issues = blockers(ctx?.projectId ?? '', blocks, { registry, templates: ctx?.templates, existingRepos: ctx?.existingRepos });
+  const blockIssues = (id: string) => issues.filter((b) => b.blockId === id).length;
+  const noAuth = authNoneSummary(blocks);
+
+  const pickProject = async (id: string) => {
+    const seq = ++pickSeq.current;
+    setProjectId(id);
+    setCtx(null);
+    setProjectError(null);
+    if (!id) return;
+    setResolving(true);
+    try {
+      const detail = await projectsApi.get(id);
+      if (!mayMaintainProject(effectiveRole(detail), user?.role_level ?? 0, detail.ungoverned)) {
+        if (seq === pickSeq.current) setProjectError(`You need the Maintainer role on ${detail.project.name} to create here.`);
+        return;
+      }
+      const platform = tenantPlatformOf(findTenantAccount(detail.project.tenant_id, user?.tenants, tenantDirectory));
+      const templates = pickTemplates(await githubTemplatesApi.list(detail.project.connection_id), platform);
+      if (seq !== pickSeq.current) return;
+      const org = connections.find((c) => c.id === detail.project.connection_id)?.org ?? '';
+      setCtx({ projectId: id, org, templates, existingRepos: detail.repositories.map((r) => r.name) });
+      setStep('compose');
+    } catch (e) {
+      if (seq === pickSeq.current) setProjectError(e instanceof Error ? e.message : 'Failed to load the project.');
+    } finally {
+      if (seq === pickSeq.current) setResolving(false);
+    }
+  };
+  const reveal = (id: string) => {
+    setExpanded((s) => new Set(s).add(id));
+    setTimeout(() => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
+  };
+  const addBlock = (kind: BlockKind) => {
+    const b = newBlock(kind);
+    setBlocks((bs) => [...bs, b]);
+    reveal(b.id);
+  };
+  const updateBlock = (b: Block) => setBlocks((bs) => bs.map((x) => (x.id === b.id ? b : x)));
+  const toggle = (id: string) =>
+    setExpanded((s) => {
+      const next = new Set(s);
+      if (!next.delete(id)) next.add(id);
+      return next;
     });
-    navigate('/ops/deployments');
+
+  const onDraft = async () => {
+    if (!ctx) return;
+    setDrafting(true);
+    setDraftError(null);
+    try {
+      const resp = await draftComposition({
+        project_id: ctx.projectId,
+        description: useCase.trim(),
+        files: files.map((f) => ({ name: f.name, text: f.text })),
+      });
+      const d = fromDraft(resp, files, registry);
+      if (d.blocks.length === 0) {
+        setDraftError('The draft came back empty. Compose manually or describe it differently.');
+        return;
+      }
+      setBlocks(d.blocks);
+      setUnused(d.unused);
+      setExpanded(new Set(d.blocks.map((b) => b.id)));
+    } catch (e) {
+      setDraftError(e instanceof Error ? e.message : 'The draft failed. Compose manually or try again.');
+    } finally {
+      setDrafting(false);
+    }
   };
 
-  // --- flow arrays (laid out once per plan/light change) ------------------
-  const onNodeModelChange = useCallback((nodeId: string, value: string) => {
-    setNodeModels((prev) => ({ ...prev, [nodeId]: value }));
-  }, []);
+  const goTo = (blockId: string | null) => {
+    if (!blockId) return setStep(ctx ? 'compose' : 'project');
+    setStep('compose');
+    reveal(blockId);
+  };
 
-  const { nodes: flowNodes, edges: flowEdges } = useMemo(() => {
-    if (!plan) return { nodes: [] as StudioFlowNode[], edges: [] as Edge[] };
-    const flow = toFlow(plan, litIds, nodeModels, onNodeModelChange);
-    return { nodes: layoutFlow(flow.nodes, flow.edges), edges: flow.edges };
-  }, [plan, litIds, nodeModels, onNodeModelChange]);
+  const startRun = () => {
+    if (!ctx) return;
+    keysRef.current = Object.fromEntries(blocks.flatMap((b) => (b.kind === 'mcp' && b.draft.keyMode === 'new' ? [[b.id, b.draft.apiKey]] : [])));
+    const r = planRun(ctx.projectId, blocks, ctx.templates);
+    saveRun(safeLocalStorage, r);
+    setRun(r);
+    topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  const retry = () => {
+    if (!run) return;
+    const next = { ...run, error: null };
+    saveRun(safeLocalStorage, next);
+    setRun(next);
+  };
+  const reset = () => {
+    if (run) clearRun(safeLocalStorage, run.projectId);
+    keysRef.current = {};
+    setRun(null);
+    setStep(ctx ? 'compose' : 'project');
+    setMode('ai');
+    setUseCase('');
+    setFiles([]);
+    setDraftError(null);
+    setBlocks([]);
+    setUnused([]);
+    setExpanded(new Set());
+  };
 
-  const showChips = plan && phase !== 'idle';
-  const showGraph = plan && (phase === 'graph' || phase === 'running' || phase === 'done');
-  const showMetrics = plan && (phase === 'running' || phase === 'done');
-  const showReadiness = plan && phase === 'done';
+  const enabled = (s: Step) => s === 'project' || (s === 'compose' ? Boolean(ctx) : Boolean(ctx) && blocks.length > 0);
+  const stepIndex = STEPS.findIndex((s) => s.key === step);
+  const next = STEPS[stepIndex + 1];
+
+  const org = ctx?.org ? `${ctx.org}/` : '';
+  const repos = blocks.map((b, i) => ({ b, repo: `${org}${b.draft.name || `unnamed-${b.kind}-${i + 1}`}`, files: blockFiles(b) }));
+  const allFiles: [string, RepoFile][] = repos.flatMap((r) => r.files.map((f) => [`${r.repo}:${f.path}`, f] as [string, RepoFile]));
+  const shown = allFiles.find(([k]) => k === preview) ?? allFiles[0];
 
   return (
     <OpsPage
-      backTo="/ops"
       title="Studio"
-      subtitle="Describe a use case and the platform synthesizes a governed agent or workflow from registered skills, MCPs, and models."
+      eyebrow="Build"
+      subtitle="Compose the MCP servers and Strands agents a project needs. Studio writes the repositories and opens pull requests. Governance decides who may use them."
     >
-      <ComingSoonBanner />
+      <div ref={topRef} className="scroll-mt-6" />
 
-      {/* ── Brief: use case + kind + synthesize ───────────────────────── */}
-      <div className={`${OPS_CARD} p-5 mb-6`}>
-        <label htmlFor="studio-usecase" className="block text-[11px] font-medium text-slate-500 uppercase tracking-wide mb-2">
-          What should it do?
-        </label>
-        <textarea
-          id="studio-usecase"
-          value={useCase}
-          onChange={(e) => onUseCaseChange(e.target.value)}
-          rows={2}
-          className="w-full resize-none rounded-lg border border-emerald-200/70 bg-white/70 px-3.5 py-2.5 text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-400/50 focus:border-emerald-400 transition-shadow"
-          placeholder="Describe the task in plain language…"
+      {run ? (
+        <RunView
+          run={run}
+          repoPath={repoPath}
+          registry={registry}
+          onRetry={retry}
+          onReset={reset}
+          needsKey={(rowKey) => {
+            const it = run.items.find((i) => `pr:${i.blockId}` === rowKey);
+            return Boolean(it?.mcp?.needsKey && !keysRef.current[it.blockId]);
+          }}
+          onKey={(rowKey, key) => {
+            keysRef.current = { ...keysRef.current, [rowKey.slice('pr:'.length)]: key };
+            retry();
+          }}
         />
-
-        <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-          <KindToggle kind={kind} onChange={onKindChange} />
-          <button type="button" onClick={onSynthesize} className={`${OPS_PRIMARY_BTN} inline-flex items-center gap-1.5`}>
-            <SparkGlyph className="h-4 w-4" />
-            {phase === 'idle' ? 'Synthesize' : 'Re-synthesize'}
-          </button>
-        </div>
-      </div>
-
-      {/* ── Searching → chips ──────────────────────────────────────────── */}
-      {showChips && plan && (
-        <div className={`${OPS_CARD} p-5 mb-6`}>
-          <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-wide mb-3">
-            {phase === 'searching' ? (
-              <span className="inline-flex items-center gap-2 text-emerald-700">
-                <Spinner />
-                Searching registry…
-              </span>
-            ) : (
-              <span className="inline-flex items-center gap-1.5 text-slate-500">
-                <CheckGlyph className="h-3.5 w-3.5 text-emerald-600" />
-                Matched from the registry
-              </span>
-            )}
+      ) : (
+        <div className={OPS_CARD}>
+          <div role="tablist" aria-label="Studio steps" className="flex items-stretch border-b border-emerald-100/70 overflow-x-auto">
+            {STEPS.map((s, i) => {
+              const active = s.key === step;
+              const on = enabled(s.key);
+              const composeIssues = issues.filter((b) => b.blockId).length;
+              return (
+                <button
+                  key={s.key}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  disabled={!on}
+                  title={on ? undefined : s.key === 'compose' ? 'Pick a project first' : 'Add a component first'}
+                  onClick={() => setStep(s.key)}
+                  className={`flex items-center gap-2 px-5 py-3 text-sm border-b-2 -mb-px transition-colors whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-40 ${
+                    active ? 'border-emerald-600 text-slate-900 font-semibold' : 'border-transparent text-slate-500 hover:text-slate-700'
+                  }`}
+                >
+                  <span
+                    className={`inline-flex items-center justify-center w-5 h-5 rounded-full text-[11px] font-semibold ${
+                      active ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-500'
+                    }`}
+                  >
+                    {i + 1}
+                  </span>
+                  {s.label}
+                  {s.key === 'project' && ctx && projectName && <span className="font-mono text-xs font-normal text-slate-500">{projectName}</span>}
+                  {s.key === 'compose' && blocks.length > 0 && (
+                    <span
+                      className={`text-[10px] font-semibold px-1.5 rounded-full ${composeIssues ? 'bg-rose-50 text-rose-700' : 'bg-emerald-50 text-emerald-700'}`}
+                      title={composeIssues ? `${composeIssues} to fix` : 'All components ready'}
+                    >
+                      {composeIssues || blocks.length}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
 
-          {phase !== 'searching' && (
-            <div className="flex flex-col gap-3">
-              <ChipRow label="Skills" items={plan.skills.map((s) => s.name)} tint="teal" />
-              {plan.mcps.length > 0 && (
-                <ChipRow label="MCP servers" items={plan.mcps.map((m) => m.name)} tint="violet" />
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ── Graph ──────────────────────────────────────────────────────── */}
-      {showGraph && (
-        <div className={`${OPS_CARD} mb-6 overflow-hidden`}>
-          <div className="flex items-center justify-between px-5 py-3 border-b border-emerald-100/70">
-            <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">
-              {kind === 'agent' ? 'Agent workflow' : 'LLM workflow'}
-            </div>
-            {phase === 'running' && (
-              <span className="inline-flex items-center gap-2 text-[11px] font-semibold text-emerald-700">
-                <Spinner />
-                Tracing the graph…
-              </span>
-            )}
-          </div>
-          <div className="h-[300px] bg-gradient-to-br from-emerald-50/40 to-white">
-            <ReactFlowProvider>
-              <ReactFlow
-                nodes={flowNodes}
-                edges={flowEdges}
-                nodeTypes={nodeTypes}
-                fitView
-                fitViewOptions={{ padding: 0.18 }}
-                minZoom={0.3}
-                maxZoom={1.4}
-                proOptions={{ hideAttribution: true }}
-                nodesDraggable={false}
-                nodesConnectable={false}
-                elementsSelectable={false}
-                panOnScroll={false}
-                zoomOnScroll={false}
-                preventScrolling={false}
-                className="!bg-transparent"
-              >
-                <FitOnChange nonce={fitNonce} />
-                <Background color="#a7f3d0" gap={22} size={1} />
-              </ReactFlow>
-            </ReactFlowProvider>
-          </div>
-
-          {/* metrics strip — tokens/run + $/run from the plan */}
-          {showMetrics && plan && (
-            <div className="flex flex-wrap items-center gap-x-8 gap-y-2 px-5 py-3 border-t border-emerald-100/70 bg-white/50">
-              <Metric label="Model" value={plan.model} />
-              <Metric label="Tokens / run" value={plan.tokensPerRun.toLocaleString()} />
-              <Metric label="Cost / run" value={`$${plan.costPerRun.toFixed(4)}`} />
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ── Readiness gate ─────────────────────────────────────────────── */}
-      {showReadiness && plan && (
-        <div className={`${OPS_CARD} p-5`}>
-          <div className="flex items-end justify-between gap-4 mb-4">
-            <div>
-              <div className="text-sm font-semibold text-slate-900">Readiness</div>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Resolve every check to unlock deployment. Eval must reach {EVAL_THRESHOLD}%.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={onDeploy}
-              disabled={!deployReady}
-              className={`shrink-0 inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-                deployReady
-                  ? 'bg-emerald-600 text-white hover:bg-emerald-700'
-                  : 'bg-slate-100 text-slate-400 cursor-not-allowed'
-              }`}
-            >
-              <CheckGlyph className="h-4 w-4" />
-              Deploy
-            </button>
-          </div>
-
-          <ul className="divide-y divide-emerald-100/70">
-            {readiness.map((item) => (
-              <ReadinessRow
-                key={item.key}
-                item={item}
-                busy={item.key === 'eval' && evalRunning}
-                onAction={() => onResolveItem(item.key)}
+          <div className="p-5">
+            {step === 'project' && (
+              <ProjectStep
+                projects={projects}
+                value={projectId}
+                resolving={resolving}
+                error={projectError}
+                onPick={(id) => void pickProject(id)}
+                onCreate={() => setCreatingProject(true)}
               />
-            ))}
-          </ul>
+            )}
+
+            {step === 'compose' &&
+              (drafting ? (
+                <DraftingSkeleton />
+              ) : blocks.length === 0 && mode === 'ai' ? (
+                <AiBox
+                  useCase={useCase}
+                  setUseCase={setUseCase}
+                  files={files}
+                  setFiles={setFiles}
+                  error={draftError}
+                  manualRef={manualRef}
+                  onDraft={() => void onDraft()}
+                  onManual={() => setMode('manual')}
+                />
+              ) : blocks.length === 0 ? (
+                <div className="max-w-xl mx-auto text-center py-8">
+                  <h3 className="text-sm font-semibold text-slate-800">No components yet</h3>
+                  <p className="text-xs text-slate-500 mt-1 mb-4">Add the MCP servers and agents this project needs. Each one becomes its own repository.</p>
+                  <AddComponent primary onAdd={addBlock} />
+                  <p className="mt-4">
+                    <button type="button" onClick={() => setMode('ai')} className="text-xs font-medium text-emerald-700 hover:underline">
+                      Compose with AI instead
+                    </button>
+                  </p>
+                </div>
+              ) : (
+                <div>
+                  <div className="flex items-start justify-between gap-3 mb-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-slate-800">Components</h3>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        {compositionLabel(blocks)} in <span className="font-mono">{projectName}</span>. Each becomes its own repository and pull request.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    {blocks.map((b) => (
+                      <BlockCard
+                        key={b.id}
+                        block={b}
+                        blocks={blocks}
+                        registry={registry}
+                        open={expanded.has(b.id)}
+                        issues={blockIssues(b.id)}
+                        onToggle={() => toggle(b.id)}
+                        onChange={updateBlock}
+                        onRemove={() => setBlocks((bs) => removeBlock(bs, b.id))}
+                      />
+                    ))}
+                  </div>
+                  <div className="mt-3">
+                    <AddComponent onAdd={addBlock} />
+                  </div>
+                  {unused.length > 0 && (
+                    <div className="mt-4">
+                      <UnusedFiles
+                        files={unused}
+                        blocks={blocks}
+                        onAssign={(f, target) => {
+                          setBlocks((bs) => assignFile(bs, f, target));
+                          setUnused((u) => u.filter((x) => x.id !== f.id));
+                          reveal(target.split(':')[0]);
+                        }}
+                        onRemove={(f) => setUnused((u) => u.filter((x) => x.id !== f.id))}
+                      />
+                    </div>
+                  )}
+                </div>
+              ))}
+
+            {step === 'review' && (
+              <div>
+                <div className="mb-4">
+                  <h3 className="text-sm font-semibold text-slate-800">What gets committed</h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {repos.length} {repos.length === 1 ? 'repository' : 'repositories'} in <span className="font-mono">{projectName}</span>, each on a
+                    new <span className="font-mono">studio/</span> branch with one pull request. Never the default branch. Click a file to read it.
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-[19rem_1fr] gap-4">
+                  <div className="space-y-3">
+                    {repos.map(({ b, repo, files: fs }) => (
+                      <RepoTree
+                        key={b.id}
+                        repo={repo}
+                        kind={b.kind === 'mcp' ? 'MCP server' : 'Strands agent'}
+                        branch="studio/…"
+                        files={fs}
+                        selected={shown?.[0] ?? ''}
+                        onSelect={setPreview}
+                        footer={
+                          b.kind === 'mcp'
+                            ? b.draft.keyMode === 'none'
+                              ? 'Authentication: none (public endpoint, not for production)'
+                              : b.draft.keyMode === 'existing'
+                                ? 'API key: existing secret, not in the repo'
+                                : 'API key: stored in Secrets Manager at Create, not in the repo'
+                            : `Declares: ${wiredNames(b.draft, blocks, registry).join(', ') || 'no MCP servers'} (usable after a Governance grant)`
+                        }
+                      />
+                    ))}
+                  </div>
+                  {shown && (
+                    <div className="min-w-0">
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <span className="font-mono text-xs text-slate-600 truncate">{shown[0].replace(':', ' / ')}</span>
+                        {shown[1].note && <span className="text-[11px] text-slate-400 shrink-0">{shown[1].note}</span>}
+                      </div>
+                      <pre className="max-h-[28rem] overflow-auto rounded-lg border border-slate-200/60 bg-slate-50 px-3 py-2.5 font-mono text-xs text-slate-700 whitespace-pre-wrap break-words">
+                        {shown[1].content}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-5 pt-5 border-t border-emerald-100/70">
+                  {noAuth && (
+                    <p role="note" className="flex items-start gap-2 rounded-lg bg-amber-50/70 border border-amber-200/70 px-3 py-2 mb-3 text-xs text-amber-800">
+                      <svg className="w-4 h-4 shrink-0 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+                      </svg>
+                      <span>
+                        <span className="font-semibold">{noAuth}.</span> {noAuth.startsWith('1 ') ? 'Its gateway calls the API' : 'Their gateways call the APIs'} without credentials: public endpoints only, not for production.
+                      </span>
+                    </p>
+                  )}
+                  {issues.length > 0 && (
+                    <div className="rounded-lg bg-rose-50 border border-rose-200/70 px-3 py-2 mb-4">
+                      <p className="text-xs font-semibold text-rose-800 mb-1">Fix these before you create</p>
+                      <ul className="space-y-0.5">
+                        {issues.map((x, i) => {
+                          const b = blocks.find((y) => y.id === x.blockId);
+                          return (
+                            <li key={`${x.blockId}-${i}`} className="text-xs text-rose-700 flex flex-wrap items-center gap-x-2">
+                              {b && <span className="font-mono font-semibold">{blockName(b)}:</span>}
+                              <span>{x.text}</span>
+                              <button type="button" onClick={() => goTo(x.blockId)} className="text-[11px] font-medium text-rose-800 underline">
+                                Go to {b ? blockName(b) : 'project'}
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  )}
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                    <p className="text-xs text-slate-500 max-w-2xl">
+                      Create makes every repository, stores any API keys, and opens one pull request per component. Builds start after they are all
+                      merged in GitHub. Studio never grants access or approves a listing.
+                    </p>
+                    <button type="button" onClick={startRun} disabled={issues.length > 0} className={`${OPS_PRIMARY_BTN} shrink-0 disabled:opacity-40`}>
+                      Create {compositionLabel(blocks)}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {step !== 'review' && !(step === 'compose' && (drafting || blocks.length === 0)) && (
+            <div className="flex items-center justify-between gap-2 px-5 py-4 border-t border-emerald-100/70">
+              <button type="button" onClick={() => setStep(STEPS[stepIndex - 1]?.key ?? 'project')} disabled={stepIndex === 0} className={SECONDARY_BTN}>
+                Back
+              </button>
+              <button type="button" onClick={() => setStep(next.key)} disabled={!enabled(next.key)} className={`${OPS_PRIMARY_BTN} disabled:opacity-40`}>
+                Next: {next.label}
+              </button>
+            </div>
+          )}
         </div>
+      )}
+
+      {creatingProject && (
+        <CreateProjectModal
+          connections={connections}
+          onClose={() => setCreatingProject(false)}
+          onCreated={(p) => {
+            setCreatingProject(false);
+            setProjects((ps) => [...ps.filter((x) => x.id !== p.id), { id: p.id, name: p.name }]);
+            void pickProject(p.id);
+          }}
+        />
       )}
     </OpsPage>
-  );
-}
-
-// ───────────────────────────── sub-components ─────────────────────────────
-
-function KindToggle({ kind, onChange }: { kind: BuildKind; onChange: (k: BuildKind) => void }): JSX.Element {
-  const options: { value: BuildKind; label: string }[] = [
-    { value: 'agent', label: 'Agent' },
-    { value: 'workflow', label: 'LLM Workflow' },
-  ];
-  return (
-    <div role="radiogroup" aria-label="Build kind" className="inline-flex rounded-lg border border-emerald-200/70 bg-white/60 p-0.5">
-      {options.map((o) => {
-        const active = kind === o.value;
-        return (
-          <button
-            key={o.value}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            onClick={() => onChange(o.value)}
-            className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-              active ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            {o.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function ChipRow({ label, items, tint }: { label: string; items: string[]; tint: 'teal' | 'violet' }): JSX.Element {
-  const chip =
-    tint === 'teal' ? 'bg-teal-50 text-teal-700 border-teal-200/70' : 'bg-violet-50 text-violet-700 border-violet-200/70';
-  return (
-    <div className="flex items-baseline gap-3">
-      <span className="shrink-0 w-24 text-[11px] font-medium text-slate-400 uppercase tracking-wide pt-1">{label}</span>
-      <div className="flex flex-wrap gap-1.5">
-        {items.map((name, i) => (
-          <span
-            key={name}
-            // a brief staggered fade-in so the chips "land" one after another.
-            style={{ animation: `studioChipIn 0.35s ease both`, animationDelay: `${i * 70}ms` }}
-            className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full border ${chip}`}
-          >
-            <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current opacity-70" />
-            {name}
-          </span>
-        ))}
-      </div>
-      {/* keyframes scoped via a style tag — Tailwind v4 has no util for a custom stagger. */}
-      <style>{`@keyframes studioChipIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}`}</style>
-    </div>
-  );
-}
-
-function Metric({ label, value }: { label: string; value: string }): JSX.Element {
-  return (
-    <div className="flex flex-col">
-      <span className="text-[10px] font-medium text-slate-400 uppercase tracking-wide">{label}</span>
-      <span className="text-sm font-semibold text-slate-900 tabular-nums">{value}</span>
-    </div>
-  );
-}
-
-function Spinner(): JSX.Element {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" className="h-3.5 w-3.5 animate-spin text-emerald-600">
-      <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2.5" strokeOpacity="0.25" />
-      <path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function ReadinessRow({
-  item,
-  busy,
-  onAction,
-}: {
-  item: ReadinessItem;
-  busy: boolean;
-  onAction: () => void;
-}): JSX.Element {
-  const ok = item.status === 'ok';
-  return (
-    <li className="flex items-center gap-3 py-2.5">
-      {/* status icon */}
-      <span
-        aria-hidden="true"
-        className={`shrink-0 h-6 w-6 rounded-full flex items-center justify-center transition-colors ${
-          ok ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
-        }`}
-      >
-        {ok ? <CheckGlyph className="h-3.5 w-3.5" /> : <span className="h-2 w-2 rounded-full bg-current" />}
-      </span>
-
-      <div className="min-w-0 flex-1">
-        <div className="text-sm font-medium text-slate-800">{item.label}</div>
-      </div>
-
-      {/* detail (eval %) — tabular so the 78→92 swap doesn't jump */}
-      {item.detail && (
-        <span className={`text-xs font-semibold tabular-nums ${ok ? 'text-emerald-700' : 'text-amber-700'}`}>
-          {item.detail}
-        </span>
-      )}
-
-      {/* status pill — emerald ok / amber warn (shared OPS_BADGE color pairs) */}
-      <span
-        className={`inline-flex items-center gap-1.5 text-[11px] font-semibold px-2 py-0.5 rounded-full ${
-          ok ? OPS_BADGE.ok : OPS_BADGE.warn
-        }`}
-      >
-        <span aria-hidden="true">●</span>
-        {ok ? 'Ready' : 'Attention'}
-      </span>
-
-      {/* inline action for warn items */}
-      {!ok && item.action && (
-        <button
-          type="button"
-          onClick={onAction}
-          disabled={busy}
-          className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-emerald-300 bg-white text-emerald-700 text-xs font-medium hover:bg-emerald-50 transition-colors disabled:opacity-60 disabled:cursor-wait"
-        >
-          {busy && <Spinner />}
-          {busy ? 'Running…' : item.action}
-        </button>
-      )}
-    </li>
   );
 }

@@ -1,0 +1,75 @@
+[project]
+name = "langgraph-agentcore-agent"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    # FLOORED at the 1.x majors, not the old 0.x line: langgraph 0.6.11 / langchain-core 0.3.86
+    # (the top of the old <1.0 range) carry 11 advisories across langgraph, langchain-core,
+    # langgraph-checkpoint and langgraph-sdk with NO fix released inside 0.x — pip-audit fails
+    # every build from this template until the majors move. 1.x/4.x are the fixed lines.
+    "langgraph>=1.0.10,<2.0",
+    # The Bedrock chat model (`ChatBedrockConverse`) and its langchain-core message/tool types.
+    # Pinned as its own floor rather than left to langgraph's transitive resolution: langgraph
+    # does not depend on langchain-aws at all, so a bare install would import-fail at startup.
+    "langchain-aws>=1.0,<2.0",
+    "langchain-core>=1.2.22,<2.0",
+    "bedrock-agentcore>=1.9.0,<2.0",
+    # OTEL: the langchain instrumentation emits the graph/LLM spans, and the HTTP OTLP exporter is
+    # what ships them to Langfuse. BOTH are declared explicitly — unlike the Strands template,
+    # which gets the exporter from a `strands-agents[otel]` extra, LangChain ships no equivalent
+    # extra, so an undeclared exporter would be a ModuleNotFoundError at module IMPORT (i.e. the
+    # container never reaches `app.run()` and the runtime crash-loops) the moment a Langfuse
+    # secret is present. That exact fault has already been shipped once in this catalog.
+    # Floored at 0.62: the version resolved against the 1.x langchain-core majors above and
+    # verified (by hand) to still install a real TracerProvider rather than silently no-op.
+    # Capped below 1.0: unverified against this pin set, same reasoning as the floor.
+    "opentelemetry-instrumentation-langchain>=0.62,<1.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.30,<2.0",
+    # Read the per-agent Langfuse project key from AWS Secrets Manager at import.
+    # (bedrock-agentcore already pulls in botocore/boto3, but declare it so the SM read is explicit.)
+    "boto3>=1.34.0",
+    # E42: `src/main.py` signs its CloudWatch (X-Ray OTLP) span export with botocore SigV4 (via boto3
+    # above) through a `requests.Session`. requests already arrives with the OTLP HTTP exporter;
+    # declared directly because this template imports it itself.
+    "requests>=2.31,<3.0",
+]
+
+[project.optional-dependencies]
+# ruff is CAPPED, not just floored. This file ships verbatim into customer repositories, and
+# ruff's DEFAULT rule set widens between minors — a float from 0.6 to 0.16 broke the lint job in
+# every materialized repo at once (S110/BLE001 became defaults, a stricter I001 landed, and old
+# `noqa` directives became unused-directive errors). Pin the minor and pair it with the explicit
+# [tool.ruff.lint] select below.
+dev = ["pytest>=8.0", "ruff>=0.16,<0.17", "pip-audit>=2.7"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+# This file's prose comments run wide deliberately (they explain AgentCore/OTEL traps at the line
+# they apply to). 110 keeps E501 meaningful without reflowing every explanation.
+line-length = 110
+
+[tool.ruff.lint]
+# SELECT EXPLICITLY. With no `select`, ruff lints against its own evolving defaults, so a new
+# release silently changes the gate under a repo nobody touched.
+# E/F = pycodestyle + pyflakes, I = isort, B = bugbear, S = bandit security (kept: this ships into
+# customer agents), BLE = blind-except, RUF = ruff's own.
+select = ["E", "F", "I", "B", "S", "BLE", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert with `assert` (S101) and may hardcode dummy credentials (S105/S106).
+"tests/**" = ["S101", "S105", "S106"]
+# `src/main.py` imports langchain/langgraph AFTER the telemetry setup call on purpose — LangChain
+# reads LANGSMITH_OTEL_ENABLED and the OTLP env at import time, so a top-of-file import would
+# capture the un-configured values. E402 is the rule that forbids exactly that ordering, and the
+# ordering is the fix, so it is ignored here rather than worked around.
+"src/main.py" = ["E402"]
+
+[tool.pytest.ini_options]
+# The tests import via the `src.` package prefix (e.g. `from src.config import Config`),
+# matching how the app runs at runtime (`python -m src.main` in the Dockerfile). Bare
+# `pytest` (as CI's build.yml runs it) does NOT put cwd on sys.path, so `src` won't
+# resolve without this.
+pythonpath = ["."]

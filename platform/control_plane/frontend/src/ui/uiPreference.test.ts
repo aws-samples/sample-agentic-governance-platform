@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getUiFlavor, setUiFlavor, UI_FLAVOR_STORAGE_KEY } from './uiPreference';
 
-// node env: no localStorage global unless a test installs one.
 function installStorage(initial: Record<string, string> = {}) {
   const store = new Map(Object.entries(initial));
   const storage = {

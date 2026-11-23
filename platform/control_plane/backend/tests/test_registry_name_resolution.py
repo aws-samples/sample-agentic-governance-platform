@@ -27,6 +27,7 @@ No AWS call is made: every client is an injected ``MagicMock``, per the suite co
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -38,10 +39,11 @@ from core.registry_resolver import (
     AmbiguousRegistryNameError,
     RegistryNotConfiguredError,
     RegistryNotFoundError,
-    resolve_registry_id,
+    find_registry_by_name,
 )
 from services.agent_registry_service import AgentRegistryService
 from services.mcp_server_service import McpServerRegistryService
+from services.registry_writer import RegistryWriter
 
 _ARN = "arn:aws:agent-registry:us-east-1:123456789012:registry/REGAGENTS0001"
 
@@ -62,20 +64,19 @@ def _ctl(registries=None, *, pages=None, list_error=None):
     return ctl
 
 
+def _resolve(name, region, *, ctl):
+    return RegistryWriter(registry_name=name, region=region, kind="agent", control_client=ctl).registry_id
+
+
 def _reg(name, rid, **extra):
     item = {"name": name, "registryId": rid, "registryArn": f"{_ARN[:-14]}{rid}", "status": "READY"}
     item.update(extra)
     return item
 
 
-# ---------------------------------------------------------------------------
-# The resolver itself.
-# ---------------------------------------------------------------------------
-
-
 def test_resolves_the_id_from_the_name():
     ctl = _ctl([_reg("other", "REGOTHER00001"), _reg("agp-agents", "REGAGENTS0001")])
-    assert resolve_registry_id("agp-agents", "us-east-1", ctl=ctl) == "REGAGENTS0001"
+    assert _resolve("agp-agents", "us-east-1", ctl=ctl) == "REGAGENTS0001"
     # The lookup is the paginated ListRegistries call and nothing else — in particular it does
     # NOT try to filter server-side on name, which the model does not support (the only
     # filterable fields are `status` and `discoveryConfiguration.authorizerType`).
@@ -91,7 +92,7 @@ def test_resolution_spans_every_page():
             {"registries": [_reg("agp-mcp-servers", "REGMCP0000001")]},
         ]
     )
-    assert resolve_registry_id("agp-mcp-servers", "us-east-1", ctl=ctl) == "REGMCP0000001"
+    assert _resolve("agp-mcp-servers", "us-east-1", ctl=ctl) == "REGMCP0000001"
 
 
 def test_an_unknown_name_fails_LOUDLY_and_actionably():
@@ -103,7 +104,7 @@ def test_an_unknown_name_fails_LOUDLY_and_actionably():
     merely on the exception type."""
     ctl = _ctl([_reg("something-else", "REGELSE000001")])
     with pytest.raises(RegistryNotFoundError) as exc:
-        resolve_registry_id("agp-agents", "eu-west-1", ctl=ctl)
+        _resolve("agp-agents", "eu-west-1", ctl=ctl)
 
     msg = str(exc.value)
     assert "agp-agents" in msg, msg  # names the registry it looked for
@@ -121,7 +122,7 @@ def test_a_duplicate_name_is_a_HARD_ERROR_naming_both_ids():
     ids so the operator can tell which to delete."""
     ctl = _ctl([_reg("agp-agents", "REGFIRST00001"), _reg("agp-agents", "REGSECOND0001")])
     with pytest.raises(AmbiguousRegistryNameError) as exc:
-        resolve_registry_id("agp-agents", "us-east-1", ctl=ctl)
+        _resolve("agp-agents", "us-east-1", ctl=ctl)
 
     msg = str(exc.value)
     assert "REGFIRST00001" in msg and "REGSECOND0001" in msg, msg
@@ -134,7 +135,7 @@ def test_a_duplicate_name_is_a_HARD_ERROR_naming_both_ids():
         ]
     )
     with pytest.raises(AmbiguousRegistryNameError):
-        resolve_registry_id("agp-agents", "us-east-1", ctl=paged)
+        _resolve("agp-agents", "us-east-1", ctl=paged)
 
 
 def test_an_aws_failure_propagates_unchanged():
@@ -144,13 +145,8 @@ def test_an_aws_failure_propagates_unchanged():
     boom = RuntimeError("ThrottlingException: Rate exceeded")
     ctl = _ctl(list_error=boom)
     with pytest.raises(RuntimeError) as exc:
-        resolve_registry_id("agp-agents", "us-east-1", ctl=ctl)
+        _resolve("agp-agents", "us-east-1", ctl=ctl)
     assert exc.value is boom
-
-
-# ---------------------------------------------------------------------------
-# The two services: lazy resolution, memoisation, and the id override.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -167,11 +163,10 @@ def test_service_resolves_by_name_lazily_and_memoises(service_cls, name):
     ctl = _ctl([_reg(name, "REGRESOLVED01")])
     svc = service_cls(registry_name=name, control_client=ctl)
 
-    # Construction alone must not have looked anything up.
     ctl.get_paginator.assert_not_called()
 
     assert svc.registry_id == "REGRESOLVED01"
-    assert svc.registry_id == "REGRESOLVED01"  # second read is served from the cache
+    assert svc.registry_id == "REGRESOLVED01"
     assert ctl.get_paginator.call_count == 1
 
 
@@ -210,9 +205,9 @@ def test_neither_id_nor_name_fails_on_first_use_not_on_construction(service_cls)
     """An unconfigured service must say so, rather than address the EMPTY-STRING registryId the
     old required-`registry_id` signature happily accepted (which 400s per call, or worse,
     reads as "no records")."""
-    svc = service_cls(control_client=_ctl())  # constructing is fine…
+    svc = service_cls(control_client=_ctl())
     with pytest.raises(RegistryNotConfiguredError) as exc:
-        svc.registry_id  # …using it is not
+        _ = svc.registry_id
     assert "REGISTRY_NAME" in str(exc.value) and "REGISTRY_ID" in str(exc.value)
 
 
@@ -237,8 +232,8 @@ def test_a_TRANSIENT_failure_is_NOT_cached_and_the_retry_succeeds(service_cls, n
     svc = service_cls(registry_name=name, control_client=ctl)
 
     with pytest.raises(RuntimeError):
-        svc.registry_id
-    assert svc.registry_id == "REGAFTERRETRY"  # the retry is not blocked by the first failure
+        _ = svc.registry_id
+    assert svc.registry_id == "REGAFTERRETRY"
 
     # A "not found" is transient in exactly the same way (the registry may not exist YET, mid
     # apply), so it must not poison the instance either.
@@ -249,20 +244,21 @@ def test_a_TRANSIENT_failure_is_NOT_cached_and_the_retry_succeeds(service_cls, n
     ]
     svc2 = service_cls(registry_name=name, control_client=ctl2)
     with pytest.raises(RegistryNotFoundError):
-        svc2.registry_id
+        _ = svc2.registry_id
     assert svc2.registry_id == "REGCREATEDNOW"
 
-
-# ---------------------------------------------------------------------------
-# Import purity — the property that makes lazy resolution meaningful.
-# ---------------------------------------------------------------------------
 
 _BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
     "module",
-    ["core.registry_resolver", "services.agent_registry_service", "services.mcp_server_service"],
+    [
+        "core.registry_resolver",
+        "services.registry_writer",
+        "services.agent_registry_service",
+        "services.mcp_server_service",
+    ],
 )
 def test_importing_the_registry_modules_builds_no_client_and_needs_no_settings(module):
     """Importing must not construct a boto3 client, reach AWS, or require env config.
@@ -302,7 +298,7 @@ def test_importing_the_registry_modules_builds_no_client_and_needs_no_settings(m
 
 
 def test_the_resolver_itself_does_not_even_IMPORT_boto3():
-    """`core.registry_resolver` imports boto3 inside `_client` only.
+    """`core.registry_resolver` takes the `ListRegistries` pages and names no client provider.
 
     Stricter than the check above and deliberately so: this module is imported by
     `scripts/ensure_registry.py`, which Terraform runs through a bare interpreter, and it is
@@ -332,40 +328,44 @@ def test_the_bootstrap_script_and_the_backend_share_ONE_find_by_name():
     duplicate-name decision, where the script creating-or-finding one registry and the backend
     reading another would be a genuinely confusing split. Asserted by identity, so a
     copy-paste divergence fails here rather than in production."""
+    import core.aws_clients as aws_clients
     import core.registry_resolver as resolver
     import scripts.ensure_registry as script
 
     assert script.find_registry_by_name is resolver.find_registry_by_name
-    assert script.SERVICE_NAME == resolver.SERVICE_NAME == "agent-registry-control"
+    assert script.REGISTRY_CONTROL == aws_clients.REGISTRY_CONTROL == "agent-registry-control"
 
 
-# ===========================================================================
-# HTTP surface: the actionable message must reach the OPERATOR, not just CloudWatch
-# ===========================================================================
-#
-# Every message above is written to be the whole remedy — it names the registry, the region,
-# `terraform apply`, the `ensure_registry.py --name` fallback and the settings involved. That
-# investment was worth nothing in production: these exceptions fell through to `main.py`'s
-# `@app.exception_handler(Exception)`, which returns
-# `{"detail": "Internal server error", "error": "An error occurred"}` unless `settings.DEBUG`
-# — and DEBUG defaults to False and is NOT set in the ECS task definition. So the one person who
-# could fix the misconfiguration got a bare 500, while the explanation sat in logs they had no
-# reason to open.
-#
-# These tests pin the dedicated handler that fixes it. They drive the handler `main.py` REGISTERS
-# (copied off `main.app.exception_handlers`) rather than a hand-rolled equivalent — a test that
-# built its own handler would pass while main.py's wiring was missing entirely, which is the
-# regression that matters.
+def test_the_writer_default_path_uses_the_provider(monkeypatch):
+    """With no `control_client`, the writer obtains its client from
+    `core.aws_clients.registry_control_client` and nowhere else, so the in-memory registry is one
+    function's switch."""
+    import services.registry_writer as writer_module
+
+    ctl = _ctl([_reg("n", "REGPROVIDED01")])
+    regions = []
+
+    def provider(region):
+        regions.append(region)
+        return ctl
+
+    monkeypatch.setattr(writer_module, "registry_control_client", provider)
+
+    assert RegistryWriter(registry_name="n", region="r", kind="agent").registry_id == "REGPROVIDED01"
+    assert regions == ["r"]
+    ctl.get_paginator.assert_called_once_with("list_registries")
 
 
 def _app_with_mains_handlers(exc: Exception):
     """A minimal app carrying `main.app`'s exception handlers and one route that raises `exc`.
 
-    Uses `main.app`'s OWN handler map so the wiring is under test, not just the behaviour. A
-    minimal app rather than `main.app` itself because the real one needs Entra auth, a tenant
-    resolver and a project resolver on the registry routes — none of which this is about, and all
-    of which would have to be faked into place to observe a status code that the handler decides
-    on its own.
+    The HTTP-surface tests below pin that every resolver message, written to be the whole remedy,
+    reaches the operator as a 503 body instead of falling through to the generic handler's masked
+    500, one fixed body for every caller. They use `main.app`'s OWN handler map and copy
+    its middleware stack too, so the wiring is under test as production builds it, not just the
+    behaviour: a test that built its own handler would pass while main.py's wiring was missing
+    entirely. A minimal app rather than `main.app` itself because the real one needs Entra auth, a
+    tenant resolver and a project resolver on the registry routes, none of which this is about.
     """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -375,13 +375,12 @@ def _app_with_mains_handlers(exc: Exception):
     app = FastAPI()
     for exc_type, handler in main_module.app.exception_handlers.items():
         app.add_exception_handler(exc_type, handler)
+    app.user_middleware = list(main_module.app.user_middleware)
 
     @app.get("/boom")
     async def boom():
         raise exc
 
-    # raise_server_exceptions=False so the generic `Exception` handler's response is observable
-    # instead of being re-raised into the test.
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -393,8 +392,7 @@ def _app_with_mains_handlers(exc: Exception):
             "with `terraform apply` in platform/control_plane/infrastructure."
         ),
         RegistryNotConfiguredError(
-            "AgentRegistryService has neither a registry id nor a registry name; set "
-            "AGENT_REGISTRY_NAME."
+            "AgentRegistryService has neither a registry id nor a registry name; set AGENT_REGISTRY_NAME."
         ),
         AmbiguousRegistryNameError(
             "2 registries are named 'agp-agents' (ids: AAA, BBB). Delete the one that should "
@@ -403,11 +401,9 @@ def _app_with_mains_handlers(exc: Exception):
     ],
     ids=["not_found", "not_configured", "ambiguous"],
 )
-def test_a_resolution_failure_returns_503_WITH_the_actionable_message(exc, monkeypatch):
-    """503, and the resolver's own message VERBATIM in the body — with DEBUG false.
+def test_a_resolution_failure_returns_503_WITH_the_actionable_message(exc):
+    """503, and the resolver's own message VERBATIM in the body.
 
-    DEBUG is forced False explicitly because that is the production shape and the entire point:
-    the old behaviour only ever showed the message when DEBUG was true, which it never is in ECS.
     Asserting on message CONTENT rather than merely on the status is deliberate — a 503 whose body
     said "An error occurred" would be the same failure wearing a better number.
 
@@ -415,33 +411,85 @@ def test_a_resolution_failure_returns_503_WITH_the_actionable_message(exc, monke
     cannot reach its registry. A 404 would send the operator hunting for deleted data. 503 also
     tells the truth about retryability — the identical request succeeds once the registry exists.
     """
-    import main as main_module
-
-    monkeypatch.setattr(main_module.settings, "DEBUG", False)
-
     resp = _app_with_mains_handlers(exc).get("/boom")
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["detail"] == str(exc)
-    # Non-vacuity: the body carries the parts that make the message actionable, not just a type
-    # name. `str(exc)` alone would still pass if the message had degraded to "not found".
     assert "agp-agents" in resp.text or "AGENT_REGISTRY_NAME" in resp.text, resp.text
-    # And it must NOT have been laundered through the generic handler.
     assert "An error occurred" not in resp.text, resp.text
 
 
-def test_every_OTHER_exception_still_gets_the_generic_masked_500(monkeypatch):
+_MARKER = "ghs_" + "a" * 36
+_PROVIDER_TEXT = "An error occurred (AccessDeniedException) when calling the ListRegistries operation"
+
+
+def _not_found_over_a_non_viable_twin():
+    ctl = _ctl(
+        [
+            _reg(
+                "agp-agents",
+                "REGFAILED0001",
+                status="CREATE_FAILED",
+                registryArn=_MARKER,
+                description=_PROVIDER_TEXT,
+            )
+        ]
+    )
+    with pytest.raises(RegistryNotFoundError) as exc:
+        _resolve("agp-agents", "eu-west-1", ctl=ctl)
+    return exc.value
+
+
+def _not_configured():
+    with pytest.raises(RegistryNotConfiguredError) as exc:
+        _ = AgentRegistryService(control_client=_ctl()).registry_id
+    return exc.value
+
+
+def _ambiguous():
+    ctl = _ctl(
+        [
+            _reg("agp-agents", "REGFIRST00001", registryArn=_MARKER, description=_PROVIDER_TEXT),
+            _reg("agp-agents", "REGSECOND0001", registryArn=_MARKER, description=_PROVIDER_TEXT),
+        ]
+    )
+    with pytest.raises(AmbiguousRegistryNameError) as exc:
+        _resolve("agp-agents", "us-east-1", ctl=ctl)
+    return exc.value
+
+
+@pytest.mark.parametrize(
+    "build, kind",
+    [
+        (_not_found_over_a_non_viable_twin, "not_found"),
+        (_not_configured, "not_configured"),
+        (_ambiguous, "ambiguous_name"),
+    ],
+    ids=["not_found", "not_configured", "ambiguous"],
+)
+def test_registry_error_detail_for_kind_carries_no_upstream_body(build, kind):
+    """The three ``Outcome(503, None)`` rows send the message verbatim, so the message must be safe by
+    construction: through the real resolver over a list response whose other fields carry a
+    token-shaped string and a provider sentence, the detail names the registry, its ids, statuses and
+    the remedy, and nothing else from the response."""
+    exc = build()
+
+    resp = _app_with_mains_handlers(exc).get("/boom")
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {"detail": str(exc), "code": f"registry.{kind}"}
+    assert _MARKER not in resp.text and _PROVIDER_TEXT not in resp.text
+
+
+def test_every_OTHER_exception_still_gets_the_generic_masked_500():
     """The exemption is per-type, and this is the guard that keeps it that way.
 
     The tempting shortcut for the test above is to make the generic handler leak `str(exc)`
     unconditionally, which would surface the registry message AND every other exception's — a
     connection string in a DB error, a token in a botocore message. This test fails if anyone
-    "fixes" the problem that way: an unrelated exception must still be masked with DEBUG false.
+    "fixes" the problem that way: an unrelated exception is still masked, one fixed 500 body that
+    carries no exception text.
     """
-    import main as main_module
-
-    monkeypatch.setattr(main_module.settings, "DEBUG", False)
-
     resp = _app_with_mains_handlers(
         RuntimeError("postgres://user:hunter2@db.internal:5432 refused the connection")
     ).get("/boom")
@@ -451,16 +499,11 @@ def test_every_OTHER_exception_still_gets_the_generic_masked_500(monkeypatch):
     assert "hunter2" not in resp.text, resp.text
 
 
-def test_the_503_response_carries_CORS_headers_so_the_SPA_can_READ_it(monkeypatch):
-    """An actionable message the browser refuses to hand over is not actionable.
-
-    `CORSMiddleware` does not decorate a response produced by an exception handler, so without
-    the explicit re-attachment the SPA sees a bare CORS failure — no status, no body — and the
-    operator is back to guessing. The generic handler has always done this; the point here is
-    that the new handler does it too (both go through the shared `_with_cors`)."""
+def test_the_503_response_carries_CORS_headers_so_the_SPA_can_READ_it():
+    """An `AppError` response gets its CORS headers from the middleware stack `main.py` builds; the
+    SPA cannot read a body without them."""
     import main as main_module
 
-    monkeypatch.setattr(main_module.settings, "DEBUG", False)
     origin = main_module.settings.CORS_ORIGINS[0]
 
     resp = _app_with_mains_handlers(RegistryNotFoundError("no registry named 'agp-agents'")).get(
@@ -476,52 +519,63 @@ def test_the_503_response_carries_CORS_headers_so_the_SPA_can_READ_it(monkeypatc
     [RegistryNotFoundError, RegistryNotConfiguredError, AmbiguousRegistryNameError],
 )
 def test_main_REGISTERS_a_handler_for_each_resolver_exception(exc_type):
-    """Pins the wiring by type, so deleting one decorator is caught even though all three
-    currently share a handler function. `RegistryNotConfiguredError` is the easiest to lose —
-    it is raised by the services rather than the resolver, so it reads as unrelated."""
+    """Pins the wiring by type: each resolver exception reaches a handler more specific than the
+    generic `Exception` one. `RegistryNotConfiguredError` is the easiest to lose — it is raised by
+    the services rather than the resolver, so it reads as unrelated."""
     import main as main_module
 
-    assert exc_type in main_module.app.exception_handlers, (
+    handled = [
+        registered
+        for registered in main_module.app.exception_handlers
+        if isinstance(registered, type) and registered is not Exception and issubclass(exc_type, registered)
+    ]
+    assert handled, (
         f"{exc_type.__name__} has no handler in main.py, so it falls through to the generic "
         "500 handler and its message is replaced with 'An error occurred' in production"
     )
 
 
-# ===========================================================================
-# Status is part of the match: a failed bootstrap must not poison its own remedy
-# ===========================================================================
-#
-# Matching on name ALONE created a state that broke the fix for itself. The realistic route to a
-# duplicate name is an interrupted bootstrap: attempt 1 leaves a registry in CREATE_FAILED,
-# attempt 2 creates one that reaches READY, and the account now holds two named `agp-agents`.
-# Name-only matching found both, raised AmbiguousRegistryNameError, and the platform hard-errored
-# on EVERY registry request — permanently, until a human deleted the corpse. And because
-# `scripts/ensure_registry.py` shares this exact function, the operator's most natural remedy
-# (re-run the bootstrap) refused too, instead of adopting the healthy registry. A self-healing
-# state became an outage, and the remedy path was the thing that was broken.
-#
-# The statuses below are the real `RegistryStatus` enum from the pinned botocore model, read
-# offline: CREATING, READY, UPDATING, CREATE_FAILED, UPDATE_FAILED, DELETING, DELETE_FAILED.
-
-
 def test_a_READY_registry_is_preferred_over_a_CREATE_FAILED_twin():
-    """THE case the finding is about: the interrupted-bootstrap pair.
+    """Status is part of the match: the interrupted-bootstrap pair.
 
-    Both are named `agp-agents`. Name-only matching saw 2 matches and refused forever; only the
-    READY one is a real candidate, so resolution must succeed and return it. Ordering is not
-    contractual, so the broken one is placed FIRST — a "take the first match" implementation that
-    merely stopped counting failures would return the corpse and pass a weaker test."""
+    Attempt 1 leaves a registry in CREATE_FAILED, attempt 2 creates one that reaches READY, and the
+    account holds two named `agp-agents`. Name-only matching saw 2 matches and refused forever, on
+    every registry request and in `ensure_registry.py` too, so the natural remedy (re-run the
+    bootstrap) refused as well. Only the READY one is a real candidate, so resolution must succeed
+    and return it. Ordering is not contractual, so the broken one is placed FIRST: a "take the first
+    match" implementation that merely stopped counting failures would return the corpse. The
+    statuses used below are the `RegistryStatus` enum of the pinned botocore model: CREATING, READY,
+    UPDATING, CREATE_FAILED, UPDATE_FAILED, DELETING, DELETE_FAILED."""
     ctl = _ctl(
         [
             _reg("agp-agents", "REGBROKEN0001", status="CREATE_FAILED"),
             _reg("agp-agents", "REGHEALTHY001", status="READY"),
         ]
     )
-    assert resolve_registry_id("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
+    assert _resolve("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
+
+
+def test_a_skipped_broken_registry_is_logged_at_INFO_naming_its_id_and_status(caplog):
+    """The skip is the line that explains an otherwise baffling "not found" for a registry the
+    operator can see in the console, so it is INFO, not DEBUG, and it names the id and the status."""
+    ctl = _ctl(
+        [
+            _reg("agp-agents", "REGBROKEN0001", status="CREATE_FAILED"),
+            _reg("agp-agents", "REGHEALTHY001", status="READY"),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="core.registry_resolver"):
+        assert _resolve("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
+
+    skipped = [r for r in caplog.records if r.name == "core.registry_resolver" and r.levelno == logging.INFO]
+    assert len(skipped) == 1, [r.getMessage() for r in caplog.records]
+    assert "REGBROKEN0001" in skipped[0].getMessage()
+    assert "CREATE_FAILED" in skipped[0].getMessage()
 
 
 def test_only_a_BROKEN_registry_errors_CLEARLY_rather_than_saying_not_found():
-    """"It exists but is unusable" and "it does not exist" have different remedies.
+    """ "It exists but is unusable" and "it does not exist" have different remedies.
 
     This is why the non-viable filter is applied CLIENT-side even though the API can filter on
     `status` server-side: a server-side filter would return an empty page and make this case
@@ -531,13 +585,12 @@ def test_only_a_BROKEN_registry_errors_CLEARLY_rather_than_saying_not_found():
     say to delete it and re-run."""
     ctl = _ctl([_reg("agp-agents", "REGBROKEN0001", status="CREATE_FAILED")])
     with pytest.raises(RegistryNotFoundError) as exc:
-        resolve_registry_id("agp-agents", "us-east-1", ctl=ctl)
+        _resolve("agp-agents", "us-east-1", ctl=ctl)
 
     msg = str(exc.value)
     assert "REGBROKEN0001" in msg, msg
     assert "CREATE_FAILED" in msg, msg
     assert "exists but" in msg, msg
-    # And it must point at a remedy, not merely describe the state.
     assert "Delete" in msg and "ensure_registry.py" in msg, msg
 
 
@@ -553,7 +606,7 @@ def test_TWO_VIABLE_registries_STILL_hard_error():
     short-circuit-on-first-viable-match implementation cannot see the second."""
     ctl = _ctl([_reg("agp-agents", "REGFIRST00001"), _reg("agp-agents", "REGSECOND0001")])
     with pytest.raises(AmbiguousRegistryNameError) as exc:
-        resolve_registry_id("agp-agents", "us-east-1", ctl=ctl)
+        _resolve("agp-agents", "us-east-1", ctl=ctl)
     msg = str(exc.value)
     assert "REGFIRST00001" in msg and "REGSECOND0001" in msg, msg
 
@@ -564,7 +617,7 @@ def test_TWO_VIABLE_registries_STILL_hard_error():
         ]
     )
     with pytest.raises(AmbiguousRegistryNameError):
-        resolve_registry_id("agp-agents", "us-east-1", ctl=paged)
+        _resolve("agp-agents", "us-east-1", ctl=paged)
 
 
 @pytest.mark.parametrize("status", ["CREATE_FAILED", "DELETING", "DELETE_FAILED"])
@@ -581,7 +634,7 @@ def test_a_broken_twin_does_not_make_a_healthy_registry_AMBIGUOUS(status):
             _reg("agp-agents", "REGHEALTHY001", status="READY"),
         ]
     )
-    assert resolve_registry_id("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
+    assert _resolve("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
 
 
 @pytest.mark.parametrize("status", ["READY", "CREATING", "UPDATING", "UPDATE_FAILED"])
@@ -597,7 +650,7 @@ def test_every_VIABLE_status_still_resolves(status):
     a registry that WAS ready and still holds every record — only a config change failed.
     Refusing it would be an outage we inflicted on a registry that reads and writes fine."""
     ctl = _ctl([_reg("agp-agents", "REGHEALTHY001", status=status)])
-    assert resolve_registry_id("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
+    assert _resolve("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
 
 
 def test_an_UNKNOWN_future_status_is_treated_as_VIABLE():
@@ -609,7 +662,7 @@ def test_an_UNKNOWN_future_status_is_treated_as_VIABLE():
     registry that then errors on its own terms, which is loud and local. The duplicate-name hard
     error remains the backstop if a future failure status ever co-exists with a healthy twin."""
     ctl = _ctl([_reg("agp-agents", "REGHEALTHY001", status="SOME_FUTURE_STATE")])
-    assert resolve_registry_id("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
+    assert _resolve("agp-agents", "us-east-1", ctl=ctl) == "REGHEALTHY001"
 
 
 def test_a_MISSING_status_field_is_treated_as_VIABLE():
@@ -619,7 +672,7 @@ def test_a_MISSING_status_field_is_treated_as_VIABLE():
     also keeps every pre-existing fixture in this suite meaningful rather than silently
     unresolvable if `status` were ever dropped from `_reg`."""
     item = {"name": "agp-agents", "registryId": "REGHEALTHY001", "registryArn": "arn:x"}
-    assert resolve_registry_id("agp-agents", "us-east-1", ctl=_ctl([item])) == "REGHEALTHY001"
+    assert _resolve("agp-agents", "us-east-1", ctl=_ctl([item])) == "REGHEALTHY001"
 
 
 def test_a_TRULY_absent_name_still_reports_ABSENCE_not_brokenness():
@@ -630,7 +683,7 @@ def test_a_TRULY_absent_name_still_reports_ABSENCE_not_brokenness():
     named X exists" wording; brokenness gets the "exists but ... is in a usable state" one."""
     ctl = _ctl([_reg("something-else", "REGOTHER00001")])
     with pytest.raises(RegistryNotFoundError) as exc:
-        resolve_registry_id("agp-agents", "us-east-1", ctl=ctl)
+        _resolve("agp-agents", "us-east-1", ctl=ctl)
 
     msg = str(exc.value)
     assert "No AWS Agent Registry named" in msg, msg
@@ -640,16 +693,14 @@ def test_a_TRULY_absent_name_still_reports_ABSENCE_not_brokenness():
 def test_find_by_name_returns_NONE_for_absence_so_the_bootstrap_can_CREATE():
     """`ensure_registry.py`'s find-or-CREATE contract: absence stays an ordinary answer.
 
-    Only the read-only callers turn absence into an error (via `resolve_registry_id`). If this
-    raised instead of returning `(None, None)`, the bootstrap could never create the first
-    registry in a fresh account — the from-zero deploy would be impossible."""
-    from core.registry_resolver import find_registry_by_name
-
-    assert find_registry_by_name(_ctl([]), "agp-agents") == (None, None)
+    Only the registry writer turns absence into an error. If this raised instead of returning
+    `(None, None)`, the bootstrap could never create the first registry in a fresh account — the
+    from-zero deploy would be impossible."""
+    assert find_registry_by_name([{"registries": []}], "agp-agents") == (None, None)
     # ... but a name that matches only a corpse is NOT absence: returning (None, None) there
     # would make the bootstrap create a SECOND registry beside the broken one, which is how the
     # duplicate-name state gets manufactured in the first place.
-    broken = _ctl([_reg("agp-agents", "REGBROKEN0001", status="CREATE_FAILED")])
+    broken = [{"registries": [_reg("agp-agents", "REGBROKEN0001", status="CREATE_FAILED")]}]
     with pytest.raises(RegistryNotFoundError):
         find_registry_by_name(broken, "agp-agents")
 
@@ -665,11 +716,7 @@ def test_the_denylist_is_a_SUBSET_of_the_real_RegistryStatus_enum():
 
     from core.registry_resolver import _NON_VIABLE_STATUSES
 
-    shapes = (
-        get_session()
-        .get_service_model("agent-registry-control")
-        ._shape_resolver._shape_map
-    )
+    shapes = get_session().get_service_model("agent-registry-control")._shape_resolver._shape_map
     enum = set(shapes["RegistryStatus"]["enum"])
 
     assert _NON_VIABLE_STATUSES <= enum, _NON_VIABLE_STATUSES - enum

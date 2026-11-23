@@ -1,32 +1,60 @@
 import { describe, it, expect } from 'vitest';
-import { toFlow, layout } from './layout';
-import type { GovernanceGraph } from '../../../api/client';
+import { toFlow, layout, NODE_WIDTH, NODE_HEIGHT } from './layout';
+import type { GovernanceGraph, GraphEdge, GraphNode } from '../../../api/openapi';
+import { stripComments } from '../../../rawSource';
+import graphNodesRaw from './graphNodes.tsx?raw';
 
-// A small user/group → agent → mcp fixture exercising both edge directions,
-// the snake→camel boundary (has_policy → data.hasPolicy), and the LR layering.
-const graph = (): GovernanceGraph => ({
-  nodes: [
-    { type: 'user', id: 'user:oid-1', label: 'Maria Bauer', ref_id: 'oid-1', metadata: { principal_type: 'User' } },
-    { type: 'group', id: 'group:gid-1', label: 'Contoso-Claims-Officers', ref_id: 'gid-1', metadata: { principal_type: 'Group' } },
-    { type: 'agent', id: 'agent:rec-a', label: 'claims-triage-de', ref_id: 'rec-a', metadata: { origin: 'Registered', platform: 'aws_bedrock' } },
-    { type: 'mcp', id: 'mcp:rec-m', label: 'internal-claims-mcp', ref_id: 'rec-m', metadata: { kind: 'gateway', cedar_enforcement_mode: 'enforce' } },
-  ],
-  edges: [
-    { id: 'asg-1', source: 'user:oid-1', target: 'agent:rec-a', type: 'access', role: 'Invoker' },
-    { id: 'asg-2', source: 'group:gid-1', target: 'agent:rec-a', type: 'access', role: 'Admin' },
-    { id: 'asg-3', source: 'agent:rec-a', target: 'mcp:rec-m', type: 'can_call', role: 'Invoker', has_policy: true },
-  ],
-});
+function graphNode(overrides: Partial<GraphNode> = {}): GraphNode {
+  return {
+    type: 'agent',
+    id: 'agent:rec-a',
+    label: 'claims-triage-de',
+    ref_id: 'rec-a',
+    metadata: {},
+    ...overrides,
+  };
+}
+
+function graphEdge(overrides: Partial<GraphEdge> = {}): GraphEdge {
+  return {
+    id: 'asg-1',
+    source: 'user:oid-1',
+    target: 'agent:rec-a',
+    type: 'access',
+    role: 'Invoker',
+    has_policy: false,
+    ...overrides,
+  };
+}
+
+function governanceGraph(overrides: Partial<GovernanceGraph> = {}): GovernanceGraph {
+  return { nodes: [], edges: [], ...overrides };
+}
+
+const graph = (): GovernanceGraph =>
+  governanceGraph({
+    nodes: [
+      graphNode({ type: 'user', id: 'user:oid-1', label: 'Maria Bauer', ref_id: 'oid-1', metadata: { principal_type: 'User' } }),
+      graphNode({ type: 'group', id: 'group:gid-1', label: 'Contoso-Claims-Officers', ref_id: 'gid-1', metadata: { principal_type: 'Group' } }),
+      graphNode({ type: 'agent', id: 'agent:rec-a', label: 'claims-triage-de', ref_id: 'rec-a', metadata: { origin: 'Registered', platform: 'aws_bedrock' } }),
+      graphNode({ type: 'mcp', id: 'mcp:rec-m', label: 'internal-claims-mcp', ref_id: 'rec-m', metadata: { kind: 'gateway', cedar_enforcement_mode: 'enforce' } }),
+    ],
+    edges: [
+      graphEdge({ id: 'asg-1', source: 'user:oid-1', target: 'agent:rec-a', type: 'access', role: 'Invoker' }),
+      graphEdge({ id: 'asg-2', source: 'group:gid-1', target: 'agent:rec-a', type: 'access', role: 'Admin' }),
+      graphEdge({ id: 'asg-3', source: 'agent:rec-a', target: 'mcp:rec-m', type: 'can_call', role: 'Invoker', has_policy: true }),
+    ],
+  });
 
 describe('toFlow', () => {
-  it('maps each API node to a React Flow node carrying id, type, label and metadata', () => {
+  it('maps each API node to a React Flow node carrying id, label and metadata, typed by the API node type React Flow resolves the component with, at a placeholder position until layout() runs', () => {
     const { nodes } = toFlow(graph());
     expect(nodes).toHaveLength(4);
 
     const agent = nodes.find((n) => n.id === 'agent:rec-a');
     expect(agent).toBeDefined();
-    expect(agent!.type).toBe('agent'); // RF node type = API node type (so T8 registers the right custom component)
-    expect(agent!.position).toEqual({ x: 0, y: 0 }); // placeholder until layout() runs
+    expect(agent!.type).toBe('agent');
+    expect(agent!.position).toEqual({ x: 0, y: 0 });
     expect(agent!.data.label).toBe('claims-triage-de');
     expect(agent!.data.refId).toBe('rec-a');
     expect(agent!.data.nodeType).toBe('agent');
@@ -47,8 +75,8 @@ describe('toFlow', () => {
     const access = edges.find((e) => e.id === 'asg-1');
     const canCall = edges.find((e) => e.id === 'asg-3');
 
-    expect(access!.type).toBe('default'); // access edges → styled default edge
-    expect(canCall!.type).toBe('policy'); // can_call edges → custom PolicyEdge (T8)
+    expect(access!.type).toBe('default');
+    expect(canCall!.type).toBe('policy');
   });
 
   it('carries role and the snake→camel has_policy boundary into edge data', () => {
@@ -58,14 +86,7 @@ describe('toFlow', () => {
     expect(canCall.target).toBe('mcp:rec-m');
     expect(canCall.data!.role).toBe('Invoker');
     expect(canCall.data!.edgeType).toBe('can_call');
-    // THE snake→camel boundary: API has_policy → data.hasPolicy
     expect(canCall.data!.hasPolicy).toBe(true);
-  });
-
-  it('defaults hasPolicy to false when has_policy is absent', () => {
-    const { edges } = toFlow(graph());
-    const access = edges.find((e) => e.id === 'asg-1')!;
-    expect(access.data!.hasPolicy).toBe(false);
   });
 });
 
@@ -102,5 +123,15 @@ describe('layout', () => {
     const before = nodes.map((n) => ({ ...n.position }));
     layout(nodes, edges);
     expect(nodes.map((n) => n.position)).toEqual(before);
+  });
+});
+
+describe('node cards', () => {
+  it('the card is laid out with the same box dagre positions: graphNodes.tsx sizes it from NODE_WIDTH and NODE_HEIGHT, never from a hand-typed size class', () => {
+    const src = stripComments(graphNodesRaw);
+    expect(src).toContain('width: NODE_WIDTH, height: NODE_HEIGHT');
+    expect(src).not.toMatch(/\b[wh]-\[\d+px\]/);
+    expect(NODE_WIDTH).toBeGreaterThan(0);
+    expect(NODE_HEIGHT).toBeGreaterThan(0);
   });
 });

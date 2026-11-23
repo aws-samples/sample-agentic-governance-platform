@@ -1,6 +1,6 @@
 # Langfuse module (base observability) — E26
 
-Self-hosted **Langfuse v3** (Aurora PostgreSQL Serverless v2 + ElastiCache/Valkey +
+Self-hosted **Langfuse v4** (Aurora PostgreSQL Serverless v2 + ElastiCache/Valkey +
 ClickHouse-on-EFS on ECS Fargate), fronted by an ALB and a CloudFront
 distribution with a Lambda@Edge **auto-login** and a `strip_frame_headers`
 origin-response Lambda so the platform can embed the Langfuse UI in an iframe.
@@ -87,44 +87,133 @@ Step-Functions deployments pipeline.
    (affects `destroy`). Langfuse now shares the root `terraform.tfstate`, so a base
    `terraform destroy` tears down Langfuse and its trace data / ClickHouse EFS.
 
-## Image currency (bump on a schedule, not on an alert)
+## Image currency (the mirror patches the base OS; the pins track features)
 
-The two pins in `ecr.tf` are the module's main security debt. Both images are long-lived and
-internet-facing (ALB + CloudFront), so a stale pin is an **exposed** pin, not merely an old one.
-Almost every finding these images attract is an **OS base-layer** package (openssl, gnutls,
-libc6) — not Langfuse code — and new Alpine/Ubuntu advisories land continuously. Version height
-cannot prevent them; only cadence keeps you inside SLA when they appear.
+Almost every finding these images attract is an **OS base-layer** package (openssl, glibc, perl,
+krb5) — not Langfuse or ClickHouse code — and new Alpine/Ubuntu advisories land continuously.
 
-**Routine — quarterly, ~15 minutes.** Bump both, `terraform apply`, confirm all 3 services reach
-steady state. Mirroring no-ops for tags already in ECR, so a re-apply is cheap.
+**Version height does not fix them, because upstream never runs a full upgrade.** Measured
+2026-09-02: `clickhouse-server:25.8.33.6` — the newest 25.8 LTS
+build, byte-identical to Docker Official `clickhouse:25.8.33.6` — shipped `openssl`
+`3.0.2-0ubuntu1.29` next to `libssl3` `3.0.2-0ubuntu1.26`. Same source package, two versions:
+the build pulled `openssl` fresh as a dependency and left the base layer's `libssl3` alone.
+**27** packages were upgradable straight from the Ubuntu 22.04 archive, two of them Critical
+(`libssl3` USN-8678-1, `perl-base` USN-8675-1). No published ClickHouse image was clean —
+`clickhouse/clickhouse-server`, Docker Official `clickhouse`, and `25.8-alpine` were all checked.
+So a tag bump alone **cannot** clear a container finding.
 
-**"Newest" is not the selection rule.** Two traps, both measured on 2026-08-04 while remediating
-SIM V2313251216:
+**`mirror-image.sh` therefore builds rather than re-tags.** `patch-base.Dockerfile` layers
+`apt-get upgrade` (ClickHouse, Ubuntu) onto the pulled image. The Langfuse v4 images ship on UBI
+micro, which has no package manager, so `patch-base.rpm.Dockerfile` runs `dnf update` from a full
+UBI stage against a copy of the image's root and layers back only the paths it changed. What
+lands in ECR is upstream plus every distro security update available that day, and base-OS
+remediation no longer waits on upstream's rebuild cadence.
 
-- **ClickHouse: stay on the 25.8 LTS line.** `SECURITY.md` upstream lists 25.8 as supported for
-  security updates while 25.9–25.12, 26.1, 26.2 and 26.4 are already EOL. And newest ≠ most
-  patched: `26.7.2.59` shipped an **older** `libssl3` than `25.8.28.1`, because these images
-  rebuild on Ubuntu 22.04 whenever upstream happens to. Crossing into 26.x is a planned major
-  upgrade of an EFS-backed store — never fold it into a CVE fix.
-- **Langfuse: check the base layer before paying for a major.** `4.4.0` and `3.225.0` ship
-  *identical* Alpine 3.24.1 and openssl 3.5.7-r0, so moving to v4 buys **zero** CVE benefit
-  while incurring the documented [v3→v4 migration](https://langfuse.com/self-hosting/upgrade/upgrade-guides/upgrade-v3-to-v4).
-  Upgrade to v4 for its features, on its own schedule — not as remediation.
+**The mirror does not reach the application's own dependencies.** Measured 2026-11-18 with Docker
+Scout on the worker image: the newest v3, `3.227.1`, still carried Critical findings in
+`next@16.2.11` and `proxy-addr@2.0.7`, at the versions `3.225.11` had; `4.83.0` carried none.
+Those arrive with a newer pin and nothing else.
 
-**Verify against the packages, not the tag.** What actually clears a finding is the installed
-version inside the image, on the arch ECS runs (`X86_64` — pass `--platform linux/amd64`, or a
-native arm64 Mac silently inspects the wrong image and can report different package versions):
+Two constraints that mechanism must respect, both learned the hard way:
+
+- **Third-party apt repos are parked during the upgrade.** The ClickHouse image carries
+  `/etc/apt/sources.list.d/clickhouse.list`, so a bare `apt-get upgrade` moved
+  `clickhouse-server` from `25.8.33.6` to **`26.8.2.7`** — off the supported LTS line and into an
+  unplanned major upgrade of an EFS-backed store. The Dockerfile moves those sources aside and
+  restores them after, keeping this strictly a base-OS patch.
+- **A fixed pin still goes stale.** ECR holds "upstream `$TAG` as patched the day we built it",
+  and the mirror skips tags already present. Bumping a pin creates a new tag and a fresh build;
+  to refresh *without* a bump, force the resource and set the env var:
+  ```bash
+  MIRROR_FORCE_REBUILD=1 terraform apply \
+    -replace='module.langfuse.null_resource.push_images["clickhouse"]'
+  ```
+
+**Routine — quarterly, ~15 minutes.** Bump both and `terraform apply`. Mirroring no-ops for tags
+already in ECR, so a re-apply is cheap.
+
+**The apply rolls the three services in order and waits for each:** ClickHouse, then web, then
+worker (`wait_for_steady_state` and `depends_on` in `ecs.tf`). The web container migrates Postgres
+and ClickHouse when it starts, so it needs the pinned ClickHouse release already serving; a worker
+that starts before those migrations end marks the background migrations it validates against them
+as failed, and a failed background migration is not retried on restart. An apply that changes a
+pin therefore lasts as long as the slowest service takes to become healthy, and fails when one
+does not.
+
+**"Newest" is still not the selection rule.** Two traps, measured 2026-08-04:
+
+- **ClickHouse: pin an LTS line upstream still supports.** `SECURITY.md` upstream lists the
+  releases that receive security updates. Every 25.x release has left that list, so the pin sits
+  on the 26.3 LTS line, the one Langfuse's own v4 compose file pins (v4 needs 25.12 or newer). A
+  move between lines is a release upgrade of an EFS-backed store and cannot be undone by
+  redeploying the older image: back the EFS volume up first, and never fold it into a base-OS
+  refresh.
+- **Langfuse: stay current on the v4 line.** Upstream patches v3 only until the end of January
+  2027, and by November 2026 its npm dependencies were already behind. A v4 image ages too:
+  `4.75.0` had 17 base packages to upgrade sixteen days after its release, and `4.54.0`, six weeks
+  old, carried Critical findings that `4.83.0` does not.
+
+**Verify against the packages, not the tag** — and verify the **patched** image, not upstream.
+What clears a finding is the installed version inside what we pushed, on the arch ECS runs
+(`X86_64` — pass `--platform linux/amd64`, or a native arm64 Mac silently inspects the wrong
+image and reports different package versions):
 
 ```bash
-finch run --rm --platform linux/amd64 --entrypoint sh langfuse/langfuse:<ver> \
-  -c 'apk list --installed | grep -E "^(libssl3|libcrypto3)-"'
-finch run --rm --platform linux/amd64 --entrypoint bash clickhouse/clickhouse-server:<ver> \
-  -c 'dpkg -l | grep -E "^ii\s+(openssl|libssl3|libgnutls30|libc6):"'
+finch run --rm --platform linux/amd64 --entrypoint bash <acct>.dkr.ecr.<region>.amazonaws.com/<name>-clickhouse:<ver> \
+  -c 'apt-get update -qq && apt-get -s upgrade | grep ^Inst'   # expect: only clickhouse-* from packages.clickhouse.com
+docker scout cves --platform linux/amd64 --only-severity critical,high \
+  local://<acct>.dkr.ecr.<region>.amazonaws.com/<name>-langfuse:<ver>   # expect: no Critical, no fixable row
 ```
+
+The Langfuse image has no package manager to ask, so it is scanned rather than queried; the scan
+also reads the npm and Go dependencies the mirror cannot patch.
+
+**Runtime validation cannot happen on an arm64 Mac.** `clickhouse-server` segfaults under qemu
+during `entrypoint.sh` (`extract-from-config`) — upstream's own unmodified image does it too, so
+it proves nothing about a patched build. Package checks above are valid (dpkg/apk metadata is
+static); functional confirmation is the ECS service reaching steady state on X86_64.
 
 Findings only clear once the **old tasks are gone** and new ones run on the new digests —
 restarting before the tag bump is pointless, since the pinned tags resolve to the same digests.
 Web and worker MUST stay on the same `langfuse_version`.
+
+## Langfuse v4 runs in the `legacy` write mode
+
+Langfuse v4 replaces the trace and observation tables with one `events` model, and by default
+(`events_only`) it stops serving what v3 served: the batch ingestion endpoints, and the read
+endpoints for traces, observations, sessions, scores and metrics all return `404`. `ecs.tf` sets
+`local.v4_migration_env` on the web and worker containers so that v4 keeps the v3 ingestion and
+read behavior, with the new tables created and not written.
+
+The mode is kept because the platform still reads the v3 endpoints:
+`services/langfuse_metrics_service.py` calls `GET /api/public/traces`, `/api/public/metrics` and
+`/api/public/metrics/daily`. Upstream removes the `legacy` and `dual` modes in a later major, so
+the move to `events_only` is owed. Before it, in the order of the
+[v3 to v4 guide](https://langfuse.com/self-hosting/upgrade/upgrade-guides/upgrade-v3-to-v4):
+
+1. The backend's readers move to the Observations API v2 and the Metrics API v2.
+2. The agents' OpenTelemetry exporters send `x-langfuse-ingestion-version: 4`, so their spans are
+   written to the new tables directly.
+3. The write mode becomes `dual`; once new data shows in both models, the historic backfill is
+   enabled, or the retention window is waited out.
+4. The four overrides are removed.
+
+**Moving an environment onto a new pin.** CI has no container engine, so the tags are mirrored
+into that account's ECR from a laptop before the apply, with the script the apply itself calls:
+
+```bash
+./mirror-image.sh langfuse/langfuse <ver> <ecr>/<name>-langfuse <ecr> <region> <name>-langfuse
+```
+
+and the same for `langfuse/langfuse-worker` and `clickhouse/clickhouse-server`. Before a major of
+either, back up the ClickHouse EFS volume and snapshot the Aurora cluster, and confirm on the
+running release that every background migration has finished (the version tag in the Langfuse UI,
+**Background Migrations**).
+
+**Going back to v3** is possible while the mode is `legacy` or `dual`, and not by redeploying the
+v3 image alone: the v3 web container refuses a ClickHouse schema newer than its own. The guide's
+"Rolling back without a restore" rewinds the schema with the `migrate` binary in the v4 web image
+(`goto 37`); the pin then returns to the newest v3.
 
 ## Provider requirements
 

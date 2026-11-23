@@ -54,6 +54,11 @@ output "ecr_repository_url" {
   value       = module.ecr.repository_url
 }
 
+output "branch_image_repository_url" {
+  description = "Account-wide ECR repository for merge-request images; empty on stacks that do not create shared resources"
+  value       = var.create_shared_resources ? aws_ecr_repository.branch_images[0].repository_url : ""
+}
+
 # ============================================================================
 # ECS Outputs
 # ============================================================================
@@ -226,18 +231,53 @@ output "entra_backend_client_secret_name" {
   value       = module.secrets_manager.graph_client_secret_name
 }
 
+output "auth_provider" {
+  description = "Inbound JWT validator the backend uses (VITE_AUTH_PROVIDER)."
+  value       = var.auth_provider
+}
+
+output "entra_tenant_id" {
+  description = "Entra tenant ID (VITE_ENTRA_TENANT_ID)."
+  value       = var.entra_tenant_id
+}
+
+output "entra_tenant_domain" {
+  description = "Entra tenant domain (VITE_ENTRA_TENANT_DOMAIN)."
+  value       = var.entra_tenant_domain
+}
+
+output "entra_spa_client_id" {
+  description = "SPA app registration client ID (VITE_ENTRA_SPA_CLIENT_ID)."
+  value       = var.entra_spa_client_id
+}
+
+output "entra_spa_redirect_uri" {
+  description = "SPA redirect URI registered in Entra (VITE_ENTRA_SPA_REDIRECT_URI)."
+  value       = "${module.cloudfront.frontend_url}/auth/callback"
+}
+
+output "entra_spa_scope" {
+  description = "API scope the SPA requests (VITE_ENTRA_SPA_SCOPE)."
+  value       = var.entra_spa_scope
+}
+
+output "product_mode" {
+  description = "Frontend product mode (VITE_PRODUCT_MODE)."
+  value       = var.product_mode
+}
+
 # ============================================================================
 # Langfuse Observability (E26)
 # ============================================================================
 
 output "langfuse_host" {
   description = "Langfuse public HTTPS endpoint (CloudFront). Fed to the backend ECS task as LANGFUSE_HOST."
-  value       = module.langfuse.langfuse_host
+  value       = local.langfuse_host
 }
 
 output "langfuse_secret_name" {
   description = "Secrets Manager secret name holding the Langfuse seed-org/admin credentials + seed project keys. Fed to the backend as LANGFUSE_ADMIN_SECRET_NAME."
-  value       = module.langfuse.langfuse_secret_name
+  value       = local.langfuse_secret_name
 }
 
 # ============================================================================

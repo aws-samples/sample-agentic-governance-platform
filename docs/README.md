@@ -25,6 +25,8 @@ provider is configured. Otherwise start with whichever question you arrived with
 - [Authorization layers](authorization-layers.md) — the three gates a governed request
   passes (platform role, tenant visibility, per-project role), the refusal each produces, and why
   two of them are routinely mistaken for defects.
+- [Architecture decision records](adr/README.md) — the decisions two or more modules depend on and
+  no type or test can carry, one file each, with the convention for writing the next one.
 
 ## Registration and operations
 

@@ -77,3 +77,33 @@ output "tenants_table_arn" {
   description = "ARN of the tenants DynamoDB table"
   value       = aws_dynamodb_table.tenants.arn
 }
+
+output "evals_table_name" {
+  description = "Name of the evals DynamoDB table"
+  value       = aws_dynamodb_table.evals.name
+}
+
+output "evals_table_arn" {
+  description = "ARN of the evals DynamoDB table"
+  value       = aws_dynamodb_table.evals.arn
+}
+
+output "containment_table_name" {
+  description = "Name of the containment DynamoDB table"
+  value       = aws_dynamodb_table.containment.name
+}
+
+output "containment_table_arn" {
+  description = "ARN of the containment DynamoDB table"
+  value       = aws_dynamodb_table.containment.arn
+}
+
+output "audit_table_name" {
+  description = "Name of the append-only audit DynamoDB table"
+  value       = aws_dynamodb_table.audit.name
+}
+
+output "audit_table_arn" {
+  description = "ARN of the append-only audit DynamoDB table"
+  value       = aws_dynamodb_table.audit.arn
+}

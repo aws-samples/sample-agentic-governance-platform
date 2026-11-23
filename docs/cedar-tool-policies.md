@@ -70,8 +70,9 @@ off detaches the engine instead; nothing is deleted, and re-attaching restores e
 ## What a deny looks like
 
 Nothing user-facing. The gateway refuses the call, and the refusal reaches the agent as a tool error
-inside its reasoning loop — the model retries, apologises, or picks another tool. Nothing in the
-platform turns a deny into a governance message: no reason string, no policy id, no blocked screen.
+inside its reasoning loop ("Tool Execution Denied: ... Policy evaluation denied due to <policy id>")
+— the model retries, apologises, or picks another tool. Nothing in the platform turns a deny into a
+governance message or a blocked screen.
 
 The console warns you in advance instead. On an enforcing gateway the Policies tab carries a standing
 note beside the posture: every call not covered by a policy is denied, for every agent connected to

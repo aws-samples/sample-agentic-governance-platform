@@ -1,18 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { agentsApi } from '../../api/client';
-import type { Agent, LifecycleState, Platform, Origin } from '../../api/client';
-import { lifecycleBadge } from './agentUi';
-// Platform labels come from the ONE shared map (E29/T9) — this file used to keep its own copy,
-// one of five that had to agree by hand.
+import type { Agent, LifecycleState, Platform } from '../../api/client';
+import { useLoad } from '../../api/useLoad';
+import { lifecycleBadge } from './agentBadges';
 import { platformLabelOr } from './platformLabels';
-import { ComingSoonBadge } from '../shared/comingSoon';
 
-// Tighter card chrome — matches the redesigned list/detail density (Decision 7).
+const NO_AGENTS: Agent[] = [];
+
 const CARD = 'bg-white/70 backdrop-blur rounded-xl border border-slate-200/60 shadow-sm';
 
-// Order used when rendering the lifecycle distribution (and to colour its bars
-// with the shared lifecycleBadge palette).
 const LIFECYCLE_ORDER: LifecycleState[] = [
   'proposed',
   'pending_approval',
@@ -21,8 +18,6 @@ const LIFECYCLE_ORDER: LifecycleState[] = [
   'deprecated',
 ];
 
-// Map a lifecycleBadge text class -> a solid bar fill in the same hue family,
-// so the Lifecycle card's bars echo the badges used everywhere else.
 const LIFECYCLE_BAR: Record<LifecycleState, string> = {
   approved: 'bg-emerald-400',
   proposed: 'bg-slate-300',
@@ -35,11 +30,9 @@ interface DistRow {
   key: string;
   label: string;
   count: number;
-  /** Optional explicit bar colour; falls back to the neutral slate bar. */
   bar?: string;
 }
 
-// A single titled distribution card: label + count + a proportional bar.
 function DistributionCard({
   title,
   rows,
@@ -79,7 +72,6 @@ function DistributionCard({
   );
 }
 
-// Sort a count map into rows, descending by count then label.
 function toRows(
   counts: Map<string, number>,
   opts?: { bar?: (key: string) => string; label?: (key: string) => string },
@@ -104,34 +96,8 @@ function tally<T>(items: T[], pick: (t: T) => string): Map<string, number> {
 }
 
 export default function AgentsOverview() {
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [reloadNonce, setReloadNonce] = useState(0);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    agentsApi
-      .list()
-      .then((res) => {
-        if (cancelled) return;
-        setAgents(res);
-        setError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Failed to load agents.');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [reloadNonce]);
-
-  // -- computed metrics (all client-side) -----------------------------------
+  const { state, reload } = useLoad(() => agentsApi.list(), [], 'Failed to load agents.');
+  const agents = state.data ?? NO_AGENTS;
 
   const counts = useMemo(() => {
     const by = (s: LifecycleState) => agents.filter((a) => a.lifecycle_state === s).length;
@@ -148,10 +114,6 @@ export default function AgentsOverview() {
   const platformRows = useMemo(
     () =>
       toRows(tally(agents, (a) => a.platform ?? '__unset'), {
-        // The raw key is the fallback, not 'Not set': this bucket key comes from a stored record,
-        // so a value written by a build that knew a platform this one does not is possible, and
-        // showing the raw key beats mislabelling a real count as unset. (`platformLabelOr`
-        // handles both the absent and the unrecognised case — it does not index blindly.)
         label: (k) => (k === '__unset' ? 'Not set' : platformLabelOr(k as Platform, k)),
       }),
     [agents],
@@ -183,13 +145,6 @@ export default function AgentsOverview() {
     }));
   }, [agents]);
 
-  const originRows = useMemo(
-    () => toRows(tally(agents, (a) => a.origin as Origin), { label: (k) => k }),
-    [agents],
-  );
-
-  // -- render ---------------------------------------------------------------
-
   const header = (
     <div className="flex items-start justify-between mb-6 animate-fade-in">
       <div>
@@ -207,7 +162,7 @@ export default function AgentsOverview() {
     </div>
   );
 
-  if (loading) {
+  if (state.kind === 'loading') {
     return (
       <div className="min-h-[calc(100vh-4rem)] relative">
         <div className="relative max-w-7xl mx-auto px-6 py-8">
@@ -218,16 +173,16 @@ export default function AgentsOverview() {
     );
   }
 
-  if (error) {
+  if (state.kind === 'error') {
     return (
       <div className="min-h-[calc(100vh-4rem)] relative">
         <div className="relative max-w-7xl mx-auto px-6 py-8">
           {header}
           <div className={`${CARD} border-red-200/70 p-6`}>
             <h3 className="text-sm font-semibold text-red-700">Couldn’t load fleet analytics</h3>
-            <p className="text-sm text-slate-600 mt-1">{error}</p>
+            <p className="text-sm text-slate-600 mt-1">{state.message}</p>
             <button
-              onClick={() => setReloadNonce((n) => n + 1)}
+              onClick={reload}
               className="mt-3 px-3 py-1.5 rounded-lg bg-white border border-slate-300 text-slate-700 text-xs font-medium hover:bg-slate-50 transition-colors"
             >
               Retry
@@ -265,10 +220,8 @@ export default function AgentsOverview() {
       <div className="relative max-w-7xl mx-auto px-6 py-8">
         {header}
 
-        {/* ----- Headline counts (real, computed) ----- */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-8">
           <StatCard label="Total agents" value={counts.total} hint="in the registry" />
-          {/* Pending approval is the actionable one — link it to the list. */}
           <Link to="/agents/all" className="block group">
             <div className={`${CARD} p-4 h-full transition-colors group-hover:border-amber-300/80`}>
               <div className="text-2xl font-semibold text-amber-700">{counts.pending}</div>
@@ -289,7 +242,6 @@ export default function AgentsOverview() {
           />
         </div>
 
-        {/* ----- Real distribution cards ----- */}
         <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-3">
           Distributions
         </h2>
@@ -310,25 +262,12 @@ export default function AgentsOverview() {
             rows={lifecycleRows}
             empty="No lifecycle data."
           />
-          <DistributionCard title="By origin" rows={originRows} empty="No origin data." />
-        </div>
-
-        {/* ----- Sample usage (Decision 3 — CLEARLY labeled, not real) ----- */}
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-3">
-          Usage
-        </h2>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <SampleActiveUsersCard />
-          <SampleSessionsCard />
         </div>
       </div>
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Headline stat card
-// ---------------------------------------------------------------------------
 function StatCard({
   label,
   value,
@@ -346,108 +285,5 @@ function StatCard({
       <div className="text-xs font-medium text-slate-700 mt-1">{label}</div>
       <div className="text-[11px] text-slate-400 mt-0.5">{hint}</div>
     </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Sample-usage cards — OBVIOUSLY placeholder data, each carries the shared
-// <ComingSoonBadge /> pill so it can't be mistaken for real telemetry. (We have
-// no real usage data yet; honesty is a hard requirement.) The badge used to be a
-// local twin labelled "30-day trend", then "Sample data" — user-requested copy
-// settled on "Coming soon" since the whole dashboard section is roadmap.
-// ---------------------------------------------------------------------------
-
-function SampleCardShell({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    // Dashed border + reduced opacity reinforce that this is illustrative only.
-    <div className="bg-white/50 backdrop-blur rounded-xl border border-dashed border-slate-300/80 shadow-sm p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-slate-500">{title}</h3>
-        <ComingSoonBadge />
-      </div>
-      {children}
-    </div>
-  );
-}
-
-// A few obviously-round sample numbers so nothing reads as measured data.
-const SAMPLE_SERIES = [12, 18, 15, 24, 22, 30, 28, 34, 31, 40, 38, 46];
-
-function SampleActiveUsersCard() {
-  const max = Math.max(...SAMPLE_SERIES);
-  const w = 320;
-  const h = 72;
-  const step = w / (SAMPLE_SERIES.length - 1);
-  const points = SAMPLE_SERIES.map((v, i) => {
-    const x = i * step;
-    const y = h - (v / max) * (h - 8) - 4;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(' ');
-  const areaPoints = `0,${h} ${points} ${w},${h}`;
-
-  return (
-    <SampleCardShell title="Active users (30 days)">
-      <div className="flex items-end gap-4">
-        <div className="text-2xl font-semibold text-slate-400">~46</div>
-        <span className="text-xs text-slate-400 pb-1">peak daily</span>
-      </div>
-      <svg
-        viewBox={`0 0 ${w} ${h}`}
-        className="mt-2 w-full h-16"
-        preserveAspectRatio="none"
-        role="img"
-        aria-label="Active-users trend over the last 30 days"
-      >
-        <polygon points={areaPoints} className="fill-slate-200/50" />
-        <polyline
-          points={points}
-          fill="none"
-          className="stroke-slate-300"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      </svg>
-    </SampleCardShell>
-  );
-}
-
-const SAMPLE_SESSIONS = [
-  { label: 'Mon', v: 120 },
-  { label: 'Tue', v: 180 },
-  { label: 'Wed', v: 150 },
-  { label: 'Thu', v: 220 },
-  { label: 'Fri', v: 260 },
-  { label: 'Sat', v: 90 },
-  { label: 'Sun', v: 70 },
-];
-
-function SampleSessionsCard() {
-  const max = Math.max(...SAMPLE_SESSIONS.map((d) => d.v));
-  return (
-    <SampleCardShell title="Sessions over time">
-      <div className="flex items-end gap-4 mb-3">
-        <div className="text-2xl font-semibold text-slate-400">~1.1k</div>
-        <span className="text-xs text-slate-400 pb-1">this week</span>
-      </div>
-      <div className="flex items-end gap-2 h-20">
-        {SAMPLE_SESSIONS.map((d) => (
-          <div key={d.label} className="flex-1 flex flex-col items-center justify-end h-full">
-            <div
-              className="w-full rounded-t bg-slate-300/70"
-              style={{ height: `${(d.v / max) * 100}%` }}
-              aria-hidden="true"
-            />
-            <span className="text-[10px] text-slate-400 mt-1">{d.label}</span>
-          </div>
-        ))}
-      </div>
-    </SampleCardShell>
   );
 }

@@ -1,6 +1,6 @@
-import type { ContentFilterConfig, GuardrailFilterType, GuardrailFilterStrength } from '../../types';
+import type { ContentFilterConfigOutput, FilterType, FilterStrength } from '../../api/client';
 
-const FILTER_TYPES: { type: GuardrailFilterType; label: string; description: string }[] = [
+const FILTER_TYPES: { type: FilterType; label: string; description: string }[] = [
   { type: 'HATE', label: 'Hate Speech', description: 'Discriminatory or hateful content' },
   { type: 'INSULTS', label: 'Insults', description: 'Demeaning or offensive language' },
   { type: 'SEXUAL', label: 'Sexual Content', description: 'Sexually explicit material' },
@@ -9,9 +9,9 @@ const FILTER_TYPES: { type: GuardrailFilterType; label: string; description: str
   { type: 'PROMPT_ATTACK', label: 'Prompt Injection', description: 'Attempts to override system instructions' },
 ];
 
-const STRENGTHS: GuardrailFilterStrength[] = ['NONE', 'LOW', 'MEDIUM', 'HIGH'];
+const STRENGTHS: FilterStrength[] = ['NONE', 'LOW', 'MEDIUM', 'HIGH'];
 
-const strengthColors: Record<GuardrailFilterStrength, string> = {
+const strengthColors: Record<FilterStrength, string> = {
   NONE: 'bg-slate-100 text-slate-600',
   LOW: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   MEDIUM: 'bg-amber-50 text-amber-700 border-amber-200',
@@ -19,20 +19,19 @@ const strengthColors: Record<GuardrailFilterStrength, string> = {
 };
 
 interface Props {
-  filters: ContentFilterConfig[];
-  onChange: (filters: ContentFilterConfig[]) => void;
+  filters: ContentFilterConfigOutput[];
+  onChange: (filters: ContentFilterConfigOutput[]) => void;
 }
 
 export default function ContentFilterPanel({ filters, onChange }: Props) {
-  const getFilter = (type: GuardrailFilterType): ContentFilterConfig => {
+  const getFilter = (type: FilterType): ContentFilterConfigOutput => {
     return filters.find((f) => f.type === type) || { type, input_strength: 'NONE', output_strength: 'NONE' };
   };
 
-  const updateFilter = (type: GuardrailFilterType, field: 'input_strength' | 'output_strength', value: GuardrailFilterStrength) => {
+  const updateFilter = (type: FilterType, field: 'input_strength' | 'output_strength', value: FilterStrength) => {
     const existing = filters.filter((f) => f.type !== type);
     const current = getFilter(type);
     const updated = { ...current, [field]: value };
-    // Only include if at least one strength is set
     if (updated.input_strength === 'NONE' && updated.output_strength === 'NONE') {
       onChange(existing);
     } else {
@@ -58,7 +57,7 @@ export default function ContentFilterPanel({ filters, onChange }: Props) {
             </div>
             <select
               value={filter.input_strength}
-              onChange={(e) => updateFilter(type, 'input_strength', e.target.value as GuardrailFilterStrength)}
+              onChange={(e) => updateFilter(type, 'input_strength', e.target.value as FilterStrength)}
               className={`input-field text-xs text-center py-1.5 ${strengthColors[filter.input_strength]}`}
             >
               {STRENGTHS.map((s) => (
@@ -70,7 +69,7 @@ export default function ContentFilterPanel({ filters, onChange }: Props) {
             ) : (
               <select
                 value={filter.output_strength}
-                onChange={(e) => updateFilter(type, 'output_strength', e.target.value as GuardrailFilterStrength)}
+                onChange={(e) => updateFilter(type, 'output_strength', e.target.value as FilterStrength)}
                 className={`input-field text-xs text-center py-1.5 ${strengthColors[filter.output_strength]}`}
               >
                 {STRENGTHS.map((s) => (

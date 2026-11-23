@@ -1,7 +1,7 @@
-"""Shared user→agent grant function tests (Epic 33, Task T3).
+"""Shared user→agent grant function tests.
 
-``services.agent_user_grant`` is the E6-shaped twin of ``services.agent_mcp_grant``: it
-applies the REAL user→agent Entra app-role assignment (the same write the E6 route
+``services.agent_user_grant`` is the twin of ``services.agent_mcp_grant``: it
+applies the REAL user→agent Entra app-role assignment (the same write the grants route
 ``POST /agents/{id}/grants`` performs) so the marketplace agent-subscription approval
 grants actual access instead of only flipping a status. These tests pin its contract:
 
@@ -22,6 +22,7 @@ NO live Graph is touched.
 """
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,17 +33,14 @@ from services.agent_user_grant import (
     apply_user_agent_grant,
     revoke_user_agent_grant,
 )
-from services.graph_service import GraphError
-
-# The repo is NOT in pytest-asyncio ``auto`` mode, so every async test is decorated
-# explicitly (same as ``test_agent_mcp_grant.py``).
+from services.graph_errors import GraphError
 
 USER_OID = "user-oid-alice"
 
 
 def _make_agent(**overrides):
     """A provisioned agent with the fields the grant body reads."""
-    base = dict(
+    base: dict[str, Any] = dict(
         id="agent-123",
         name="claims-triage-de",
         entra_sp_id="agent-sp-obj-id",
@@ -64,16 +62,12 @@ def _patch_graph(graph):
     return patch("api.routes.grants.get_graph_service", return_value=graph)
 
 
-# --------------------------------------------------------------------------- #
-# apply_user_agent_grant
-# --------------------------------------------------------------------------- #
-
 @pytest.mark.asyncio
 async def test_apply_assigns_invoker_role_and_returns_assignment_id():
     """The happy path: assign the agent's INVOKER role to the user oid on the agent's SP
     and return the new assignment id.
 
-    Note the E6 argument order (``graph_service.assign_app_role(agent_sp_id,
+    Note the argument order (``graph_service.assign_app_role(agent_sp_id,
     principal_id, app_role_id)``): the RESOURCE is the agent SP and the PRINCIPAL is the
     human user — the inverse of the agent→MCP grant, where the principal is an agent SP.
     """
@@ -85,11 +79,7 @@ async def test_apply_assigns_invoker_role_and_returns_assignment_id():
         assignment_id = await apply_user_agent_grant(agent, USER_OID)
 
     assert assignment_id == "assign-new"
-    graph.assign_app_role.assert_awaited_once_with(
-        "agent-sp-obj-id", USER_OID, "role-invoker-guid"
-    )
-    # The Admin role is NEVER assigned by this path — a marketplace subscription grants
-    # invoke access only.
+    graph.assign_app_role.assert_awaited_once_with("agent-sp-obj-id", USER_OID, "role-invoker-guid")
     assert graph.assign_app_role.await_args.args[2] != agent.admin_role_id
 
 
@@ -101,20 +91,12 @@ async def test_apply_already_assigned_recovers_existing_assignment_id(status):
     re-approval must not fail just because the access already exists."""
     agent = _make_agent()
     graph = MagicMock()
-    graph.assign_app_role = AsyncMock(
-        side_effect=GraphError(status, "Request_BadRequest")
-    )
+    graph.assign_app_role = AsyncMock(side_effect=GraphError(status, "Request_BadRequest"))
     graph.list_assignments = AsyncMock(
         return_value=[
-            # A different principal holding the same role → must not match.
-            {"id": "assign-other", "principalId": "someone-else",
-             "appRoleId": "role-invoker-guid"},
-            # The same principal holding a DIFFERENT role → must not match.
-            {"id": "assign-admin", "principalId": USER_OID,
-             "appRoleId": "role-admin-guid"},
-            # The real one: same principal AND same role.
-            {"id": "assign-existing", "principalId": USER_OID,
-             "appRoleId": "role-invoker-guid"},
+            {"id": "assign-other", "principalId": "someone-else", "appRoleId": "role-invoker-guid"},
+            {"id": "assign-admin", "principalId": USER_OID, "appRoleId": "role-admin-guid"},
+            {"id": "assign-existing", "principalId": USER_OID, "appRoleId": "role-invoker-guid"},
         ]
     )
 
@@ -134,8 +116,7 @@ async def test_apply_recovery_without_a_match_raises_user_grant_error():
     graph = MagicMock()
     graph.assign_app_role = AsyncMock(side_effect=GraphError(409, "Conflict"))
     graph.list_assignments = AsyncMock(
-        return_value=[{"id": "assign-other", "principalId": "someone-else",
-                       "appRoleId": "role-invoker-guid"}]
+        return_value=[{"id": "assign-other", "principalId": "someone-else", "appRoleId": "role-invoker-guid"}]
     )
 
     with _patch_graph(graph):
@@ -143,10 +124,13 @@ async def test_apply_recovery_without_a_match_raises_user_grant_error():
             await apply_user_agent_grant(agent, USER_OID)
 
 
-@pytest.mark.parametrize("matched", [
-    {"principalId": USER_OID, "appRoleId": "role-invoker-guid"},              # no id key
-    {"id": "", "principalId": USER_OID, "appRoleId": "role-invoker-guid"},    # empty id
-])
+@pytest.mark.parametrize(
+    "matched",
+    [
+        {"principalId": USER_OID, "appRoleId": "role-invoker-guid"},
+        {"id": "", "principalId": USER_OID, "appRoleId": "role-invoker-guid"},
+    ],
+)
 @pytest.mark.asyncio
 async def test_apply_recovery_match_without_an_id_raises_user_grant_error(matched):
     """A MATCHED assignment carrying no usable ``id`` is not a resolution: returning "" would
@@ -171,10 +155,12 @@ async def test_apply_recovery_idless_match_does_not_hide_a_later_usable_match():
     agent = _make_agent()
     graph = MagicMock()
     graph.assign_app_role = AsyncMock(side_effect=GraphError(409, "Conflict"))
-    graph.list_assignments = AsyncMock(return_value=[
-        {"principalId": USER_OID, "appRoleId": "role-invoker-guid"},
-        {"id": "assign-existing", "principalId": USER_OID, "appRoleId": "role-invoker-guid"},
-    ])
+    graph.list_assignments = AsyncMock(
+        return_value=[
+            {"principalId": USER_OID, "appRoleId": "role-invoker-guid"},
+            {"id": "assign-existing", "principalId": USER_OID, "appRoleId": "role-invoker-guid"},
+        ]
+    )
 
     with _patch_graph(graph):
         assert await apply_user_agent_grant(agent, USER_OID) == "assign-existing"
@@ -207,7 +193,6 @@ async def test_apply_other_graph_failure_raises_user_grant_error():
         with pytest.raises(UserGrantError):
             await apply_user_agent_grant(agent, USER_OID)
 
-    # A 5xx is NOT an already-assigned, so no recovery read is attempted.
     graph.list_assignments.assert_not_awaited()
 
 
@@ -236,7 +221,7 @@ async def test_apply_without_an_assignment_id_raises_user_grant_error(response):
 
 @pytest.mark.asyncio
 async def test_apply_error_message_never_leaks_the_graph_detail():
-    """T-GRAPH no-leak guard: the raised message is a FIXED literal, never ``str(err)`` /
+    """No-leak guard: the raised message is a FIXED literal, never ``str(err)`` /
     the Graph ``error.message`` (which reaches the client as an error detail)."""
     agent = _make_agent()
     graph = MagicMock()
@@ -251,10 +236,6 @@ async def test_apply_error_message_never_leaks_the_graph_detail():
     assert "secret-ish resource detail" not in str(ei.value)
     assert "InternalServerError" not in str(ei.value)
 
-
-# --------------------------------------------------------------------------- #
-# revoke_user_agent_grant
-# --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
 async def test_revoke_deletes_the_assignment():
@@ -294,13 +275,12 @@ async def test_revoke_other_graph_failure_raises_user_grant_error():
         with pytest.raises(UserGrantError) as ei:
             await revoke_user_agent_grant(agent, "assign-existing")
 
-    # Not the not-found subtype — a real failure must not be mistaken for success.
     assert not isinstance(ei.value, UserGrantNotFoundError)
 
 
 @pytest.mark.asyncio
 async def test_not_found_is_not_a_user_grant_error_subclass():
-    """C4 pins the two exceptions as SIBLINGS: a caller that catches ``UserGrantError``
+    """The two exceptions are SIBLINGS: a caller that catches ``UserGrantError``
     for the failure path must NOT accidentally swallow the not-found (= success) case,
     and vice versa. This ordering-independence is what makes the service's
     except-clauses safe."""

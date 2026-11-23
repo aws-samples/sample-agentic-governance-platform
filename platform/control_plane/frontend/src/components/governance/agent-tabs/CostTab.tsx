@@ -1,20 +1,11 @@
-// CostTab — the per-agent "Cost" tab of AgentDetail (Epic 26 / Task 9).
-//
-// Renders one agent's Langfuse-backed cost + token story: KPI tiles, a cost &
-// traces timeseries, and a cost-by-model donut, with a date-range selector.
-// This is the per-agent sibling of the platform ObservabilityDashboard (T8) — it
-// reuses the very same chart recipe (agentMetricsToSeries → buildDashboardSeries,
-// the shared CHART_COLORS/tooltipStyle, the glass CARD token), so the two read as
-// one design. The backend enforces tenant scope (a foreign agent 404s); this tab
-// adds no role gating — VIEWER-readable like the rest of AgentDetail.
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   ResponsiveContainer, ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   PieChart, Pie, Cell,
 } from 'recharts';
 import { observabilityApi } from '../../../api/client';
-import type { AgentMetrics } from '../../../types';
-import { tooltipStyle } from '../../govern/mockData';
+import { useLoad } from '../../../api/useLoad';
+import { tooltipStyle } from '../../shared/chartTheme';
 import { defaultDateRange } from '../observability/observabilityMetrics';
 import { agentMetricsToSeries, fmtUsd } from './agentObservability';
 import { ObsEmptyCard } from './ObsEmptyCard';
@@ -25,27 +16,20 @@ const fmtInt = (n: number) => n.toLocaleString();
 
 export default function CostTab({ agentId }: { agentId: string }) {
   const [range, setRange] = useState(() => defaultDateRange());
-  const [metrics, setMetrics] = useState<AgentMetrics | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const { dateFrom, dateTo } = range;
+  const { state } = useLoad(
+    () => observabilityApi.getAgentMetrics(agentId, { dateFrom, dateTo }),
+    [agentId, dateFrom, dateTo],
+    'Failed to load cost metrics',
+  );
+  const metrics = state.data;
+  const loading = state.kind === 'loading';
+  const error = state.kind === 'error' ? state.message : '';
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError('');
-    observabilityApi
-      .getAgentMetrics(agentId, { dateFrom: range.dateFrom, dateTo: range.dateTo })
-      .then((m) => { if (!cancelled) setMetrics(m); })
-      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load cost metrics'); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [agentId, range.dateFrom, range.dateTo]);
-
-  const series = useMemo(() => agentMetricsToSeries(metrics), [metrics]);
+  const series = useMemo(() => agentMetricsToSeries(metrics, range), [metrics, range]);
 
   return (
     <div className="space-y-4">
-      {/* Date-range selector (mirrors the dashboard controls) */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="flex items-end gap-4">
           <div>
@@ -86,14 +70,12 @@ export default function CostTab({ agentId }: { agentId: string }) {
         />
       ) : (
         <>
-          {/* KPI tiles */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <Kpi label="Total Cost" value={fmtUsd(series.totals.cost)} sub="model spend (USD)" color="#f59e0b" />
             <Kpi label="Total Tokens" value={fmtInt(series.totals.tokens)} sub="input + output" color="#6366f1" />
             <Kpi label="Total Traces" value={fmtInt(series.totals.traces)} sub="invocations" color="#3b82f6" />
           </div>
 
-          {/* Cost & traces timeseries + cost by model */}
           <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4">
             <div className={CARD}>
               <div className="text-sm font-semibold text-slate-900 mb-3">Cost &amp; Traces</div>
@@ -152,8 +134,6 @@ export default function CostTab({ agentId }: { agentId: string }) {
             </div>
           </div>
 
-          {/* Cost by User — spend attributed to the Entra identity the agent stamps on
-              each trace, so it answers "who is driving this agent's spend". */}
           <div className={CARD}>
             <div className="text-sm font-semibold text-slate-900 mb-3">Cost by User</div>
             {(metrics?.by_user?.length ?? 0) > 0 ? (

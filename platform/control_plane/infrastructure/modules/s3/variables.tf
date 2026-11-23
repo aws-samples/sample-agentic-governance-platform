@@ -19,3 +19,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "ephemeral" {
+  description = "Allow terraform destroy to empty and delete the buckets"
+  type        = bool
+  default     = false
+}

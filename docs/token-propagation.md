@@ -20,7 +20,7 @@ deliberately different.**
 | Store | Contents | Cleared when |
 |---|---|---|
 | `sessionStorage` | the whole MSAL cache — accounts, refresh artifacts, ID and access tokens | tab close |
-| `localStorage.auth_token` | a hand-managed **mirror of the raw access token string** | on acquire failure, on sign-out, on any 401 |
+| `localStorage.auth_token` | a hand-managed **mirror of the raw access token string** | on acquire failure, on sign-out, on the one reload a 401 may trigger (left in place at the halt, §2) |
 
 The mirror exists because the axios interceptor reads that key (§2) and the MSAL cache is not addressable that way;
 MSAL keeps its own in `sessionStorage` for a smaller cross-site-scripting blast radius. The consequence: **the raw
@@ -29,33 +29,54 @@ bearer token outlives the MSAL session** — close the tab and MSAL's cache is g
 audience the SPA client-ID GUID — a valid JWT the backend rejects on audience, and one reason the validator accepts
 that GUID at all (§4.1).
 
+MSAL's cache is per tab, so a new tab holds no account. Before it shows the sign-in screen, `EntraProvider.tsx` asks
+Microsoft for the session the browser already has: one `ssoSilent` call, carrying as its login hint the username
+remembered under `localStorage` key `agp.auth.loginHint` — written whenever an account is active, removed on sign-out,
+a username and never a secret; absent on a first-ever tab, in which case the request carries no hint and Microsoft
+resolves a single session or asks for interaction. The answer arrives through MSAL v5's redirect bridge: the hidden
+iframe lands on the redirect URI, and `main.tsx` runs `bootAuth()` at `/auth/callback` before mounting React, where
+`broadcastResponseToMainFrame()` hands the response to the tab and renders nothing (after an interactive
+`loginRedirect` the same page caches the response and navigates back to where sign-in started). On success the
+account becomes active and the acquire path above mirrors the token as usual; on any failure the attempt is logged at
+`console.info` with MSAL's error code, never as an error, and the screen shows the button — which now means one of two
+things: the browser holds no Microsoft session, or third-party cookies are blocked and the iframe cannot see it.
+
 ## 2. Attaching the token, and what a 401 does
 
-One axios instance is the **only** egress to the API — no raw `fetch()` reaches the backend — so one request
-interceptor reads `localStorage.auth_token` and sets `Authorization: Bearer <token>`. The **first 401 of an incident**
-removes `auth_token`, calls `window.location.reload()`, and rejects with `Session expired. Please log in again.`;
-anything else rejects with the response's `detail`, which is why the FastAPI `detail` string *is* the client-side error
-message quoted throughout. There is **no refresh-and-retry**: it hard-reloads, and the provider re-acquires silently
-because MSAL still holds the account.
+One axios instance is the **only** egress to the API — no raw `fetch()` reaches the backend — and its request
+interceptor asks `tokenBroker.currentAccessToken()` for a token **on every request**: an `acquireTokenSilent` for the
+active account, answered from MSAL's cache while the token is fresh and refreshed through the refresh token when it is
+not, with concurrent callers coalesced onto one in-flight call by `coalesceAsync` (`frontend/src/api/authRetry.ts`).
+When the broker answers `null` — no account yet, or MSAL needs interaction — the interceptor falls back to the
+`localStorage.auth_token` mirror of §1. Whichever it holds goes on the wire as `Authorization: Bearer <token>`; with
+neither, the request leaves without the header.
 
-**The reload budget is one** (E36/T19). A 401 that survives the reload is not expiry, so the second one does *not*
-reload: it rejects with a terminal message naming the configuration causes, and `auth_token` is deliberately left in
+A 401 is answered in two steps. **First, one retry with a forced refresh:** the response interceptor asks the broker for
+a token with `forceRefresh` and, if it gets one, replays the request once with it (the request is marked so a 401 on the
+replay is not retried again); a token the backend accepts ends the incident there, and any 2xx to a request that carried
+an `Authorization` header clears the suspicion count. **Then the reload budget, which is one** (E36/T19): `decide401` in
+`frontend/src/api/authRetry.ts` reads the count under `sessionStorage` key `agp.auth.401count`. At zero it writes one,
+removes `auth_token`, calls `window.location.reload()` and rejects with `Session expired. Please log in again.`; at one
+or more it rejects with a terminal message naming the configuration causes, and `auth_token` is deliberately left in
 place — clearing it would assert "your session ended" about a token the provider issued and the backend refuses. The
-count lives in `sessionStorage` under `agp.auth.401count`, is written *before* the reload it authorises, and is
-cleared by **any** successful response — a 2xx is the only evidence that actually retires the suspicion, which makes
-the budget per-incident rather than per-session. The decision is `decide401` in `frontend/src/api/authRetry.ts`; the
-interceptor only does the storage and `window` calls.
+count is written *before* the reload it authorises and cleared by any 2xx to a request that carried the `Authorization`
+header — a success without the header says nothing about the token, so an authenticated 2xx is the only evidence that
+actually retires the suspicion, which makes the budget per-incident rather than per-session; the decision is latched for
+the rest of the page load, and the interceptor only does the storage and `window` calls. Anything other than a 401
+rejects with the response's `detail`, which is why the FastAPI `detail` string *is* the client-side error message quoted
+throughout.
 
 Requests go to `VITE_API_URL`, which **already contains the stage segment**, and client paths are absolute — so the
 composed URL carries the stage, which is why the application registers every route twice (§12).
 
-> **Known limitation — a structural 401 states itself, but only as an error message.** Reloading recovers *expiry*
-> and nothing else: if the cause is structural — mismatched audience, roles on the wrong app registration, the wrong
-> scope baked into the SPA build — the fresh token is rejected identically. That used to loop 401 → reload → 401 for
-> as long as the tab was open, which was self-obscuring: the page never settled long enough to render the error, so
-> the most diagnosable failure in the system presented as a flickering blank page. Bounded since E36/T19 — one
-> reload, then every call rejects with *"Sign-in is not working for this deployment… ask an administrator to check
-> the token audience, the requested scope, and the app registration holding the role assignments."* What remains is
+> **Known limitation — a structural 401 states itself, but only as an error message.** A forced refresh and a reload
+> recover *expiry* and nothing else: if the cause is structural — mismatched audience, roles on the wrong app
+> registration, the wrong scope baked into the SPA build — the fresh token is rejected identically. That used to loop
+> 401 → reload → 401 for as long as the tab was open, which was self-obscuring: the page never settled long enough to
+> render the error, so the most diagnosable failure in the system presented as a flickering blank page. Bounded since
+> E36/T19 — one refresh, one reload, then every call rejects with *"Sign-in is not working for this deployment… ask an
+> administrator to check the token audience, the requested scope, and the app registration holding the role
+> assignments."* What remains is
 > that the terminal state **is that message and nothing more**: there is no full-page error screen, so it appears
 > wherever the calling surface renders `err.message`, and the count is per-tab (`sessionStorage`), so a new tab gets
 > a fresh reload before it halts again. §11 maps the causes.
@@ -156,6 +177,14 @@ one request.
 > the Compose file is explicit: `USE_DEV_AUTH=true` is for local use, **`DEBUG=true` is not to be set** — but nothing
 > stops a deployment setting either, which is why an anonymous `GET $API/api/v1/agents` answering **200** instead of
 > **401** means it is live.
+>
+> The frontend has a twin of the bypass: the `devauth` build arm, selected by `vite --mode devauth` (what
+> `agp up` runs), swaps three modules under `src/auth/` for twins that sign the SPA in as `dev@example.com`
+> with no token and install the `x-user-email` header on every request. It is absent from every other build
+> by construction, since the swap happens only in that mode, and by two nets in `vite.config.ts`: the path
+> lock, which fails any other build at load time when a module under `src/auth/devauth/` enters its graph,
+> then the chunk scan, which fails it when an emitted chunk carries the whole word `devauth`;
+> `deploy-frontend.sh` refuses such a bundle as well.
 
 ## 5. From claims to decisions
 
@@ -192,6 +221,26 @@ And **this is the real user-to-agent enforcement point**, because the provider r
 no app-role assignment on the agent's service principal — which is why the backend sets assignment-required on every one
 it creates. Failures map three ways (§11 catalogues two; anything else answers with status and code alone); only the
 `AADSTS50105` one is a governance answer rather than a fault, shown as a calm amber card.
+
+**The route no longer holds either platform's invoke body (E38).** `invoke_agent` keeps exactly the parts that
+are the same on every platform — authentication, the record load, RBAC, the per-verb readiness gate, and the
+kind→HTTP mapping — and then dispatches through the platform adapter seam. The AgentCore direct-invoke (the
+httpx bearer-POST of §7) lives in the AWS adapter; the ~700 lines of Databricks token-exchange machinery live
+in `services/databricks_invoke.py`, fronted by the Databricks adapter. The token journey is unchanged; what
+moved is where the code that mints and spends the token sits, so the route reads one contract and each
+platform owns its own hops.
+
+**A host target is validated before the token that will be sent to it is minted or attached.** Both invoke
+paths interpolate a caller-settable field into the *host* of an outbound request that then carries a bearer
+token, and both close that off the same way. The Databricks workspace URL — the RFC 8693 exchange target — is
+parsed through `httpx.URL` and its `.host` is *touched*, which forces the IDNA encode to run, **before the
+federated assertion is sent to it**; a URL that fails answers `502 workspace_url_invalid`. The AgentCore side
+is the twin: `agent_arn` is settable through `PUT /agents/{id}` with no validator, and its region segment
+becomes the host of the runtime URL, so that segment is checked against a closed region-shape allowlist
+**before the already-minted on-behalf-of token is attached to the request**; a segment carrying a dot, a
+slash, an `@` or an empty label answers `502 agent_arn_invalid` and the ARN is never echoed back (it can carry
+an account id). Neither check is defence-in-depth over another layer — each is the only thing standing between
+a one-field write and a user's agent-audience token being POSTed to a host of the registrant's choosing.
 
 ## 7. What the runtime receives
 
@@ -306,7 +355,9 @@ may surface — a real access-denied message names the role ARN and account id.
 | Databricks exchange | `502 sp_secret_disabled` | the record carries the dormant `sp_secret` binding and this deployment keeps it off | `DATABRICKS_ALLOW_SP_SECRET_BINDING`; the agent's binding badge |
 | Databricks exchange | `502 workspace_stage_unresolved` | the invoke's stage has no workspace in the tenant's config | the tenant's stage set |
 | Databricks exchange | `502 invalid_runtime_handle` | the stored App URL failed validation or lookup | the agent's runtime handle on its detail page |
+| Databricks exchange | `502 workspace_url_invalid` | the tenant's workspace URL — the exchange target — failed the request-builder parse before any assertion was sent | the tenant's stage workspace config |
 | Databricks exchange | `502 binding_mode_unresolved` | the agent's `binding_mode` is empty or unrecognized | the agent's registry record |
+| invoke (AgentCore) | `502 agent_arn_invalid` | the stored `agent_arn`'s region segment failed the region-shape allowlist, checked before the OBO token is attached | the agent's `agent_arn` on its registry record |
 | runtime (AgentCore) | `502 agent rejected the token` | the runtime's JWT authorizer refused: wrong `aud`, expired, or authorizer unwired | the runtime's authorizer configuration |
 | runtime (AgentCore) | `504 agent invocation timed out` (120 s) or `502` transport / non-2xx | the runtime was unreachable, slow, or errored | backend logs, then the runtime's own logs |
 | exchange 2 (AgentCore) | **an answer with fewer tools, and no error** | consent revoked, or the gateway refused the MCP token — that server is silently degrade-dropped | a warning log inside the runtime |

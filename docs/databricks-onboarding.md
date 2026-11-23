@@ -175,7 +175,8 @@ A token and a non-empty app count (once you have at least one App) means the ten
 
 - Watch the tenant's **capability badges**: `can_discover`, `user_sync`, `account_admin`, and a
   **readiness** badge — `Federation` when the account-admin credential + user sync are both
-  present, otherwise **`Invoke unavailable — federation required`** naming what is missing
+  present, otherwise **`Invoke unavailable`** (the "— federation required" half, naming what is
+  missing, moves to the badge's hover/`title` on the dense tenant list)
   (`tenant_service.py:125-139` defines the binding-mode vocabulary; the probe computes
   `binding_mode = "federation"` iff `account_admin AND user_sync`, else `"invoke_unavailable"`). A
   tenant in that state is still useful: it discovers, registers, catalogues, and observes agents,
@@ -198,7 +199,7 @@ A token and a non-empty app count (once you have at least one App) means the ten
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Tenant shows `Invoke unavailable — federation required` badge | The probe found either no account-admin credential, or no user sync (Entra identities not synced to Databricks via AIM), or both | Supply both: the account-admin credential in the tenant form, and configure Entra SSO + automatic identity management on the Databricks account. Both must be present for `binding_mode = "federation"` (`tenant_service.py:125-139`). |
+| Tenant shows `Invoke unavailable` badge (hover reads "— federation required") | The probe found either no account-admin credential, or no user sync (Entra identities not synced to Databricks via AIM), or both | Supply both: the account-admin credential in the tenant form, and configure Entra SSO + automatic identity management on the Databricks account. Both must be present for `binding_mode = "federation"` (`tenant_service.py:125-139`). |
 | `can_discover` capability is False | The workspace SP cannot authenticate, or has no workspace-level assignment, or (with `--scope discover`) lacks per-app `CAN_MANAGE` grants | Re-check the SP's client secret, verify the SP is assigned to the workspace, and for `discover` scope grant the SP `CAN_MANAGE` on each governed app. |
 | `account_admin` capability is False | The SP does not hold the account's `account_admin` role, or the account-admin credential fields were left empty | Grant the SP the `account_admin` role in the Databricks account console (User management → Service principals → Roles), then update the tenant with the same client id + secret in the account-admin fields. |
 | `user_sync` capability is False | Entra identities are not synced to the Databricks account — Entra SSO or automatic identity management (AIM) is missing or misconfigured | Configure Entra SSO and AIM on the Databricks account. Verify in the Databricks account console that Entra users appear as Databricks users. |

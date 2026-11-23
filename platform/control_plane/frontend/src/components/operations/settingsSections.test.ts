@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { ReactElement } from 'react';
 import {
+  GITHUB_CONNECTION_SECTION_ID,
   ROLE_LEVEL_ADMIN,
   SETTINGS_SECTIONS,
   SETTINGS_TAB_LABEL,
@@ -16,23 +17,20 @@ import {
 } from './settingsSections';
 import ConnectionsAdmin from './ConnectionsAdmin.tsx';
 import GitHubLink from './GitHubLink.tsx';
-import connectionsAdminSrc from './ConnectionsAdmin.tsx?raw';
-import gitHubLinkSrc from './GitHubLink.tsx?raw';
-// Vite's `?raw` rather than `node:fs`: `tsconfig.app.json` sets `types: ["vite/client"]`
-// (no `node`), so `node:fs` has no type declarations here — while `vite/client` declares
-// `*?raw`. Same idiom as operationsNav.test.ts / githubLinkApi.test.ts. The explicit `.tsx`
-// is load-bearing: on a case-insensitive filesystem a name that differs from a sibling
-// module only in casing resolves to the sibling (`./GitHubLink` → `githubLink.ts`). `tsc`
-// DOES catch that — TS1149 + TS1192, non-zero exit — so the extension is belt to the
-// typecheck gate's braces, not a substitute for it.
-import settingsSrc from './Settings.tsx?raw';
+import connectionsAdminRaw from './ConnectionsAdmin.tsx?raw';
+import gitHubLinkRaw from './GitHubLink.tsx?raw';
+import settingsRaw from './Settings.tsx?raw';
+import sidebarRaw from '../Sidebar.tsx?raw';
+import { stripComments } from '../../rawSource';
 
-// Role levels as the backend mirrors them (core/rbac.py ENTRA_ROLE_VIEWER/OPERATOR/ADMIN).
+const connectionsAdminSrc = stripComments(connectionsAdminRaw);
+const gitHubLinkSrc = stripComments(gitHubLinkRaw);
+const settingsSrc = stripComments(settingsRaw);
+const sidebarSrc = stripComments(sidebarRaw);
+
 const VIEWER = 0;
 const OPERATOR = 1;
 
-// The underlying body component + its source, per section id. Keyed by id so adding a section
-// without registering it here FAILS rather than silently skipping the frame-less check below.
 const SECTION_BODY_COMPONENT: Record<string, unknown> = {
   'github-connection': GitHubLink,
   'org-connections': ConnectionsAdmin,
@@ -50,7 +48,6 @@ describe('SETTINGS_SECTIONS — registry shape', () => {
   it('every section has a stable, unique, slug-shaped id', () => {
     const ids = SETTINGS_SECTIONS.map((s) => s.id);
     for (const id of ids) {
-      // Slug-shaped because the id is also the URL fragment a deep link uses.
       expect(id, id).toMatch(/^[a-z][a-z0-9-]*$/);
     }
     expect(new Set(ids).size).toBe(ids.length);
@@ -77,16 +74,13 @@ describe('SETTINGS_SECTIONS — registry shape', () => {
   });
 
   it("everything on the 'admin' tab is admin-gated", () => {
-    // The tab is LABELLED Admin, so a non-gated section landing there would both mislead
-    // and — because tab visibility is derived from section visibility — expose the tab to
-    // a viewer. Cheaper to forbid than to explain.
     for (const s of SETTINGS_SECTIONS.filter((x) => x.tab === 'admin')) {
       expect(s.gate, s.id).toBe('admin');
     }
   });
 });
 
-describe('SETTINGS_SECTIONS — the pinned first sections (T8 brief)', () => {
+describe('SETTINGS_SECTIONS — the pinned first sections', () => {
   it("General's first section is the personal GitHub connection", () => {
     const general = SETTINGS_SECTIONS.filter((s) => s.tab === 'general');
     expect(general.length).toBeGreaterThan(0);
@@ -116,9 +110,6 @@ describe('isSectionVisible', () => {
   });
 
   it('mirrors the backend ladder: ADMIN is 2', () => {
-    // core/rbac.py maps ENTRA_ROLE_VIEWER/OPERATOR/ADMIN to 0/1/2 and every other
-    // frontend surface open-codes `>= 2`. Drifting this constant would silently widen
-    // or narrow every gate at once.
     expect(ROLE_LEVEL_ADMIN).toBe(2);
   });
 });
@@ -146,7 +137,6 @@ describe('visibleSections', () => {
 
   it('filters, never reorders or rewrites', () => {
     const forViewer = visibleSections(VIEWER);
-    // Same object identities, in the same relative order as the registry.
     for (const s of forViewer) expect(SETTINGS_SECTIONS).toContain(s);
     const order = forViewer.map((s) => SETTINGS_SECTIONS.indexOf(s));
     expect(order).toEqual([...order].sort((a, b) => a - b));
@@ -169,9 +159,6 @@ describe('visibleTabs', () => {
   });
 
   it('is DERIVED from the registry, not a hardcoded list', () => {
-    // Expected value computed from SETTINGS_SECTIONS: the distinct `tab` values of the
-    // sections this role can see, in first-appearance order. Appending a section with a
-    // new tab must grow this without touching visibleTabs.
     for (const level of [VIEWER, OPERATOR, ROLE_LEVEL_ADMIN]) {
       const expected = [...new Set(visibleSections(level).map((s) => s.tab))];
       expect(visibleTabs(level).map((t) => t.key)).toEqual(expected);
@@ -197,7 +184,7 @@ describe('visibleTabs', () => {
   });
 });
 
-describe('showTabStrip — a one-item tablist is suppressed (FIX-1)', () => {
+describe('showTabStrip — a one-item tablist is suppressed', () => {
   it('a viewer gets NO strip: one tab is a choice that does not exist', () => {
     expect(visibleTabs(VIEWER)).toHaveLength(1);
     expect(showTabStrip(VIEWER)).toBe(false);
@@ -210,15 +197,13 @@ describe('showTabStrip — a one-item tablist is suppressed (FIX-1)', () => {
   });
 
   it('is derived from the tab COUNT, not from the role', () => {
-    // So the day a second General-visible tab exists, a viewer gets a strip automatically
-    // rather than this needing to be revisited.
     for (const level of [VIEWER, OPERATOR, ROLE_LEVEL_ADMIN]) {
       expect(showTabStrip(level), String(level)).toBe(visibleTabs(level).length > 1);
     }
   });
 });
 
-describe('settingsSubtitle — never promises a hidden surface (FIX-1)', () => {
+describe('settingsSubtitle — never promises a hidden surface', () => {
   it("a viewer's subtitle does not mention administrators or platform-wide settings", () => {
     const sub = settingsSubtitle(VIEWER);
     expect(sub.length).toBeGreaterThan(0);
@@ -236,41 +221,29 @@ describe('settingsSubtitle — never promises a hidden surface (FIX-1)', () => {
     expect(settingsSubtitle(VIEWER)).not.toBe(settingsSubtitle(ROLE_LEVEL_ADMIN));
     for (const level of [VIEWER, OPERATOR, ROLE_LEVEL_ADMIN]) {
       const seesAdmin = visibleTabs(level).some((t) => t.key === 'admin');
-      // The admin clause may appear if and only if the Admin tab is actually reachable.
       expect(/administrator/i.test(settingsSubtitle(level)), String(level)).toBe(seesAdmin);
     }
   });
 });
 
-describe('section bodies compose frame-less (FIX-2)', () => {
-  // The bug this pins: `GitHubLink` is a full PAGE (its own OpsPage → its own <h1> and its own
-  // "← Operations" back link). Mounted bare inside Settings it produced a nested max-w-7xl, a
-  // SECOND <h1> duplicating the band heading, and a second back link. It takes `embedded` to
-  // suppress that — and nothing detected that the prop was never passed.
+describe('section bodies compose frame-less', () => {
   it('the GitHub section does NOT mount the bare page component', () => {
     const section = SETTINGS_SECTIONS.find((s) => s.id === 'github-connection')!;
     expect(section.Component).not.toBe(GitHubLink);
   });
 
-  it('it mounts a wrapper that passes embedded: true', () => {
+  it('mounts a wrapper that passes embedded: true, inspectable by calling it without rendering GitHubLink', () => {
     const section = SETTINGS_SECTIONS.find((s) => s.id === 'github-connection')!;
-    // Calling the wrapper builds the element WITHOUT rendering GitHubLink itself (no hooks
-    // run, so this needs no DOM) — which makes the props it binds directly inspectable.
-    // Cast via `unknown`: `ComponentType`'s call signature takes props, so TS rightly refuses
-    // the direct conversion to a zero-arg function.
     const el = (section.Component as unknown as () => ReactElement<{ embedded?: boolean }>)();
     expect(el.type).toBe(GitHubLink);
     expect(el.props.embedded).toBe(true);
   });
 
   it('no section mounts a component that renders its own OpsPage frame', () => {
-    // Generalized so section 3..11 cannot reintroduce the same double-frame bug. A section
-    // body must be frame-less: either natively (ConnectionsAdmin) or via a wrapper (above).
     for (const s of SETTINGS_SECTIONS) {
       const src = SECTION_BODY_SRC[s.id];
       expect(src, `${s.id} has no source registered in SECTION_BODY_SRC`).toBeDefined();
       if (src.includes('OpsPage')) {
-        // It IS a page component, so the registry must not mount it directly.
         expect(s.Component, s.id).not.toBe(SECTION_BODY_COMPONENT[s.id]);
       }
     }
@@ -284,7 +257,6 @@ describe('resolveInitialTab', () => {
   });
 
   it('opens the tab that owns the deep-linked section', () => {
-    // The profile menu deep-links to #github-connection; a bookmark may name an admin one.
     expect(resolveInitialTab(ROLE_LEVEL_ADMIN, '#org-connections')).toBe('admin');
     expect(resolveInitialTab(ROLE_LEVEL_ADMIN, '#github-connection')).toBe('general');
   });
@@ -294,7 +266,6 @@ describe('resolveInitialTab', () => {
   });
 
   it('ignores a fragment naming a section the caller cannot see', () => {
-    // A viewer following an admin's bookmark gets General, not an empty Admin tab.
     expect(resolveInitialTab(VIEWER, '#org-connections')).toBe('general');
   });
 
@@ -320,6 +291,18 @@ describe('DOM id derivations', () => {
   });
 });
 
+describe('the GitHub-connection section id has one owner', () => {
+  it('is exported as a constant that names a registered section on the General tab, so a renamed id cannot leave a deep link pointing at the top of Settings', () => {
+    const section = SETTINGS_SECTIONS.find((s) => s.id === GITHUB_CONNECTION_SECTION_ID);
+    expect(section?.tab).toBe('general');
+  });
+
+  it("Sidebar.tsx builds the profile menu's Settings deep link from the constant and never retypes the fragment", () => {
+    expect(sidebarSrc).toContain('GITHUB_CONNECTION_SECTION_ID');
+    expect(sidebarRaw).not.toContain('#github-connection');
+  });
+});
+
 describe('Settings.tsx reads the registry rather than restating it', () => {
   it('parses the source (guards the assertions below against an empty read)', () => {
     expect(settingsSrc.length).toBeGreaterThan(500);
@@ -332,26 +315,18 @@ describe('Settings.tsx reads the registry rather than restating it', () => {
   });
 
   it('never hardcodes a tab label — labels live only in SETTINGS_TAB_LABEL', () => {
-    // The whole point of the registry is that adding a section (or a third tab) is a
-    // config entry. A label literal here is the first step back to a layout change.
     expect(settingsSrc).not.toContain("'General'");
     expect(settingsSrc).not.toContain("'Admin'");
   });
 
-  it('carries the accessible tablist contract, not a tenth bare-button pill bar', () => {
-    // ProjectDetail.tsx is the app's only accessible tab strip; this is the second.
+  it('carries the accessible tablist contract, with the panel role attached only when a tablist exists and no aria-current on a client-side tab', () => {
     expect(settingsSrc).toContain('role="tablist"');
     expect(settingsSrc).toContain('role="tab"');
     expect(settingsSrc).toContain('aria-selected');
     expect(settingsSrc).toContain('aria-controls');
     expect(settingsSrc).toContain('aria-labelledby');
-    // The panel's tab semantics are applied via a conditional prop spread (they are attached
-    // only when a tablist actually exists to own them — FIX-1), so match either spelling
-    // rather than the JSX-attribute form alone.
     expect(settingsSrc).toMatch(/role[=:]\s*'?"?tabpanel/);
     expect(settingsSrc).toContain('tabPanelId(');
-    // `aria-current="page"` is for navigation between PAGES — on a client-side tab it
-    // announces a "current page" the URL contradicts (WCAG 4.1.2).
     expect(settingsSrc).not.toContain('aria-current');
   });
 
@@ -359,17 +334,13 @@ describe('Settings.tsx reads the registry rather than restating it', () => {
     expect(settingsSrc).toContain('nextTabKey');
   });
 
-  it('takes the strip condition and the subtitle from the registry (FIX-1)', () => {
+  it('takes the strip condition and the subtitle from the registry', () => {
     expect(settingsSrc).toContain('showTabStrip(');
     expect(settingsSrc).toContain('settingsSubtitle(');
-    // The subtitle must not be a literal in the layout — that is how it drifted from what the
-    // page actually renders in the first place.
     expect(settingsSrc).not.toContain('for administrators');
   });
 
   it('does not open-code the `role_level >= 2` gate', () => {
-    // Twelve surfaces open-code this. The gate on THIS page is the registry's, so a
-    // comparison literal here means a second, drift-prone authority.
     expect(settingsSrc).not.toContain('>= 2');
     expect(settingsSrc).not.toContain('role_level ?? 0) >=');
   });

@@ -1,14 +1,13 @@
-import type { ContextualGroundingConfig } from '../../types';
+import type { ContextualGroundingConfigOutput } from '../../api/client';
 
 interface Props {
-  config: ContextualGroundingConfig;
-  onChange: (config: ContextualGroundingConfig) => void;
+  config: ContextualGroundingConfigOutput;
+  onChange: (config: ContextualGroundingConfigOutput) => void;
 }
 
 export default function ContextualGroundingPanel({ config, onChange }: Props) {
   return (
     <div className="space-y-5">
-      {/* Enable toggle */}
       <div className="flex items-center justify-between p-4 bg-slate-50 rounded-xl">
         <div>
           <p className="text-sm font-medium text-slate-800">Enable Contextual Grounding</p>
@@ -30,7 +29,6 @@ export default function ContextualGroundingPanel({ config, onChange }: Props) {
 
       {config.enabled && (
         <div className="space-y-5 pl-1">
-          {/* Grounding threshold */}
           <div>
             <div className="flex items-center justify-between mb-2">
               <div>
@@ -54,7 +52,6 @@ export default function ContextualGroundingPanel({ config, onChange }: Props) {
             </div>
           </div>
 
-          {/* Relevance threshold */}
           <div>
             <div className="flex items-center justify-between mb-2">
               <div>

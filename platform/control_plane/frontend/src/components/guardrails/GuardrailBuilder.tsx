@@ -1,6 +1,12 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { guardrailsApi } from '../../api/client';
-import type { GuardrailTemplateCreate, GuardrailPreset, ContentFilterConfig, PiiEntityConfig, DeniedTopic, WordFilterConfig, ContextualGroundingConfig } from '../../types';
+import { failureOf } from '../../api/loadState';
+import { useLoad } from '../../api/useLoad';
+import { useUser } from '../../contexts/useUser';
+import type { GuardrailPreset, ContentFilterConfigOutput, PiiEntityConfigOutput, DeniedTopicOutput, WordFilterConfigOutput, ContextualGroundingConfigOutput } from '../../api/client';
+import { tenantSelectOptions } from '../governance/tenantUi';
+import { useTenantDirectory } from '../governance/useTenantDirectory';
+import { canCreateGuardrail, guardrailCreatePayload } from './guardrailForm';
 import ContentFilterPanel from './ContentFilterPanel';
 import PiiDetectionPanel from './PiiDetectionPanel';
 import DeniedTopicsPanel from './DeniedTopicsPanel';
@@ -23,24 +29,26 @@ const SECTIONS = [
 ] as const;
 
 export default function GuardrailBuilder({ onComplete }: Props) {
+  const { user } = useUser();
+  const isAdmin = (user?.role_level ?? 0) >= 2;
+  const tenantDirectory = useTenantDirectory(isAdmin);
+  const tenantOptions = tenantSelectOptions(user?.tenants ?? [], tenantDirectory, isAdmin);
+  const presets = useLoad(() => guardrailsApi.getPresets(), []);
+
   const [step, setStep] = useState<Step>('preset');
-  const [presets, setPresets] = useState<GuardrailPreset[]>([]);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState('');
   const [expandedSection, setExpandedSection] = useState<string | null>('content');
 
-  // Form state
+  const [chosenTenantId, setChosenTenantId] = useState('');
+  const tenantId = chosenTenantId || (tenantOptions.length === 1 ? tenantOptions[0].id : '');
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [contentFilters, setContentFilters] = useState<ContentFilterConfig[]>([]);
-  const [piiEntities, setPiiEntities] = useState<PiiEntityConfig[]>([]);
-  const [deniedTopics, setDeniedTopics] = useState<DeniedTopic[]>([]);
-  const [wordFilter, setWordFilter] = useState<WordFilterConfig>({ enable_profanity: false, blocked_words: [] });
-  const [contextualGrounding, setContextualGrounding] = useState<ContextualGroundingConfig>({ enabled: false, grounding_threshold: 0.7, relevance_threshold: 0.7 });
-
-  useEffect(() => {
-    guardrailsApi.getPresets().then(setPresets).catch(() => {});
-  }, []);
+  const [contentFilters, setContentFilters] = useState<ContentFilterConfigOutput[]>([]);
+  const [piiEntities, setPiiEntities] = useState<PiiEntityConfigOutput[]>([]);
+  const [deniedTopics, setDeniedTopics] = useState<DeniedTopicOutput[]>([]);
+  const [wordFilter, setWordFilter] = useState<WordFilterConfigOutput>({ enable_profanity: false, blocked_words: [] });
+  const [contextualGrounding, setContextualGrounding] = useState<ContextualGroundingConfigOutput>({ enabled: false, grounding_threshold: 0.7, relevance_threshold: 0.7 });
 
   const applyPreset = (preset: GuardrailPreset) => {
     setName(preset.config.name);
@@ -54,24 +62,15 @@ export default function GuardrailBuilder({ onComplete }: Props) {
   };
 
   const handleCreate = async () => {
-    if (!name.trim()) { setError('Please provide a name'); return; }
     setCreating(true);
     setError('');
     try {
-      const payload: GuardrailTemplateCreate = {
-        name: name.trim(),
-        description: description.trim() || undefined,
-        content_filters: contentFilters,
-        denied_topics: deniedTopics,
-        pii_entities: piiEntities,
-        sensitive_regexes: [],
-        word_filter: wordFilter,
-        contextual_grounding: contextualGrounding,
-      };
-      await guardrailsApi.create(payload);
+      await guardrailsApi.create(
+        guardrailCreatePayload({ name, description, tenantId, contentFilters, piiEntities, deniedTopics, wordFilter, contextualGrounding }),
+      );
       onComplete();
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Failed to create guardrail');
+    } catch (err: unknown) {
+      setError(failureOf(err, 'Failed to create guardrail').message);
     } finally {
       setCreating(false);
     }
@@ -85,7 +84,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
     contextualGrounding.enabled,
   ].filter(Boolean).length;
 
-  // --- Step: Preset selection ---
   if (step === 'preset') {
     return (
       <div className="space-y-6">
@@ -97,7 +95,7 @@ export default function GuardrailBuilder({ onComplete }: Props) {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {presets.map((preset) => (
+          {(presets.state.data ?? []).map((preset) => (
             <button
               key={preset.id}
               onClick={() => applyPreset(preset)}
@@ -120,7 +118,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
             </button>
           ))}
 
-          {/* Start from scratch */}
           <button
             onClick={() => setStep('configure')}
             className="card text-left hover:border-slate-300 hover:shadow-md transition-all border-dashed group"
@@ -140,7 +137,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
     );
   }
 
-  // --- Step: Configure ---
   if (step === 'configure') {
     const sectionActive = (id: string) =>
       (id === 'content' && contentFilters.length > 0)
@@ -161,7 +157,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
 
     return (
       <div className="h-[calc(100vh-8rem)] flex flex-col overflow-hidden">
-        {/* Header */}
         <div className="flex items-center justify-between px-1 pb-4 flex-shrink-0">
           <div>
             <h2 className="text-lg font-semibold text-slate-900">Configure Guardrail</h2>
@@ -173,17 +168,14 @@ export default function GuardrailBuilder({ onComplete }: Props) {
           </div>
         </div>
 
-        {/* Protection Pipeline - Hero Visualization */}
         <div className="flex-shrink-0 bg-gradient-to-r from-slate-50 via-white to-slate-50 border border-slate-200 rounded-xl p-5 mb-4 shadow-sm">
           <div className="flex items-center justify-between relative">
-            {/* Connecting line behind nodes */}
             <div className="absolute top-1/2 left-[10%] right-[10%] h-0.5 bg-slate-200 -translate-y-1/2 z-0" />
             <div
               className="absolute top-1/2 left-[10%] h-0.5 -translate-y-1/2 z-0 bg-gradient-to-r from-blue-400 to-blue-600 transition-all duration-500"
               style={{ width: `${activeFeatureCount > 0 ? (activeFeatureCount / 5) * 80 : 0}%` }}
             />
 
-            {/* Data input indicator */}
             <div className="flex flex-col items-center z-10 w-16">
               <div className="w-8 h-8 rounded-full bg-blue-100 border-2 border-blue-300 flex items-center justify-center">
                 <svg className="w-4 h-4 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -193,7 +185,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
               <span className="text-[10px] text-slate-500 mt-1.5 font-medium">Input</span>
             </div>
 
-            {/* Pipeline nodes */}
             {SECTIONS.map(({ id, label, icon }) => {
               const active = sectionActive(id);
               const colors = pipelineColors[id];
@@ -224,7 +215,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
               );
             })}
 
-            {/* Data output indicator */}
             <div className="flex flex-col items-center z-10 w-16">
               <div className={`w-8 h-8 rounded-full flex items-center justify-center border-2 transition-all duration-300 ${
                 activeFeatureCount > 0 ? 'bg-green-100 border-green-300' : 'bg-slate-100 border-slate-200'
@@ -238,9 +228,7 @@ export default function GuardrailBuilder({ onComplete }: Props) {
           </div>
         </div>
 
-        {/* Two-column layout: Settings (left) + Live Preview (right) */}
         <div className="flex-1 grid grid-cols-5 gap-4 min-h-0">
-          {/* Left column - Accordion Settings */}
           <div className="col-span-3 overflow-y-auto pr-1 space-y-2">
             {SECTIONS.map(({ id, label, icon, description: desc }) => {
               const active = sectionActive(id);
@@ -251,7 +239,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
                 <div key={id} className={`rounded-xl border transition-all duration-200 ${
                   isExpanded ? `${colors.bg} ${colors.border} shadow-sm` : 'bg-white border-slate-200 hover:border-slate-300'
                 }`}>
-                  {/* Accordion header */}
                   <button
                     onClick={() => setExpandedSection(isExpanded ? null : id)}
                     className="w-full flex items-center gap-3 px-4 py-3 text-left"
@@ -271,7 +258,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
                     </svg>
                   </button>
 
-                  {/* Accordion content */}
                   {isExpanded && (
                     <div className="px-4 pb-4 pt-1 border-t border-slate-200/60">
                       {id === 'content' && <ContentFilterPanel filters={contentFilters} onChange={setContentFilters} />}
@@ -286,17 +272,14 @@ export default function GuardrailBuilder({ onComplete }: Props) {
             })}
           </div>
 
-          {/* Right column - Sticky Live Preview */}
           <div className="col-span-2 overflow-y-auto">
             <div className="sticky top-0 bg-white border border-slate-200 rounded-xl shadow-sm h-full flex flex-col">
-              {/* Preview header */}
               <div className="flex items-center gap-2 px-4 py-3 border-b border-slate-100 bg-slate-50/50 rounded-t-xl flex-shrink-0">
                 <div className={`w-2 h-2 rounded-full ${activeFeatureCount > 0 ? 'bg-green-500 animate-pulse' : 'bg-slate-300'}`} />
                 <span className="text-xs font-semibold text-slate-700">Live Preview</span>
                 <span className="ml-auto text-[10px] text-slate-400">{activeFeatureCount} layer{activeFeatureCount !== 1 ? 's' : ''} applied</span>
               </div>
 
-              {/* Preview content */}
               <div className="flex-1 p-4 space-y-3 overflow-y-auto text-sm leading-relaxed">
                 {activeFeatureCount === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-center text-slate-400 py-12">
@@ -308,9 +291,7 @@ export default function GuardrailBuilder({ onComplete }: Props) {
                   </div>
                 ) : (
                   <>
-                    {/* Sample conversation */}
                     <div className="space-y-3">
-                      {/* User message */}
                       <div className="flex gap-2">
                         <div className="w-6 h-6 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0 mt-0.5">
                           <span className="text-[10px] font-bold text-blue-600">U</span>
@@ -341,7 +322,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
                         </div>
                       </div>
 
-                      {/* PII redaction output */}
                       {piiEntities.length > 0 && (
                         <div className="ml-8 bg-amber-50 rounded-lg p-3 border border-amber-200">
                           <div className="flex items-center gap-1.5 mb-2">
@@ -372,7 +352,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
                         </div>
                       )}
 
-                      {/* Content filter example */}
                       {contentFilters.length > 0 && (
                         <div className="ml-8 bg-red-50 rounded-lg p-3 border border-red-200">
                           <div className="flex items-center gap-1.5 mb-2">
@@ -388,7 +367,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
                         </div>
                       )}
 
-                      {/* Denied topics example */}
                       {deniedTopics.length > 0 && (
                         <div className="ml-8 bg-purple-50 rounded-lg p-3 border border-purple-200">
                           <div className="flex items-center gap-1.5 mb-2">
@@ -406,7 +384,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
                         </div>
                       )}
 
-                      {/* Word filter example */}
                       {(wordFilter.enable_profanity || wordFilter.blocked_words.length > 0) && (
                         <div className="ml-8 bg-orange-50 rounded-lg p-3 border border-orange-200">
                           <div className="flex items-center gap-1.5 mb-2">
@@ -428,7 +405,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
                         </div>
                       )}
 
-                      {/* Contextual grounding example */}
                       {contextualGrounding.enabled && (
                         <div className="ml-8 bg-teal-50 rounded-lg p-3 border border-teal-200">
                           <div className="flex items-center gap-1.5 mb-2">
@@ -466,7 +442,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
     );
   }
 
-  // --- Step: Review & Create ---
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -481,8 +456,27 @@ export default function GuardrailBuilder({ onComplete }: Props) {
         <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">{error}</div>
       )}
 
-      {/* Name and description */}
       <div className="card space-y-4">
+        <div>
+          <label htmlFor="guardrail-tenant" className="label">Tenant *</label>
+          <select
+            id="guardrail-tenant"
+            value={tenantId}
+            onChange={(e) => setChosenTenantId(e.target.value)}
+            aria-label="Tenant"
+            className="input-field w-full"
+          >
+            <option value="">Select a tenant (required)</option>
+            {tenantOptions.map((t) => (
+              <option key={t.id} value={t.id}>{t.name}</option>
+            ))}
+          </select>
+          {tenantOptions.length === 0 && (
+            <p className="mt-1 text-xs text-slate-400">
+              You aren’t a member of any tenant yet — ask an admin to link your Entra group.
+            </p>
+          )}
+        </div>
         <div>
           <label className="label">Guardrail Name *</label>
           <input
@@ -505,7 +499,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
         </div>
       </div>
 
-      {/* Summary */}
       <div className="card">
         <h3 className="text-sm font-semibold text-slate-800 mb-3">Configuration Summary</h3>
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -532,7 +525,6 @@ export default function GuardrailBuilder({ onComplete }: Props) {
         </div>
       </div>
 
-      {/* Data Flow */}
       <DataFlowVisualizer
         contentFilters={contentFilters}
         piiEntities={piiEntities}
@@ -541,10 +533,9 @@ export default function GuardrailBuilder({ onComplete }: Props) {
         contextualGrounding={contextualGrounding}
       />
 
-      {/* Create button */}
       <button
         onClick={handleCreate}
-        disabled={creating || !name.trim()}
+        disabled={creating || !canCreateGuardrail(name, tenantId)}
         className="btn-primary w-full py-3 text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
       >
         {creating ? (

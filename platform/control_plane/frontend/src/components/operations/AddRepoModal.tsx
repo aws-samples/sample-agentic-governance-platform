@@ -1,136 +1,99 @@
-// AddRepoModal — the "New repository from template" modal, EXTRACTED VERBATIM out of
-// `ProjectRepositoriesTab.tsx` (E28/T13).
-//
-// ---------------------------------------------------------------------------
-// WHY IT MOVED
-//
-// It was 620 lines at the bottom of a 1542-line file, and it owns a SECOND POLLER — its own 3s
-// `getRepoStatus` interval for the live materialize timeline, entirely separate from the
-// promoting-row poller the table above it runs. Two independent intervals, two `pollRef`s and two
-// `mountedRef`s in one module made the file unreadable on the question that matters most about it
-// ("what polls, when, and what tears it down?"), and T13 unloads that table into the shared
-// `RepoRow`, so leaving the modal behind would have left the file's bulk exactly where it was.
-//
-// NOTHING ABOUT THE BEHAVIOUR CHANGED IN THE MOVE. The component body, its state, both effects,
-// every callback and all the markup are byte-identical to the block that was deleted; the only
-// additions are this comment, the imports it needs and the `export default`. The form-field and
-// pill class-string constants came WITH it — they were declared in the old file and, apart from
-// the pill, are used only here, matching the house idiom where each surface re-declares the
-// label/input strings it needs (`AddUserModal` inlines the same label classes; `PrincipalPicker`
-// re-declares CARD).
-//
-// The step-timeline pieces (`isMaterializeTerminal`, `nextBadgeFromSteps`, `stepStatusText`,
-// `StepNode`, `MaterializeTimeline`) deliberately did NOT move with it. They stayed in
-// `ProjectRepositoriesTab.tsx` because `ProjectDetail.tsx` re-exports the first two for
-// `ProjectDetail.stepTimeline.test.ts`'s pinned import path, and `RepositoryDetail.tsx` imports
-// two of them from that module directly — moving them would break a pinned test path and three
-// import sites for no gain. So this file imports them, which is why the timeline renders here
-// through the same code the project page and the detail page use.
-//
-// THE EXPLICIT `.tsx` on that import is load-bearing on a case-insensitive filesystem: an
-// extensionless specifier probes `<Name>.ts` first, and a sibling companion module differing only
-// in casing wins — which is a silent bind to a module with no default export (TS1149). This epic
-// hit that trap four times.
-//
-// House style: emerald-on-glass Ops tokens (opsUi.ts), Tailwind v4 utility strings, 2-space
-// indent — unchanged from the module it left.
-
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   githubTemplatesApi,
   projectsApi,
   type DataClassification,
   type Repository,
+  type RepositoryCreate,
   type StepState,
   type TemplateView,
 } from '../../api/client';
-import { ModalShell } from './ConnectionsAdmin';
-// The timeline and its two pure predicates stay in their home module — see the note above on why
-// they did not travel with the modal.
-import {
-  MaterializeTimeline,
-  isMaterializeTerminal,
-  nextBadgeFromSteps,
-} from './ProjectRepositoriesTab.tsx';
-import { maintainerActionMessage } from './projectRoles';
+import { useLoad } from '../../api/useLoad';
+import { ModalShell } from './ModalShell';
+import { MaterializeTimeline } from './ProjectRepositoriesTab.tsx';
+import { isMaterializeTerminal, nextBadgeFromSteps } from './materializeSteps.ts';
+import { isNothingToRetry, maintainerActionMessage } from './projectRoles';
 import { OPS_BADGE, OPS_PRIMARY_BTN } from './opsUi';
+import { AGENT_NAME_RE } from './studioModel';
+import { STUDIO_AGENT_MODEL_ID } from './studioRun';
+import {
+  ARTIFACT_KIND_OPTIONS,
+  BUILD_KIND_CHIP,
+  INFRA_CHIP,
+  MCP_DESCRIPTION_MAX,
+  PLATFORM_CHIP,
+  PREVIEW_CHIP,
+  buildKindLabel,
+  frameworkForTemplate,
+  kindEmptyReason,
+  mcpDescriptionError,
+  mcpNameError,
+  mcpNameHint,
+  pickTemplateName,
+  pickerEmptyReason,
+  selectedTemplate,
+  templateOptionLabel,
+  materializeDialogCopy,
+  templatesForKind,
+  templatesForPlatform,
+  type ArtifactKind,
+} from './templateChain.ts';
 
-// Form-field tokens — moved WITH the modal, which is their only consumer. Declared locally rather
-// than shared, matching the house idiom where each surface re-declares the label/input class
-// strings it needs (AddUserModal inlines the same label classes; PrincipalPicker re-declares CARD).
 const FIELD_LABEL = 'block text-[11px] uppercase tracking-wide text-slate-400 font-medium mb-1';
 const FIELD_INPUT =
   'w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/40';
 const FIELD_SELECT =
   'w-full px-3 py-2 text-sm rounded-lg border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500/40 disabled:opacity-40';
-// The materialize-modal header pill KEEPS `capitalize`: it is passed a lowercase OPS_BADGE key
-// (`nextBadgeFromSteps`'s return, which doubles as the label) and relies on the transform. The
-// status tables' sentence-case labels must never go through this — `capitalize` upper-cases every
-// word, so "Promoting to prod…" would render as "Promoting To Prod…".
 const PILL_SHAPE =
   'inline-flex items-center gap-1.5 text-[11px] font-semibold px-2 py-0.5 rounded-full capitalize';
 
-// agent_name mirror of the backend regex (models/project.py AGENT_NAME_RE): leading letter,
-// then up to 31 more [A-Za-z0-9_] — 32 total. E28A/T1b narrowed this from 48: agent_name is the
-// STEM the runtime Terraform module derives two stage-scoped, account-global names from
-// (`{name}_{stage}`, AWS cap 48; `{name}-{stage}-agentcore-exec`, IAM cap 64), and at 48 both
-// overflowed. Keep it byte-identical to the backend — a looser mirror here calls a name valid
-// that the API then rejects with a 502; a tighter one refuses names the platform accepts.
-const AGENT_NAME_RE = /^[a-zA-Z][a-zA-Z0-9_]{0,31}$/;
-
-// Class-A data-classification options — the CAPITALIZED wire values the backend
-// DataClassification enum accepts (models/agent.py). Order runs least→most sensitive.
 const DATA_CLASSIFICATIONS: DataClassification[] = ['Public', 'Internal', 'Confidential', 'Restricted'];
+const EMPTY_TEMPLATES: TemplateView[] = [];
 
-// --- Add-repository-from-template modal -------------------------------------
-// Loads the org's GitHub template catalog (githubTemplatesApi.list(connectionId))
-// as the template select options, then collects a repo name + agent.config +
-// Class-A governance attributes (business_unit, region, data_classification) + an
-// optional Class-B CI-var override editor (repo_overrides). On submit
-// projectsApi.addRepo materializes the repo+agent; the 502 materialize errors
-// surface inline. The agent.config field idiom (agent_name + AGENT_NAME_RE,
-// model_id default, framework fixed 'strands' read-only) is copied from the
-// T19-deleted CreateProjectFromTemplate.
 export default function AddRepoModal({
   projectId,
   connectionId,
+  tenantPlatform,
   mayMaintain,
+  initialKind = 'agent',
+  doneLabel,
   onClose,
   onCreated,
 }: {
   projectId: string;
   connectionId: string;
-  /** Whether the caller may run the MAINTAINER-gated retry (see `mayMaintainProject`). */
+  /** The project's tenant's platform, folded by the page; `"aws"` when the tenant is unknown to this caller. */
+  tenantPlatform: string;
   mayMaintain: boolean;
+  initialKind?: ArtifactKind;
+  /** Replaces the finished timeline's "Done" button label; the caller then opens the new object. */
+  doneLabel?: string;
   onClose: () => void;
-  onCreated: () => void;
+  onCreated: (repo?: Repository) => void;
 }) {
   const [name, setName] = useState('');
+  const [kind, setKind] = useState<ArtifactKind>(initialKind);
+  const [mcpName, setMcpName] = useState('');
   const [templateName, setTemplateName] = useState('');
   const [agentName, setAgentName] = useState('');
-  const [modelId, setModelId] = useState('us.anthropic.claude-sonnet-4-6');
+  const [modelId, setModelId] = useState(STUDIO_AGENT_MODEL_ID);
   const [purpose, setPurpose] = useState('');
-  // framework is fixed to 'strands' (the only supported scaffold) — shown read-only.
 
-  // Class-A governance attributes for the pre-registered Agent record.
   const [businessUnit, setBusinessUnit] = useState('');
   const [region, setRegion] = useState('');
   const [dataClassification, setDataClassification] = useState<DataClassification | ''>('');
 
-  // Class-B CI-var overrides — a small {key,value} list serialized to a
-  // Record<string,string> on submit. Blank keys are dropped; last wins on dupes.
   const [overrides, setOverrides] = useState<{ key: string; value: string }[]>([]);
 
-  const [templates, setTemplates] = useState<TemplateView[]>([]);
-  const [loadingTemplates, setLoadingTemplates] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const templatesLoad = useLoad(() => githubTemplatesApi.list(connectionId), [connectionId], 'Failed to load templates.');
+  const templates = templatesLoad.state.data ?? EMPTY_TEMPLATES;
+  const loadingTemplates = templatesLoad.state.kind === 'loading';
+  const loadError = templatesLoad.state.kind === 'error' ? templatesLoad.state.message : null;
 
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // Live materialize timeline (E25C): once addRepo returns 202 we keep the modal open,
-  // swap the body form → timeline, and poll getRepoStatus every 3s until terminal.
   const [repo, setRepo] = useState<Repository | null>(null);
   const [steps, setSteps] = useState<StepState[]>([]);
   const [retrying, setRetrying] = useState(false);
@@ -153,9 +116,6 @@ export default function AddRepoModal({
     }
   }, []);
 
-  // Poll the live timeline while a repo is materializing. Mirrors the
-  // Polling precedent: a ref-tracked 3s interval that GETs the
-  // status, updates steps, and clears itself on the terminal state or on unmount/close.
   const repoId = repo?.id ?? null;
   const terminal = steps.length > 0 && isMaterializeTerminal(steps);
   useEffect(() => {
@@ -165,60 +125,47 @@ export default function AddRepoModal({
     }
     if (pollRef.current) return;
     pollRef.current = window.setInterval(async () => {
-      try {
-        const fresh = await projectsApi.getRepoStatus(projectId, repoId);
-        if (!mountedRef.current) return;
-        setRepo(fresh);
-        setSteps(fresh.steps);
-        if (isMaterializeTerminal(fresh.steps)) stopPolling();
-      } catch {
-        /* transient — keep polling */
-      }
+      const fresh = await projectsApi.getRepoStatus(projectId, repoId).catch(() => null);
+      if (fresh === null || !mountedRef.current) return;
+      setRepo(fresh);
+      setSteps(fresh.steps);
+      if (isMaterializeTerminal(fresh.steps)) stopPolling();
     }, 3000);
     return stopPolling;
   }, [repoId, terminal, projectId, stopPolling]);
 
-  // Belt-and-suspenders: clear the interval on unmount.
   useEffect(() => stopPolling, [stopPolling]);
 
   useEffect(() => {
     nameRef.current?.focus();
   }, []);
 
-  // Load the org's GitHub template catalog → the template select options.
-  useEffect(() => {
-    let cancelled = false;
-    setLoadingTemplates(true);
-    githubTemplatesApi
-      .list(connectionId)
-      .then((data) => {
-        if (cancelled) return;
-        const names = data.map((t) => t.name);
-        setTemplates(data);
-        setTemplateName((prev) => (names.includes(prev) ? prev : names[0] ?? ''));
-        setLoadError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setLoadError(err instanceof Error ? err.message : 'Failed to load templates.');
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingTemplates(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [connectionId]);
+  const platformOffered = useMemo(
+    () => templatesForPlatform(templates, tenantPlatform),
+    [templates, tenantPlatform],
+  );
+  const offered = useMemo(() => templatesForKind(platformOffered, kind), [platformOffered, kind]);
+  const [offeredFor, setOfferedFor] = useState(offered);
+  if (offeredFor !== offered) {
+    setOfferedFor(offered);
+    setTemplateName(pickTemplateName(offered, templateName));
+  }
+  const isMcp = kind === 'mcp_server';
+  const changeKind = useCallback((next: ArtifactKind) => setKind(next), []);
+  const chosen = useMemo(() => selectedTemplate(offered, templateName), [offered, templateName]);
+  const framework = useMemo(() => frameworkForTemplate(offered, templateName), [offered, templateName]);
 
   const agentNameValid = AGENT_NAME_RE.test(agentName);
+  const effectiveMcpName = mcpName.trim() || name.trim();
+  const mcpNameProblem = mcpNameError(effectiveMcpName);
+  const mcpHint = mcpNameHint(mcpName, name);
+  const mcpDescriptionProblem = mcpDescriptionError(purpose);
   const canSubmit =
     name.trim().length > 0 &&
-    templateName.length > 0 &&
-    agentNameValid &&
+    chosen !== null &&
+    (isMcp ? mcpNameProblem === null && mcpDescriptionProblem === null : agentNameValid) &&
     !actionPending;
 
-  // Serialize the {key,value} override rows → Record<string,string>, dropping
-  // blank keys (trimmed); returns undefined when empty so the field is omitted.
   const serializeOverrides = useCallback((): Record<string, string> | undefined => {
     const entries = overrides
       .map((o) => [o.key.trim(), o.value] as const)
@@ -231,14 +178,12 @@ export default function AddRepoModal({
     setActionPending(true);
     setActionError(null);
     try {
-      // 202: the record comes back PENDING with a full pending timeline. Keep the modal
-      // open and switch the body to the live timeline instead of closing + refetching.
-      const created = await projectsApi.addRepo(projectId, {
+      const body: RepositoryCreate = !isMcp ? {
         name: name.trim(),
         template_name: templateName,
         agent_config: {
           agent_name: agentName.trim(),
-          framework: 'strands',
+          framework,
           model_id: modelId.trim(),
         },
         business_unit: businessUnit.trim() || undefined,
@@ -246,22 +191,24 @@ export default function AddRepoModal({
         data_classification: dataClassification || undefined,
         repo_overrides: serializeOverrides(),
         purpose: purpose.trim() || undefined,
-      });
+      } : {
+        name: name.trim(),
+        template_name: templateName,
+        mcp_name: effectiveMcpName,
+        business_unit: businessUnit.trim() || undefined,
+        region: region.trim() || undefined,
+        data_classification: dataClassification || undefined,
+        repo_overrides: serializeOverrides(),
+        purpose: purpose.trim() || undefined,
+      };
+      const created = await projectsApi.addRepo(projectId, body);
       if (mountedRef.current) {
         setRepo(created);
         setSteps(created.steps);
       }
     } catch (err: unknown) {
       if (mountedRef.current) {
-        // Mapped, not raw (E27/T11 FIX 3): the route is MAINTAINER-gated, so a caller whose
-        // standing changed since this page loaded would otherwise read the lowercase internal
-        // fragment `insufficient project role` after filling in the whole form.
-        setActionError(
-          maintainerActionMessage(
-            err instanceof Error ? err.message : '',
-            'Failed to create the repository.'
-          )
-        );
+        setActionError(maintainerActionMessage(err, 'Failed to create the repository.'));
       }
     } finally {
       if (mountedRef.current) setActionPending(false);
@@ -270,7 +217,10 @@ export default function AddRepoModal({
     canSubmit,
     projectId,
     name,
+    isMcp,
+    effectiveMcpName,
     templateName,
+    framework,
     agentName,
     modelId,
     businessUnit,
@@ -291,9 +241,6 @@ export default function AddRepoModal({
     []
   );
 
-  // Retry from the first failed step. 202 → the returned record has its failed steps
-  // reset to pending; poll resumes. 409 "Nothing to retry" → treat as already-complete:
-  // refetch the current status once and let the terminal (done) view render.
   const handleRetry = useCallback(async () => {
     if (!repo || retrying) return;
     setRetrying(true);
@@ -305,78 +252,51 @@ export default function AddRepoModal({
         setSteps(resumed.steps);
       }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to retry.';
-      if (/nothing to retry/i.test(message)) {
-        try {
-          const fresh = await projectsApi.getRepoStatus(projectId, repo.id);
-          if (mountedRef.current) {
-            setRepo(fresh);
-            setSteps(fresh.steps);
-          }
-        } catch {
-          /* leave the current (failed) view in place */
+      if (isNothingToRetry(err)) {
+        const fresh = await projectsApi.getRepoStatus(projectId, repo.id).catch(() => null);
+        if (fresh !== null && mountedRef.current) {
+          setRepo(fresh);
+          setSteps(fresh.steps);
         }
       } else if (mountedRef.current) {
-        // Same mapping as the create path — the retry route carries the same MAINTAINER
-        // gate and the same 403 literal. The "nothing to retry" 409 is matched on the RAW
-        // message above, before this, because it is control flow rather than copy.
-        setActionError(maintainerActionMessage(message, 'Failed to retry.'));
+        setActionError(maintainerActionMessage(err, 'Failed to retry.'));
       }
     } finally {
       if (mountedRef.current) setRetrying(false);
     }
   }, [repo, retrying, projectId]);
 
-  // Closing the modal always stops polling. Once a repo exists (materialize started),
-  // closing folds back into the table via onCreated() so the new row + its live
-  // cicd_status show up; before that it's a plain form cancel.
   const handleClose = useCallback(() => {
     stopPolling();
     if (repo) {
-      onCreated();
+      onCreated(repo);
     } else {
       onClose();
     }
   }, [repo, stopPolling, onCreated, onClose]);
 
-  const noTemplates = !loadingTemplates && !loadError && templates.length === 0;
+  const noTemplates = !loadingTemplates && !loadError && offered.length === 0;
+  const emptyReason = noTemplates
+    ? (pickerEmptyReason(templates.length, platformOffered.length, tenantPlatform) ?? kindEmptyReason(kind))
+    : null;
 
-  // Timeline-view derived flags.
   const materializing = repo !== null;
   const hasFailed = steps.some((s) => s.status === 'failed');
   const allDone = steps.length > 0 && steps.every((s) => s.status === 'done');
   const badgeKey = steps.length > 0 ? nextBadgeFromSteps(steps) : 'provisioning';
 
-  // --- Live timeline view (post-202) --------------------------------------
-  // Modal stays open; the form body is replaced by the polled step timeline. The
-  // backdrop/Escape close is disabled while a step is still running (actionPending on
-  // ModalShell) so the operator doesn't lose the view mid-flight.
-  //
-  // THE COUNT IN THE DESCRIPTION IS FIVE (E28B/T3, D-B2). It said eight, and five of those eight
-  // steps did not get renamed — they stopped existing: a second branch cut, two GitHub
-  // Environments and their variables are gone, because AGP now creates an empty repo and pushes the
-  // whole template in ONE commit rather than making six sequential writes into a repository GitHub
-  // was concurrently writing to. The number is stated at all because the operator is watching a
-  // timeline and a promised total is something they can count the rows against — which is also why
-  // a stale one is worse than none: it invites them to wait for three steps that will never appear.
-  //
-  // The rows themselves are NOT affected by this number: the timeline renders `steps[].label` from
-  // the record, so a historical repo carrying the OLD eight keys still renders its own eight stored
-  // labels. That is deliberate and there is no key→label map anywhere in the frontend to make an
-  // unknown key crash or blank a row.
   if (materializing) {
     const inFlight = !terminal;
+    const heading = materializeDialogCopy(repo?.name, { allDone, hasFailed });
     return (
       <ModalShell
-        title={repo?.name ? `Materializing ${repo.name}` : 'Materializing repository'}
-        description="Provisioning the repository + agent — this runs five steps in the background."
+        title={heading.title}
+        description={heading.description}
         ariaLabel="Repository materialization progress"
-        actionPending={inFlight}
+        actionPending={false}
         onClose={handleClose}
         footer={
           <>
-            {/* MAINTAINER-gated server-side, so conditionally rendered rather than shown
-                and refused (E27/T11 FIX 3). `disabled` stays reserved for in-flight. */}
             {hasFailed && mayMaintain && (
               <button
                 type="button"
@@ -392,14 +312,11 @@ export default function AddRepoModal({
               onClick={handleClose}
               className="px-3.5 py-1.5 rounded-lg bg-white border border-slate-300 text-slate-700 text-sm font-medium hover:bg-slate-50 transition-colors"
             >
-              {allDone ? 'Done' : inFlight ? 'Run in background' : 'Close'}
+              {allDone ? (doneLabel ?? 'Done') : inFlight ? 'Run in background' : 'Close'}
             </button>
           </>
         }
       >
-        {/* Status header pill — color AND label both derive from badgeKey (one source),
-            so a provisioning repo reads amber "provisioning" here exactly as it does in
-            the repos-table row; ready is emerald, failed is rose. */}
         <div className="flex items-center justify-between gap-3">
           <span className={`${PILL_SHAPE} ${OPS_BADGE[badgeKey]}`}>
             <span aria-hidden="true">●</span>
@@ -417,7 +334,7 @@ export default function AddRepoModal({
 
         {allDone && (
           <div className="rounded-lg bg-emerald-50 border border-emerald-200/70 px-3 py-2 text-sm text-emerald-800">
-            Repository materialized. Close to return to the project.
+            {doneLabel ? `Ready. ${doneLabel} to build and test it.` : 'Repository materialized. Close to return to the project.'}
           </div>
         )}
         {hasFailed && (
@@ -450,9 +367,9 @@ export default function AddRepoModal({
 
   return (
     <ModalShell
-      title="New repository from template"
-      description="Materialize a repository + agent from a GitHub template in this project's org."
-      ariaLabel="New repository from template"
+      title={isMcp ? 'New MCP server' : 'New agent'}
+      description={`Creates the ${isMcp ? 'MCP server' : 'agent'} and its source repository from a GitHub template in this project's org.`}
+      ariaLabel={isMcp ? 'New MCP server' : 'New agent'}
       actionPending={actionPending}
       onClose={onClose}
       footer={
@@ -470,8 +387,9 @@ export default function AddRepoModal({
             onClick={handleSubmit}
             disabled={!canSubmit || noTemplates}
             className={`${OPS_PRIMARY_BTN} disabled:opacity-40`}
+            data-testid="add-repo-submit"
           >
-            {actionPending ? 'Provisioning…' : 'Create repository'}
+            {actionPending ? 'Provisioning…' : isMcp ? 'Create MCP server' : 'Create agent'}
           </button>
         </>
       }
@@ -482,14 +400,38 @@ export default function AddRepoModal({
         </p>
       )}
 
-      {noTemplates && (
-        <p className="text-sm text-slate-500">
-          No templates in this org — roll out the base templates under Admin › Org Connections ›
-          Manage templates.
-        </p>
-      )}
+      {emptyReason && <p className="text-sm text-slate-500">{emptyReason}</p>}
 
-      {/* Repository name. */}
+      <div>
+        <span id="add-repo-kind-label" className={FIELD_LABEL}>
+          Builds
+        </span>
+        <div
+          role="radiogroup"
+          aria-labelledby="add-repo-kind-label"
+          className="inline-flex p-0.5 rounded-lg bg-slate-100 border border-slate-200"
+        >
+          {ARTIFACT_KIND_OPTIONS.map((o) => {
+            const active = kind === o.kind;
+            return (
+              <button
+                key={o.kind}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                onClick={() => changeKind(o.kind)}
+                disabled={actionPending}
+                className={`px-3.5 py-1 text-sm font-medium rounded-md transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 disabled:opacity-40 ${
+                  active ? 'bg-white text-emerald-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                {o.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       <div>
         <label htmlFor="add-repo-name" className={FIELD_LABEL}>
           Repository name
@@ -501,16 +443,18 @@ export default function AddRepoModal({
           value={name}
           onChange={(e) => setName(e.target.value)}
           disabled={actionPending}
-          placeholder="my-agent-repo"
+          placeholder={isMcp ? 'claims-api-mcp' : 'my-agent-repo'}
           className={`${FIELD_INPUT} disabled:opacity-40`}
           autoComplete="off"
         />
       </div>
 
-      {/* Template (org GitHub catalog). */}
       <div>
         <label htmlFor="add-repo-template" className={FIELD_LABEL}>
-          Template
+          Template{' '}
+          <span className="text-slate-400 font-normal normal-case tracking-normal">
+            ({tenantPlatform} templates)
+          </span>
         </label>
         <select
           id="add-repo-template"
@@ -526,15 +470,94 @@ export default function AddRepoModal({
                 ? 'No templates available'
                 : 'Select a template'}
           </option>
-          {templates.map((t) => (
+          {/* An option element holds text only, so the badges ride in templateOptionLabel's words; the chips below are the selected template's. */}
+          {offered.map((t) => (
             <option key={t.name} value={t.name}>
-              {t.name}
+              {templateOptionLabel(t)}
             </option>
           ))}
         </select>
+
+        {chosen && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${PLATFORM_CHIP}`}>
+              {chosen.platform}
+            </span>
+            <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${BUILD_KIND_CHIP}`}>
+              {buildKindLabel(chosen.build_kind)}
+            </span>
+            <span className={`text-[11px] font-medium px-2 py-0.5 rounded-full ${INFRA_CHIP}`}>
+              {chosen.infra_template_id}
+            </span>
+            {chosen.preview && (
+              <span className={`text-[11px] font-medium px-2 py-0.5 rounded-full ${PREVIEW_CHIP}`}>
+                Preview
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
-      {/* agent.config fields. */}
+      {isMcp && (
+        <div className="space-y-4">
+          <div>
+            <label htmlFor="add-repo-mcp-name" className={FIELD_LABEL}>
+              MCP server name
+            </label>
+            <input
+              id="add-repo-mcp-name"
+              type="text"
+              value={mcpName}
+              onChange={(e) => setMcpName(e.target.value)}
+              disabled={actionPending}
+              placeholder={name.trim() || 'claims-api'}
+              aria-invalid={mcpHint.tone === 'error'}
+              aria-describedby="add-repo-mcp-name-hint"
+              className={`${FIELD_INPUT} disabled:opacity-40`}
+              autoComplete="off"
+            />
+            <p
+              id="add-repo-mcp-name-hint"
+              className={`text-[11px] mt-1 ${mcpHint.tone === 'error' ? 'text-rose-600' : 'text-slate-400'}`}
+            >
+              {mcpHint.text}
+            </p>
+          </div>
+          <div>
+            <div className="flex items-baseline justify-between">
+              <label htmlFor="add-repo-mcp-description" className={FIELD_LABEL}>
+                Description <span className="text-slate-400 font-normal">(optional)</span>
+              </label>
+              <span
+                className={`text-[11px] tabular-nums ${mcpDescriptionProblem ? 'text-rose-600 font-medium' : 'text-slate-400'}`}
+                aria-live="polite"
+              >
+                {purpose.length}/{MCP_DESCRIPTION_MAX}
+              </span>
+            </div>
+            <input
+              id="add-repo-mcp-description"
+              type="text"
+              value={purpose}
+              onChange={(e) => setPurpose(e.target.value)}
+              maxLength={MCP_DESCRIPTION_MAX}
+              disabled={actionPending}
+              placeholder="What these tools do — shown in the MCP Servers governance view."
+              aria-invalid={mcpDescriptionProblem !== null}
+              aria-describedby={mcpDescriptionProblem ? 'add-repo-mcp-description-error' : undefined}
+              className={`${FIELD_INPUT} disabled:opacity-40`}
+              autoComplete="off"
+            />
+            {mcpDescriptionProblem && (
+              <p id="add-repo-mcp-description-error" className="text-[11px] text-rose-600 mt-1">
+                {mcpDescriptionProblem}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {!isMcp && (
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
           <label htmlFor="add-repo-agent-name" className={FIELD_LABEL}>
@@ -563,14 +586,16 @@ export default function AddRepoModal({
           <input
             id="add-repo-framework"
             type="text"
-            value="strands"
+            value={framework || '—'}
             readOnly
             disabled
             className={`${FIELD_INPUT} bg-slate-50 text-slate-500`}
           />
         </div>
       </div>
+      )}
 
+      {!isMcp && (
       <div>
         <label htmlFor="add-repo-model" className={FIELD_LABEL}>
           Model ID
@@ -581,13 +606,13 @@ export default function AddRepoModal({
           value={modelId}
           onChange={(e) => setModelId(e.target.value)}
           disabled={actionPending}
-          placeholder="us.anthropic.claude-sonnet-4-6"
+          placeholder={STUDIO_AGENT_MODEL_ID}
           className={`${FIELD_INPUT} disabled:opacity-40`}
           autoComplete="off"
         />
       </div>
+      )}
 
-      {/* Class-A governance attributes for the pre-registered Agent (optional). */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
           <label htmlFor="add-repo-business-unit" className={FIELD_LABEL}>
@@ -641,7 +666,6 @@ export default function AddRepoModal({
         </select>
       </div>
 
-      {/* Class-B CI-var overrides — optional per-repo scaffold variables. */}
       <div>
         <div className="flex items-center justify-between mb-1">
           <span className={`${FIELD_LABEL} mb-0`}>
@@ -699,7 +723,7 @@ export default function AddRepoModal({
         )}
       </div>
 
-      {/* Governance purpose for the pre-registered Agent record (optional). */}
+      {!isMcp && (
       <div>
         <label htmlFor="add-repo-purpose" className={FIELD_LABEL}>
           Purpose <span className="text-slate-400 font-normal">(optional)</span>
@@ -714,6 +738,7 @@ export default function AddRepoModal({
           className={`${FIELD_INPUT} disabled:opacity-40`}
         />
       </div>
+      )}
 
       {actionError && (
         <p className="text-sm text-red-600" role="alert">

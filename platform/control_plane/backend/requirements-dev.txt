@@ -10,3 +10,8 @@
 pytest==7.4.4
 pytest-asyncio==0.23.3
 moto==5.0.0
+
+# Lint
+ruff==0.17.1
+pyright==1.1.414
+pre-commit==4.7.0

@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { observabilityApi } from '../api/client';
-import type { ObservabilitySettings } from '../types';
+import { useLoad } from '../api/useLoad';
 import ObservabilityDashboard from './governance/observability/ObservabilityDashboard';
 
 type TabId = 'dashboard' | 'langfuse';
@@ -9,31 +9,20 @@ type TabId = 'dashboard' | 'langfuse';
 export default function Observability() {
   const [searchParams] = useSearchParams();
   const tabParam = searchParams.get('tab');
-  const [activeTab, setActiveTab] = useState<TabId>('dashboard');
-  const [settings, setSettings] = useState<ObservabilitySettings | null>(null);
-  const [loadingSettings, setLoadingSettings] = useState(true);
+  const paramTab: TabId | null = tabParam === 'langfuse' || tabParam === 'dashboard' ? tabParam : null;
+  const [override, setOverride] = useState<TabId | null>(null);
+  const [seenTabParam, setSeenTabParam] = useState(tabParam);
+  if (tabParam !== seenTabParam) {
+    setSeenTabParam(tabParam);
+    setOverride(null);
+  }
+  const activeTab: TabId = override ?? paramTab ?? 'dashboard';
   const [iframeError, setIframeError] = useState(false);
 
-  useEffect(() => {
-    if (tabParam === 'langfuse' || tabParam === 'dashboard') setActiveTab(tabParam);
-  }, [tabParam]);
+  const settings = useLoad(() => observabilityApi.getSettings(), []);
 
-  // Detection is now the observability settings endpoint (`configured` =
-  // backend has a LANGFUSE_HOST) — Langfuse is base infra, not a per-user
-  // deploy. Fail-silent: on error we degrade to a not-configured settings shape
-  // so the page renders calm empty-states rather than crashing.
-  useEffect(() => {
-    let cancelled = false;
-    observabilityApi
-      .getSettings()
-      .then((s) => { if (!cancelled) setSettings(s); })
-      .catch(() => { if (!cancelled) setSettings({ langfuse_host: null, configured: false }); })
-      .finally(() => { if (!cancelled) setLoadingSettings(false); });
-    return () => { cancelled = true; };
-  }, []);
-
-  const configured = !!settings?.configured;
-  const langfuseHost = settings?.langfuse_host ?? null;
+  const configured = !!settings.state.data?.configured;
+  const langfuseHost = settings.state.data?.langfuse_host ?? null;
 
   const tabs: { id: TabId; label: string }[] = [
     { id: 'dashboard', label: 'Dashboard' },
@@ -42,7 +31,6 @@ export default function Observability() {
 
   return (
     <div className="min-h-[calc(100vh-4rem)] relative">
-      {/* Ombre gradient background */}
       <div className="absolute inset-0 pointer-events-none" style={{
         background: 'radial-gradient(ellipse 80% 70% at 20% 50%, rgba(219,234,254,0.8) 0%, transparent 60%), radial-gradient(ellipse 60% 80% at 80% 40%, rgba(221,214,254,0.6) 0%, transparent 55%), radial-gradient(ellipse 50% 60% at 50% 80%, rgba(252,231,243,0.5) 0%, transparent 50%)',
         animation: 'gradientDrift 20s ease-in-out infinite',
@@ -54,12 +42,11 @@ export default function Observability() {
           <p className="text-slate-500 mt-2 max-w-2xl">Monitor, trace, and evaluate your deployed AI agents — a platform dashboard drawn from Langfuse data, plus the embedded Langfuse UI.</p>
         </div>
 
-        {/* Tabs */}
         <div className="flex gap-2 mb-8 animate-fade-in stagger-1">
           {tabs.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => setOverride(tab.id)}
               className={`px-5 py-2.5 rounded-lg text-sm font-medium transition-all ${
                 activeTab === tab.id
                   ? 'bg-slate-800 text-white'
@@ -71,7 +58,7 @@ export default function Observability() {
           ))}
         </div>
 
-        {loadingSettings ? (
+        {settings.state.kind === 'loading' ? (
           <div className="card">
             <div className="flex items-center gap-3">
               <div className="w-5 h-5 border-2 border-slate-300 border-t-slate-600 rounded-full animate-spin"></div>
@@ -83,7 +70,6 @@ export default function Observability() {
             <ObservabilityDashboard configured={configured} />
           </div>
         ) : (
-          /* Langfuse Tab — the embedded Langfuse UI (base-infra host from settings) */
           <div className="space-y-6 animate-fade-in">
             <div className="card">
               <div className="flex items-start gap-4">
@@ -136,7 +122,6 @@ export default function Observability() {
                   </div>
                 </div>
 
-                {/* Embedded Langfuse Dashboard */}
                 {!iframeError ? (
                   <div className="rounded-xl border border-violet-200 overflow-hidden bg-white" style={{ height: 'calc(100vh - 20rem)' }}>
                     <iframe
@@ -145,15 +130,13 @@ export default function Observability() {
                       title="Langfuse Dashboard"
                       onError={() => setIframeError(true)}
                       onLoad={(e) => {
-                        // Detect X-Frame-Options block (iframe loads but shows blank/error)
                         try {
                           const iframe = e.target as HTMLIFrameElement;
-                          // If we can't access contentWindow, it's likely blocked
                           if (iframe.contentWindow?.location.href === 'about:blank') {
                             setIframeError(true);
                           }
                         } catch {
-                          // Cross-origin access denied means iframe loaded successfully
+                          // The same-origin policy throws on a cross-origin contentWindow: the frame loaded Langfuse.
                         }
                       }}
                     />

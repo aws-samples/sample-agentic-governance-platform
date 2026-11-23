@@ -157,8 +157,28 @@ resource "aws_iam_role_policy" "deploy" {
           "iam:ListPolicyVersions"
         ]
         Resource = "*"
+      },
+      {
+        # E40 (live L3): CreateApiKeyCredentialProvider with an EXTERNAL secret reads the
+        # secret with the CALLER's credentials — this role, via the gateway module's
+        # provider — not the gateway role's. Scoped to the reserved MCP namespace only;
+        # the gateway module refuses any secret outside agp-mcp/<mcp_name>/ at plan.
+        # (CodeBuild's own iac-provisioning grant already covers this via secretsmanager:*.)
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:agp-mcp/*"
       }
     ]
   })
 }
+
+# This role lives in the account + region this root applies to (the default tenant).
+data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
+
+data "aws_partition" "current" {}
 

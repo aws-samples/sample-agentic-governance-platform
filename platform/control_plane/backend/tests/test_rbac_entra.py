@@ -1,46 +1,31 @@
 """Tests for _extract_role under AUTH_PROVIDER=entra."""
 
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
 
-@pytest.fixture(autouse=True)
-def reset_modules():
-    import sys
-    for mod in ["core.rbac", "core.security_entra", "core.config"]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
-
-
-def _fake_request(authorization_header: str = ""):
+def _fake_request(authorization_header: str = "") -> Request:
     """Build a minimal Request-like object with the headers we care about."""
-    class FakeRequest:
-        headers = {}
-    req = FakeRequest()
-    req.headers = {"Authorization": authorization_header} if authorization_header else {}
-    return req
+    headers = {"Authorization": authorization_header} if authorization_header else {}
+    return cast(Request, SimpleNamespace(headers=headers))
 
 
 def test_admin_role_claim_maps_to_admin(entra_settings):
     from core.rbac import Role, _extract_role
 
-    with patch("core.security_entra.verify_entra_token", return_value={
-        "oid": "lars-oid",
-        "roles": ["Platform.Admin"],
-    }):
+    with patch(
+        "core.security_entra.verify_entra_token",
+        return_value={
+            "oid": "lars-oid",
+            "roles": ["Platform.Admin"],
+        },
+    ):
         role = _extract_role(_fake_request("Bearer fake-token"))
 
     assert role == Role.ADMIN
@@ -49,10 +34,13 @@ def test_admin_role_claim_maps_to_admin(entra_settings):
 def test_operator_role_claim_maps_to_operator(entra_settings):
     from core.rbac import Role, _extract_role
 
-    with patch("core.security_entra.verify_entra_token", return_value={
-        "oid": "maria-oid",
-        "roles": ["Platform.Operator"],
-    }):
+    with patch(
+        "core.security_entra.verify_entra_token",
+        return_value={
+            "oid": "maria-oid",
+            "roles": ["Platform.Operator"],
+        },
+    ):
         role = _extract_role(_fake_request("Bearer fake-token"))
 
     assert role == Role.OPERATOR
@@ -61,10 +49,13 @@ def test_operator_role_claim_maps_to_operator(entra_settings):
 def test_viewer_role_claim_maps_to_viewer(entra_settings):
     from core.rbac import Role, _extract_role
 
-    with patch("core.security_entra.verify_entra_token", return_value={
-        "oid": "hans-oid",
-        "roles": ["Platform.Viewer"],
-    }):
+    with patch(
+        "core.security_entra.verify_entra_token",
+        return_value={
+            "oid": "hans-oid",
+            "roles": ["Platform.Viewer"],
+        },
+    ):
         role = _extract_role(_fake_request("Bearer fake-token"))
 
     assert role == Role.VIEWER
@@ -74,9 +65,12 @@ def test_no_role_claim_defaults_to_viewer(entra_settings):
     """Token validates but has no `roles` claim → least-privilege default."""
     from core.rbac import Role, _extract_role
 
-    with patch("core.security_entra.verify_entra_token", return_value={
-        "oid": "stranger-oid",
-    }):
+    with patch(
+        "core.security_entra.verify_entra_token",
+        return_value={
+            "oid": "stranger-oid",
+        },
+    ):
         role = _extract_role(_fake_request("Bearer fake-token"))
 
     assert role == Role.VIEWER
@@ -86,10 +80,13 @@ def test_multiple_roles_picks_highest(entra_settings):
     """If a user has multiple Platform.* role claims, return the highest."""
     from core.rbac import Role, _extract_role
 
-    with patch("core.security_entra.verify_entra_token", return_value={
-        "oid": "multi-oid",
-        "roles": ["Platform.Viewer", "Platform.Admin", "Platform.Operator"],
-    }):
+    with patch(
+        "core.security_entra.verify_entra_token",
+        return_value={
+            "oid": "multi-oid",
+            "roles": ["Platform.Viewer", "Platform.Admin", "Platform.Operator"],
+        },
+    ):
         role = _extract_role(_fake_request("Bearer fake-token"))
 
     assert role == Role.ADMIN
@@ -119,30 +116,49 @@ def test_invalid_token_under_entra_returns_401(entra_settings):
     assert exc.value.status_code == 401
 
 
+@pytest.mark.parametrize(
+    ("claimed", "required", "sentence"),
+    [
+        ("Platform.Viewer", "OPERATOR", "Requires operator role or higher"),
+        ("Platform.Operator", "ADMIN", "Requires admin role or higher"),
+    ],
+)
+def test_a_role_below_the_minimum_is_auth_role_required(entra_settings, claimed, required, sentence):
+    import asyncio
+
+    from core.rbac import AuthError, Role, require_role
+
+    checker = require_role(Role[required])
+    with patch("core.security_entra.verify_entra_token", return_value={"oid": "o", "roles": [claimed]}):
+        with pytest.raises(AuthError) as exc:
+            asyncio.run(checker(_fake_request("Bearer fake-token")))
+
+    assert exc.value.status_code == 403
+    assert exc.value.body() == {"detail": sentence, "code": "auth.role_required"}
+
+
 def test_use_dev_auth_does_not_apply_under_entra(monkeypatch):
     """With dev-auth OFF, the Entra path validates tokens and never falls back.
 
-    Entra is the sole real provider. When USE_DEV_AUTH/DEBUG are off (the
-    default), a missing token returns 401 and an invalid token returns 401 —
-    the dev flag being off grants no admin bypass.
+    Entra is the sole real provider. With USE_DEV_AUTH off (the default), a
+    missing token returns 401 and an invalid token returns 401 — the dev flag
+    being off grants no admin bypass.
     """
     monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")  # dev-auth off → real Entra validation
-    monkeypatch.setenv("DEBUG", "False")
+    monkeypatch.setenv("USE_DEV_AUTH", "False")
     monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
     monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
 
     import sys
+
     sys.modules.pop("core.rbac", None)
     sys.modules.pop("core.config", None)
     from core.rbac import _extract_role
 
-    # No auth header → 401 (no dev-auth fallback).
     with pytest.raises(HTTPException) as exc:
         _extract_role(_fake_request(""))
     assert exc.value.status_code == 401
 
-    # Invalid token → 401 (verify_entra_token rejects it; no bypass).
     def fail(*args, **kwargs):
         raise HTTPException(status_code=401, detail="boom")
 
@@ -152,35 +168,37 @@ def test_use_dev_auth_does_not_apply_under_entra(monkeypatch):
     assert exc2.value.status_code == 401
 
 
-# ===========================================================================
-# E36/T18 — `principal_email`: ONE precedence order, shared by both live sites
-# ===========================================================================
-# The defect was two orders: `Principal.email` (→ `created_by`) read
-# `preferred_username` first, while `/users/me` (→ what the UI shows) read the
-# `email` claim first, so a token carrying both with different values attributed
-# a caller's writes to one address and showed them another. The spec decision is
-# `preferred_username` → `email` → `upn`, in one helper both sites call.
-
-
 def test_principal_email_prefers_preferred_username_over_every_other_claim():
-    """Rung 1: with all three present, `preferred_username` wins."""
+    """Rung 1: with all three present, `preferred_username` wins. One precedence for both
+    `Principal.email` (what `created_by` records) and `/users/me` (what the UI shows), so a token
+    carrying two different addresses cannot attribute a caller's writes to one and show the other."""
     from core.rbac import principal_email
 
-    assert principal_email({
-        "preferred_username": "pu@example.com",
-        "email": "mail@example.com",
-        "upn": "upn@example.com",
-    }) == "pu@example.com"
+    assert (
+        principal_email(
+            {
+                "preferred_username": "pu@example.com",
+                "email": "mail@example.com",
+                "upn": "upn@example.com",
+            }
+        )
+        == "pu@example.com"
+    )
 
 
 def test_principal_email_falls_back_to_the_email_claim():
     """Rung 2: no `preferred_username` → the `email` claim, ahead of `upn`."""
     from core.rbac import principal_email
 
-    assert principal_email({
-        "email": "mail@example.com",
-        "upn": "upn@example.com",
-    }) == "mail@example.com"
+    assert (
+        principal_email(
+            {
+                "email": "mail@example.com",
+                "upn": "upn@example.com",
+            }
+        )
+        == "mail@example.com"
+    )
 
 
 def test_principal_email_falls_back_to_upn_last():

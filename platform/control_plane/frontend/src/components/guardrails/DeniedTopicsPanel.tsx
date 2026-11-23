@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import type { DeniedTopic } from '../../types';
+import type { DeniedTopicOutput } from '../../api/client';
 
 interface Props {
-  topics: DeniedTopic[];
-  onChange: (topics: DeniedTopic[]) => void;
+  topics: DeniedTopicOutput[];
+  onChange: (topics: DeniedTopicOutput[]) => void;
 }
 
 const SUGGESTIONS = [
@@ -23,7 +23,7 @@ export default function DeniedTopicsPanel({ topics, onChange }: Props) {
     onChange(topics.filter((_, i) => i !== index));
   };
 
-  const updateTopic = (index: number, field: keyof DeniedTopic, value: string | string[]) => {
+  const updateTopic = (index: number, field: keyof DeniedTopicOutput, value: string | string[]) => {
     onChange(topics.map((t, i) => (i === index ? { ...t, [field]: value } : t)));
   };
 
@@ -47,7 +47,6 @@ export default function DeniedTopicsPanel({ topics, onChange }: Props) {
 
   return (
     <div className="space-y-4">
-      {/* Suggestions */}
       {topics.length === 0 && (
         <div className="p-4 bg-blue-50/50 border border-blue-100 rounded-xl">
           <p className="text-xs font-medium text-blue-700 mb-2">Quick Add (FSI Suggestions)</p>
@@ -65,7 +64,6 @@ export default function DeniedTopicsPanel({ topics, onChange }: Props) {
         </div>
       )}
 
-      {/* Topic list */}
       {topics.map((topic, index) => (
         <div key={index} className="border border-slate-200 rounded-xl p-4 space-y-3">
           <div className="flex items-start justify-between gap-3">
@@ -95,7 +93,6 @@ export default function DeniedTopicsPanel({ topics, onChange }: Props) {
             </button>
           </div>
 
-          {/* Examples */}
           <div>
             <p className="text-xs text-slate-500 mb-1.5">Examples (optional, max 5)</p>
             <div className="flex flex-wrap gap-1.5 mb-2">

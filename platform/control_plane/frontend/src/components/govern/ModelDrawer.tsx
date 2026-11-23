@@ -2,7 +2,8 @@ import {
   LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts';
 import Drawer from './Drawer';
-import { MODELS, MODEL_DETAILS, tooltipStyle } from './mockData';
+import { MODELS, MODEL_DETAILS } from './mockData';
+import { tooltipStyle } from '../shared/chartTheme';
 
 interface Props {
   modelId: string | null;
@@ -35,7 +36,6 @@ export default function ModelDrawer({ modelId, onClose }: Props) {
     >
       {model && detail && (
         <div className="space-y-6">
-          {/* Summary pills */}
           <div className="flex flex-wrap items-center gap-2">
             <span className={`text-xs font-semibold px-2.5 py-1 rounded-full ring-1 ${tierBg[model.tier]}`}>{model.tier}</span>
             <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-slate-100 text-slate-700">{model.status}</span>
@@ -45,7 +45,6 @@ export default function ModelDrawer({ modelId, onClose }: Props) {
 
           <p className="text-sm text-slate-600 leading-relaxed">{detail.description}</p>
 
-          {/* KPI row */}
           <div className="grid grid-cols-4 gap-3">
             <div className="bg-slate-50/80 rounded-xl p-3">
               <div className="text-[10px] uppercase tracking-widest text-slate-400">Eval score</div>
@@ -65,7 +64,6 @@ export default function ModelDrawer({ modelId, onClose }: Props) {
             </div>
           </div>
 
-          {/* Eval history */}
           <div>
             <div className="text-sm font-semibold text-slate-900 mb-2">Evaluation History</div>
             <div className="bg-white rounded-xl border border-slate-200 p-4">
@@ -84,7 +82,6 @@ export default function ModelDrawer({ modelId, onClose }: Props) {
             </div>
           </div>
 
-          {/* Drift */}
           <div>
             <div className="text-sm font-semibold text-slate-900 mb-2">Drift Signals (6-week)</div>
             <div className="bg-white rounded-xl border border-slate-200 p-4">
@@ -103,7 +100,6 @@ export default function ModelDrawer({ modelId, onClose }: Props) {
             </div>
           </div>
 
-          {/* Attestation */}
           <div>
             <div className="text-sm font-semibold text-slate-900 mb-2">Attestation & Documentation</div>
             <div className="grid grid-cols-3 gap-3">
@@ -135,7 +131,6 @@ export default function ModelDrawer({ modelId, onClose }: Props) {
             </div>
           </div>
 
-          {/* Approval chain */}
           <div>
             <div className="text-sm font-semibold text-slate-900 mb-2">Approval Chain</div>
             <div className="bg-white rounded-xl border border-slate-200 divide-y divide-slate-100">
@@ -153,7 +148,6 @@ export default function ModelDrawer({ modelId, onClose }: Props) {
             </div>
           </div>
 
-          {/* Use cases */}
           <div>
             <div className="text-sm font-semibold text-slate-900 mb-2">Use Cases ({detail.useCasesList.length})</div>
             <div className="bg-white rounded-xl border border-slate-200 divide-y divide-slate-100">

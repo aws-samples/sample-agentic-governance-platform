@@ -1,8 +1,8 @@
-"""MCP wire-protocol tool-scanner tests (Epic 7, Task T-SCAN).
+"""MCP wire-protocol tool-scanner tests.
 
 ``scan_mcp_tools`` hand-rolls the MCP "Streamable HTTP" JSON-RPC handshake
 (``initialize`` → ``notifications/initialized`` → ``tools/list``) over async
-``httpx`` to read a server's tools (research §5). NO live network — every test
+``httpx`` to read a server's tools . NO live network — every test
 injects an ``httpx.AsyncClient`` backed by an ``httpx.MockTransport`` whose
 handler records each request and returns a canned response (the repo's pure-
 service mocking idiom — see ``test_graph_service.py``).
@@ -29,16 +29,10 @@ from services.mcp_tool_scanner import McpScanError, scan_mcp_tools
 ENDPOINT = "https://gw-abc123.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
 
 
-# ---------------------------------------------------------------------------
-# Mock-transport handler builder
-# ---------------------------------------------------------------------------
-
 def _sse(frame: dict) -> httpx.Response:
     """A ``text/event-stream`` response carrying ``frame`` as a single ``data:`` event."""
-    body = f'data: {json.dumps(frame)}\n\n'
-    return httpx.Response(
-        200, headers={"content-type": "text/event-stream"}, text=body
-    )
+    body = f"data: {json.dumps(frame)}\n\n"
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=body)
 
 
 def _jsonr(frame: dict, *, headers: dict | None = None) -> httpx.Response:
@@ -74,8 +68,6 @@ def _make_client(responder):
     return client, calls
 
 
-# A canonical initialize result; protocolVersion echoes the sent version unless a
-# test overrides it.
 def _init_result(protocol_version: str = "2025-06-18") -> dict:
     return {
         "jsonrpc": "2.0",
@@ -94,10 +86,6 @@ def _tools_result(tools: list[dict], *, next_cursor: str | None = None) -> dict:
         result["nextCursor"] = next_cursor
     return {"jsonrpc": "2.0", "id": 2, "result": result}
 
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_scan_does_handshake_then_tools_list():
@@ -122,14 +110,12 @@ async def test_scan_does_handshake_then_tools_list():
         "notifications/initialized",
         "tools/list",
     ]
-    # All three POST to the same endpoint.
     assert all(c["url"] == ENDPOINT for c in calls)
-    # Accept lists BOTH content types on every POST.
     for c in calls:
         accept = c["headers"]["accept"]
         assert "application/json" in accept
         assert "text/event-stream" in accept
-        assert c["headers"]["mcp-protocol-version"]  # present + truthy
+        assert c["headers"]["mcp-protocol-version"]
         assert c["headers"]["content-type"] == "application/json"
 
 
@@ -145,9 +131,7 @@ async def test_scan_maps_inputSchema_to_input_schema():
         if body.get("method") == "notifications/initialized":
             return httpx.Response(202)
         return _jsonr(
-            _tools_result(
-                [{"name": "search", "description": "Search the web", "inputSchema": schema}]
-            )
+            _tools_result([{"name": "search", "description": "Search the web", "inputSchema": schema}])
         )
 
     client, _ = _make_client(responder)
@@ -214,7 +198,6 @@ async def test_scan_echoes_session_id():
     async with client:
         await scan_mcp_tools(ENDPOINT, http_client=client)
 
-    # initialize had no session id to send; the later two echo it.
     assert "mcp-session-id" not in {k.lower() for k in calls[0]["headers"]}
     assert calls[1]["headers"]["mcp-session-id"] == "sess-xyz"
     assert calls[2]["headers"]["mcp-session-id"] == "sess-xyz"
@@ -236,7 +219,6 @@ async def test_scan_uses_negotiated_protocol_version():
     async with client:
         await scan_mcp_tools(ENDPOINT, http_client=client)
 
-    # initialize sends the default version; the later POSTs send the negotiated one.
     assert calls[0]["headers"]["mcp-protocol-version"] == "2025-06-18"
     assert calls[1]["headers"]["mcp-protocol-version"] == "2025-03-26"
     assert calls[2]["headers"]["mcp-protocol-version"] == "2025-03-26"
@@ -252,11 +234,8 @@ async def test_scan_paginates_on_next_cursor():
             return _jsonr(_init_result())
         if body.get("method") == "notifications/initialized":
             return httpx.Response(202)
-        # tools/list — page 1 has a cursor, page 2 does not.
         if body["params"].get("cursor") is None:
-            return _jsonr(
-                _tools_result([{"name": "p1", "inputSchema": {}}], next_cursor="CUR1")
-            )
+            return _jsonr(_tools_result([{"name": "p1", "inputSchema": {}}], next_cursor="CUR1"))
         return _jsonr(_tools_result([{"name": "p2", "inputSchema": {}}]))
 
     client, calls = _make_client(responder)
@@ -264,7 +243,6 @@ async def test_scan_paginates_on_next_cursor():
         tools = await scan_mcp_tools(ENDPOINT, http_client=client)
 
     assert [t.name for t in tools] == ["p1", "p2"]
-    # Two tools/list POSTs; the second carried the cursor.
     tools_list_calls = [c for c in calls if c["method"] == "tools/list"]
     assert len(tools_list_calls) == 2
     assert tools_list_calls[1]["body"]["params"]["cursor"] == "CUR1"
@@ -317,9 +295,7 @@ async def test_scan_raises_on_jsonrpc_error_frame():
             return _jsonr(_init_result())
         if body.get("method") == "notifications/initialized":
             return httpx.Response(202)
-        return _jsonr(
-            {"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "Method not found"}}
-        )
+        return _jsonr({"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "Method not found"}})
 
     client, _ = _make_client(responder)
     with pytest.raises(McpScanError):
@@ -365,7 +341,6 @@ async def test_scan_caps_pagination_at_max_pages():
             return _jsonr(_init_result())
         if body.get("method") == "notifications/initialized":
             return httpx.Response(202)
-        # Always return the same cursor — an infinite-loop server.
         return _jsonr(_tools_result([{"name": "t", "inputSchema": {}}], next_cursor="FOREVER"))
 
     client, calls = _make_client(responder)
@@ -374,7 +349,6 @@ async def test_scan_caps_pagination_at_max_pages():
 
     tools_list_calls = [c for c in calls if c["method"] == "tools/list"]
     assert len(tools_list_calls) == _MAX_PAGES
-    # Each page contributed one tool.
     assert len(tools) == _MAX_PAGES
 
 
@@ -385,7 +359,6 @@ async def test_scan_raises_on_non_dict_jsonrpc_body():
     covers both JSON and SSE transports)."""
 
     def responder_list(i, body, request):
-        # Return a JSON array instead of an object — malformed remote.
         return httpx.Response(
             200,
             headers={"content-type": "application/json"},
@@ -408,7 +381,6 @@ async def test_scan_raises_on_nameless_tool():
             return _jsonr(_init_result())
         if body.get("method") == "notifications/initialized":
             return httpx.Response(202)
-        # Tool is missing the "name" key entirely.
         return _jsonr(_tools_result([{"description": "no name here", "inputSchema": {}}]))
 
     client, _ = _make_client(responder)

@@ -48,16 +48,27 @@ for you in `run_dev.sh` and in the `Dockerfile` (`ENV PYTHONPATH=/app/src`).
 ```bash
 cd platform/control_plane/backend
 cp .env.example .env          # then fill it in — the server refuses to start without it
-./run_dev.sh                  # creates the venv, installs deps, serves on :8000
+./run_dev.sh                  # creates the venv, installs deps, serves on 127.0.0.1:8000
 ```
 
 `run_dev.sh` installs `requirements-dev.txt` (which pulls in `requirements.txt`), exports
-`PYTHONPATH=src`, and runs uvicorn with hot reload. API docs are at `http://localhost:8000/docs`.
+`PYTHONPATH=src`, and `exec`s uvicorn with hot reload, bound to loopback: an API whose dev bypass makes
+every caller an admin is never on the LAN by default. Four variables adjust it: `AGP_BIND_HOST`
+(default `127.0.0.1`), `PORT` (default `8000`), and `ENV_FILE`, the env file uvicorn loads without
+overriding what the shell already exports: unset means `.env` (the script exits 1 when it is missing),
+empty means no env file at all, and `Settings` reads the same variable the same way, so a worktree with no
+git-ignored `.env` points `ENV_FILE` at another checkout's, and the local launcher (`agp up`) exports it
+empty so nothing a laptop's `.env` holds reaches that backend, with `REGISTRY_IN_MEMORY=true` and
+`GRAPH_IN_MEMORY=true` selecting the in-memory registry and directory. `UVICORN_RELOAD` is the fourth: unset,
+or any non-empty value, means hot reload over the backend tree, empty means one fixed process, and the
+launcher exports it empty too, because a reload restarts the server and wipes the in-memory registry and
+every in-memory store a session has built. API docs are at `http://127.0.0.1:8000/docs`.
 
-For local API work without an Entra token, set `USE_DEV_AUTH=true` in `.env` — a header-driven
-bypass (`x-user-email` / `x-user-role`) that exists only for development. Do **not** set
-`DEBUG=true`: it also enables the bypass, but it additionally makes the global exception handler echo
-exception text to the caller.
+For local API work without an Entra token, run the local launcher (`agp up`, above) or set `USE_DEV_AUTH=true`,
+`REGISTRY_IN_MEMORY=true` and `GRAPH_IN_MEMORY=true` in `.env` with every table, bucket and log-group setting
+empty: the header-driven bypass (`x-user-email` / `x-user-role`) is honoured only in that shape, and beside a
+configured store the backend refuses it, says so once at startup and requires a token. `DEBUG=true` raises the
+log level to DEBUG and nothing else; a 500 body is the same fixed shape for every caller.
 
 `docker compose up --build` runs the real image instead, from the repo root as build context. Read the
 header of [`docker-compose.yml`](docker-compose.yml) first — it explains why `.env` is not optional
@@ -77,7 +88,7 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt -r requirements
 venv/bin/python -m pytest -q
 ```
 
-Current: **3275 passed, 6 skipped** out of 3281 collected, about 63 seconds. No AWS credentials, no
+No AWS credentials, no
 deployed stack, and no network are required — and that last one is enforced: `tests/conftest.py`
 installs an autouse guard that **fails any test which opens a TCP connection to a non-loopback
 address**. If a new test starts reaching the internet, that guard is what tells you, not a slow
@@ -90,6 +101,18 @@ prefixing it is now optional for tests, and still required for anything under `s
 ```bash
 PYTHONPATH=src venv/bin/python scripts/seed_agents.py --dry-run
 ```
+
+Two more gates judge every Python file in the six linted areas (this tree's `src/`, `tests/` and `scripts/`, the
+root `scripts/lint/` and `scripts/entra-setup/`, and `applications/`), from the pre-commit hooks and from CI alike.
+`scripts/lint/suppressions.sh --all` holds every suppression to one grammar:
+`# noqa: S105 — a key name, not a credential; expires 2027-10-23; added E<n>/T<id>`, the origin being the epic and
+task (or hotfix) that added it, the same tail on `type: ignore[...]`, `pyright: ignore[...]` and
+`pragma: no cover`; the reason is non-empty and free of band-aid words, the expiry is at most a year out, and an
+expired line fails the next pipeline until it is fixed or renewed in a reviewed diff.
+`scripts/lint/comments.sh --ratio --all` holds the density ceiling: a file with more than ten comment lines is at
+most 10% comment lines, counting `tokenize` comment tokens over total lines (docstrings are not comments). A
+comment's knowledge goes into a test name, a `Field(description=...)`, a named function or an ADR under
+`docs/adr/`; `tests/test_error_layer.py` holds the error layer those ADRs describe.
 
 ---
 
@@ -144,8 +167,9 @@ ARN* on a record, never the material.
 ## Configuration
 
 Every setting is a field on `Settings` in `src/core/config.py`, read from the environment (and from
-`.env` locally — Pydantic Settings is configured with `env_file = ".env"` and `extra = "ignore"`, so
-one `.env` can carry variables belonging to sibling tools without breaking startup).
+the dotenv file `ENV_FILE` names locally, `.env` when unset and none when empty — Pydantic Settings is
+configured with `extra = "ignore"`, so one `.env` can carry variables belonging to sibling tools without
+breaking startup).
 
 [`.env.example`](.env.example) is the authoritative local template and lists every variable you must
 supply, with the Entra values annotated. It is deliberately short: the rest have working defaults, and

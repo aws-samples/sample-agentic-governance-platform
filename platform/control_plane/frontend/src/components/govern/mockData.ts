@@ -1,18 +1,3 @@
-// Mock data for Govern / FinOps — patterns borrowed from AI_Trust_Platform
-// (AgenticDashboard.js, cost-tracker/costData.js) and restyled to our palette.
-
-// ─────────────────────────── Shared palette ───────────────────────────
-export const CHART_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#6366f1'];
-export const tooltipStyle = {
-  background: 'rgba(255,255,255,0.98)',
-  border: '1px solid #e2e8f0',
-  borderRadius: 8,
-  fontSize: 12,
-  color: '#0f172a',
-  boxShadow: '0 4px 12px rgba(15,23,42,0.08)',
-};
-
-// ─────────────────────────── Governance Dashboard ───────────────────────────
 export const TRUST_SCORE = {
   overall: 78,
   trend: 'improving' as const,
@@ -44,7 +29,6 @@ export const COMPLIANCE_FRAMEWORKS = [
   { name: 'SOC 2 Type II',   covered:  96, total: 100, status: 'on-track' as const },
 ];
 
-// Agent × risk heatmap
 export const RISK_CATEGORIES = ['Hallucination', 'PII Leak', 'Prompt Injection', 'Bias', 'Cost Spike', 'Availability'] as const;
 export const AGENT_RISK: { agent: string; scores: number[] }[] = [
   { agent: 'KYC Banking',           scores: [15, 10, 22, 18, 25, 12] },
@@ -57,7 +41,6 @@ export const AGENT_RISK: { agent: string; scores: number[] }[] = [
   { agent: 'Compliance Investig.',  scores: [12, 15, 8,  10, 18, 12] },
 ];
 
-// Recent incidents / guardrail hits
 export const GUARDRAIL_FEED = [
   { ts: '12:04', agent: 'Customer Service',    event: 'PII redacted',            severity: 'low' as const,    action: 'anonymize' },
   { ts: '11:58', agent: 'Fraud Detection',     event: 'Prompt injection blocked', severity: 'high' as const,   action: 'block' },
@@ -77,7 +60,6 @@ export const TOP_RISKY_USE_CASES = [
   { name: 'Market Surveillance',   riskScore: 42, invocations: 7100,  incidents: 0 },
 ];
 
-// 30-day risk + guardrail trend
 export const RISK_TREND_30D = Array.from({ length: 30 }, (_, i) => ({
   day: i + 1,
   trustScore: 72 + Math.round(6 * Math.sin(i / 3) + i * 0.2),
@@ -85,7 +67,6 @@ export const RISK_TREND_30D = Array.from({ length: 30 }, (_, i) => ({
   violations:   Math.max(0, 20 + Math.round(8 * Math.sin(i / 5) - i * 0.3)),
 }));
 
-// ─────────────────────────── Cost & FinOps ───────────────────────────
 export const COST_HEALTH = {
   score: 72,
   trend: 'improving' as const,
@@ -160,7 +141,6 @@ export const OPTIMIZATION_OPPS = [
 
 export const TOTAL_POTENTIAL_SAVINGS = OPTIMIZATION_OPPS.reduce((s, o) => s + o.savings, 0);
 
-// ─────────────────────────── FinOps extended ───────────────────────────
 export const FORECAST_12M = Array.from({ length: 12 }, (_, i) => {
   const month = `M${i + 1}`;
   const conservative = parseFloat((12000 * Math.pow(1.08, i)).toFixed(0));
@@ -206,10 +186,9 @@ export const COMMITMENTS = [
   { model: 'Nova Pro',            mode: 'On-demand',             monthlySpend:  640, proposedCommitment:  500, savingsIfCommitted: 75,   breakEvenMo: 3, status: 'Evaluating' as const },
 ];
 
-// ─────────────────────────── Audit & Incidents ───────────────────────────
 export type AuditEvent = {
   id: string;
-  ts: string;           // ISO-ish; we render human-readable
+  ts: string;
   category: 'guardrail' | 'incident' | 'approval' | 'deployment' | 'config';
   severity: 'low' | 'medium' | 'high' | 'critical';
   agent?: string;
@@ -241,10 +220,9 @@ export const INCIDENT_SUMMARY = {
   open: 3,
   critical: 1,
   resolved7d: 14,
-  mttrMin: 28, // mean time to resolve, in minutes
+  mttrMin: 28,
 };
 
-// ─────────────────────────── Model Inventory ───────────────────────────
 export const MODELS = [
   { id: 'haiku-4-5',  name: 'Claude Haiku 4.5',  provider: 'Anthropic (Bedrock)', owner: 'Retail Banking',  useCases: 12, tier: 'Tier 3' as const, evalScore: 82, monthlyCost: 5280, lastValidated: '2026-04-28', status: 'Production' as const },
   { id: 'sonnet-4-5', name: 'Claude Sonnet 4.5', provider: 'Anthropic (Bedrock)', owner: 'Risk & Fraud',    useCases:  8, tier: 'Tier 2' as const, evalScore: 88, monthlyCost: 3820, lastValidated: '2026-04-15', status: 'Production' as const },
@@ -253,7 +231,6 @@ export const MODELS = [
   { id: 'nova-lite',  name: 'Nova Lite',         provider: 'Amazon (Bedrock)',    owner: 'Customer Svc',    useCases:  3, tier: 'Tier 3' as const, evalScore: 68, monthlyCost:  460, lastValidated: '2026-02-10', status: 'Pending Review' as const },
 ];
 
-// ─────────────────────────── Model 360 drill-down ───────────────────────────
 export type ModelDetail = {
   id: string;
   description: string;
@@ -456,7 +433,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
   },
 };
 
-// ─────────────────────────── Agent × Risk drill-down ───────────────────────────
 export type RiskDrill = {
   agent: string;
   category: string;
@@ -468,7 +444,6 @@ export type RiskDrill = {
 };
 
 export function getRiskDrill(agent: string, category: string, score: number): RiskDrill {
-  // Deterministic-ish mock based on score
   const tier: 'low' | 'medium' | 'high' = score >= 60 ? 'high' : score >= 40 ? 'medium' : 'low';
   const baseIncidentCount = Math.max(1, Math.round(score / 20));
   const incidents = Array.from({ length: baseIncidentCount }).map((_, i) => ({
@@ -543,7 +518,6 @@ export function getRiskDrill(agent: string, category: string, score: number): Ri
   };
 }
 
-// ─────────────────────────── Framework detail ───────────────────────────
 export type FrameworkDetail = {
   name: string;
   summary: string;
@@ -553,7 +527,6 @@ export type FrameworkDetail = {
   }[];
 };
 
-// ─────────────────────────── Compliance Center Frameworks ───────────────────────────
 export type ControlStatus = 'pass' | 'fail' | 'in-progress' | 'not-started';
 
 export type ComplianceControl = {

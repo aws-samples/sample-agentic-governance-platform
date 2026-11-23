@@ -18,6 +18,12 @@ Note on the fixture: CPython's `basicConfig` applies its `level=` only when root
 yet, so the import-time conditions have to be reproduced by clearing root around the call (pytest's
 logging plugin installs a root handler for every test phase). Everything is restored afterwards —
 logging is global state and the rest of the suite shares it.
+
+The four reference agents under `applications/` configure logging themselves from a `LOG_LEVEL` env
+var their READMEs advertise, and they read the same Langfuse secret with boto3, so they need the same
+clamp. They cannot be imported here (their deps, `strands` and `bedrock_agentcore`, are not in the
+backend image), so that guard is a source check, the approach `test_no_token_logging.py` takes for the
+same reason: the agents are near-clones, so a fix in one file does not stay fixed.
 """
 
 from __future__ import annotations
@@ -30,11 +36,6 @@ import pytest
 
 from main import _WIRE_LOGGERS, configure_logging
 
-# The four reference agents configure logging themselves from a `LOG_LEVEL` env var their READMEs
-# advertise, and they read the same Langfuse secret with boto3 — so they need the same clamp. They
-# cannot be imported here (their deps, `strands`/`bedrock_agentcore`, are not in the backend image),
-# so the guard is a source check, the same approach `test_no_token_logging.py` takes for the same
-# reason: the agents are near-clones, so a fix in one file does not stay fixed.
 APPS_DIR = Path(__file__).resolve().parents[4] / "applications"
 AGENT_FILES = sorted(APPS_DIR.glob("acme_*_agent/agent.py"))
 
@@ -114,9 +115,6 @@ def test_default_info_log_level_is_unchanged_by_the_clamp(configure_logging_from
         assert logging.getLogger(name).getEffectiveLevel() == 20, name
 
 
-# -- the four reference agents ------------------------------------------------------------------
-
-
 def _clamp_loop(agent_file: Path) -> ast.For:
     """Return the module-level `for` loop that clamps the wire loggers, or fail."""
     for node in ast.parse(agent_file.read_text()).body:
@@ -138,11 +136,13 @@ def test_the_four_reference_agents_exist():
 
 @pytest.mark.parametrize("agent_file", AGENT_FILES, ids=lambda p: p.parent.name)
 def test_reference_agent_clamps_the_same_wire_loggers_at_info(agent_file: Path):
+    """The clamp is a floor, not a fixed level, with the same semantics as the backend's
+    `configure_logging`."""
     loop = _clamp_loop(agent_file)
+    assert isinstance(loop.iter, ast.Tuple | ast.List)
     clamped = {e.value for e in loop.iter.elts if isinstance(e, ast.Constant)}
     assert clamped == set(_WIRE_LOGGERS), f"{agent_file.parent.name}: {clamped}"
 
-    body = ast.unparse(loop.body)
+    body = ast.unparse(ast.Module(body=loop.body, type_ignores=[]))
     assert "setLevel(logging.INFO)" in body, f"{agent_file.parent.name}: {body}"
-    # A floor, not a fixed level — same semantics as the backend's `configure_logging`.
     assert "getEffectiveLevel() < logging.INFO" in body, f"{agent_file.parent.name}: {body}"

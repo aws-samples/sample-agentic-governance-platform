@@ -2,6 +2,7 @@
   "id": "strands-agentcore",
   "name": "Strands + AgentCore",
   "framework": "strands",
+  "infra_template_id": "agentcore-runtime",
   "description": "Barebones Strands agent on Bedrock AgentCore — build-only CI, platform-owned runtime IaC.",
   "aws_services": ["bedrock", "ecr", "agentcore"],
   "tags": ["starter", "python", "strands"],

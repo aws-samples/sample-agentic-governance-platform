@@ -25,6 +25,11 @@ or waste an operator's afternoon:
    print it, or the operator's only copy is gone.
 5. **Dry-run writes nothing at all.** It is the safe first run against a
    configured tenant, so "zero mutations" is a test, not a promise.
+
+The fixture's identifiers on already-existing registrations and its tenant permission ids are unlike
+anything the module mints or hardcodes, so a re-minted scope or role identifier, or a permission id
+taken from the module's own table instead of the tenant's Graph principal, shows up as a changed value
+rather than as a pass.
 """
 
 from __future__ import annotations
@@ -39,26 +44,16 @@ from typing import Any, Callable
 
 import pytest
 
-# The script is a standalone single file, not an installed package: put its
-# directory on the import path so the tests run the same way regardless of the
-# working directory pytest was invoked from.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import setup_entra  # noqa: E402  (import follows the sys.path bootstrap above)
+import setup_entra
 
-
-# ===========================================================================
-# The scripted tenant
-# ===========================================================================
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 GRAPH_SP_ID = "22222222-2222-2222-2222-222222222222"
 ME_ID = "33333333-3333-3333-3333-333333333333"
 ME_UPN = "admin@contoso.onmicrosoft.com"
 INITIAL_DOMAIN = "contoso.onmicrosoft.com"
 
-# Identifiers on the ALREADY-EXISTING registrations, deliberately unlike anything
-# the fake mints for a create: a re-run that quietly re-minted a scope or role
-# identifier would show up as a changed value here rather than as a pass.
 EXISTING_SCOPE_ID = "aaaaaaaa-0000-0000-0000-000000000001"
 EXISTING_ROLE_IDS = {
     "Platform.Admin": "aaaaaaaa-0000-0000-0000-000000000002",
@@ -70,11 +65,6 @@ EXISTING_BACKEND_CLIENT_ID = "existing-backend-client-id"
 EXISTING_SPA_OBJECT_ID = "existing-spa-object-id"
 EXISTING_SPA_CLIENT_ID = "existing-spa-client-id"
 
-# What THIS tenant says the six Microsoft Graph permissions are called, deliberately
-# unlike the module's fallback table. A fake whose Graph principal is built from that
-# table cannot tell a tenant-resolved identifier from a hardcoded one, which makes
-# the resolution itself untestable — the very feature that exists so a renamed or
-# unavailable permission fails loudly instead of granting the wrong thing quietly.
 TENANT_PERMISSION_IDS = {
     name: f"tenant-permission-{index}"
     for index, name in enumerate(setup_entra.GRAPH_APP_PERMISSIONS, start=1)
@@ -167,8 +157,7 @@ def existing_backend_application(
         else []
     )
     resource_access = [
-        {"id": permission_id, "type": "Role"}
-        for permission_id in setup_entra.GRAPH_APP_PERMISSIONS.values()
+        {"id": permission_id, "type": "Role"} for permission_id in setup_entra.GRAPH_APP_PERMISSIONS.values()
     ]
     return {
         "id": EXISTING_BACKEND_OBJECT_ID,
@@ -227,9 +216,7 @@ def existing_spa_application(
     return app
 
 
-def service_principal_for(
-    app_id: str, *, assignment_required: bool = True, sp_id: str | None = None
-) -> dict:
+def service_principal_for(app_id: str, *, assignment_required: bool = True, sp_id: str | None = None) -> dict:
     """A service principal already present in the tenant, keyed by its app id."""
     return {
         "id": sp_id or f"sp-of-{app_id}",
@@ -278,7 +265,6 @@ class FakeClient:
         self._app_count = 0
         self._sp_count = 0
 
-    # --- what the tests assert on -----------------------------------------
     @property
     def mutations(self) -> list[Call]:
         return [call for call in self.calls if call.method in ("POST", "PATCH")]
@@ -289,17 +275,12 @@ class FakeClient:
 
     def sent(self, method: str, path: str) -> list[dict]:
         """Every body sent to one endpoint, in order."""
-        return [
-            call.payload or {}
-            for call in self.calls
-            if call.method == method and call.path == path
-        ]
+        return [call.payload or {} for call in self.calls if call.method == method and call.path == path]
 
-    # --- the GraphClient surface ------------------------------------------
     def get(self, path: str, params: dict | None = None) -> dict:
         self.calls.append(Call("GET", path, params))
         scripted = self._scripted("GET", path, params)
-        if scripted is not _NORMAL:
+        if scripted is not _NO_SCRIPTED_FAILURE:
             return scripted
         if path == "/me":
             return dict(self.me)
@@ -308,17 +289,13 @@ class FakeClient:
         if path == "/applications":
             return {"value": self._filter_applications((params or {}).get("$filter", ""))}
         if path == "/servicePrincipals":
-            return {
-                "value": self._filter_service_principals(
-                    (params or {}).get("$filter", "")
-                )
-            }
+            return {"value": self._filter_service_principals((params or {}).get("$filter", ""))}
         raise AssertionError(f"the flow read an endpoint the fake does not model: {path}")
 
     def post(self, path: str, payload: dict) -> dict:
         self.calls.append(Call("POST", path, payload))
         scripted = self._scripted("POST", path, payload)
-        if scripted is not _NORMAL:
+        if scripted is not _NO_SCRIPTED_FAILURE:
             return scripted
         if path == "/applications":
             return self.store_application(payload)
@@ -333,14 +310,13 @@ class FakeClient:
     def patch(self, path: str, payload: dict) -> None:
         self.calls.append(Call("PATCH", path, payload))
         scripted = self._scripted("PATCH", path, payload)
-        if scripted is not _NORMAL:
+        if scripted is not _NO_SCRIPTED_FAILURE:
             return None
         for sp in self.service_principals:
             if path == f"/servicePrincipals/{sp['id']}":
                 sp.update(payload)
         return None
 
-    # --- tenant state ------------------------------------------------------
     def store_application(self, payload: dict) -> dict:
         """Apply a ``POST /applications`` to the tenant and answer with the object.
 
@@ -373,14 +349,13 @@ class FakeClient:
         self.service_principals.append(created)
         return created
 
-    # --- internals ---------------------------------------------------------
     def _scripted(self, method: str, path: str, payload: dict | None) -> Any:
         queued = self._failures.get((method, path))
         if not queued:
-            return _NORMAL
+            return _NO_SCRIPTED_FAILURE
         entry = queued.pop(0)
         if entry is None:
-            return _NORMAL
+            return _NO_SCRIPTED_FAILURE
         if isinstance(entry, Exception):
             raise entry
         if callable(entry):
@@ -390,16 +365,10 @@ class FakeClient:
     def _filter_applications(self, filter_value: str) -> list[dict]:
         if filter_value.startswith("identifierUris/any"):
             wanted = _quoted_literal(filter_value)
-            return [
-                dict(app)
-                for app in self.applications
-                if wanted in (app.get("identifierUris") or [])
-            ]
+            return [dict(app) for app in self.applications if wanted in (app.get("identifierUris") or [])]
         if filter_value.startswith("displayName eq"):
             wanted = _quoted_literal(filter_value)
-            return [
-                dict(app) for app in self.applications if app.get("displayName") == wanted
-            ]
+            return [dict(app) for app in self.applications if app.get("displayName") == wanted]
         raise AssertionError(f"unmodelled application filter: {filter_value!r}")
 
     def _filter_service_principals(self, filter_value: str) -> list[dict]:
@@ -409,9 +378,7 @@ class FakeClient:
         return [dict(sp) for sp in self.service_principals if sp.get("appId") == wanted]
 
 
-# Sentinel meaning "no failure was scripted for this call", so that a scripted
-# answer of ``None`` (a PATCH's empty body) stays distinguishable from it.
-_NORMAL = object()
+_NO_SCRIPTED_FAILURE = object()
 
 
 def _status_codes(text: str) -> list[str]:
@@ -445,9 +412,7 @@ def run(monkeypatch) -> Callable[..., int]:
             expires_on=4102444800,
         )
         monkeypatch.setattr(setup_entra, "get_az_token", lambda: token)
-        monkeypatch.setattr(
-            setup_entra, "GraphClient", lambda *args, **kwargs: client
-        )
+        monkeypatch.setattr(setup_entra, "GraphClient", lambda *args, **kwargs: client)
         return setup_entra.main(argv or [])
 
     return _run
@@ -472,14 +437,9 @@ def configured_tenant(*, backend: dict | None = None, **kwargs) -> FakeClient:
 
 
 def already_exists() -> setup_entra.AlreadyExists:
-    return setup_entra.AlreadyExists(
-        400, "Request_BadRequest", "Permission entry already exists."
-    )
+    return setup_entra.AlreadyExists(400, "Request_BadRequest", "Permission entry already exists.")
 
 
-# ===========================================================================
-# The Executor seam
-# ===========================================================================
 def test_executor_sends_a_post_and_hands_back_the_response() -> None:
     """A real run's ``apply`` is a thin pass-through, because the response is the
     only place server-generated fields such as a secret's text ever appear."""
@@ -498,9 +458,7 @@ def test_executor_sends_a_post_and_hands_back_the_response() -> None:
 def test_executor_treats_a_tolerated_already_exists_as_success(capsys) -> None:
     """A duplicate consent IS the desired end state, so it is logged and the flow
     continues. Letting it escape would turn every re-run into a failure."""
-    client = FakeClient(
-        failures={("POST", "/oauth2PermissionGrants"): already_exists()}
-    )
+    client = FakeClient(failures={("POST", "/oauth2PermissionGrants"): already_exists()})
     executor = setup_entra.Executor(client, dry_run=False)
 
     result = executor.apply(
@@ -561,13 +519,9 @@ def test_executor_in_dry_run_prints_the_plan_and_sends_nothing(capsys) -> None:
     assert result is None
     assert client.calls == []
     assert "WOULD POST /applications — create the backend app registration" in out
-    # The payload is printed too: a plan the operator cannot read is not a plan.
     assert '"displayName": "AGP - Backend Graph Client"' in out
 
 
-# ===========================================================================
-# Reads
-# ===========================================================================
 def test_resolve_context_reads_the_runner_tenant_and_permissions() -> None:
     """The four facts every later call needs, in one place."""
     client = fresh_tenant()
@@ -631,15 +585,9 @@ def test_resolve_context_falls_back_only_for_the_permissions_the_tenant_omits() 
     resolved = setup_entra.resolve_context(client).permission_ids
 
     assert resolved["User.Read.All"] == TENANT_PERMISSION_IDS["User.Read.All"]
-    assert (
-        resolved["Directory.Read.All"]
-        == setup_entra.GRAPH_APP_PERMISSIONS["Directory.Read.All"]
-    )
+    assert resolved["Directory.Read.All"] == setup_entra.GRAPH_APP_PERMISSIONS["Directory.Read.All"]
 
 
-# ===========================================================================
-# Existence lookups
-# ===========================================================================
 def test_find_backend_matches_on_the_identifier_uri() -> None:
     """The identifier URI is unique tenant-wide; the display name is not. Matching
     the backend on the name would let a second app with the same name shadow it."""
@@ -661,9 +609,7 @@ def test_find_backend_escapes_a_quote_in_the_audience() -> None:
 
     setup_entra.find_backend(client, "api://o'brien")
 
-    assert client.calls[-1].payload["$filter"] == (
-        "identifierUris/any(u:u eq 'api://o''brien')"
-    )
+    assert client.calls[-1].payload["$filter"] == ("identifierUris/any(u:u eq 'api://o''brien')")
 
 
 def test_find_backend_returns_none_on_a_fresh_tenant() -> None:
@@ -679,17 +625,13 @@ def test_find_spa_matches_on_the_display_name() -> None:
 
     assert found is not None
     assert found["appId"] == EXISTING_SPA_CLIENT_ID
-    assert client.calls[-1].payload["$filter"] == (
-        f"displayName eq '{setup_entra.DEFAULT_SPA_NAME}'"
-    )
+    assert client.calls[-1].payload["$filter"] == (f"displayName eq '{setup_entra.DEFAULT_SPA_NAME}'")
 
 
 def test_find_spa_refuses_to_guess_between_two_matches() -> None:
     """Display names are not unique. Picking the first match would silently point
     the deployment at whichever registration Graph happened to list first."""
-    client = FakeClient(
-        applications=[existing_spa_application(), existing_spa_application()]
-    )
+    client = FakeClient(applications=[existing_spa_application(), existing_spa_application()])
 
     with pytest.raises(setup_entra.PreflightError) as excinfo:
         setup_entra.find_spa(client, setup_entra.DEFAULT_SPA_NAME)
@@ -698,17 +640,9 @@ def test_find_spa_refuses_to_guess_between_two_matches() -> None:
     assert "--spa-name" in str(excinfo.value)
 
 
-# ===========================================================================
-# Drift comparison
-# ===========================================================================
 def test_compare_backend_is_silent_on_a_matching_registration() -> None:
     """No news is the clean result: an empty list means nothing to report."""
-    assert (
-        setup_entra.compare_backend(
-            existing_backend_application(), setup_entra.DEFAULT_AUDIENCE
-        )
-        == []
-    )
+    assert setup_entra.compare_backend(existing_backend_application(), setup_entra.DEFAULT_AUDIENCE) == []
 
 
 @pytest.mark.parametrize(
@@ -749,9 +683,7 @@ def test_compare_spa_is_silent_on_the_registration_this_script_creates() -> None
     """The frontend registration this script writes has to compare clean against
     itself, or every re-run reports drift it caused."""
     assert (
-        setup_entra.compare_spa(
-            existing_spa_application(), EXISTING_BACKEND_CLIENT_ID, EXISTING_SCOPE_ID
-        )
+        setup_entra.compare_spa(existing_spa_application(), EXISTING_BACKEND_CLIENT_ID, EXISTING_SCOPE_ID)
         == []
     )
 
@@ -767,9 +699,7 @@ def test_compare_spa_is_silent_on_the_registration_this_script_creates() -> None
         (existing_spa_application(scope_id="an-unrelated-scope"), "an-unrelated-scope"),
     ],
 )
-def test_compare_spa_names_what_a_browser_sign_in_cannot_survive(
-    app: dict, expected: str
-) -> None:
+def test_compare_spa_names_what_a_browser_sign_in_cannot_survive(app: dict, expected: str) -> None:
     """The frontend registration is matched on display name and nothing else, so an
     application that merely shares that name is adopted, printed as the deployment's
     client id, and fails at sign-in with a scope or redirect error that names neither
@@ -780,9 +710,6 @@ def test_compare_spa_names_what_a_browser_sign_in_cannot_survive(
     assert any(expected in line for line in lines), lines
 
 
-# ===========================================================================
-# The fresh-tenant run
-# ===========================================================================
 def test_fresh_run_performs_the_documented_mutation_sequence(run, capsys) -> None:
     """The ordering is a dependency chain, not a preference.
 
@@ -825,16 +752,12 @@ def test_fresh_run_sends_the_payload_fields_that_cannot_be_repaired(run) -> None
     assert backend["identifierUris"] == [setup_entra.DEFAULT_AUDIENCE]
     assert backend["api"]["requestedAccessTokenVersion"] == 2
     assert backend["displayName"] == setup_entra.DEFAULT_BACKEND_NAME
-    assert backend["passwordCredentials"]  # the one chance to read a secret
+    assert backend["passwordCredentials"]
     assert spa["spa"] == {"redirectUris": []}
     assert spa["displayName"] == setup_entra.DEFAULT_SPA_NAME
 
-    # The hardest coupling in the script: the frontend references the backend's
-    # scope BY IDENTIFIER, so the two values have to be the same GUID.
     scope_id = backend["api"]["oauth2PermissionScopes"][0]["id"]
-    assert spa["requiredResourceAccess"][0]["resourceAccess"] == [
-        {"id": scope_id, "type": "Scope"}
-    ]
+    assert spa["requiredResourceAccess"][0]["resourceAccess"] == [{"id": scope_id, "type": "Scope"}]
     assert spa["requiredResourceAccess"][0]["resourceAppId"] == "created-app-client-1"
 
 
@@ -845,13 +768,9 @@ def test_fresh_run_requires_assignment_and_consents_every_permission(run) -> Non
 
     assert run(client) == 0
 
-    assert client.sent("PATCH", "/servicePrincipals/created-sp-1") == [
-        {"appRoleAssignmentRequired": True}
-    ]
+    assert client.sent("PATCH", "/servicePrincipals/created-sp-1") == [{"appRoleAssignmentRequired": True}]
     consents = client.sent("POST", f"/servicePrincipals/{GRAPH_SP_ID}/appRoleAssignedTo")
-    assert [consent["appRoleId"] for consent in consents] == list(
-        setup_entra.GRAPH_APP_PERMISSIONS.values()
-    )
+    assert [consent["appRoleId"] for consent in consents] == list(setup_entra.GRAPH_APP_PERMISSIONS.values())
     assert {consent["principalId"] for consent in consents} == {"created-sp-1"}
     assert {consent["resourceId"] for consent in consents} == {GRAPH_SP_ID}
 
@@ -882,9 +801,7 @@ def test_fresh_run_assigns_the_runner_on_the_backend_principal(run) -> None:
     assert run(client) == 0
 
     backend = client.sent("POST", "/applications")[0]
-    admin_role_id = next(
-        role["id"] for role in backend["appRoles"] if role["value"] == "Platform.Admin"
-    )
+    admin_role_id = next(role["id"] for role in backend["appRoles"] if role["value"] == "Platform.Admin")
     assert client.sent("POST", "/servicePrincipals/created-sp-1/appRoleAssignedTo") == [
         {
             "principalId": ME_ID,
@@ -894,9 +811,6 @@ def test_fresh_run_assigns_the_runner_on_the_backend_principal(run) -> None:
     ]
 
 
-# ===========================================================================
-# The idempotent re-run
-# ===========================================================================
 def test_rerun_creates_nothing_and_succeeds(run, capsys) -> None:
     """A second run against a configured tenant is the normal case, not an edge
     case: the operator re-runs it to check the setup or after changing a flag.
@@ -925,7 +839,6 @@ def test_rerun_creates_nothing_and_succeeds(run, capsys) -> None:
     assert client.sent("POST", "/servicePrincipals") == []
     assert [call for call in client.mutations if call.method == "PATCH"] == []
     assert out.count("already present") == 8
-    # Nothing was created, so the secret cannot be shown again.
     assert "<existing secret — cannot be re-read>" in out
 
 
@@ -946,19 +859,13 @@ def test_rerun_reads_the_identifiers_off_the_found_registration(run) -> None:
     assert run(client) == 0
 
     spa = client.sent("POST", "/applications")[0]
-    assert spa["requiredResourceAccess"][0]["resourceAccess"] == [
-        {"id": EXISTING_SCOPE_ID, "type": "Scope"}
-    ]
+    assert spa["requiredResourceAccess"][0]["resourceAccess"] == [{"id": EXISTING_SCOPE_ID, "type": "Scope"}]
     assert spa["requiredResourceAccess"][0]["resourceAppId"] == EXISTING_BACKEND_CLIENT_ID
-    grants = client.sent(
-        "POST", f"/servicePrincipals/sp-of-{EXISTING_BACKEND_CLIENT_ID}/appRoleAssignedTo"
-    )
+    grants = client.sent("POST", f"/servicePrincipals/sp-of-{EXISTING_BACKEND_CLIENT_ID}/appRoleAssignedTo")
     assert grants[0]["appRoleId"] == EXISTING_ROLE_IDS["Platform.Admin"]
 
 
-def test_the_printed_audience_is_read_back_from_the_created_registration(
-    run, capsys
-) -> None:
+def test_the_printed_audience_is_read_back_from_the_created_registration(run, capsys) -> None:
     """The audience in the block is a fact about the tenant, not a restatement of the
     flag.
 
@@ -969,16 +876,12 @@ def test_the_printed_audience_is_read_back_from_the_created_registration(
     """
     stored_uri = "api://agp-as-the-directory-stored-it"
 
-    def create_and_store_a_different_uri(
-        client: FakeClient, path: str, payload: dict
-    ) -> dict:
+    def create_and_store_a_different_uri(client: FakeClient, path: str, payload: dict) -> dict:
         created = client.store_application(payload)
         created["identifierUris"] = [stored_uri]
         return created
 
-    client = fresh_tenant(
-        failures={("POST", "/applications"): [create_and_store_a_different_uri]}
-    )
+    client = fresh_tenant(failures={("POST", "/applications"): [create_and_store_a_different_uri]})
 
     assert run(client) == 0
     out = capsys.readouterr().out
@@ -1011,19 +914,13 @@ def test_the_printed_audience_is_the_one_the_lookup_matched(run, capsys) -> None
 
     matched = re.escape(setup_entra.DEFAULT_AUDIENCE)
     assert re.search(rf'^entra_audience +\= "{matched}"$', out, re.MULTILINE)
-    assert (
-        f"VITE_ENTRA_SPA_SCOPE={setup_entra.DEFAULT_AUDIENCE}/{setup_entra.SCOPE_NAME}"
-        in out
-    )
+    assert f"VITE_ENTRA_SPA_SCOPE={setup_entra.DEFAULT_AUDIENCE}/{setup_entra.SCOPE_NAME}" in out
     assert "api://agp-legacy/" not in out
     assert "api://agp-newer/" not in out
-    # ...and the extra URIs are named, once, as drift.
     assert "identifier URI: expected only" in out
 
 
-def test_a_backend_without_the_admin_role_assigns_nobody_and_says_so(
-    run, capsys
-) -> None:
+def test_a_backend_without_the_admin_role_assigns_nobody_and_says_so(run, capsys) -> None:
     """The receipt has to match what happened.
 
     A registration that predates the role cannot have anybody assigned to it, and a
@@ -1032,9 +929,7 @@ def test_a_backend_without_the_admin_role_assigns_nobody_and_says_so(
     carries no roles claim at all.
     """
     client = configured_tenant(
-        backend=existing_backend_application(
-            roles=("Platform.Operator", "Platform.Viewer")
-        )
+        backend=existing_backend_application(roles=("Platform.Operator", "Platform.Viewer"))
     )
 
     exit_code = run(client)
@@ -1053,9 +948,7 @@ def test_a_backend_without_the_admin_role_assigns_nobody_and_says_so(
     assert "app role Platform.Admin" in out
 
 
-def test_a_backend_without_the_delegated_scope_refuses_to_create_the_frontend(
-    run, capsys
-) -> None:
+def test_a_backend_without_the_delegated_scope_refuses_to_create_the_frontend(run, capsys) -> None:
     """The one guard between a missing scope and an unusable frontend registration.
 
     Without it the frontend is created asking for scope id ``null``: Microsoft Entra
@@ -1139,16 +1032,11 @@ def test_a_frontend_name_the_operator_passed_is_looked_up_verbatim(run) -> None:
     assert client.sent("POST", "/applications")[0]["displayName"] == "TEST - Frontend"
 
 
-# ===========================================================================
-# The drift run
-# ===========================================================================
 def test_drift_run_reports_and_changes_nothing(run, capsys) -> None:
     """Drift is reported, never repaired — and the run still succeeds, because the
     operator asked what the state was, not for it to be rewritten."""
     client = configured_tenant(
-        backend=existing_backend_application(
-            roles=("Platform.Admin", "Platform.Viewer")
-        )
+        backend=existing_backend_application(roles=("Platform.Admin", "Platform.Viewer"))
     )
     for sp in client.service_principals:
         if sp["appId"] == EXISTING_BACKEND_CLIENT_ID:
@@ -1164,9 +1052,7 @@ def test_drift_run_reports_and_changes_nothing(run, capsys) -> None:
     assert client.sent("POST", "/applications") == []
 
 
-def test_an_unrelated_registration_with_the_frontend_name_is_reported_as_drift(
-    run, capsys
-) -> None:
+def test_an_unrelated_registration_with_the_frontend_name_is_reported_as_drift(run, capsys) -> None:
     """Adopting a registration is not the same as verifying it.
 
     The frontend is matched on display name alone, so an application that merely
@@ -1201,9 +1087,6 @@ def test_an_unrelated_registration_with_the_frontend_name_is_reported_as_drift(
     assert [call for call in client.mutations if call.method == "PATCH"] == []
 
 
-# ===========================================================================
-# Dry run
-# ===========================================================================
 def test_dry_run_reads_only(run, capsys) -> None:
     """The safe first run against a configured tenant. Zero writes is a test."""
     client = fresh_tenant()
@@ -1232,8 +1115,6 @@ def test_dry_run_prints_every_mutation_it_would_send(run, capsys) -> None:
     assert "WOULD POST /servicePrincipals/<backend-sp-id>/appRoleAssignedTo" in out
     assert '"principalId": "<backend-sp-id>"' in out
     assert '"clientId": "<spa-sp-id>"' in out
-    # Values that only a real run can produce say so, rather than printing an
-    # angle-bracketed id the operator might paste into a config file.
     assert "<created-on-real-run>" in out
 
 
@@ -1257,17 +1138,12 @@ def test_the_dry_run_plan_is_internally_consistent(run, capsys) -> None:
         rf'"id": "([0-9a-f-]{{36}})",\s*\n\s*"value": "{setup_entra.SCOPE_NAME}"',
         backend_plan,
     )
-    admin_role_id = re.search(
-        r'"id": "([0-9a-f-]{36})",\s*\n\s*"value": "Platform\.Admin"', backend_plan
-    )
+    admin_role_id = re.search(r'"id": "([0-9a-f-]{36})",\s*\n\s*"value": "Platform\.Admin"', backend_plan)
     assert scope_id and admin_role_id, backend_plan
 
     assert f'"id": "{scope_id.group(1)}"' in spa_plan
-    # The assignment plan is the one addressed to the BACKEND principal; the six
-    # consent plans are addressed to Microsoft Graph's.
     assignment_plan = out.split(
-        f"WOULD POST /servicePrincipals/{setup_entra.BACKEND_SP_PLACEHOLDER}"
-        "/appRoleAssignedTo"
+        f"WOULD POST /servicePrincipals/{setup_entra.BACKEND_SP_PLACEHOLDER}/appRoleAssignedTo"
     )[-1]
     assert f'"appRoleId": "{admin_role_id.group(1)}"' in assignment_plan
 
@@ -1315,16 +1191,12 @@ def test_a_dry_run_with_rotation_predicts_the_secret_it_would_mint(run, capsys) 
     out = capsys.readouterr().out
 
     assert client.mutations == []
-    assert (
-        f"WOULD POST /applications/{EXISTING_BACKEND_OBJECT_ID}/addPassword" in out
-    )
+    assert f"WOULD POST /applications/{EXISTING_BACKEND_OBJECT_ID}/addPassword" in out
     assert "<existing secret — cannot be re-read>" not in out
     assert "second secret" in out.lower()
 
 
-def test_a_dry_run_on_a_fresh_tenant_still_promises_the_secret_it_will_create(
-    run, capsys
-) -> None:
+def test_a_dry_run_on_a_fresh_tenant_still_promises_the_secret_it_will_create(run, capsys) -> None:
     """The third branch, unchanged: a tenant with no backend registration gets one on
     a real run, and its secret is printed exactly once."""
     client = fresh_tenant()
@@ -1337,15 +1209,10 @@ def test_a_dry_run_on_a_fresh_tenant_still_promises_the_secret_it_will_create(
     assert "A real run creates one" in out
 
 
-# ===========================================================================
-# Failure paths
-# ===========================================================================
 def test_an_ambiguous_frontend_name_exits_two(run, capsys) -> None:
     """A preflight-class problem: nothing has been changed and there is nothing to
     retry, so it gets its own exit code and names the flag that resolves it."""
-    client = FakeClient(
-        applications=[existing_spa_application(), existing_spa_application()]
-    )
+    client = FakeClient(applications=[existing_spa_application(), existing_spa_application()])
 
     exit_code = run(client)
 
@@ -1399,15 +1266,11 @@ def test_a_failure_after_the_backend_create_still_prints_the_secret(run, capsys)
     assert exit_code == 1
     assert "generated-secret-1" in captured.out
     assert "created-app-client-1" in captured.out
-    # The block has to be recognisable as partial, or it reads as a success.
     assert "partial" in captured.out.lower()
-    # And it has to say the value cannot be recovered, or nobody copies it.
     assert "cannot" in captured.out.lower()
 
 
-def test_a_backend_create_answered_already_exists_fails_and_prints_no_placeholders(
-    run, capsys
-) -> None:
+def test_a_backend_create_answered_already_exists_fails_and_prints_no_placeholders(run, capsys) -> None:
     """The most expensive lie this script could tell, and it is one call away.
 
     An already-exists answer to a CREATE is not the desired end state: the response
@@ -1431,8 +1294,6 @@ def test_a_backend_create_answered_already_exists_fails_and_prints_no_placeholde
 
     assert exit_code == 1
     assert "already present" not in captured.out
-    # The run stopped at the refused create. Nothing was attempted against a
-    # placeholder id.
     assert client.mutation_sequence == [("POST", "/applications")]
     for marker in (
         setup_entra.BACKEND_APP_PLACEHOLDER,
@@ -1444,15 +1305,12 @@ def test_a_backend_create_answered_already_exists_fails_and_prints_no_placeholde
     ):
         assert marker not in captured.out
     assert "Configuration values" not in captured.out
-    # The message has to be actionable, which means naming where to look.
     assert "30 days" in captured.err
     assert "Deleted applications" in captured.err
     assert "--audience" in captured.err
 
 
-def test_a_principal_create_answered_already_exists_fails_and_keeps_the_secret(
-    run, capsys
-) -> None:
+def test_a_principal_create_answered_already_exists_fails_and_keeps_the_secret(run, capsys) -> None:
     """The same classification, on the call that is likeliest to hit it.
 
     The service-principal create names a just-created application, so under eventual
@@ -1462,9 +1320,7 @@ def test_a_principal_create_answered_already_exists_fails_and_keeps_the_secret(
     against ``<backend-sp-id>``. The backend's secret, already captured by then, is
     still rescued.
     """
-    client = fresh_tenant(
-        failures={("POST", "/servicePrincipals"): already_exists()}
-    )
+    client = fresh_tenant(failures={("POST", "/servicePrincipals"): already_exists()})
 
     exit_code = run(client)
     captured = capsys.readouterr()
@@ -1487,9 +1343,7 @@ def test_a_create_whose_response_has_no_identifiers_stops_the_run(run, capsys) -
     registration is probably there and a re-run will adopt it.
     """
     client = fresh_tenant(
-        failures={
-            ("POST", "/applications"): {"displayName": setup_entra.DEFAULT_BACKEND_NAME}
-        }
+        failures={("POST", "/applications"): {"displayName": setup_entra.DEFAULT_BACKEND_NAME}}
     )
 
     exit_code = run(client)
@@ -1527,8 +1381,6 @@ def test_a_principal_create_with_an_unreadable_answer_stops_the_run(run, capsys)
     captured = capsys.readouterr()
 
     assert exit_code == 1
-    # Nothing was addressed to a placeholder: the run got no further than the two
-    # creates, so there is no PATCH and there are no consents.
     assert client.mutation_sequence == [
         ("POST", "/applications"),
         ("POST", "/servicePrincipals"),
@@ -1536,10 +1388,8 @@ def test_a_principal_create_with_an_unreadable_answer_stops_the_run(run, capsys)
     assert setup_entra.BACKEND_SP_PLACEHOLDER not in captured.out
     assert setup_entra.UNKNOWN_UNTIL_REAL_RUN not in captured.out
     assert "Configuration values" not in captured.out
-    # The backend service principal is named, and so is the way out.
     assert "backend service principal" in captured.err
     assert "re-run" in captured.err.lower()
-    # ...and the secret the backend create disclosed is not lost with the run.
     assert "generated-secret-1" in captured.out
 
 
@@ -1569,10 +1419,9 @@ def test_a_reuse_path_failure_still_names_what_it_created(run, capsys) -> None:
     assert exit_code == 1
     assert "PARTIAL SETUP" in captured.out
     block = captured.out.split("PARTIAL SETUP")[1]
-    assert "created-app-client-1" in block  # the new frontend registration
-    assert "created-sp-1" in block  # and its service principal
+    assert "created-app-client-1" in block
+    assert "created-sp-1" in block
     assert "frontend app registration" in block
-    # The backend was reused, not created, and no secret was minted on this path.
     assert "backend app registration" not in block
     assert "entra_backend_client_secret" not in block
 
@@ -1586,14 +1435,10 @@ def test_a_failed_run_still_reports_the_drift_it_found(run, capsys) -> None:
     diagnose something is perverse.
     """
     client = configured_tenant(
-        backend=existing_backend_application(
-            roles=("Platform.Admin", "Platform.Viewer")
-        ),
+        backend=existing_backend_application(roles=("Platform.Admin", "Platform.Viewer")),
         failures={
             ("POST", f"/servicePrincipals/{GRAPH_SP_ID}/appRoleAssignedTo"): (
-                setup_entra.GraphError(
-                    500, "InternalServerError", "the directory is having a bad day"
-                )
+                setup_entra.GraphError(500, "InternalServerError", "the directory is having a bad day")
             )
         },
     )
@@ -1604,14 +1449,10 @@ def test_a_failed_run_still_reports_the_drift_it_found(run, capsys) -> None:
     assert exit_code == 1
     assert "Drift report" in captured.out
     assert "Platform.Operator" in captured.out
-    # Nothing was created and no secret was minted, so there is no partial block to
-    # bury the error under.
     assert "PARTIAL SETUP" not in captured.out
 
 
-def test_an_ambiguity_after_the_backend_create_still_prints_the_secret(
-    run, capsys
-) -> None:
+def test_an_ambiguity_after_the_backend_create_still_prints_the_secret(run, capsys) -> None:
     """The rescue is on BOTH failure arms, not just the Graph one.
 
     Exit 2 is not "nothing was attempted": a duplicated frontend name is only
@@ -1619,9 +1460,7 @@ def test_an_ambiguity_after_the_backend_create_still_prints_the_secret(
     secret is disclosed exactly once, so an unguarded exit here destroys the
     operator's only copy just as thoroughly as a 500 would.
     """
-    client = fresh_tenant(
-        applications=[existing_spa_application(), existing_spa_application()]
-    )
+    client = fresh_tenant(applications=[existing_spa_application(), existing_spa_application()])
 
     exit_code = run(client)
     captured = capsys.readouterr()
@@ -1645,17 +1484,12 @@ def test_a_lost_frontend_create_response_is_recovered_not_repeated(run, capsys) 
             0, "transport_failure", "Could not reach Microsoft Graph after 11 attempts"
         )
 
-    client = fresh_tenant(
-        failures={
-            ("POST", "/applications"): [None, create_lands_but_the_answer_is_lost]
-        }
-    )
+    client = fresh_tenant(failures={("POST", "/applications"): [None, create_lands_but_the_answer_is_lost]})
 
     exit_code = run(client)
     out = capsys.readouterr().out
 
     assert exit_code == 0, out
-    # Exactly two create attempts: the backend, and the frontend one that landed.
     assert client.mutation_sequence.count(("POST", "/applications")) == 2
     assert len(client.applications) == 2
 
@@ -1667,9 +1501,7 @@ def test_a_frontend_create_that_really_failed_exits_one(run, capsys) -> None:
         failures={
             ("POST", "/applications"): [
                 None,
-                setup_entra.GraphError(
-                    0, "transport_failure", "Could not reach Microsoft Graph"
-                ),
+                setup_entra.GraphError(0, "transport_failure", "Could not reach Microsoft Graph"),
             ]
         }
     )
@@ -1678,14 +1510,10 @@ def test_a_frontend_create_that_really_failed_exits_one(run, capsys) -> None:
     captured = capsys.readouterr()
 
     assert exit_code == 1
-    # A transport failure carries status 0 as a sentinel meaning "no response at
-    # all". Rendering it as a status sends the operator looking up an HTTP code
-    # that does not exist, so neither the raw form nor a dressed-up one appears.
     assert "status=0" not in captured.err
     assert "HTTP 0" not in captured.err
     assert "0" not in _status_codes(captured.err)
     assert "Could not reach Microsoft Graph" in captured.err
-    # ...and the backend secret is still not lost.
     assert "generated-secret-1" in captured.out
 
 
@@ -1712,18 +1540,13 @@ def test_rotate_secret_appends_on_an_existing_backend(run, capsys) -> None:
     out = capsys.readouterr().out
 
     assert exit_code == 0, out
-    assert client.sent(
-        "POST", f"/applications/{EXISTING_BACKEND_OBJECT_ID}/addPassword"
-    ) == [{"passwordCredential": {"displayName": setup_entra._SECRET_DISPLAY_NAME}}]
+    assert client.sent("POST", f"/applications/{EXISTING_BACKEND_OBJECT_ID}/addPassword") == [
+        {"passwordCredential": {"displayName": setup_entra._SECRET_DISPLAY_NAME}}
+    ]
     assert "rotated-secret" in out
     assert "<existing secret — cannot be re-read>" not in out
 
 
-# ===========================================================================
-# Preflight: finding the Azure CLI
-# ===========================================================================
-# These live here rather than with the transport tests because what they pin is a
-# platform hazard in how the flow starts, not the token parsing those tests cover.
 def test_the_azure_cli_is_invoked_at_its_resolved_path(monkeypatch) -> None:
     """On Windows the Azure CLI ships as ``az.cmd``.
 
@@ -1746,7 +1569,6 @@ def test_the_azure_cli_is_invoked_at_its_resolved_path(monkeypatch) -> None:
 
     assert token.access_token == "an-access-token"
     assert recorded[0][0] == r"C:\azure-cli\az.cmd"
-    # The documented, cloud-aware token request is unchanged by the resolution.
     assert "ms-graph" in recorded[0]
 
 
@@ -1784,9 +1606,6 @@ def _completed_az_process():
     )
 
 
-# ===========================================================================
-# The command line
-# ===========================================================================
 def test_the_flags_default_to_the_documented_values() -> None:
     """These four defaults are a contract with the setup guide and with
     ``secrets.auto.tfvars``; changing one silently breaks a paste-ready output."""

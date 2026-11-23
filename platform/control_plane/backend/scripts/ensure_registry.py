@@ -1,45 +1,26 @@
 #!/usr/bin/env python
-"""Idempotently provision ONE AWS Agent Registry on the `agent-registry` namespace (E32).
+"""Idempotently provision ONE AWS Agent Registry on the `agent-registry` namespace.
 
-Why this script exists at all
------------------------------
-AWS moved the Registry APIs out of Bedrock AgentCore into their own `agent-registry`
-service on 2026-08-06. The old `bedrock-agentcore-control` namespace shuts down on
-2026-09-17 and brand-new AWS accounts cannot reach it *at all*, so every registry
-call in this platform now goes through `boto3.client("agent-registry-control")`.
-This module replaces the two Preview-era bootstrap scripts
-(`ensure_agent_registry.py` + `ensure_mcp_registry.py`) with a single
-name-parameterised one: the agent registry and the MCP-server registry differ only
-by `--name`, so one script covers both.
+The agent registry and the MCP-server registry differ only by `--name`, so one script
+covers both. Every registry call goes through the client `core.aws_clients.registry_control_client`
+returns.
 
-Why it is so much smaller than what it replaces
------------------------------------------------
-The old scripts were written against an *unpublished* Preview API and were full of
-defensive guesswork. The service model is published now, so all of that guesswork is
-dead weight and has been deleted rather than translated. Verified against
-botocore 1.43.67 (`agent-registry-control`):
-
-  * `ListRegistries` returns exactly `{"registries": [...], "nextToken": ...}` and its
-    paginator IS registered (`ctl.can_paginate("list_registries")` is True). No more
-    probing `("registries", "registrySummaries", "items")` — we paginate and match on
-    `item["name"]`.
-  * `ListRegistries` items carry a real `registryId` member (alongside `name`,
-    `registryArn`, `status`, ...), so the found path needs no ARN parsing either.
-  * A `RegistryReady` waiter ships with the model (`ctl.waiter_names` includes
-    `registry_ready`; delay 30, maxAttempts 5, success on `status == READY`, failure on
-    `CREATE_FAILED`/`UPDATE_FAILED`/`DELETE_FAILED`). That replaces
-    `ensure_mcp_registry.py`'s hand-rolled 30x2s poll-to-READY loop, which is gone.
-  * `CreateRegistry` returns **ONLY** `registryArn` — there is no `registryId` member in
-    its output shape. The id is the ARN tail (`arn:...:registry/{registryId}`), so we
-    parse it, exactly as the Preview scripts did.
-  * The create shape changed: auth is nested under
-    `discoveryConfiguration={"authorizerType": "AWS_IAM"}` (with AWS_IAM we omit
-    `authorizerConfiguration` entirely), and the old `autoApproval: False` boolean became
-    an enum list. `approvalConfiguration={"autoApprovalRules": []}` is the new spelling of
-    "manual approval required" — an empty rule list auto-approves nothing.
-  * `clientToken` has a minimum length of 33, so the deterministic `uuid5` idiom is kept:
-    a stable 36-char token per registry name makes a racing double-invocation (or a plain
-    retry) idempotent instead of creating a duplicate registry.
+Service facts this script relies on (botocore 1.43.67, `agent-registry-control`)
+---------------------------------------------------------------------------------
+  * `ListRegistries` returns `{"registries": [...], "nextToken": ...}`, its paginator is
+    registered, and each item carries `registryId`, `name`, `registryArn` and `status`.
+    The lookup itself is `core.registry_resolver.find_registry_by_name`, the one
+    implementation the backend uses too, so both agree on what "the registry named X"
+    means (a duplicate name is a hard error, never a silent first match).
+  * A `RegistryReady` waiter ships with the model (delay 30, maxAttempts 5, success on
+    `status == READY`, failure on `CREATE_FAILED`/`UPDATE_FAILED`/`DELETE_FAILED`).
+  * `CreateRegistry` returns ONLY `registryArn`; the id is the ARN tail
+    (`arn:...:registry/{registryId}`).
+  * Auth is nested under `discoveryConfiguration={"authorizerType": "AWS_IAM"}` (with
+    AWS_IAM, `authorizerConfiguration` is omitted), and
+    `approvalConfiguration={"autoApprovalRules": []}` means "manual approval required".
+  * `clientToken` has a minimum length of 33: a stable `uuid5` per registry name makes a
+    racing double-invocation (or a plain retry) idempotent instead of creating a duplicate.
 
 Waiting for READY on BOTH paths is deliberate: a freshly created registry is `CREATING`
 before `READY`, and creating a record against a non-READY registry fails with
@@ -61,12 +42,16 @@ stray `print()` — or one log record leaking onto stdout — breaks that parse,
 script prints one actionable line to stderr and exits non-zero rather than dumping a raw
 traceback at an operator.
 
-Usage (from the backend dir; PYTHONPATH=src is required — src/ is not a package):
+Terraform runs this script with NO `PYTHONPATH` (`modules/agent_registry/main.tf`), so the
+backend's `src/` is put on `sys.path` here rather than required from the environment; the
+insert is a no-op under `PYTHONPATH=src`.
+
+Usage (from the backend dir):
 
     cd platform/control_plane/backend && \
         PYTHONPATH=src venv/bin/python scripts/ensure_registry.py --name agp-agents
 
-Terraform now creates both registries, so a manual invocation is a fallback/diagnostic.
+Terraform creates both registries, so a manual invocation is a fallback/diagnostic.
 """
 
 import argparse
@@ -76,26 +61,15 @@ import os
 import sys
 import uuid
 
-# The find-by-name lookup this script pioneered now lives in `core.registry_resolver`, because
-# the BACKEND resolves its registry ids by name too (it stopped taking them from Terraform,
-# which is what killed the two-applies-from-zero problem — see that module's docstring). ONE
-# implementation, imported by both, rather than a second copy that can drift: the two must
-# agree on what "the registry named X" means, including that a DUPLICATE name is a hard error
-# rather than a silent first-match. `SERVICE_NAME` comes from there for the same reason.
-#
-# WHY THE sys.path SHIM RATHER THAN REQUIRING PYTHONPATH=src. Terraform runs this script
-# through `python_bin` with NO PYTHONPATH — deliberately, and documented as such in
-# `modules/agent_registry/main.tf` ("The script needs no PYTHONPATH"). Making the Terraform
-# contract depend on an env var would move a plan-time-invisible failure into the middle of an
-# apply. So `src/` is put on `sys.path` here instead, the same idiom `bootstrap_demo_gateway.py`
-# and `migrate_to_e25b.py` already use. It is a no-op under `PYTHONPATH=src` (pytest, the
-# documented manual invocation), because the entry is only inserted when absent.
 _SRC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from core.registry_resolver import (  # noqa: E402 — after the sys.path shim
-    SERVICE_NAME,
+from core.aws_clients import (  # noqa: E402 — `core.` resolves only after the sys.path shim above; expires 2027-10-23; added E52A/T4
+    REGISTRY_CONTROL,
+    registry_control_client,
+)
+from core.registry_resolver import (  # noqa: E402 — `core.` resolves only after the sys.path shim above; expires 2027-10-23; added E49A-50A/T17
     find_registry_by_name,
 )
 
@@ -103,23 +77,7 @@ logger = logging.getLogger("ensure_registry")
 
 DEFAULT_REGION = "us-east-1"
 
-# One script now serves both the agent registry and the MCP-server registry, which the two
-# Preview scripts described distinctly. The name is the only thing that differs, so the
-# description is derived from it rather than adding a CLI flag the Terraform contract
-# does not include. `description` is create-only — it is never used to update a registry
-# that already exists.
 _DESCRIPTION_TEMPLATE = "Agentic Governance Platform registry: {name}"
-
-
-def _client(region):
-    """Return an `agent-registry-control` client for `region`.
-
-    boto3 is imported lazily so that importing this module stays side-effect-free (tests
-    inject their own client and never touch AWS). Tests monkeypatch this function.
-    """
-    import boto3
-
-    return boto3.client(SERVICE_NAME, region_name=region)
 
 
 def create_registry(ctl, name: str, description: str):
@@ -128,7 +86,9 @@ def create_registry(ctl, name: str, description: str):
     `discoveryConfiguration={"authorizerType": "AWS_IAM"}` -> omit
     `authorizerConfiguration`. `approvalConfiguration={"autoApprovalRules": []}` -> every
     record requires explicit approval. The deterministic `clientToken` (>= 33 chars, as
-    the API demands) makes retries idempotent.
+    the API demands) makes retries idempotent. `description` is create-only; it never
+    updates a registry that already exists. The id is the ARN tail, because CreateRegistry
+    returns only `registryArn`.
     """
     resp = ctl.create_registry(
         name=name,
@@ -137,8 +97,6 @@ def create_registry(ctl, name: str, description: str):
         approvalConfiguration={"autoApprovalRules": []},
         clientToken=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"agp-registry:{name}")),
     )
-    # CreateRegistry's output shape contains registryArn and nothing else, so the id has
-    # to come from the ARN tail (arn:...:registry/{registryId}).
     arn = resp.get("registryArn")
     if not arn:
         raise RuntimeError(
@@ -150,13 +108,15 @@ def create_registry(ctl, name: str, description: str):
 def resolve_registry(name: str, region: str, *, ctl=None):
     """Find-or-create the registry, wait for READY, return `(registryId, registryArn)`.
 
-    `ensure_registry` is the id-only contract Task 6's Terraform module depends on; this
-    variant also hands back the ARN for the `--json` payload.
+    `ensure_registry` is the id-only contract the Terraform module depends on; this
+    variant also hands back the ARN for the `--json` payload. READY is awaited on both
+    paths: a fresh registry is CREATING first, and an existing one found mid-CREATING is
+    not yet usable for records either.
     """
-    ctl = ctl if ctl is not None else _client(region)
+    ctl = ctl if ctl is not None else registry_control_client(region)
 
     logger.info("Looking for an existing registry named %r in region %s ...", name, region)
-    rid, arn = find_registry_by_name(ctl, name)
+    rid, arn = find_registry_by_name(ctl.get_paginator("list_registries").paginate(), name)
     if rid:
         logger.info("Found existing registry %r -> %s (no create needed)", name, rid)
     else:
@@ -164,8 +124,6 @@ def resolve_registry(name: str, region: str, *, ctl=None):
         rid, arn = create_registry(ctl, name, _DESCRIPTION_TEMPLATE.format(name=name))
         logger.info("Created registry %r -> %s", name, rid)
 
-    # Wait on both paths: a fresh registry is CREATING before READY, and an existing one
-    # found mid-CREATING is not yet usable for records either.
     logger.info("Waiting for registry %s to become READY ...", rid)
     ctl.get_waiter("registry_ready").wait(registryId=rid)
     logger.info("Registry %s is READY.", rid)
@@ -210,9 +168,6 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    # stream=sys.stderr is load-bearing: stdout must stay parseable by Terraform even at
-    # --verbose. logging's default handler writes to stderr already, but pinning it makes
-    # the contract explicit and immune to a future default change.
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -221,10 +176,7 @@ def main(argv=None) -> int:
 
     try:
         rid, arn = resolve_registry(args.name, args.region)
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        # botocore exceptions (ClientError, EndpointConnectionError, NoCredentials,
-        # UnknownServiceError) and the waiter's WaiterError are caught broadly so an
-        # operator never sees a raw traceback from a bootstrap step.
+    except Exception as exc:
         logger.error(
             "Failed to ensure registry %r in region %s: %s "
             "(check AWS credentials/permissions for %s and that boto3 exposes it; "
@@ -232,12 +184,12 @@ def main(argv=None) -> int:
             args.name,
             args.region,
             exc,
-            SERVICE_NAME,
+            REGISTRY_CONTROL,
         )
+        logger.debug("the failure's traceback", exc_info=True)
         return 1
 
     if args.json:
-        # The ONLY write to stdout. One line, no trailing content.
         print(
             json.dumps(
                 {

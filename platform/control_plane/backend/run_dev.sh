@@ -22,11 +22,19 @@ source venv/bin/activate
 echo "Installing dependencies..."
 pip install -q -r requirements-dev.txt   # includes requirements.txt via -r
 
-# Check if .env exists
-if [ ! -f ".env" ]; then
-    echo "Error: .env file not found!"
-    echo "Please create .env file with required configuration."
-    exit 1
+ENV_FILE="${ENV_FILE-.env}"
+if [ -n "$ENV_FILE" ]; then
+    [ -f "$ENV_FILE" ] || { echo "Error: $ENV_FILE not found (set ENV_FILE to point at one, or empty to run without one)"; exit 1; }
+    ENV_ARGS=(--env-file "$ENV_FILE")
+else
+    ENV_ARGS=()
+fi
+
+UVICORN_RELOAD="${UVICORN_RELOAD-1}"
+if [ -n "$UVICORN_RELOAD" ]; then
+    RELOAD_ARGS=(--reload)
+else
+    RELOAD_ARGS=()
 fi
 
 # Set PYTHONPATH for imports to work
@@ -35,7 +43,7 @@ export PYTHONPATH=src
 # Start the server
 echo ""
 echo "Starting FastAPI server..."
-echo "API will be available at: http://localhost:8000"
-echo "API docs: http://localhost:8000/docs"
+echo "API will be available at: http://${AGP_BIND_HOST:-127.0.0.1}:${PORT:-8000}"
+echo "API docs: http://${AGP_BIND_HOST:-127.0.0.1}:${PORT:-8000}/docs"
 echo ""
-python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+exec python -m uvicorn src.main:app "${RELOAD_ARGS[@]}" "${ENV_ARGS[@]}" --host "${AGP_BIND_HOST:-127.0.0.1}" --port "${PORT:-8000}"

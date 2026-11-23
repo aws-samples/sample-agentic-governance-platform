@@ -1,0 +1,19 @@
+extend = "platform/control_plane/backend/pyproject.toml"
+
+[lint.per-file-ignores]
+"applications/**/test_*.py" = ["S101"]
+"scripts/entra-setup/tests/**" = ["S101", "S105", "S106"]
+"applications/**" = ["TID251", "PLC0415"]
+"scripts/entra-setup/**" = ["TID251"]
+"e2e/tests/**" = ["S101", "S106", "S107", "S607"]
+"e2e/suite/**" = ["S101"]
+"e2e/write/**" = ["S101"]
+"platform/control_plane/infrastructure/examples/claims-api/test_handler.py" = ["S101"]
+"e2e/cli.py" = ["S603", "S607"]
+"e2e/launch.py" = ["S603", "S607"]
+# the banned-api messages name the backend's factory and HTTP client, true of the backend alone
+"e2e/**" = ["TID251"]
+"platform/control_plane/infrastructure/examples/claims-api/**" = ["TID251"]
+
+[lint.isort]
+known-first-party = ["mcp_runtime", "setup_entra", "agp", "cli", "launch", "suite", "handler"]

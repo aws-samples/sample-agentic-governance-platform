@@ -1,4 +1,4 @@
-"""Regenerate the captured strands-agentcore invoke SSE fixtures (E28D/T3).
+"""Regenerate the captured strands-agentcore invoke SSE fixtures.
 
 WHY THIS EXISTS. The template (the PRODUCER) and ``_extract_sse_text`` (the CONSUMER) live in
 trees that cannot import each other, so each side used to be tested against its own *model* of
@@ -39,11 +39,8 @@ FIXTURE_DIR = Path(__file__).resolve().parent
 TEMPLATE_ROOT = (FIXTURE_DIR / "../../../agent-templates/strands-agentcore").resolve()
 
 sys.path.insert(0, str(TEMPLATE_ROOT))
-
-# Imported after the sys.path insert above, deliberately (E402): the template ships standalone, so
-# `src.main` only resolves once TEMPLATE_ROOT is on the path.
-import src.main as main_module
-from src.main import handler
+main_module = importlib.import_module("src.main")
+handler = main_module.handler
 
 
 def _load_template_tests():
@@ -55,13 +52,14 @@ def _load_template_tests():
     spec = importlib.util.spec_from_file_location(
         "_template_test_agent", TEMPLATE_ROOT / "tests" / "test_agent.py"
     )
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 def _drain(agent_stub, prompt="math please"):
-    main_module.agent = agent_stub
+    vars(main_module)["agent"] = agent_stub
 
     async def _collect():
         return [chunk async for chunk in handler({"prompt": prompt})]
@@ -74,8 +72,8 @@ def _encode_sse(chunks) -> str:
 
 
 def _git(*args: str) -> str:
-    # Fixed argv, no shell. `check=False` on purpose: a git failure must degrade the stamp to
-    # UNKNOWN, not abort a regeneration that is otherwise fine.
+    """Run git in the template tree; a failure yields "" so the stamp degrades to UNKNOWN instead of
+    aborting a regeneration that is otherwise fine."""
     out = subprocess.run(
         ["git", *args],
         capture_output=True,
@@ -89,7 +87,7 @@ def _git(*args: str) -> str:
 def _template_commit() -> str:
     """The template's last commit, suffixed ``-dirty`` when its tree has uncommitted changes.
 
-    The dirty check is the load-bearing half. ``git log`` alone names the last COMMITTED commit,
+    The dirty check is the half that matters. ``git log`` alone names the last COMMITTED commit,
     which is not necessarily the code that produced these bytes: regenerate with an edited
     ``handler`` (or an edited ``_STRANDS_EVENTS``) and the stamp would name a commit that provably
     does NOT produce the fixture. Someone debugging a fence failure would then check out that
@@ -146,9 +144,10 @@ def main() -> None:
     )
 
     class _ThrottledAfterToolAgent:
-        # The stub from tests/test_agent.py's test_handler_does_not_forward_textless_tool_messages
-        # (a completed tool cycle, then a mid-run Bedrock throttle). The messages come from the
-        # imported module; only this 3-line shape is restated, because it is function-local there.
+        """The stub from tests/test_agent.py's test_handler_does_not_forward_textless_tool_messages (a
+        completed tool cycle, then a mid-run Bedrock throttle); the messages come from the imported
+        module, only this three-line shape is restated because it is function-local there."""
+
         async def stream_async(self, _prompt):
             yield {"message": tests._TOOL_USE_MESSAGE}
             yield {"message": tests._TOOL_RESULT_MESSAGE}

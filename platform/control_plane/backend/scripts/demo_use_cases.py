@@ -21,8 +21,8 @@ Each entry is a dict with:
                        ``inputSchema.type == "object"``). 6 tools per domain (design §6).
   * ``handler_src``  — the FULL inline Lambda handler SOURCE for the domain. It is built
                        by concatenating a shared ``_HANDLER_PREAMBLE`` (the module
-                       docstring + the ``_tool_name(context)`` ``"___"``-splitter copied
-                       VERBATIM from ``bootstrap_demo_gateway.py``'s ``LAMBDA_HANDLER_SRC``)
+                       docstring + the ``_tool_name(context)`` ``"___"``-splitter, the same
+                       preamble ``bootstrap_demo_gateway.py``'s handler carries)
                        with a per-domain ``def handler(event, context):`` that branches per
                        tool and returns a DETERMINISTIC mock dict (no ``random``, no
                        ``datetime.now`` — fixed ISO strings; echoes back the input ids) and
@@ -35,18 +35,6 @@ appears as a branch in it (drift guard), so the advertised tools and the mock
 implementation can never silently diverge.
 """
 
-# ---------------------------------------------------------------------------
-# Shared handler preamble — the module docstring + the _tool_name("___"-splitter)
-# copied VERBATIM from bootstrap_demo_gateway.py's LAMBDA_HANDLER_SRC. Each domain's
-# handler_src = _HANDLER_PREAMBLE + a per-domain `def handler(event, context):`.
-#
-# AgentCore lambda-target contract (research §8.1, §6.2): the Gateway invokes the
-# Lambda with the tool ARGS as the `event` and the tool NAME in the client context at
-# context.client_context.custom["bedrockAgentCoreToolName"]. The gateway prefixes the
-# tool name with the target name joined by "___" (e.g. "agp-...-target___echo"),
-# so we split on "___" and take the last segment. This event/context shape IS the
-# AgentCore lambda-target contract — keep it in sync with the gateway target config.
-# ---------------------------------------------------------------------------
 _HANDLER_PREAMBLE = '''\
 """agp MCP tools — Lambda backing the AgentCore Gateway inline-lambda target.
 
@@ -73,9 +61,6 @@ def _tool_name(context):
 '''
 
 
-# ===========================================================================
-# 1) Contact Center — agp-contact-center-mcp  (design §6.1)
-# ===========================================================================
 _CONTACT_CENTER_TOOL_SCHEMA = [
     {
         "name": "get_customer_profile",
@@ -269,9 +254,6 @@ def handler(event, context):
 '''
 
 
-# ===========================================================================
-# 2) First Notification of Loss (FNOL) — agp-fnol-mcp  (design §6.2)
-# ===========================================================================
 _FNOL_TOOL_SCHEMA = [
     {
         "name": "start_claim",
@@ -441,9 +423,6 @@ def handler(event, context):
 '''
 
 
-# ===========================================================================
-# 3) Insurance Support — agp-insurance-support-mcp  (design §6.3)
-# ===========================================================================
 _INSURANCE_SUPPORT_TOOL_SCHEMA = [
     {
         "name": "list_policies",
@@ -629,9 +608,6 @@ def handler(event, context):
 '''
 
 
-# ===========================================================================
-# The registry — one entry per demo domain. handler_src = preamble + per-domain handler.
-# ===========================================================================
 DEMO_USE_CASES = [
     {
         "key": "contact-center",
@@ -645,7 +621,9 @@ DEMO_USE_CASES = [
         "key": "fnol",
         "prefix": "agp-fnol",
         "display_name": "First Notification of Loss",
-        "description": "Agentic Governance Platform First Notification of Loss (FNOL) MCP tools (dev helper).",
+        "description": (
+            "Agentic Governance Platform First Notification of Loss (FNOL) MCP tools (dev helper)."
+        ),
         "tool_schema": _FNOL_TOOL_SCHEMA,
         "handler_src": _HANDLER_PREAMBLE + _FNOL_HANDLER,
     },

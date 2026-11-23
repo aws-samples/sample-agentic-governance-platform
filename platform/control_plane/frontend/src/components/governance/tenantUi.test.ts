@@ -4,13 +4,11 @@ import {
   tenantSelectOptions,
   resolveTenantName,
   findTenantAccount,
-  derivePublishState,
   canEditShared,
   sharedBadge,
   tenantNames,
 } from './tenantUi';
 
-// UserTenant fixtures (the /users/me membership shape — E24/T4).
 const stage = (account_id: string) => ({
   account_id,
   region: 'us-east-1',
@@ -22,6 +20,9 @@ const ut = (id: string, name: string): UserTenant => ({
   id,
   name,
   line_of_business: `${name} LoB`,
+  platform: 'aws',
+  binding_mode: '',
+  readiness: {},
   stages: { dev: stage('111111111111'), prod: stage('222222222222') },
 });
 
@@ -36,7 +37,7 @@ describe('tenantSelectOptions', () => {
   it('admin picks from the full directory once loaded', () => {
     expect(tenantSelectOptions([RETAIL], [FRAUD, ANNUITIES], true)).toEqual([ANNUITIES, FRAUD]);
   });
-  it('admin falls back to memberships while the directory is still loading (null)', () => {
+  it('admin degrades to memberships while the directory is still loading or failed (null)', () => {
     expect(tenantSelectOptions([RETAIL], null, true)).toEqual([RETAIL]);
   });
   it('sorts by name and does not mutate the input', () => {
@@ -69,38 +70,13 @@ describe('findTenantAccount', () => {
   it('matches from the memberships first', () => {
     expect(findTenantAccount('t-retail', [RETAIL], [FRAUD])).toEqual(RETAIL);
   });
-  it('falls back to the admin directory', () => {
+  it('reads the admin directory when the memberships miss', () => {
     expect(findTenantAccount('t-fraud', [RETAIL], [FRAUD])).toEqual(FRAUD);
   });
   it('returns null when unknown or when the id is missing', () => {
     expect(findTenantAccount('t-nope', [RETAIL], [FRAUD])).toBeNull();
     expect(findTenantAccount(null, [RETAIL], [FRAUD])).toBeNull();
     expect(findTenantAccount(undefined, [], null)).toBeNull();
-  });
-});
-
-describe('derivePublishState', () => {
-  it('published record: Published badge, Unpublish action, next=false', () => {
-    const s = derivePublishState(true, 1);
-    expect(s.published).toBe(true);
-    expect(s.badge.label).toBe('Published');
-    expect(s.badge.cls.length).toBeGreaterThan(0);
-    expect(s.actionLabel).toBe('Unpublish');
-    expect(s.next).toBe(false);
-  });
-  it('unpublished (false or undefined): Private badge, Publish action, next=true', () => {
-    for (const v of [false, undefined]) {
-      const s = derivePublishState(v, 1);
-      expect(s.published).toBe(false);
-      expect(s.badge.label).toBe('Private');
-      expect(s.actionLabel).toBe('Publish');
-      expect(s.next).toBe(true);
-    }
-  });
-  it('only OPERATOR+ (role_level >= 1) may toggle', () => {
-    expect(derivePublishState(true, 0).canToggle).toBe(false);
-    expect(derivePublishState(true, 1).canToggle).toBe(true);
-    expect(derivePublishState(false, 2).canToggle).toBe(true);
   });
 });
 

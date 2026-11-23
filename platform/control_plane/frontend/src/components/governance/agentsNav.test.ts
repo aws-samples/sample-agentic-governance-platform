@@ -2,12 +2,11 @@ import { describe, it, expect } from 'vitest';
 import { GOVERNANCE_NAV, allRoutes, visibleNavItems } from './agentsNav';
 import { OPERATIONS_NAV } from '../operations/operationsNav';
 
-/** Every leaf route in a nav config that carries `comingSoon: true`, in declaration order. */
 function comingSoonRoutes(nav: typeof GOVERNANCE_NAV): string[] {
   return nav.flatMap((sec) => sec.items.filter((i) => i.comingSoon).map((i) => i.to));
 }
 
-describe('GOVERNANCE_NAV (Epic 15 IA)', () => {
+describe('GOVERNANCE_NAV', () => {
   it('declares the collapsible groups in order', () => {
     const groups = GOVERNANCE_NAV.filter((s) => s.label !== '').map((s) => s.label);
     expect(groups).toEqual(['Inventory', 'Security & Policy', 'Operations', 'Resources']);
@@ -34,10 +33,10 @@ describe('GOVERNANCE_NAV (Epic 15 IA)', () => {
     }
   });
 
-  it('Inventory holds agents, tools, model registry and the graph', () => {
+  it('Inventory holds agents, tools and the graph; the LLM Gateway mock has no entry', () => {
     const sec = GOVERNANCE_NAV.find((s) => s.id === 'inventory')!;
     expect(sec.items.map((i) => i.to)).toEqual([
-      '/agents', '/tools-mcp', '/govern/models', '/governance-graph',
+      '/agents', '/tools-mcp', '/governance-graph',
     ]);
   });
 
@@ -56,18 +55,18 @@ describe('GOVERNANCE_NAV (Epic 15 IA)', () => {
     }
   });
 
-  it('renames the Inventory tools + models labels (Epic 15b)', () => {
+  it('labels the Inventory tools entry MCPs', () => {
     const inv = GOVERNANCE_NAV.find((s) => s.id === 'inventory')!;
     expect(inv.items.find((i) => i.to === '/tools-mcp')!.label).toBe('MCPs');
-    expect(inv.items.find((i) => i.to === '/govern/models')!.label).toBe('LLM Gateway');
   });
 });
 
-describe('comingSoon flags (Epic 31F)', () => {
-  it('flags exactly the three not-yet-live governance destinations', () => {
-    expect(comingSoonRoutes(GOVERNANCE_NAV)).toEqual([
-      '/govern/models', '/govern/audit', '/govern/finops',
-    ]);
+describe('no SOON entries in either nav', () => {
+  it('no governance item is SOON-tagged, and the three mock pages have no entry', () => {
+    expect(comingSoonRoutes(GOVERNANCE_NAV)).toEqual([]);
+    for (const r of ['/govern/models', '/govern/audit', '/govern/finops']) {
+      expect(allRoutes()).not.toContain(r);
+    }
   });
 
   it('never flags Guardrails & Policy — it is a real surface', () => {
@@ -75,34 +74,20 @@ describe('comingSoon flags (Epic 31F)', () => {
     expect(sec.items.find((i) => i.to === '/secure/guardrails')!.comingSoon).toBeUndefined();
   });
 
-  it('flags exactly the six operations mock destinations', () => {
-    expect(comingSoonRoutes(OPERATIONS_NAV)).toEqual([
-      '/ops/studio', '/ops/experiments', '/ops/playground',
-      '/ops/deployments', '/ops/access', '/ops/models',
-    ]);
-  });
-
-  it('flags every item under the operations Coming Soon group and nothing outside it', () => {
-    const group = OPERATIONS_NAV.find((s) => s.id === 'coming-soon')!;
-    expect(group.items.every((i) => i.comingSoon === true)).toBe(true);
-    for (const sec of OPERATIONS_NAV.filter((s) => s.id !== 'coming-soon')) {
-      for (const item of sec.items) expect(item.comingSoon).toBeUndefined();
-    }
+  it('no operations item is SOON-tagged', () => {
+    expect(comingSoonRoutes(OPERATIONS_NAV)).toEqual([]);
   });
 });
 
-describe('allRoutes (Epic 15)', () => {
-  it('omits /prompts (hidden from nav this epic) and includes the new canonical paths', () => {
+describe('allRoutes', () => {
+  it('omits /prompts, hidden from the nav while its route remains, and includes the canonical Marketplace and Admin paths', () => {
     const routes = allRoutes();
     expect(routes).not.toContain('/prompts');
     expect(routes).toContain('/marketplace');
     expect(routes).toContain('/admin');
   });
-  it('keeps the relocated routes reachable', () => {
-    const routes = allRoutes();
-    for (const r of ['/govern/models', '/govern/audit', '/govern/finops', '/observability']) {
-      expect(routes).toContain(r);
-    }
+  it('keeps Observability reachable', () => {
+    expect(allRoutes()).toContain('/observability');
   });
   it('returns a deduped set (no repeated leaf route)', () => {
     const routes = allRoutes();

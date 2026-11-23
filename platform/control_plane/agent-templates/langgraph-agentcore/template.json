@@ -1,0 +1,10 @@
+{
+  "id": "langgraph-agentcore",
+  "name": "LangGraph + AgentCore",
+  "framework": "langgraph",
+  "infra_template_id": "agentcore-runtime",
+  "description": "Barebones LangGraph agent on Bedrock AgentCore — build-only CI, platform-owned runtime IaC.",
+  "aws_services": ["bedrock", "ecr", "agentcore"],
+  "tags": ["starter", "python", "langgraph"],
+  "version": "1.0.0"
+}

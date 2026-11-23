@@ -1,257 +1,303 @@
-"""Pydantic models for Tenants — the multi-tenancy unit of ownership (E24/T1, reshaped E25/T1).
+"""Pydantic models for Tenants, the multi-tenancy unit of ownership.
 
-Plain ``BaseModel``s — the ``connection``/``project`` idiom. A ``Tenant`` is a
-line-of-business unit that OWNS agents, MCP servers, and projects (they carry a
-``tenant_id``) and maps to one or more Entra groups (the members who can see/act on
-the tenant's resources) plus a per-stage AWS deployment config (dev/prod).
+A ``Tenant`` is a line-of-business unit that owns agents, MCP servers and projects (they carry a
+``tenant_id``), maps to one or more Entra groups and carries a per-stage platform config. A tenant is
+platform-typed: ``platform`` is an immutable ``TenantPlatform`` discriminator and ``stages`` a union of
+per-platform shapes, ``TenantStageConfig`` (AWS) and ``DatabricksStageConfig``. Records written before
+platform typing hydrate as ``aws`` through ``hydrate_tenant_item``, which also folds the older flat
+``aws_account_*`` fields into ``stages``. ``TenantUpdate`` carries no ``platform``: a live tenant is never
+re-typed, and the service refuses a stages update whose shape contradicts the stored platform.
 
-E25 reshape: the flat ``aws_account_dev``/``aws_account_prod``/``aws_region`` fields
-became a nested ``stages: Dict[str, TenantStageConfig]`` map so each stage carries its
-own account, region, ECR repo, and the push/deploy role ARNs the cross-account CICD
-needs. Legacy flat records still validate on read via :func:`hydrate_tenant_item`,
-which folds them into the nested shape (mirror of ``ProjectService._hydrate_project``).
+Credentials are write-only: ``DatabricksStageConfig.sp_client_secret`` and the ``account_admin_*`` pair
+on ``TenantCreate`` / ``TenantUpdate`` are accepted on the way in and absent on the way out; the read
+model carries only the two Secrets Manager pointers. The JSON keys inside those secrets are declared
+here, next to the ARN fields that point at them, because the writer (``tenant_service``) and the
+readers (``runtime_catalog``, ``databricks_identity_service``) are different modules and a key spelled
+twice drifts into a silent "no credential found".
 
-E29 reshape: a tenant is now **platform-typed**. ``platform`` is an immutable
-:class:`TenantPlatform` discriminator (``aws``/``databricks``) and ``stages`` became a
-union of per-platform stage shapes — :class:`TenantStageConfig` (AWS, unchanged) and
-:class:`DatabricksStageConfig`. Pre-E29 records carry no ``platform`` key and hydrate as
-``"aws"`` via :func:`hydrate_tenant_item` (zero migration, same idiom as the E25 folding).
-``TenantUpdate`` deliberately carries NO ``platform`` field — a live tenant can never be
-re-typed; the service additionally refuses a stages update whose shape contradicts the
-stored platform.
+``binding_mode`` is the closed ``TenantBindingMode``; a stored value outside it folds to ``""`` with
+a warning naming the tenant, and the document promises the set.
 
-E29/T3 adds the WRITE-ONLY credential half (OB-7). ``DatabricksStageConfig.sp_client_secret``
-and ``TenantCreate``/``TenantUpdate``'s ``account_admin_client_id``/``account_admin_secret``
-are accepted on the way in and absent on the way out; the read model carries only the two
-Secrets Manager pointers (``sp_client_secret_arn`` per stage, ``account_admin_secret_arn`` per
-tenant). Before this the backend DROPPED all three — pydantic's ``extra="ignore"`` swallowed
-keys the admin form had always sent, so credentials were collected and silently discarded.
-
-The AWS account ids are 12-digit strings, validated on write via
-:data:`ACCOUNT_ID_RE`; the Databricks workspace origin + id are validated via
-:data:`WORKSPACE_URL_RE` / :data:`WORKSPACE_ID_RE`, and the Databricks *account* UUID via
-:data:`DATABRICKS_ACCOUNT_ID_RE` (a security boundary, not a format check — see its comment).
-Persistence + validation orchestration live in ``tenant_service`` — no boto3, no I/O here
-(pure models).
+The regexes are security boundaries matched with ``fullmatch`` at every call site (``$`` alone also
+matches before a trailing newline) and pinned over hostile inputs in ``tests/test_tenant_model.py``.
+Persistence and validation orchestration live in ``tenant_service``; no boto3, no I/O here.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import Field, PrivateAttr, ValidationInfo, field_validator
 
-# A 12-digit AWS account id.
+from models.base import WireModel
+
+logger = logging.getLogger(__name__)
+
 ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
 
-# A Databricks workspace origin: https, lowercase host, no port/path/query/fragment.
-# Matched with ``fullmatch`` (never ``.match``) — ``$`` alone also matches just before a
-# trailing newline, which would let "https://host\njavascript:…" through.
 WORKSPACE_URL_RE = re.compile(r"^https://[a-z0-9][a-z0-9.-]+[a-z0-9]$", re.ASCII)
 
-# A Databricks workspace id is a digits-string ("0" is a real value — see below).
-# ``re.ASCII`` keeps ``\d`` to 0-9: without it ``\d`` also matches Unicode digits
-# (e.g. Arabic-Indic "١٢٣"), which no Databricks API would accept.
 WORKSPACE_ID_RE = re.compile(r"^\d+$", re.ASCII)
 
-# A Databricks ACCOUNT id — a lowercase-hex UUID (E29/T3, OB-11).
-#
-# WHY THIS IS A SECURITY BOUNDARY AND NOT A TIDINESS CHECK. ``account_id`` is interpolated
-# into ``/oidc/accounts/{account_id}/v1/token`` — the ACCOUNT-ADMIN token mint, the highest-
-# privilege call in ``databricks_workspace_service``. A stored value shaped like
-# ``a1/../../accounts/other/v1/token`` re-aims that mint at a DIFFERENT Databricks account.
-# The client already ``quote``s the value, which stops the traversal at the URL layer; this
-# regex stops such a value from ever being STORED, so the guarantee survives a future caller
-# that forgets to quote. Two independent guards, deliberately.
-#
-# ``fullmatch`` at every call site (never ``.match``): ``$`` alone also matches just before a
-# trailing newline, so ``.match`` would accept "<valid-uuid>\n../evil". ``re.ASCII`` for the
-# same reason ``WORKSPACE_ID_RE`` has it. Lowercase only — Databricks emits lowercase, and a
-# case-insensitive id would make two spellings of one account look like two accounts.
 DATABRICKS_ACCOUNT_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.ASCII
 )
 
-# The JSON keys inside a tenant's Secrets Manager entries (E29/T3). Declared HERE, next to
-# the ARN fields that point at them, because the writer (``tenant_service``) and the readers
-# (``runtime_catalog``, and T6's provisioning half) are different modules — a key spelled
-# twice is a key that drifts, and the failure mode is a silent "no credential found".
-SP_SECRET_KEY = "sp_client_secret"
+SP_SECRET_KEY = "sp_client_secret"  # noqa: S105 — a key name, not a credential; expires 2027-10-23; added E49A-50A/T3
 ACCOUNT_ADMIN_ID_KEY = "account_admin_client_id"
-ACCOUNT_ADMIN_SECRET_KEY = "account_admin_secret"
+ACCOUNT_ADMIN_SECRET_KEY = "account_admin_secret"  # noqa: S105 — a key name, not a credential; expires 2027-10-23; added E49A-50A/T3
 
 
 class TenantPlatform(str, Enum):
-    """The runtime platform a tenant's agents live on — immutable after create.
-
-    A ``str`` enum so it serializes to the wire value ("aws"/"databricks") and compares
-    equal to it, matching the stored-record shape of pre-E29 items."""
+    """The runtime platform a tenant's agents live on; immutable after create. A ``str`` enum so it
+    serializes to and compares equal to the wire value."""
 
     AWS = "aws"
     DATABRICKS = "databricks"
 
 
-class TenantStageConfig(BaseModel):
-    """Per-stage AWS deployment config (e.g. ``dev``/``prod``). ``account_id`` is a
-    12-digit id (validated on write in the service); the ECR repo + role ARNs default
-    empty and are populated as the cross-account CICD provisions them (E25)."""
+class TenantStageConfig(WireModel):
+    """Per-stage AWS deployment config. The ECR repository and the role ARNs default empty and are
+    populated as the cross-account CICD provisions them. ``account_id`` is validated on write against
+    ``ACCOUNT_ID_RE``."""
 
-    account_id: str  # 12-digit AWS account id
+    account_id: str = Field(description="A 12-digit AWS account id, validated on write")
     region: str = "us-east-1"
     ecr_repo_uri: str = ""
     push_role_arn: str = ""
     deploy_role_arn: str = ""
 
 
-class DatabricksStageConfig(BaseModel):
-    """Per-stage Databricks workspace config (E29). The stage's *identity* is the
-    workspace service principal: ``sp_client_id`` on the record, its secret ONLY in
-    Secrets Manager (``sp_client_secret_arn``) — never in DynamoDB, never echoed.
+class DatabricksStageConfig(WireModel):
+    """Per-stage Databricks workspace config. The stage's identity is the workspace service principal:
+    ``sp_client_id`` on the record, its secret only in Secrets Manager.
 
-    ``workspace_id`` is a digits-string, not an int: it is an opaque identifier and ``"0"``
-    is a real value (a workspace URL that carries no ``o=`` parameter). ``account_id`` is
-    the Databricks *account* UUID — required only for federation binding mode, and validated
-    against :data:`DATABRICKS_ACCOUNT_ID_RE` on write because it aims a URL path.
+    ``sp_client_secret`` is write-only, one field with two directions: on the way in it carries what
+    the admin typed (before it existed, pydantic's ``extra="ignore"`` swallowed the key the form sent
+    and the API answered 201 with nothing stored); on the way out ``exclude=True`` removes it from
+    every ``model_dump`` and ``model_dump_json``, which are the FastAPI response and the DynamoDB
+    persist alike. The same ``DatabricksStageConfig`` is what a create body carries, what the record
+    stores and what the ``StageConfig`` union resolves on read, so one model with an excluded field
+    replaces the two-model split ``connection.py`` uses.
 
-    **``sp_client_secret`` IS WRITE-ONLY (E29/T3, OB-7)** — one field, two directions:
+    ``workspace_url`` and ``account_id`` are validated on write against ``WORKSPACE_URL_RE`` and
+    ``DATABRICKS_ACCOUNT_ID_RE``; the account id is interpolated into the account-admin token-mint
+    path, the highest-privilege call, so a traversal-shaped value is refused before it is stored
+    even though the client also quotes it.
+    """
 
-    * On the way IN it carries what the admin typed. It exists at all because the backend was
-      otherwise DROPPING it: pydantic's default ``extra="ignore"`` swallowed the key the admin
-      form has always sent, so the UI collected a credential, the API answered 201, and nothing
-      was ever stored. A silently-discarded credential is worse than a rejected one.
-    * On the way OUT it does not exist. ``exclude=True`` removes it from every
-      ``model_dump``/``model_dump_json``, which is BOTH serializers that matter here — the
-      FastAPI ``response_model`` and the DynamoDB ``_to_item`` persist. So the secret cannot
-      reach a client and cannot reach the table; only ``sp_client_secret_arn`` does.
-
-    This is ``connection.py``'s write/read split expressed on ONE model rather than two.
-    ``Connection`` could split cleanly (``ConnectionCreate.token`` vs ``Connection.secret_arn``)
-    because a connection's read and write shapes are separate models. A stage is not: the SAME
-    ``DatabricksStageConfig`` is what a create body carries, what the record stores, and what
-    the ``StageConfig`` union resolves on read, so a second class would have to be threaded
-    through the union — and every ``isinstance(stage, DatabricksStageConfig)`` branch in the
-    service and in T6 would then need to know which half it was holding. ``exclude=True``
-    achieves the same asymmetry with no branch that can be got wrong."""
-
-    workspace_url: str  # https origin, no trailing slash (validated on write)
-    workspace_id: str = "0"  # digits-string; "0" is legal (no o= in the URL)
-    cloud: str = "aws"  # "aws" | "azure" | "gcp"
+    workspace_url: str = Field(
+        description="An https origin with no port, path or trailing slash, validated on write"
+    )
+    workspace_id: str = Field(
+        default="0",
+        description=(
+            'A digits-string, not an int: an opaque identifier where "0" is a real value (a workspace URL '
+            "with no o= parameter)"
+        ),
+    )
+    cloud: str = Field(default="aws", description="aws, azure or gcp")
     region: str = ""
-    account_id: str = ""  # Databricks account UUID; REQUIRED for federation mode only
+    account_id: str = Field(
+        default="",
+        description=(
+            "The Databricks account UUID, required for federation binding mode only and validated on write"
+        ),
+    )
     sp_client_id: str = ""
-    # WRITE-ONLY (see above): accepted on input, excluded from every dump. The service
-    # consumes it into Secrets Manager and persists only the ARN below.
-    sp_client_secret: str = Field(default="", exclude=True)
-    sp_client_secret_arn: str = ""  # Secrets Manager ARN; the secret is NEVER in DDB
+    sp_client_secret: str = Field(
+        default="",
+        exclude=True,
+        description="Write-only; the service consumes it into Secrets Manager and persists only the ARN",
+    )
+    sp_client_secret_arn: str = Field(
+        default="", description="Secrets Manager ARN; the secret is never in DynamoDB"
+    )
 
 
-# A stage entry is one shape or the other, chosen by the tenant's ``platform``. Pydantic's
-# smart union resolves a stored dict to the model its keys fit; the service is what refuses
-# a shape that contradicts the stored platform (a dict carrying BOTH shapes' keys is
-# otherwise ambiguous).
 StageConfig = Union[TenantStageConfig, DatabricksStageConfig]
 
+TenantBindingMode = Literal["", "federation", "invoke_unavailable", "sp_secret"]
 
-class Tenant(BaseModel):
-    """Read-model — a line-of-business tenant. Carries only metadata, no credential
-    (E29: a Databricks tenant's SP secret lives in Secrets Manager — only its ARN is here)."""
 
-    id: str  # "ten-<8 hex>" (or "default" for the seed tenant)
+class Tenant(WireModel):
+    """Read model: a line-of-business tenant. Carries only metadata; a Databricks tenant's secrets live
+    in Secrets Manager and only their ARNs are here. ``stages`` resolves each stored dict to the model
+    its keys fit (pydantic's smart union); the service refuses a shape that contradicts the stored
+    platform. ``binding_mode`` is the closed ``TenantBindingMode``: ``services.tenant_service``, the
+    only writer, writes members, and a stored value outside the set folds to ``""`` with a warning."""
+
+    id: str = Field(description='"ten-<8 hex>", or "default" for the seed tenant')
     name: str
     line_of_business: str
-    entra_group_ids: List[str]  # >= 1
-    platform: TenantPlatform = TenantPlatform.AWS  # immutable after create
-    stages: Dict[str, StageConfig]  # per-stage platform config (e.g. dev/prod)
-    # Capability flags — written by the connect-time probe (E29/T3), read-only to clients:
-    # keys "can_discover", "account_admin", "user_sync". Absent ⇒ never probed.
-    capabilities: Dict[str, bool] = Field(default_factory=dict)
-    # A plain ``str``, deliberately — not a ``Literal``/enum. Legacy envelopes (and pre-T14a
-    # records carrying the dormant word) must keep loading; the vocabulary is declared once in
-    # ``services.tenant_service`` (BINDING_*), which is the only writer of this field.
-    binding_mode: str = ""  # "" (aws) | "federation" | "invoke_unavailable" | "sp_secret" (dormant, §3B)
-    # Secrets Manager ARN of the OPTIONAL account-admin credential (E29/T3, OB-7). The ARN
-    # ONLY — the client id and the secret both live inside that secret's JSON body (keys
-    # :data:`ACCOUNT_ADMIN_ID_KEY` / :data:`ACCOUNT_ADMIN_SECRET_KEY`), so neither half is a
-    # read field on this model. Empty ⇒ no account-admin credential was ever supplied, which
-    # is the ordinary case: federation is an extra grant a customer may not have made.
-    account_admin_secret_arn: str = ""
+    entra_group_ids: List[str] = Field(description="At least one group")
+    platform: TenantPlatform = Field(default=TenantPlatform.AWS, description="Immutable after create")
+    stages: Dict[str, StageConfig] = Field(description="Per-stage platform config, e.g. dev and prod")
+    capabilities: Dict[str, bool] = Field(
+        default_factory=dict,
+        description=(
+            "Written by the connect-time probe, read-only to clients: can_discover, account_admin, "
+            "user_sync; absent means never probed"
+        ),
+    )
+    binding_mode: TenantBindingMode = Field(
+        default="",
+        description=(
+            '"" (aws), federation, invoke_unavailable or sp_secret (dormant); written by the connect-time '
+            "probe, read-only to clients"
+        ),
+    )
+    account_admin_secret_arn: str = Field(
+        default="",
+        description=(
+            "Secrets Manager ARN of the optional account-admin credential; the ARN only, since the client "
+            "id and the secret both live inside the secret's JSON body. Empty is the ordinary case: "
+            "federation is an extra grant a customer may not have made"
+        ),
+    )
     description: str = ""
     created_by: str
     created_at: str
     updated_at: str
+    _row_version: int | None = PrivateAttr(default=None)
+
+    @field_validator("binding_mode", mode="before")
+    @classmethod
+    def _fold_binding_mode(cls, value: object, info: ValidationInfo) -> object:
+        if value in get_args(TenantBindingMode):
+            return value
+        logger.warning(
+            "%s %r is outside its set on %s; folded to %r", "binding_mode", value, info.data.get("id"), ""
+        )
+        return ""
 
 
-class TenantCreate(BaseModel):
-    """Write-only input — the POST /tenants body. ``platform`` is settable HERE and only
-    here (it is immutable afterwards); the capability fields are not client-writable —
-    the connect-time probe owns them."""
+class TenantCreate(WireModel):
+    """Write-only input: the ``POST /tenants`` body. ``platform`` is settable here and only here; the
+    capability fields are not client-writable, the connect-time probe owns them.
+
+    The optional account-admin credential is two plain strings rather than a nested object because the
+    pair only means anything together (an id with no secret cannot mint a token), and the frontend
+    already refuses a half-filled pair. The service puts both halves in Secrets Manager and persists
+    only ``Tenant.account_admin_secret_arn``. They unlock ``federation`` binding mode; without them the
+    account-level federation probe cannot run and the tenant is badged ``invoke_unavailable``.
+    """
 
     name: str
     line_of_business: str
     entra_group_ids: List[str]
     platform: TenantPlatform = TenantPlatform.AWS
     stages: Dict[str, StageConfig]
-    # OPTIONAL account-admin credential, Databricks only, WRITE-ONLY (E29/T3, OB-7). Present
-    # on a write model and on NO read model: the service puts both halves in Secrets Manager
-    # and persists only ``Tenant.account_admin_secret_arn``.
-    #
-    # ALL-OR-NOTHING, and that is why it is two plain strings rather than a nested object: the
-    # pair only means anything together (an id with no secret cannot mint a token), and the
-    # frontend's own ``isAccountAdminCredentialUsable`` already refuses a half-filled pair.
-    # These are what UNLOCK ``federation`` binding mode — without them the account-level
-    # federation-policy probe cannot run, so the tenant is honestly badged
-    # ``invoke_unavailable`` (E29/T14a, design §3B: no silent downgrade to ``sp_secret``).
-    account_admin_client_id: str = ""
-    account_admin_secret: str = ""
+    account_admin_client_id: str = Field(default="", description="Write-only; Databricks only")
+    account_admin_secret: str = Field(default="", description="Write-only; Databricks only")
     description: str = ""
 
 
-class TenantUpdate(BaseModel):
-    """Write-only input — the PUT /tenants/{id} body. All optional (partial update).
+class TenantUpdate(WireModel):
+    """Write-only input: the ``PUT /tenants/{id}`` body, every field optional.
 
-    NO ``platform`` field, by contract: a tenant's platform is immutable after create, so
-    a body carrying one is dropped rather than obeyed. A ``stages`` update must still match
-    the stored platform's shape — enforced in ``tenant_service``."""
+    No ``platform`` field, by contract: a body carrying one is dropped rather than obeyed. A ``stages``
+    update must still match the stored platform's shape, enforced in ``tenant_service``. The
+    account-admin pair rotates the write-only credential so an admin can unlock federation on a tenant
+    that connected without it: ``None`` (unset) leaves the stored credential alone and a supplied pair
+    replaces it, which the service reads off ``exclude_unset``, hence ``Optional`` rather than the
+    create model's ``""``. ``account_admin_secret_arn`` is deliberately absent: the ARN is the server's
+    value, and a client that could send one could re-point a tenant at another tenant's secret; the
+    per-stage ``sp_client_secret_arn`` lives inside the ``stages`` shape, so the service ignores a
+    body-supplied one explicitly.
+    """
 
     name: Optional[str] = None
     line_of_business: Optional[str] = None
     entra_group_ids: Optional[List[str]] = None
     stages: Optional[Dict[str, StageConfig]] = None
-    # ROTATION of the write-only account-admin credential (E29/T3, OB-7). Present here so an
-    # admin can unlock federation on a tenant that connected WITHOUT the extra grant — a real
-    # sequence, since Tier-3 account-admin access is often obtained after the workspace one.
-    #
-    # ``None`` (unset) means "leave the stored credential alone"; a supplied pair means
-    # "replace it". The service reads that distinction off ``exclude_unset``, which is why
-    # these are ``Optional`` rather than defaulting to ``""`` like their ``TenantCreate``
-    # counterparts — on create, absent and blank mean the same thing; on update they do NOT.
-    #
-    # Note what is NOT here: ``account_admin_secret_arn``. The ARN is the SERVER's value
-    # (OB-10) — a client that could send one could re-point a tenant at another tenant's
-    # secret. The per-stage ``sp_client_secret_arn`` cannot be omitted the same way (it lives
-    # inside the ``stages`` shape), so the service ignores a body-supplied one explicitly.
-    account_admin_client_id: Optional[str] = None
-    account_admin_secret: Optional[str] = None
+    account_admin_client_id: Optional[str] = Field(
+        default=None, description="Write-only; rotates the credential"
+    )
+    account_admin_secret: Optional[str] = Field(
+        default=None, description="Write-only; rotates the credential"
+    )
     description: Optional[str] = None
 
 
+class Verb(str, Enum):
+    """The capabilities a tenant surface reports on, one per named requirement. ``MIRROR`` is the
+    platform-side ACL write; ``MCP_DELIVERY`` is serving MCP servers to a runtime; ``OBSERVABILITY``
+    is having a trace destination at all (whether AGP can wire it is
+    ``PlatformDeclaration.trace_auto_delivery``, a separate fact)."""
+
+    DISCOVER = "discover"
+    INVOKE = "invoke"
+    MIRROR = "mirror"
+    DEPLOY = "deploy"
+    PUBLISH = "publish"
+    GUARDRAILS = "guardrails"
+    MCP_DELIVERY = "mcp_delivery"
+    OBSERVABILITY = "observability"
+
+
+ReadinessReason = Literal[
+    "",
+    "unsupported",
+    "deploy_role_not_assumable",
+    "probe_unreachable",
+    "invoke_unavailable",
+]
+
+
+class VerbReadiness(WireModel):
+    """One verb's verdict for one tenant, derived by ``services.platform_registry.tenant_readiness``
+    and never stored. ``verb`` is the entry's own key in the readiness map, carried so the document
+    types the key set. ``reason`` is one of ``platform_registry.READINESS_REASONS``, a closed set the
+    frontend maps to copy exhaustively, and is ``""`` unless the state is ``unavailable``. ``stage``
+    is the only variable part and travels in its own field, ``None`` unless the verdict is
+    stage-scoped, never as a suffix on ``reason``: it is a key from the tenant's own stage map, and
+    keeping it out of ``reason`` is what keeps the reason set closed."""
+
+    verb: Verb
+    state: Literal["ready", "unavailable", "not_applicable"]
+    reason: ReadinessReason
+    stage: Optional[str] = None
+
+
+class TenantView(Tenant):
+    """The tenant as the admin list and the probe answer it: every ``Tenant`` field plus
+    ``readiness``, derived per verb from the stored ``capabilities`` and ``binding_mode`` on the way
+    out, so the two cannot disagree, and never stored."""
+
+    readiness: Dict[str, VerbReadiness] = Field(
+        description="Keyed by the verb's wire value, one entry per Verb; each entry repeats its verb"
+    )
+
+
+def tenant_platform(tenant: Tenant) -> str:
+    """The tenant's platform as the one string the template picker filters on
+    (``infra_template.platform == tenant.platform``).
+
+    ``"aws"`` is the fold for a blank or ``None`` value, because a record written before the field
+    existed hydrates with no value and every such tenant is an AWS tenant; the fold matters because a
+    ``""`` filter key would match no infra template and empty the picker, which reads as "no templates"
+    rather than "unknown platform". Takes a ``Tenant``, not any attribute-bearing object, so a raw item
+    cannot be mistaken for an AWS tenant. Returns the enum's ``.value``, never ``str()``, which renders
+    ``TenantPlatform.AWS`` and matches no template.
+    """
+    platform = getattr(tenant, "platform", None) or TenantPlatform.AWS
+    return getattr(platform, "value", platform)
+
+
 def hydrate_tenant_item(clean: dict) -> dict:
-    """Fold legacy tenant items forward on read — the zero-migration path.
+    """Fold legacy tenant items forward on read, mutating and returning the same dict.
 
-    Two generations of defaults, both applied to the SAME dict object (mutate + return, so
-    callers holding the reference see the hydration):
-
-    * **E29** — a record written before platform typing has no ``platform`` key. Default it
-      to ``"aws"``: every pre-E29 tenant was an AWS tenant. ``capabilities``/``binding_mode``
-      need no defaulting here — the model's own field defaults cover them. An explicit
-      ``platform`` is never overwritten.
-    * **E25** — a pre-E25 record has no ``stages`` key but carries flat
-      ``aws_account_dev``/``aws_account_prod``/``aws_region`` fields. Build a ``stages`` map
-      (dev/prod, both inheriting the flat region; ECR + roles default empty) and drop the
-      three flat keys. If ``stages`` is already present, leave it alone (mirror of the
-      legacy-default pattern in ``ProjectService._hydrate_project``)."""
+    A record written before platform typing has no ``platform`` key and defaults to ``"aws"``; an
+    explicit platform is never overwritten, and ``capabilities`` / ``binding_mode`` need no defaulting
+    because the model's own defaults cover them. A record written before nested stages has flat
+    ``aws_account_dev`` / ``aws_account_prod`` / ``aws_region`` fields: they become a ``stages`` map
+    (dev and prod, both inheriting the flat region, ECR and roles empty) and the flat keys are dropped;
+    a ``stages`` key already present is left alone.
+    """
     clean.setdefault("platform", TenantPlatform.AWS.value)
     if "stages" in clean or "aws_account_dev" not in clean:
         return clean

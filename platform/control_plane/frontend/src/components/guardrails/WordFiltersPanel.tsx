@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import type { WordFilterConfig } from '../../types';
+import type { WordFilterConfigOutput } from '../../api/client';
 
 interface Props {
-  config: WordFilterConfig;
-  onChange: (config: WordFilterConfig) => void;
+  config: WordFilterConfigOutput;
+  onChange: (config: WordFilterConfigOutput) => void;
 }
 
 export default function WordFiltersPanel({ config, onChange }: Props) {
@@ -22,7 +22,6 @@ export default function WordFiltersPanel({ config, onChange }: Props) {
 
   return (
     <div className="space-y-5">
-      {/* Profanity toggle */}
       <div className="flex items-center justify-between p-4 bg-slate-50 rounded-xl">
         <div>
           <p className="text-sm font-medium text-slate-800">Managed Profanity Filter</p>
@@ -42,7 +41,6 @@ export default function WordFiltersPanel({ config, onChange }: Props) {
         </button>
       </div>
 
-      {/* Custom blocked words */}
       <div>
         <p className="text-sm font-medium text-slate-800 mb-2">Custom Blocked Words</p>
         <p className="text-xs text-slate-500 mb-3">Add specific words or phrases that should be blocked</p>

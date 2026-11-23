@@ -64,7 +64,7 @@ variable "postgres_max_capacity" {
 variable "postgres_version" {
   description = "PostgreSQL engine version to use"
   type        = string
-  default     = "15.12"
+  default     = "15.17"
 }
 
 variable "cache_node_type" {

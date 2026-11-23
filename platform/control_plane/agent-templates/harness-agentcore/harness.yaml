@@ -1,0 +1,59 @@
+# The agent. This file IS the deploy artifact.
+#
+# There is no code in this repository and there is no container: the AgentCore harness is a
+# MANAGED, config-driven runtime, so an agent is a set of parameters rather than a program.
+# Edit the five keys below, push to the trunk, and the platform's Terraform module reads this
+# exact file (`yamldecode(file(...))`) and applies the harness. Your change to a system prompt
+# is a deploy — treat it like one.
+#
+# The KEY NAMES are a contract, not a convention. The infra module consumes them verbatim, so
+# renaming one, nesting it, or dropping it does not produce a "default" — it fails the apply.
+# Adding your own keys is safe (the module reads only these five and ignores the rest), but do
+# not rely on an extra key doing anything until the module is taught to read it.
+
+# The Bedrock model the harness runs. An inference-profile id (the `us.` prefix) rather than a
+# bare model id, so the request can cross regions inside the partition instead of throttling on
+# one. The model must be ENABLED in the target account/region — a model you have not been
+# granted access to fails at invoke time, not at apply time.
+model_id: us.anthropic.claude-sonnet-4-6
+
+# The agent's standing instructions. This is the whole of its behaviour: there is no
+# orchestration loop of yours to put logic in. Written as a YAML block scalar (`|`) so it can
+# be multiple paragraphs without quoting games.
+system_prompt: |
+  You are a helpful assistant. Answer clearly and concisely.
+
+  Say so plainly when you do not know something, and never invent a fact to fill a gap.
+
+# Tools the harness may call, as AgentCore Gateway ARNs. EMPTY is a valid, working agent — a
+# conversational one with no side effects, which is the right starting point.
+#
+# EVERY ENTRY MUST BE A FULL GATEWAY ARN, NOT A NAME:
+#
+#   tools:
+#     - arn:aws:bedrock-agentcore:<region>:<account-id>:gateway/<gateway-id>
+#
+# A tool is NOT code you write here. Register the tool as a Gateway target, then list its ARN.
+# The infra module passes each entry through verbatim — into the harness's gateway_arn AND into
+# the Resource list of the execution role's IAM policy — so a bare name is rejected by IAM and
+# the deploy fails with MalformedPolicyDocument. That same list is what SCOPES the grant: the
+# role may reach exactly the gateways named here, which is why names and wildcards are out.
+#
+# Anything listed must exist and be reachable by the harness's execution role before the deploy
+# that references it, or the apply fails on an unresolvable target.
+#
+# Gateways governed by AGP (MCP servers in its registry) get token exchange automatically: the
+# build adds OAuth TOKEN_EXCHANGE auth for those ARNs, so the gateway sees the calling user.
+# Listing an ARN is not access — the MCP owner's grant to this agent is.
+tools: []
+
+# The reasoning-loop ceiling: how many think→act→observe cycles one invocation may take before
+# the harness stops. This is a COST AND LATENCY BOUND, not a quality dial — raising it does not
+# make the agent smarter, it makes a runaway tool loop more expensive. Keep it near the number
+# of steps your worst legitimate request needs.
+max_iterations: 10
+
+# Wall-clock ceiling for a single invocation, in seconds. Whatever calls this agent has its own
+# timeout, and this one should expire FIRST — otherwise the caller gives up while the harness is
+# still billing.
+timeout_seconds: 300

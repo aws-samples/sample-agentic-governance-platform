@@ -1,0 +1,13 @@
+# Evaluation settings for this agent. AGP reads this file at HEAD (see README -> "Evaluations").
+version: 1
+dataset: evals/dataset.jsonl
+checks:
+  tools: in_order        # exact | in_order | any_order | off   (tool names)
+  args: subset           # exact | subset | off                  (tool arguments)
+  no_error: true         # the invoke must succeed
+judges:                  # AgentCore Evaluations built-in ids; [] = checks only
+  - Builtin.GoalSuccessRate
+  - Builtin.Correctness
+gate:
+  checks: all_pass       # every item must pass every enabled check
+  judge_min_mean: 0.8    # every judge's mean score across items must be >= this

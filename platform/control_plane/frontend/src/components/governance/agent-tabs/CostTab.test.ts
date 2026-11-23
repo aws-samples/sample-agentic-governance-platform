@@ -1,10 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import type { AgentMetrics } from '../../../types';
-import { CHART_COLORS } from '../../govern/mockData';
+import type { AgentMetrics } from '../../../api/client';
+import { CHART_COLORS } from '../../shared/chartTheme';
 import { agentMetricsToSeries } from './agentObservability';
 
-// A fully-populated per-agent metrics payload (C3 /agents/{id}/metrics shape:
-// AgentMetrics — no by_agent). snake_case exactly as the backend emits.
 const POPULATED: AgentMetrics = {
   totals: { traces: 24, cost_usd: 2.4, tokens: 6000 },
   daily: [
@@ -18,7 +16,6 @@ const POPULATED: AgentMetrics = {
   by_user: [],
 };
 
-// A "provisioned but no traces yet" agent — every scalar zeroed, lists empty.
 const EMPTY: AgentMetrics = {
   totals: { traces: 0, cost_usd: 0, tokens: 0 },
   daily: [],
@@ -49,7 +46,7 @@ describe('CostTab · agentMetricsToSeries', () => {
     ]);
   });
 
-  it('a single agent carries no per-agent breakdown', () => {
+  it('a single agent carries no per-agent breakdown: AgentMetrics is the aggregate half of ScopeMetrics and reuses its series recipe', () => {
     expect(agentMetricsToSeries(POPULATED).byAgent).toEqual([]);
   });
 

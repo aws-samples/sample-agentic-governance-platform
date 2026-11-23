@@ -1,30 +1,18 @@
-"""Tests for ``services.databricks_identity_service`` — E29/T6, the PLATFORM half of
-provisioning for a Databricks-hosted agent.
+"""Tests for ``services.databricks_identity_service``, the platform half of provisioning for a
+Databricks-hosted agent.
 
-SECURITY-SENSITIVE / SECRET-HANDLING. The tenant's workspace service-principal secret is
-fetched at CALL TIME from Secrets Manager and flows only into a token mint. It must never
-reach the agent record, a log line, or an exception message — there are explicit tests for
-all three, driven by a sentinel value (``WS_SECRET_SENTINEL``) so a leak is a failing
-assertion rather than a reading exercise.
+The tenant's workspace service-principal secret is fetched at call time from Secrets Manager and
+flows only into a token mint; it must never reach the agent record, a log line or an exception
+message, and the tests for all three are driven by a sentinel value (``WS_SECRET_SENTINEL``) so a
+leak is a failing assertion.
 
-ALL external collaborators are doubles — no live AWS, no live Databricks:
-  - ``DatabricksWorkspaceService`` → ``_FakeDatabricks``, which REJECTS wrong-shaped calls
-    (a fake more generous than reality makes tests that cannot fail — Global Constraints):
-    it validates that a token was minted before any authenticated call, that
-    ``ensure_federation_audience`` is keyword-called with ``present=``, and that
-    ``grant_app_can_use`` gets a non-empty app name.
-  - boto3 ``secretsmanager`` → ``_FakeSecrets`` (a MagicMock would silently accept a wrong
-    ``SecretId``; this one 404s on an unknown id, which is what proves the ARN is used).
-  - ``AgentRegistryService`` → ``MagicMock`` whose ``persist_identity`` records each call.
-
-The repo is NOT in pytest-asyncio ``auto`` mode, so every async test is decorated
-``@pytest.mark.asyncio`` explicitly.
-
-Contract: plan §T6 + design §3 (federation mode = user-sync verified → audience →
-CAN_USE grants → persist ``oauth2_app_client_id``; sp_secret mode = per-agent SP + secret;
-both idempotent + resumable), contracts C-1/C-2/C-4, and the ledger's cross-task
-obligations OB-1 (/reprovision dispatch), OB-2 (client-settable service fields are
-untrusted) and OB-6 (federation-policy failures surface actionably).
+Every external collaborator is a double. ``DatabricksWorkspaceService`` is ``_FakeDatabricks``,
+which rejects wrong-shaped calls: a token minted before any authenticated call,
+``ensure_federation_audience`` keyword-called with ``present=``, a non-empty app name. boto3
+``secretsmanager`` is ``_FakeSecrets``, which 404s on an unknown id, proving the stored ARN is what
+is read. ``AgentRegistryService`` is a ``MagicMock`` whose ``persist_identity`` records each call.
+The repo is not in pytest-asyncio ``auto`` mode, so every async test carries
+``@pytest.mark.asyncio``.
 """
 
 from __future__ import annotations
@@ -37,47 +25,35 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from botocore.exceptions import ClientError
 
-from models.agent import Agent, AuthType, LifecycleState, Platform
+from models.agent import Agent, AgentAuthType, IdentityStatus, LifecycleState, Platform
 from models.tenant import (
     ACCOUNT_ADMIN_ID_KEY,
     ACCOUNT_ADMIN_SECRET_KEY,
     SP_SECRET_KEY,
     DatabricksStageConfig,
     Tenant,
+    TenantBindingMode,
     TenantPlatform,
 )
 from services.agent_identity_service import ProvisioningError
 from services.databricks_workspace_service import DatabricksError
+from services.platform_adapter import Artifact, ArtifactPolicy
 
-# ---------------------------------------------------------------------------
-# Sentinels / builders
-# ---------------------------------------------------------------------------
 WORKSPACE_URL = "https://dbc-test.cloud.databricks.com"
 APP_NAME = "claims-triage"
 APP_URL = "https://claims-triage-1234.aws.databricksapps.com"
 APP_OAUTH_CLIENT_ID = "app-oauth-client-id-from-listing"
 ACCOUNT_ID = "11111111-2222-3333-4444-555555555555"
-WS_SECRET_ARN = (
-    "arn:aws:secretsmanager:us-east-1:000000000000:secret:agp/databricks/ws-AbCdEf"
-)
-# Distinct, unmistakable sentinels. If either ever appears in a log record, an exception
-# message, or on the agent envelope, the corresponding test fails.
+WS_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:000000000000:secret:agp/databricks/ws-AbCdEf"
 WS_SECRET_SENTINEL = "WORKSPACE_SP_SECRET_DO_NOT_LEAK"
-# The account-admin credential (T3 stores BOTH halves inside one tenant-level secret body).
-ADMIN_SECRET_ARN = (
-    "arn:aws:secretsmanager:us-east-1:000000000000:secret:agp/databricks/admin-GhIjKl"
-)
+ADMIN_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:000000000000:secret:agp/databricks/admin-GhIjKl"
 ADMIN_CLIENT_ID = "account-admin-client-id"
 ADMIN_SECRET_SENTINEL = "ACCOUNT_ADMIN_SECRET_DO_NOT_LEAK"
-# The secret this module MINTS for a per-agent service principal.
 MINTED_SP_SECRET = "MINTED_PER_AGENT_SP_SECRET_DO_NOT_LEAK"
 SCIM_SP_ID = "7788990011"
 AGENT_AUDIENCE = "api://agp-agent-rec-abc123"
 GROUP_A = "group-aaa"
 GROUP_B = "group-bbb"
-# The tenant's WORKSPACE service principal — the credential AGP itself connects with, and
-# therefore the one entry besides ``admins`` that design §3A's asserted ACL must keep: without
-# CAN_MANAGE, the next ACL write (a per-user grant) would be refused by Databricks.
 WS_SP_CLIENT_ID = "ws-sp-client-id"
 _ADMINS_ACL = ("admins", "group", "CAN_MANAGE")
 _TENANT_SP_ACL = (WS_SP_CLIENT_ID, "service_principal", "CAN_MANAGE")
@@ -94,10 +70,10 @@ def _make_agent(
     runtime_handle: str | None = APP_URL,
     runtime_kind: str | None = "app",
     platform: Platform | None = Platform.DATABRICKS,
-    auth_type: AuthType = AuthType.ENTRA,
+    auth_type: AgentAuthType = AgentAuthType.ENTRA,
     tenant_id: str | None = "ten-1",
-    identity_status: str = "pending",
-    binding_mode: str | None = None,
+    identity_status: IdentityStatus = IdentityStatus.PENDING,
+    binding_mode: TenantBindingMode | None = None,
     databricks_sp_id: str | None = None,
     databricks_sp_secret_arn: str | None = None,
     oauth2_app_client_id: str | None = None,
@@ -132,7 +108,7 @@ def _make_agent(
 
 def _make_tenant(
     *,
-    binding_mode: str = "federation",
+    binding_mode: TenantBindingMode = "federation",
     capabilities: dict | None = None,
     entra_group_ids: list[str] | None = None,
     account_id: str = ACCOUNT_ID,
@@ -163,8 +139,6 @@ def _make_tenant(
         stages=stages,
         capabilities=capabilities,
         binding_mode=binding_mode,
-        federation_audience="",
-        entra_tenant_id="00000000-0000-0000-0000-000000000001",
         account_admin_secret_arn=account_admin_secret_arn,
         created_by="seed",
         created_at="2026-08-06T00:00:00+00:00",
@@ -172,25 +146,19 @@ def _make_tenant(
     )
 
 
-# ---------------------------------------------------------------------------
-# Doubles
-# ---------------------------------------------------------------------------
 class _FakeDatabricks:
-    """A DatabricksWorkspaceService double that REFUSES wrong-shaped calls.
+    """A DatabricksWorkspaceService double that refuses wrong-shaped calls.
 
-    Anything it accepts is a shape the real client would accept; anything it rejects the
-    real client would reject too (or would silently do the wrong thing, which is worse).
-    Every call is recorded in ``self.calls`` so ordering is assertable.
+    Anything it accepts is a shape the real client would accept; anything it rejects the real
+    client would reject too (or would silently do the wrong thing, which is worse). Every call is
+    recorded in ``self.calls`` so ordering is assertable. ``apps_by_workspace`` models a tenant
+    with more than one workspace, only one of which lists the app: a Databricks app URL carries
+    no workspace identity, so stage resolution is testable only by which workspace answers with
+    the app.
     """
 
     def __init__(self, *, apps=None, apps_by_workspace=None):
         self.calls: list[tuple] = []
-        # ``apps_by_workspace`` models a tenant with more than one workspace: only the
-        # workspace that really hosts the app lists it. That is what makes stage resolution
-        # testable, because a Databricks app URL
-        # (``<app>-<n>.<region>.databricksapps.com``) carries NO workspace identity — the
-        # host cannot be matched against ``workspace_url``, so the only honest evidence is
-        # which workspace answers with the app.
         self._apps_by_workspace = apps_by_workspace
         self._apps = (
             apps
@@ -202,15 +170,9 @@ class _FakeDatabricks:
         self.audiences: set[str] = set()
         self.raise_on: dict[str, Exception] = {}
         self.grant_failures: set[str] = set()
-        # The app's ACL, as ``get_app_permissions`` returns it and ``set_app_permissions``
-        # REPLACES it (T13a). Seeded the way a real app arrives: the workspace admins hold
-        # CAN_MANAGE, and whatever the customer granted directly is also here — which is what
-        # design §3A's assert takes over.
-        self.acl: list[dict] = [
-            {"principal": "admins", "kind": "group", "level": "CAN_MANAGE"}
-        ]
+        self.acl: list[dict] = [{"principal": "admins", "kind": "group", "level": "CAN_MANAGE"}]
         self.sp_seq = 0
-        self.account_hosts: list[str] = []
+        self.account_hosts: list[str | None] = []
         self.account_credentials: list[tuple[str, str]] = []
 
     def _maybe_raise(self, what: str) -> None:
@@ -228,9 +190,7 @@ class _FakeDatabricks:
         self.minted_ws_tokens += 1
         return f"ws-token-{self.minted_ws_tokens}"
 
-    async def mint_account_token(
-        self, account_id, client_id, client_secret, *, account_host=None
-    ):
+    async def mint_account_token(self, account_id, client_id, client_secret, *, account_host=None):
         assert account_id, "an account token cannot be minted without an account id"
         assert client_id and client_secret
         self.calls.append(("mint_account_token", account_id))
@@ -251,9 +211,9 @@ class _FakeDatabricks:
     async def grant_app_can_use(
         self, workspace_url, token, app_name, service_principal_or_group, kind="group"
     ):
-        """The ADDITIVE (PATCH) grant. Kept on the double deliberately even though
-        provisioning no longer calls it (design §3A): the tests that assert it is never
-        reached would pass trivially against a double that could not receive the call."""
+        """The additive (PATCH) grant. Kept on the double even though provisioning no longer calls
+        it: the tests that assert it is never reached would pass trivially against a double that
+        could not receive the call."""
         assert token.startswith("ws-token-"), "a grant needs a WORKSPACE token"
         assert app_name, "a grant with no app name would PATCH the collection root"
         assert service_principal_or_group, "a grant needs a principal"
@@ -276,9 +236,7 @@ class _FakeDatabricks:
         assert token.startswith("ws-token-"), "asserting an app ACL needs a WORKSPACE token"
         assert app_name, "no app name would PUT the permissions collection root"
         assert any(
-            e.get("principal") == "admins"
-            and e.get("kind") == "group"
-            and e.get("level") == "CAN_MANAGE"
+            e.get("principal") == "admins" and e.get("kind") == "group" and e.get("level") == "CAN_MANAGE"
             for e in entries
         ), "the real client REFUSES an ACL that does not keep the admins' CAN_MANAGE"
         for entry in entries:
@@ -286,7 +244,6 @@ class _FakeDatabricks:
                 f"an unrecognised ACL kind is refused upstream: {entry!r}"
             )
             assert entry.get("principal"), f"an ACL entry needs a principal: {entry!r}"
-            # The app ACL vocabulary is CLOSED upstream — anything else is refused there.
             assert entry.get("level") in ("CAN_USE", "CAN_MANAGE"), (
                 f"an unrecognised ACL level is refused upstream: {entry!r}"
             )
@@ -294,11 +251,13 @@ class _FakeDatabricks:
                 "an inherited entry must never be re-PUT — that would convert it into a "
                 f"permanent direct grant: {entry!r}"
             )
-        self.calls.append((
-            "set_app_permissions",
-            app_name,
-            tuple(sorted((e["principal"], e["kind"], e["level"]) for e in entries)),
-        ))
+        self.calls.append(
+            (
+                "set_app_permissions",
+                app_name,
+                tuple(sorted((e["principal"], e["kind"], e["level"]) for e in entries)),
+            )
+        )
         self._maybe_raise("set_app_permissions")
         self.acl = [dict(entry) for entry in entries]
 
@@ -315,7 +274,6 @@ class _FakeDatabricks:
 
     async def create_service_principal_secret(self, workspace_url, token, sp_id):
         assert token.startswith("ws-token-"), "minting an SP secret needs a WORKSPACE token"
-        # The SCIM id, NOT the application id — the real endpoint 404s the latter.
         assert sp_id.startswith(SCIM_SP_ID), (
             f"the secret mint must be addressed by the SCIM id, got {sp_id!r}"
         )
@@ -323,19 +281,11 @@ class _FakeDatabricks:
         self._maybe_raise("create_service_principal_secret")
         return {"secret": MINTED_SP_SECRET, "secret_hash": "sha256:abc", "id": "secret-rec-1"}
 
-    async def ensure_federation_audience(
-        self, account_host, account_id, token, audience, *, present
-    ):
-        # ``present`` is keyword-only in the real client; a positional call would be a
-        # TypeError there, so the fake must not be more forgiving.
+    async def ensure_federation_audience(self, account_host, account_id, token, audience, *, present):
         assert token.startswith("account-token-"), (
-            "the federation policy is an ACCOUNT-level resource — a workspace token "
-            "cannot write it"
+            "the federation policy is an ACCOUNT-level resource — a workspace token cannot write it"
         )
         assert audience, "an empty audience would be appended as a trust entry"
-        # The real client accepts one string or a sequence (livefix-7: one list + one
-        # PATCH for a multi-form removal). The fake records ONE tuple per audience so
-        # assertions can name each form, while still counting as a single client call.
         forms = [audience] if isinstance(audience, str) else list(audience)
         assert all(forms), "an empty audience would be appended as a trust entry"
         for form in forms:
@@ -357,13 +307,10 @@ class _FakeSecretsExceptions:
 
 
 class _FakeSecrets:
-    """A Secrets Manager double that 404s on an unknown id — which is what proves the service
-    reads the tenant's stored ARN rather than a name it made up.
-
-    It resolves a name OR an ARN, because the real API does: ``create_secret`` returns an ARN,
-    every later call is made with that ARN, and a fake that only answered to names would have
-    made "store then read back" pass while the live path 404'd. (It did: three tests failed on
-    exactly this until the fake was corrected.)
+    """A Secrets Manager double that 404s on an unknown id, which is what proves the service reads
+    the tenant's stored ARN rather than a name it made up. It resolves a name or an ARN, because
+    the real API does: ``create_secret`` returns an ARN and every later call is made with it, so a
+    fake that only answered to names would pass "store then read back" while the live path 404'd.
     """
 
     def __init__(self, store=None):
@@ -371,10 +318,7 @@ class _FakeSecrets:
         self.store: dict[str, str] = dict(store or {})
         self.created: list[dict] = []
         self.deleted: list[str] = []
-        # A STORE FAULT on delete (not a 404 — that one is a success by design). Exercises the
-        # non-blocking half of teardown's asymmetry; see the final-review section at the end.
         self.raise_on_delete = False
-        # name -> ARN, populated by create_secret, mirroring the real service's two handles.
         self._arns: dict[str, str] = {k: k for k in self.store}
 
     def _resolve(self, secret_id: str) -> str:
@@ -386,40 +330,35 @@ class _FakeSecrets:
                 return name
         raise self.exceptions.ResourceNotFoundException(secret_id)
 
-    def get_secret_value(self, SecretId):  # noqa: N803 — boto3 casing
+    def get_secret_value(self, SecretId):
         key = self._resolve(SecretId)
         return {"SecretString": self.store[key], "ARN": self._arns.get(key, key)}
 
-    def create_secret(self, Name, SecretString, Tags=None):  # noqa: N803
+    def create_secret(self, Name, SecretString, Tags=None):
         if Name in self.store:
             raise self.exceptions.ResourceExistsException(Name)
         self.store[Name] = SecretString
-        # SIX random alphanumerics, as the real service appends. A shorter stand-in made the
-        # fake unfaithful and hid a live ownership-check failure (fix round 3).
         arn = f"arn:aws:secretsmanager:us-east-1:000000000000:secret:{Name}-AbC123"
         self._arns[Name] = arn
         self.created.append({"Name": Name, "Tags": Tags})
         return {"ARN": arn}
 
-    def put_secret_value(self, SecretId, SecretString):  # noqa: N803
+    def put_secret_value(self, SecretId, SecretString):
         key = self._resolve(SecretId)
         self.store[key] = SecretString
         return {"ARN": self._arns.get(key, key)}
 
-    def delete_secret(self, SecretId, ForceDeleteWithoutRecovery=False):  # noqa: N803
+    def delete_secret(self, SecretId, ForceDeleteWithoutRecovery=False):
         key = self._resolve(SecretId)
         if self.raise_on_delete:
-            # A real boto3 fault shape, so the service's `_STORE_FAULTS` arm is the one taken.
-            raise ClientError(
-                {"Error": {"Code": "InternalServiceError", "Message": "boom"}}, "DeleteSecret"
-            )
+            raise ClientError({"Error": {"Code": "InternalServiceError", "Message": "boom"}}, "DeleteSecret")
         self.store.pop(key)
         self.deleted.append(SecretId)
 
 
 def _default_secret_store() -> dict:
-    """The two tenant-level secrets T3 writes: the per-stage workspace SP credential, and the
-    optional account-admin pair (BOTH halves in ONE body, under T3's key names)."""
+    """The two tenant-level secrets the tenant service writes: the per-stage workspace SP
+    credential, and the optional account-admin pair (both halves in one body)."""
     return {
         WS_SECRET_ARN: json.dumps({SP_SECRET_KEY: WS_SECRET_SENTINEL}),
         ADMIN_SECRET_ARN: json.dumps(
@@ -469,27 +408,18 @@ def _persisted_statuses(registry) -> list[str]:
 
 @pytest.fixture
 def sp_secret_gate_on(monkeypatch):
-    """E29/T14a (design §3B) — the sp_secret leg is DORMANT, behind an off-by-default flag.
+    """The sp_secret leg is dormant behind an off-by-default flag; every test that exercises it
+    opts in here, and the tests that assert the refusal do not take this fixture.
 
-    Every test that exercises that leg opts in here, which is what keeps it pinned: the
-    capability still works exactly as it did, it is simply never selected by the connect flow
-    and never consumable on a default deployment. Tests that assert the REFUSAL deliberately do
-    NOT take this fixture.
-
-    Patched on the SERVICE MODULE's ``settings`` object (the ``agents_module.settings`` idiom
-    used further down this file), not on a fresh ``from core.config import settings``: the
-    ``reprovision_env`` fixture pops ``core.config`` out of ``sys.modules``, so a re-import here
-    would hand back a DIFFERENT ``Settings`` instance than the one the service is reading — and
-    the flag would appear to have no effect for every test that ran after it."""
+    Patched on the service module's ``settings`` object, not on a fresh
+    ``from core.config import settings``: the ``reprovision_env`` fixture pops ``core.config`` out
+    of ``sys.modules``, so a re-import here would hand back a different ``Settings`` instance than
+    the one the service reads, and the flag would appear to have no effect."""
     import services.databricks_identity_service as dbx_module
 
     monkeypatch.setattr(dbx_module.settings, "DATABRICKS_ALLOW_SP_SECRET_BINDING", True)
     return dbx_module.settings
 
-
-# ===========================================================================
-# Federation mode — the governed path
-# ===========================================================================
 
 @pytest.mark.asyncio
 async def test_federation_happy_path_adds_audience_asserts_the_acl_and_persists():
@@ -499,20 +429,10 @@ async def test_federation_happy_path_adds_audience_asserts_the_acl_and_persists(
 
     out = await svc.provision_databricks_runtime(agent, tenant)
 
-    # The agent's OWN audience is what lands on the account policy (design §3 step 2) —
-    # in the CLIENT-ID GUID form, because that is the `aud` a v2 OBO'd per-agent token
-    # actually carries (E29 livefix-6, proven live 2026-08-12: the api:// URI form made
-    # every exchange fail invalid_grant; the URI stays AgentCore's allowedAudience only).
     assert ("ensure_federation_audience", "agent-app-guid", True) in db.calls
     assert db.audiences == {"agent-app-guid"}
-    assert not any(
-        c == ("ensure_federation_audience", AGENT_AUDIENCE, True) for c in db.calls
-    )
-    # Design §3A: the app's ACL is ASSERTED to exactly admins + the tenant's workspace SP,
-    # keyed on the app NAME read from the listing. Nobody can call the app until a grant
-    # mirrors an Entra assignment onto it.
+    assert not any(c == ("ensure_federation_audience", AGENT_AUDIENCE, True) for c in db.calls)
     assert ("set_app_permissions", APP_NAME, _asserted_acl()) in db.calls
-    # The app's OAuth client id is persisted from the app record when readable.
     assert out.oauth2_app_client_id == APP_OAUTH_CLIENT_ID
     assert out.binding_mode == "federation"
     assert out.identity_status == "provisioned"
@@ -524,9 +444,7 @@ async def test_federation_never_writes_sp_fields():
     """Federation mode uses no per-agent Databricks SP, so an SP id/ARN on the record would
     be a credential path the invoke chain could pick up. Both are forced empty."""
     svc, db, _s, _r = _make_service()
-    agent = _make_agent(
-        databricks_sp_id="client-planted-sp", databricks_sp_secret_arn="arn:aws:planted"
-    )
+    agent = _make_agent(databricks_sp_id="client-planted-sp", databricks_sp_secret_arn="arn:aws:planted")
 
     out = await svc.provision_databricks_runtime(agent, _make_tenant())
 
@@ -537,9 +455,9 @@ async def test_federation_never_writes_sp_fields():
 
 @pytest.mark.asyncio
 async def test_ob2_client_supplied_binding_mode_is_overwritten_from_the_tenant():
-    """OB-2: ``binding_mode`` is settable on ``AgentCreate``, so it arrives UNTRUSTED. The
-    tenant's stored mode is the only truth — a caller claiming ``sp_secret`` on a
-    federation tenant must not get the weaker attribution path."""
+    """``binding_mode`` is settable on ``AgentCreate``, so it arrives untrusted. The tenant's
+    stored mode is the only truth: a caller claiming ``sp_secret`` on a federation tenant must not
+    get the weaker attribution path."""
     svc, db, _s, _r = _make_service()
     agent = _make_agent(binding_mode="sp_secret")
 
@@ -568,7 +486,7 @@ async def test_ob2_client_supplied_federation_claim_cannot_skip_sp_mode(sp_secre
 async def test_ob2_client_supplied_oauth_client_id_is_cleared_when_unconfirmed():
     """``oauth2_app_client_id`` is on ``AgentBase``, so it arrives client-settable. A provisioned
     record must not assert a Databricks OAuth client id that AGP never read from the workspace."""
-    db = _FakeDatabricks(apps=[{"name": APP_NAME, "url": APP_URL}])  # no oauth id in the record
+    db = _FakeDatabricks(apps=[{"name": APP_NAME, "url": APP_URL}])
     svc, _db, _s, _r = _make_service(databricks=db)
     agent = _make_agent(oauth2_app_client_id="client-planted-oauth-id")
 
@@ -591,15 +509,11 @@ async def test_ob2_the_sp_secret_leg_also_clears_a_planted_oauth_client_id(sp_se
     assert out.oauth2_app_client_id is None
 
 
-# ---- user sync (the loud failure) -----------------------------------------
-
 @pytest.mark.asyncio
 async def test_user_sync_missing_fails_loudly_and_never_downgrades():
     svc, db, _s, registry = _make_service()
     agent = _make_agent()
-    tenant = _make_tenant(
-        capabilities={"can_discover": True, "account_admin": True, "user_sync": False}
-    )
+    tenant = _make_tenant(capabilities={"can_discover": True, "account_admin": True, "user_sync": False})
 
     with pytest.raises(ProvisioningError) as err:
         await svc.provision_databricks_runtime(agent, tenant)
@@ -607,10 +521,8 @@ async def test_user_sync_missing_fails_loudly_and_never_downgrades():
     assert "user_sync_missing" in str(err.value)
     assert agent.identity_status == "failed"
     assert _persisted_statuses(registry)[-1] == "failed"
-    # NEVER a silent downgrade: the mode stays federation and no SP was created.
     assert agent.binding_mode == "federation"
     assert agent.databricks_sp_id is None
-    # And nothing at all was called on Databricks — the check is a precondition.
     assert db.calls == []
 
 
@@ -627,8 +539,6 @@ async def test_unprobed_tenant_fails_closed_on_user_sync():
     assert db.calls == []
 
 
-# ---- OB-6: actionable federation-policy errors ----------------------------
-
 @pytest.mark.parametrize(
     "kind",
     ["federation_policy_missing", "federation_policy_unreadable", "federation_policy_ambiguous"],
@@ -644,10 +554,9 @@ async def test_ob6_federation_policy_errors_are_actionable(kind):
         await svc.provision_databricks_runtime(agent, _make_tenant())
 
     message = str(err.value)
-    # Actionable: it names WHO must act and WHICH issuer the policy is for.
     assert "Databricks account admin" in message
     assert "login.microsoftonline.com" in message
-    assert kind in message  # the safe code stays, for support
+    assert kind in message
     assert agent.identity_status == "failed"
     assert _persisted_statuses(registry)[-1] == "failed"
 
@@ -668,34 +577,22 @@ async def test_ob6_actionable_message_carries_no_upstream_body():
     assert "PERMISSION_DENIED" not in str(err.value)
 
 
-# ---- the ACL assert (design §3A) ------------------------------------------
-#
-# What replaced the old "CAN_USE for every tenant group, attempt-all-then-raise" step. The
-# group-wide grant governed AGP's invoke PATH, not access: a revoked user kept a direct route
-# to the app through group membership. Provisioning now asserts the list AGP owns, and the
-# per-user entries arrive one grant at a time (T13c).
-
 @pytest.mark.asyncio
 async def test_the_tenants_entra_groups_are_never_granted_can_use():
     svc, db, _s, _r = _make_service()
 
-    await svc.provision_databricks_runtime(
-        _make_agent(), _make_tenant(entra_group_ids=[GROUP_A, GROUP_B])
-    )
+    await svc.provision_databricks_runtime(_make_agent(), _make_tenant(entra_group_ids=[GROUP_A, GROUP_B]))
 
     assert not any(c[0] == "grant_app_can_use" for c in db.calls)
     asserted = [c for c in db.calls if c[0] == "set_app_permissions"]
     assert asserted == [("set_app_permissions", APP_NAME, _asserted_acl())]
-    # And the group ids appear in NO entry of the asserted list, under any level.
-    assert not any(
-        GROUP_A in entry or GROUP_B in entry for entry in asserted[0][2]
-    )
+    assert not any(GROUP_A in entry or GROUP_B in entry for entry in asserted[0][2])
 
 
 @pytest.mark.asyncio
 async def test_the_assert_strips_pre_existing_entries_and_logs_each_by_principal(caplog):
-    """A takeover is loud, never silent (design §3A). The stripped entries are the record of
-    what a workspace owner had granted around AGP, so each one is named."""
+    """A takeover is loud, never silent. The stripped entries are the record of what a workspace
+    owner had granted around AGP, so each one is named."""
     db = _FakeDatabricks()
     db.acl = [
         {"principal": "admins", "kind": "group", "level": "CAN_MANAGE"},
@@ -709,27 +606,22 @@ async def test_the_assert_strips_pre_existing_entries_and_logs_each_by_principal
 
     assert out.identity_status == "provisioned"
     text = "\n".join(r.getMessage() for r in caplog.records)
-    # Each stripped principal by name, with its kind and the level it held...
     assert "hand.granted@example.com" in text
     assert "data-eng" in text
     assert "CAN_USE" in text and "user" in text
-    # ...plus the count line, so an operator scanning logs sees the takeover's size at once.
     assert "stripped 2" in text
-    # The admins entry survived, so it is not reported as stripped.
     assert db.acl == [
         {"principal": "admins", "kind": "group", "level": "CAN_MANAGE"},
         {"principal": WS_SP_CLIENT_ID, "kind": "service_principal", "level": "CAN_MANAGE"},
     ]
-    # Secrets never reach a log line, no matter how loud the line is.
     assert WS_SECRET_SENTINEL not in text
     assert ADMIN_SECRET_SENTINEL not in text
 
 
 @pytest.mark.asyncio
 async def test_an_inherited_entry_is_not_reported_as_stripped(caplog):
-    """A PUT cannot remove an inherited grant (T13a flags them for exactly this reason), so
-    calling one "stripped" would claim a takeover that did not happen. It is reported as what it
-    is: access that survives the assert."""
+    """A PUT cannot remove an inherited grant, so calling one "stripped" would claim a takeover
+    that did not happen. It is reported as what it is: access that survives the assert."""
     db = _FakeDatabricks()
     db.acl = [
         {"principal": "admins", "kind": "group", "level": "CAN_MANAGE", "inherited": False},
@@ -774,7 +666,7 @@ async def test_an_unreadable_acl_is_an_actionable_failure_not_a_blind_assert():
     with pytest.raises(ProvisioningError) as err:
         await svc.provision_databricks_runtime(agent, _make_tenant())
 
-    assert "CAN_MANAGE on the app" in str(err.value)  # the actionable 'forbidden' hint
+    assert "CAN_MANAGE on the app" in str(err.value)
     assert "forbidden" in str(err.value)
     assert not any(c[0] == "set_app_permissions" for c in db.calls)
     assert agent.identity_status == "failed"
@@ -799,34 +691,26 @@ async def test_a_failed_acl_assert_fails_provisioning_loudly():
     assert _persisted_statuses(registry)[-1] == "failed"
 
 
-# ---- idempotency + resumability -------------------------------------------
-
 @pytest.mark.asyncio
 async def test_reprovision_after_a_mid_failure_completes_without_duplicating_anything():
     db = _FakeDatabricks()
     db.raise_on["set_app_permissions"] = DatabricksError("rejected", kind="forbidden")
-    svc, _db, _s, registry = _make_service(databricks=db)
+    svc, _db, _s, _registry = _make_service(databricks=db)
     agent = _make_agent()
     tenant = _make_tenant()
 
     with pytest.raises(ProvisioningError):
         await svc.provision_databricks_runtime(agent, tenant)
     assert agent.identity_status == "failed"
-    assert db.audiences == {"agent-app-guid"}  # the audience write already landed
+    assert db.audiences == {"agent-app-guid"}
 
-    # The operator fixes the ACL permission and re-provisions the SAME record. The assert is
-    # idempotent by construction — it PUTs a list computed from the tenant, not a delta.
     db.raise_on.pop("set_app_permissions")
     out = await svc.provision_databricks_runtime(agent, tenant)
 
     assert out.identity_status == "provisioned"
-    # One audience entry, not two — ensure_federation_audience is idempotent by contract
-    # and this path must not work around it by tracking state on the record.
     assert db.audiences == {"agent-app-guid"}
     assert not any(c[0] == "create_service_principal" for c in db.calls)
 
-
-# ---- app resolution ------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_app_missing_from_the_listing_is_an_actionable_failure():
@@ -844,8 +728,8 @@ async def test_app_missing_from_the_listing_is_an_actionable_failure():
 
 @pytest.mark.asyncio
 async def test_unreadable_oauth_client_id_does_not_fail_provisioning():
-    """``oauth2_app_client_id`` is an UNVERIFIED field name (research §2.1). Missing it is a
-    gap in a nice-to-have, not a reason to leave the agent unprovisioned."""
+    """``oauth2_app_client_id`` is an unverified field name. Missing it is a gap in a convenience
+    field, not a reason to leave the agent unprovisioned."""
     db = _FakeDatabricks(apps=[{"name": APP_NAME, "url": APP_URL}])
     svc, _db, _s, _r = _make_service(databricks=db)
 
@@ -867,15 +751,11 @@ async def test_serving_endpoint_kind_is_refused_not_silently_ungranted():
     assert not any(c[0] == "set_app_permissions" for c in db.calls)
 
 
-# ===========================================================================
-# sp_secret mode
-# ===========================================================================
-
 @pytest.mark.asyncio
 async def test_sp_secret_creates_an_sp_mints_its_secret_stores_it_and_asserts_the_acl(
     sp_secret_gate_on,
 ):
-    svc, db, secrets, registry = _make_service()
+    svc, db, _secrets, registry = _make_service()
     agent = _make_agent()
     tenant = _make_tenant(binding_mode="sp_secret")
 
@@ -885,22 +765,15 @@ async def test_sp_secret_creates_an_sp_mints_its_secret_stores_it_and_asserts_th
         ("create_service_principal", "agp-agent-rec-abc123")
     ]
     assert out.databricks_sp_id == "sp-app-id-1"
-    # The mint is addressed by the SCIM id (the fake asserts it), and the secret was STORED —
-    # its ARN, never its value, is what lands on the record.
     assert any(c[0] == "create_service_principal_secret" for c in db.calls)
     assert out.databricks_sp_secret_arn
     assert MINTED_SP_SECRET not in json.dumps(out.to_envelope(), default=str)
-    # The asserted ACL carries the agent's own SP at CAN_USE, keyed on its APPLICATION id (the
-    # ACL principal form — the SCIM id is not an ACL principal). It is on the list because in
-    # this mode that SP *is* the invoke identity: assert without it and every call to the app
-    # would 401 while provisioning reported success.
     assert (
         "set_app_permissions",
         APP_NAME,
         _asserted_acl(("sp-app-id-1", "service_principal", "CAN_USE")),
     ) in db.calls
     assert not any(c[0] == "grant_app_can_use" for c in db.calls)
-    # No account-level federation write on this path.
     assert not any(c[0] == "ensure_federation_audience" for c in db.calls)
     assert out.binding_mode == "sp_secret"
     assert out.identity_status == "provisioned"
@@ -916,10 +789,9 @@ async def test_the_scim_id_rides_in_the_secret_body_not_on_the_agent_record(sp_s
 
     out = await svc.provision_databricks_runtime(agent, _make_tenant(binding_mode="sp_secret"))
 
-    body = json.loads(secrets.store[secrets.created[0]["Name"]])  # the final stored body
+    body = json.loads(secrets.store[secrets.created[0]["Name"]])
     assert body["scim_id"] == f"{SCIM_SP_ID}1"
     assert body["client_secret"] == MINTED_SP_SECRET
-    # The SCIM id is nowhere on the envelope; the APPLICATION id is.
     envelope = out.to_envelope()
     assert f"{SCIM_SP_ID}1" not in json.dumps(envelope, default=str)
     assert envelope["databricks_sp_id"] == "sp-app-id-1"
@@ -955,14 +827,10 @@ async def test_a_failed_mint_leaves_the_sp_recorded_so_a_retry_creates_no_second
     with pytest.raises(ProvisioningError):
         await svc.provision_databricks_runtime(agent, tenant)
 
-    # The SP id was persisted BEFORE the failing mint (the CRITIQUE-FIX-A idiom).
     assert agent.databricks_sp_id == "sp-app-id-1"
-    assert "sp-app-id-1" in [
-        c.args[0].databricks_sp_id for c in registry.persist_identity.call_args_list
-    ]
+    assert "sp-app-id-1" in [c.args[0].databricks_sp_id for c in registry.persist_identity.call_args_list]
     assert agent.identity_status == "failed"
 
-    # The operator retries; no SECOND service principal is created.
     db.raise_on.pop("create_service_principal_secret")
     out = await svc.provision_databricks_runtime(agent, tenant)
     assert out.identity_status == "provisioned"
@@ -998,7 +866,7 @@ async def test_a_persist_failure_after_the_mint_keeps_the_secret_so_a_retry_can_
 
     def _persist(agent):
         calls["n"] += 1
-        if calls["n"] == 2:  # the post-mint persist
+        if calls["n"] == 2:
             raise RuntimeError("ddb conflict")
         return agent
 
@@ -1013,7 +881,6 @@ async def test_a_persist_failure_after_the_mint_keeps_the_secret_so_a_retry_can_
     assert secrets.deleted == [], "the recorded credential must NOT be deleted"
     assert agent.identity_status == "failed"
 
-    # And the retry completes without minting a second credential or a second principal.
     registry.persist_identity.side_effect = lambda a: a
     out = await svc.provision_databricks_runtime(agent, tenant)
     assert out.identity_status == "provisioned"
@@ -1027,9 +894,7 @@ async def test_the_minted_secret_never_reaches_a_log_or_the_record(caplog, sp_se
     agent = _make_agent()
 
     with caplog.at_level(logging.DEBUG):
-        out = await svc.provision_databricks_runtime(
-            agent, _make_tenant(binding_mode="sp_secret")
-        )
+        out = await svc.provision_databricks_runtime(agent, _make_tenant(binding_mode="sp_secret"))
 
     assert MINTED_SP_SECRET not in caplog.text
     assert MINTED_SP_SECRET not in json.dumps(out.to_envelope(), default=str)
@@ -1046,11 +911,6 @@ async def test_unknown_binding_mode_is_refused():
     assert db.calls == []
 
 
-# ===========================================================================
-# E29/T14a (design §3B) — invoke_unavailable refuses ACTIONABLY, and the dormant
-# sp_secret leg is unreachable unless the gate is on.
-# ===========================================================================
-
 @pytest.mark.asyncio
 async def test_invoke_unavailable_is_refused_naming_what_federation_needs():
     """The tenant could not be badged ``federation``, so there is nothing to provision — and the
@@ -1059,14 +919,11 @@ async def test_invoke_unavailable_is_refused_naming_what_federation_needs():
     svc, db, _s, registry = _make_service()
 
     with pytest.raises(ProvisioningError) as err:
-        await svc.provision_databricks_runtime(
-            _make_agent(), _make_tenant(binding_mode="invoke_unavailable")
-        )
+        await svc.provision_databricks_runtime(_make_agent(), _make_tenant(binding_mode="invoke_unavailable"))
 
     msg = str(err.value)
     assert "federation_unavailable" in msg
     assert "account-admin" in msg and "user sync" in msg
-    # Nothing was attempted on the Databricks side, and no SP was created behind the refusal.
     assert db.calls == []
     assert _persisted_statuses(registry) == ["failed"]
 
@@ -1079,9 +936,7 @@ async def test_sp_secret_is_refused_naming_the_flag_when_the_gate_is_off():
     svc, db, _s, _r = _make_service()
 
     with pytest.raises(ProvisioningError) as err:
-        await svc.provision_databricks_runtime(
-            _make_agent(), _make_tenant(binding_mode="sp_secret")
-        )
+        await svc.provision_databricks_runtime(_make_agent(), _make_tenant(binding_mode="sp_secret"))
 
     msg = str(err.value)
     assert "sp_secret_disabled" in msg
@@ -1092,11 +947,10 @@ async def test_sp_secret_is_refused_naming_the_flag_when_the_gate_is_off():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["invoke_unavailable", "sp_secret"])
 async def test_a_refused_provision_never_persists_client_planted_sp_pointers(mode):
-    """OB-2 on the REFUSAL legs. Both T14a refusals raise, and ``provision_databricks_runtime``
-    turns that into ``_persist_failed`` — an envelope write of the WHOLE record. So a planted
-    ``databricks_sp_id`` + foreign ARN must be scrubbed BEFORE the dispatch, or the failed record
-    keeps naming another agent's principal (and the teardown residue log, which T12's orphan list
-    reads, names it too)."""
+    """Both refusals raise, and ``provision_databricks_runtime`` turns that into ``_persist_failed``,
+    an envelope write of the whole record. So a planted ``databricks_sp_id`` and foreign ARN must
+    be scrubbed before the dispatch, or the failed record keeps naming another agent's principal
+    and the teardown residue log names it too."""
     svc, _db, _s, registry = _make_service()
     agent = _make_agent(
         databricks_sp_id="foreign-sp-id",
@@ -1121,25 +975,17 @@ async def test_the_dormant_sp_secret_leg_still_works_when_the_gate_is_on(sp_secr
     deliberate record and the unchanged leg."""
     svc, db, _s, _r = _make_service()
 
-    out = await svc.provision_databricks_runtime(
-        _make_agent(), _make_tenant(binding_mode="sp_secret")
-    )
+    out = await svc.provision_databricks_runtime(_make_agent(), _make_tenant(binding_mode="sp_secret"))
 
     assert out.identity_status == "provisioned"
     assert out.databricks_sp_id == "sp-app-id-1"
     assert any(c[0] == "create_service_principal" for c in db.calls)
 
 
-# ===========================================================================
-# Secret hygiene
-# ===========================================================================
-
 @pytest.mark.asyncio
 async def test_workspace_secret_never_reaches_the_record_a_log_or_an_error(caplog):
     db = _FakeDatabricks()
-    db.raise_on["ensure_federation_audience"] = DatabricksError(
-        "safe", kind="federation_policy_missing"
-    )
+    db.raise_on["ensure_federation_audience"] = DatabricksError("safe", kind="federation_policy_missing")
     svc, _db, _s, _r = _make_service(databricks=db)
     agent = _make_agent()
 
@@ -1163,27 +1009,21 @@ async def test_the_secret_is_read_by_the_tenants_stored_arn_only():
         await svc.provision_databricks_runtime(_make_agent(), _make_tenant())
 
     assert "secret" in str(err.value).lower()
-    assert db.calls == []  # no token minted without a credential
+    assert db.calls == []
 
 
 @pytest.mark.asyncio
 async def test_a_raw_string_workspace_secret_is_accepted():
-    """T3 writes a JSON envelope, but a secret rotated by hand in the console is a bare string.
-    Refusing that would turn a console-side fix into an outage, so both are read."""
+    """The tenant service writes a JSON envelope, but a secret rotated by hand in the console is a
+    bare string. Refusing that would turn a console-side fix into an outage, so both are read."""
     store = _default_secret_store()
-    store[WS_SECRET_ARN] = WS_SECRET_SENTINEL  # bare string, not an envelope
+    store[WS_SECRET_ARN] = WS_SECRET_SENTINEL
     svc, _db, _s, _r = _make_service(secrets=_FakeSecrets(store=store))
 
-    out = await svc.provision_databricks_runtime(
-        _make_agent(), _make_tenant(account_admin_secret_arn="")
-    )
+    out = await svc.provision_databricks_runtime(_make_agent(), _make_tenant(account_admin_secret_arn=""))
 
     assert out.identity_status == "provisioned"
 
-
-# ===========================================================================
-# Preconditions
-# ===========================================================================
 
 @pytest.mark.asyncio
 async def test_a_non_databricks_agent_is_refused():
@@ -1200,7 +1040,7 @@ async def test_a_non_databricks_agent_is_refused():
 async def test_a_tenant_can_be_resolved_from_the_agents_tenant_id():
     tenants = MagicMock()
     tenants.get.return_value = _make_tenant()
-    svc, db, _s, _r = _make_service(tenants=tenants)
+    svc, _db, _s, _r = _make_service(tenants=tenants)
 
     out = await svc.provision_databricks_runtime(_make_agent(), None)
 
@@ -1243,14 +1083,11 @@ async def test_the_stage_is_the_workspace_that_actually_lists_the_app_not_the_fi
         sp_client_id="ws-sp-client-id",
         sp_client_secret_arn=WS_SECRET_ARN,
     )
-    # ``prod`` first so a positional pick would choose the wrong workspace.
     tenant = _make_tenant(stages={"prod": other, "dev": mine})
     db = _FakeDatabricks(
         apps_by_workspace={
             other_url: [{"name": "someone-elses-app", "url": "https://other.example"}],
-            WORKSPACE_URL: [
-                {"name": APP_NAME, "url": APP_URL, "oauth2_app_client_id": APP_OAUTH_CLIENT_ID}
-            ],
+            WORKSPACE_URL: [{"name": APP_NAME, "url": APP_URL, "oauth2_app_client_id": APP_OAUTH_CLIENT_ID}],
         }
     )
     store = _default_secret_store()
@@ -1263,9 +1100,7 @@ async def test_the_stage_is_the_workspace_that_actually_lists_the_app_not_the_fi
     out = await svc.provision_databricks_runtime(_make_agent(), tenant)
 
     assert out.identity_status == "provisioned"
-    # The ACCOUNT token was minted for the account of the workspace that hosts the app...
     assert ("mint_account_token", ACCOUNT_ID) in db.calls
-    # ...and never for the other tenant workspace's account.
     assert ("mint_account_token", "99999999-9999-9999-9999-999999999999") not in db.calls
 
 
@@ -1286,22 +1121,17 @@ async def test_federation_without_an_account_id_is_refused():
     assert not any(c[0] == "ensure_federation_audience" for c in db.calls)
 
 
-# ===========================================================================
-# The account-level credential + the per-cloud account host
-# ===========================================================================
-
 @pytest.mark.asyncio
 async def test_the_account_admin_credential_is_preferred_over_the_workspace_sp():
-    """Writing a federation policy is an account-admin act, and T3 stores exactly that
-    credential at TENANT level. Silently using the workspace SP when an account-admin credential
-    exists would make a correctly-configured tenant fail for no visible reason."""
+    """Writing a federation policy is an account-admin act, and the tenant stores exactly that
+    credential at tenant level. Silently using the workspace SP when an account-admin credential
+    exists would make a correctly configured tenant fail for no visible reason."""
     svc, db, _s, _r = _make_service()
 
     out = await svc.provision_databricks_runtime(_make_agent(), _make_tenant())
 
     assert out.identity_status == "provisioned"
     assert db.account_credentials == [(ADMIN_CLIENT_ID, ADMIN_SECRET_SENTINEL)]
-    # The WORKSPACE token was still minted from the workspace SP — the two are not interchanged.
     assert db.minted_ws_tokens >= 1
 
 
@@ -1311,9 +1141,7 @@ async def test_without_an_account_admin_credential_the_workspace_sp_is_the_fallb
     missing optional credential into one actionable Databricks error instead of a crash."""
     svc, db, _s, _r = _make_service()
 
-    await svc.provision_databricks_runtime(
-        _make_agent(), _make_tenant(account_admin_secret_arn="")
-    )
+    await svc.provision_databricks_runtime(_make_agent(), _make_tenant(account_admin_secret_arn=""))
 
     assert db.account_credentials == [("ws-sp-client-id", WS_SECRET_SENTINEL)]
 
@@ -1321,14 +1149,13 @@ async def test_without_an_account_admin_credential_the_workspace_sp_is_the_fallb
 @pytest.mark.asyncio
 async def test_a_half_filled_account_admin_credential_is_refused_not_silently_skipped():
     store = _default_secret_store()
-    store[ADMIN_SECRET_ARN] = json.dumps({ACCOUNT_ADMIN_ID_KEY: ADMIN_CLIENT_ID})  # no secret
+    store[ADMIN_SECRET_ARN] = json.dumps({ACCOUNT_ADMIN_ID_KEY: ADMIN_CLIENT_ID})
     svc, db, _s, _r = _make_service(secrets=_FakeSecrets(store=store))
 
     with pytest.raises(ProvisioningError) as err:
         await svc.provision_databricks_runtime(_make_agent(), _make_tenant())
 
     assert "incomplete" in str(err.value)
-    # It did NOT quietly fall back to the workspace SP for an account-level write.
     assert db.account_credentials == []
 
 
@@ -1348,8 +1175,8 @@ async def test_the_account_admin_secret_never_reaches_a_log_or_an_error(caplog):
 
 @pytest.mark.asyncio
 async def test_the_account_host_follows_the_stages_cloud():
-    """The account console host is per-cloud and NOT derivable from the workspace URL (research
-    §5.1), so an Azure tenant's account-level call must not be aimed at the AWS console."""
+    """The account console host is per cloud and not derivable from the workspace URL, so an
+    Azure tenant's account-level call must not be aimed at the AWS console."""
     azure_stage = DatabricksStageConfig(
         workspace_url="https://adb-123.4.azuredatabricks.net",
         cloud="azure",
@@ -1366,9 +1193,7 @@ async def test_the_account_host_follows_the_stages_cloud():
     )
     svc, _db, _s, _r = _make_service(databricks=db)
 
-    out = await svc.provision_databricks_runtime(
-        _make_agent(), _make_tenant(stages={"dev": azure_stage})
-    )
+    out = await svc.provision_databricks_runtime(_make_agent(), _make_tenant(stages={"dev": azure_stage}))
 
     assert out.identity_status == "provisioned"
     assert db.account_hosts == ["https://accounts.azuredatabricks.net"]
@@ -1383,15 +1208,11 @@ async def test_an_aws_tenant_uses_the_aws_account_console():
     assert db.account_hosts == ["https://accounts.cloud.databricks.com"]
 
 
-# ===========================================================================
-# Deprovision
-# ===========================================================================
-
 @pytest.mark.asyncio
 async def test_teardown_of_an_invoke_unavailable_agent_is_a_graceful_no_op():
-    """E29/T14a — a tenant that could never be provisioned still copies its mode onto the agent,
-    so ``binding_mode`` alone is truthy and the record enters the teardown path. Nothing exists
-    to remove, so this must SUCCEED silently rather than fail a delete cascade."""
+    """A tenant that could never be provisioned still copies its mode onto the agent, so
+    ``binding_mode`` alone is truthy and the record enters the teardown path. Nothing exists to
+    remove, so this must succeed silently rather than fail a delete cascade."""
     svc, db, secrets, _r = _make_service()
     agent = _make_agent(binding_mode="invoke_unavailable")
 
@@ -1410,9 +1231,6 @@ async def test_deprovision_federation_removes_the_audience():
 
     await svc.delete_databricks_runtime(agent, tenant)
 
-    # BOTH forms are removed: the GUID (what provisioning appends since livefix-6) and
-    # the legacy api:// URI (what pre-fix records left on customer policies) — each an
-    # idempotent no-op when absent, so removal self-cleans old residue.
     assert ("ensure_federation_audience", "agent-app-guid", False) in db.calls
     assert ("ensure_federation_audience", AGENT_AUDIENCE, False) in db.calls
     assert db.audiences == set()
@@ -1420,16 +1238,12 @@ async def test_deprovision_federation_removes_the_audience():
 
 @pytest.mark.asyncio
 async def test_deprovision_sp_secret_deletes_the_secret_by_its_stored_arn():
-    """Deleted BY THE STORED ARN, never by a reconstructed name: the ARN is what the record
-    actually holds, and rebuilding a name from a prefix would silently miss (or, worse, hit
-    the wrong) secret if the prefix ever changed.
-
-    E29/T14a: this test deliberately takes NO ``sp_secret_gate_on`` fixture. Teardown is never
-    gated — deleting what exists is always allowed, and leaving a live credential behind because
-    a flag is off would be the harm the flag was meant to prevent."""
+    """Deleted by the stored ARN, never by a reconstructed name: the ARN is what the record holds,
+    and rebuilding a name from a prefix would silently miss (or hit the wrong) secret if the prefix
+    ever changed. Deliberately takes no ``sp_secret_gate_on`` fixture: teardown is never gated,
+    because leaving a live credential behind over a flag would be the harm the flag prevents."""
     agent_secret_arn = (
-        "arn:aws:secretsmanager:us-east-1:000000000000:secret:"
-        "agp-test/databricks-agent-sp/rec-abc123-QrStUv"
+        "arn:aws:secretsmanager:us-east-1:000000000000:secret:agp-test/databricks-agent-sp/rec-abc123-QrStUv"
     )
     secrets = _FakeSecrets(
         store={
@@ -1449,7 +1263,6 @@ async def test_deprovision_sp_secret_deletes_the_secret_by_its_stored_arn():
     assert secrets.deleted == [agent_secret_arn]
     assert not any(c[0] == "ensure_federation_audience" for c in db.calls)
 
-    # Idempotent: a second teardown of an already-gone secret is a success, not a raise.
     await svc.delete_databricks_runtime(agent, tenant)
 
 
@@ -1478,10 +1291,6 @@ async def test_deprovision_attempts_every_item_then_raises():
     assert "audience" in str(err.value).lower()
 
 
-# ===========================================================================
-# OB-1 — /reprovision dispatches by platform
-# ===========================================================================
-
 def _reprovision_client(agent):
     """A minimal app carrying only the agents router, with both resolver singletons and the
     registry seeded — the ``test_agent_project_gating.py`` idiom (no dependency_overrides)."""
@@ -1492,6 +1301,7 @@ def _reprovision_client(agent):
     import api.routes.projects as projects_module
     import api.routes.tenants as tenants_module
     import api.routes.users as users_module
+    from core.errors import install_error_handlers
     from services.project_resolver import ProjectContext
     from services.tenant_resolver import TenantContext
 
@@ -1516,6 +1326,7 @@ def _reprovision_client(agent):
     tenants_module._svc = MagicMock()
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(agents_module.router, prefix="/api/v1")
     client = TestClient(app, headers={"Authorization": "Bearer fake"})
     return client, svc
@@ -1530,14 +1341,15 @@ def reprovision_env(monkeypatch):
         "core.security_entra",
         "core.config",
         "api.routes.agents",
+        "api.routes.project_repos",
         "api.routes.projects",
+        "api.routes.repositories",
         "api.routes.users",
         "api.routes.tenants",
     ]:
         sys.modules.pop(mod, None)
     monkeypatch.setenv("AUTH_PROVIDER", "entra")
     monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("DEBUG", "False")
     monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
     monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
     monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
@@ -1552,14 +1364,21 @@ def reprovision_env(monkeypatch):
     patcher.start()
     yield
     patcher.stop()
-    for mod in ["api.routes.agents", "api.routes.projects", "api.routes.users", "api.routes.tenants"]:
+    for mod in [
+        "api.routes.agents",
+        "api.routes.project_repos",
+        "api.routes.projects",
+        "api.routes.repositories",
+        "api.routes.users",
+        "api.routes.tenants",
+    ]:
         sys.modules.pop(mod, None)
 
 
 def test_reprovision_accepts_a_databricks_governed_agent(reprovision_env):
-    """OB-1: the route hard-409'd every non-AgentCore agent, so a Databricks agent stuck at
-    'failed' had NO recovery affordance — the resumable design was unreachable."""
-    agent = _make_agent(identity_status="failed")
+    """The route used to 409 every non-AgentCore agent, so a Databricks agent stuck at 'failed'
+    had no recovery affordance and the resumable design was unreachable."""
+    agent = _make_agent(identity_status=IdentityStatus.FAILED)
     client, svc = _reprovision_client(agent)
 
     with patch("api.routes.agents.get_identity_service") as get_identity:
@@ -1591,13 +1410,11 @@ async def test_teardown_keys_on_the_sp_id_so_partial_state_is_still_cleaned():
     agent = _make_agent(
         binding_mode="sp_secret",
         databricks_sp_id="sp-app-id-1",
-        databricks_sp_secret_arn=None,  # the partial state
+        databricks_sp_secret_arn=None,
     )
 
     await svc.delete_databricks_runtime(agent, _make_tenant(binding_mode="sp_secret"))
 
-    # Nothing to delete in Secrets Manager, and no crash — but the surviving principal is
-    # REPORTED by id, so it is nameable rather than silently abandoned.
     assert secrets.deleted == []
     assert not any(c[0] == "ensure_federation_audience" for c in db.calls)
 
@@ -1614,56 +1431,48 @@ async def test_teardown_reports_the_surviving_service_principal_by_id(caplog):
     assert "no SCIM delete" in caplog.text
 
 
-# ===========================================================================
-# The factory wiring (item 8) — without this, the dispatch seam is unreachable live
-# ===========================================================================
-
-def test_the_identity_service_factory_wires_the_databricks_half(monkeypatch, reprovision_env):
-    """The seam existed but nothing constructed the collaborator, so every live Databricks
-    provisioning would have taken the fail-closed branch. Pinned so it cannot regress to that."""
+def _wire_agents_module(monkeypatch, *, tenants_table: str):
+    """The shared arrange: a route module with inert singletons and a given tenants table."""
     import api.routes.agents as agents_module
     import api.routes.tenants as tenants_module
 
-    monkeypatch.setattr(agents_module.settings, "TENANTS_TABLE_NAME", "agp-tenants")
+    monkeypatch.setattr(agents_module.settings, "TENANTS_TABLE_NAME", tenants_table)
     monkeypatch.setattr(agents_module, "_identity_svc", None)
     monkeypatch.setattr(agents_module, "_databricks_identity_svc", None)
     monkeypatch.setattr(agents_module, "get_graph_service", lambda: MagicMock())
     monkeypatch.setattr(agents_module, "get_service", lambda: MagicMock())
     monkeypatch.setattr(tenants_module, "_svc", MagicMock())
+    return agents_module
 
-    svc = agents_module.get_identity_service()
 
-    assert svc._databricks_identity is not None
-    assert type(svc._databricks_identity).__name__ == "DatabricksIdentityService"
+def test_the_identity_service_factory_wires_the_databricks_half(monkeypatch, reprovision_env):
+    """The seam existed but nothing constructed the collaborator, so every live Databricks
+    provisioning would have taken the fail-closed branch. Pinned so it cannot regress to that."""
+    from models.tenant import TenantPlatform
+
+    agents_module = _wire_agents_module(monkeypatch, tenants_table="agp-tenants")
+
+    adapter = agents_module.get_adapters()[TenantPlatform.DATABRICKS]
+
+    assert adapter._databricks_identity is not None
+    assert type(adapter._databricks_identity).__name__ == "DatabricksIdentityService"
 
 
 def test_an_agentcore_only_deployment_needs_no_databricks_config(monkeypatch, reprovision_env):
-    """No tenants table ⇒ no Databricks wiring. NOT a silent skip: `provision()` raises for a
-    Databricks agent with no collaborator, so the gap surfaces as a persisted 'failed'."""
-    import api.routes.agents as agents_module
+    """No tenants table ⇒ no Databricks wiring. NOT a silent skip: the platform is left OUT of
+    the adapter dict, so a Databricks WRITE is refused with `platform_unsupported` (a persisted
+    'failed', never a stranded 'pending') and a status READ degrades to `unknown`."""
+    from models.tenant import TenantPlatform
 
-    monkeypatch.setattr(agents_module.settings, "TENANTS_TABLE_NAME", "")
-    monkeypatch.setattr(agents_module, "_identity_svc", None)
-    monkeypatch.setattr(agents_module, "_databricks_identity_svc", None)
-    monkeypatch.setattr(agents_module, "get_graph_service", lambda: MagicMock())
-    monkeypatch.setattr(agents_module, "get_service", lambda: MagicMock())
+    agents_module = _wire_agents_module(monkeypatch, tenants_table="")
 
-    assert agents_module.get_identity_service()._databricks_identity is None
+    assert TenantPlatform.DATABRICKS not in agents_module.get_adapters()
 
-
-# ===========================================================================
-# OB-2, the cross-agent case: sp_secret resumability state is CLIENT-SETTABLE
-#
-# `databricks_sp_id` / `databricks_sp_secret_arn` are the sp_secret leg's resumability state AND
-# fields on `AgentBase`. Clearing them only in the federation branch left the sp_secret branch
-# trusting whatever a registration body claimed. These tests are the executed attacks.
-# ===========================================================================
 
 def _agent_secret_arn(agent_id: str) -> str:
     """An ARN of the shape this service itself writes, for the given agent id."""
     return (
-        "arn:aws:secretsmanager:us-east-1:000000000000:secret:"
-        f"agp-test/databricks-agent-sp/{agent_id}-AbC123"
+        f"arn:aws:secretsmanager:us-east-1:000000000000:secret:agp-test/databricks-agent-sp/{agent_id}-AbC123"
     )
 
 
@@ -1679,18 +1488,13 @@ async def test_agent_b_cannot_provision_onto_agent_as_service_principal(sp_secre
     await svc.provision_databricks_runtime(agent_a, tenant)
     a_sp_id, a_arn = agent_a.databricks_sp_id, agent_a.databricks_sp_secret_arn
 
-    # B is registered with A's pointers in its create body.
-    agent_b = _make_agent(
-        agent_id="rec-agent-b", databricks_sp_id=a_sp_id, databricks_sp_secret_arn=a_arn
-    )
+    agent_b = _make_agent(agent_id="rec-agent-b", databricks_sp_id=a_sp_id, databricks_sp_secret_arn=a_arn)
     await svc.provision_databricks_runtime(agent_b, tenant)
 
     assert agent_b.databricks_sp_id != a_sp_id, "B provisioned onto A's service principal"
     assert agent_b.databricks_sp_secret_arn != a_arn, "B is pointing at A's secret"
-    # B got its OWN principal and its own secret, under its own name.
     assert len([c for c in db.calls if c[0] == "create_service_principal"]) == 2
     assert "agp-test/databricks-agent-sp/rec-agent-b" in secrets.store
-    # ...and A's secret is untouched.
     assert "agp-test/databricks-agent-sp/rec-agent-a" in secrets.store
 
 
@@ -1718,10 +1522,10 @@ async def test_agent_bs_teardown_cannot_delete_agent_as_secret(sp_secret_gate_on
 
 @pytest.mark.asyncio
 async def test_agent_bs_teardown_cannot_delete_another_agents_secret_with_the_gate_off():
-    """THE SAME ATTACK IN THE DEFAULT CONFIGURATION (E29/T14a). The gate-on variant above needs
-    the flag only because its SETUP provisions agent A; here B's record is constructed directly,
-    so nothing provisions and the flag stays at its shipped default. Teardown is never gated, so
-    the ownership guard — not the flag — is what must refuse the cross-agent delete."""
+    """The same attack in the default configuration. The gate-on variant above needs the flag only
+    because its setup provisions agent A; here B's record is constructed directly, so nothing
+    provisions and the flag stays at its shipped default. Teardown is never gated, so the
+    ownership guard, not the flag, is what must refuse the cross-agent delete."""
     import services.databricks_identity_service as dbx_module
 
     assert dbx_module.settings.DATABRICKS_ALLOW_SP_SECRET_BINDING is False
@@ -1754,12 +1558,10 @@ async def test_a_planted_tenant_credential_arn_is_refused_and_never_deleted(sp_s
     tenant = _make_tenant(binding_mode="sp_secret")
     agent = _make_agent(databricks_sp_id="whatever", databricks_sp_secret_arn=WS_SECRET_ARN)
 
-    # Provisioning ignores the planted pointer and mints the agent's own credential.
     out = await svc.provision_databricks_runtime(agent, tenant)
     assert out.databricks_sp_secret_arn != WS_SECRET_ARN
     assert WS_SECRET_ARN in secrets.store
 
-    # And a teardown driven from the planted ARN never reaches the tenant credential.
     planted = _make_agent(
         agent_id="rec-agent-c",
         binding_mode="sp_secret",
@@ -1790,40 +1592,32 @@ async def test_an_agents_own_stored_arn_is_still_trusted_so_resumability_survive
 
 
 def test_the_ownership_check_is_injective_and_prefix_independent():
-    """Executed over hostile inputs (Global Constraints).
-
-    Ownership keys on the trailing ``/{agent.id}`` segment ONLY — never on the configured prefix
-    (item C: a settable config value must not decide whether an agent recognises its own state)
-    and never on ``-``-splitting (item D: non-injective).
+    """Executed over hostile inputs. Ownership keys on the trailing ``/{agent.id}`` segment only,
+    never on the configured prefix (a settable config value must not decide whether an agent
+    recognises its own state) and never on ``-``-splitting (non-injective).
     """
     svc, _db, _s, _r = _make_service()
     agent = _make_agent(agent_id="rec-abc")
 
-    # Ours, with and without the random suffix.
-    assert svc._owns_secret_arn(agent, _agent_secret_arn("rec-abc"))
-    assert svc._owns_secret_arn(
-        agent, "arn:aws:secretsmanager:us-east-1:000000000000:secret:"
-        "agp-test/databricks-agent-sp/rec-abc"
+    assert svc._secrets.owns_secret_arn(agent, _agent_secret_arn("rec-abc"))
+    assert svc._secrets.owns_secret_arn(
+        agent, "arn:aws:secretsmanager:us-east-1:000000000000:secret:agp-test/databricks-agent-sp/rec-abc"
     )
-    # PREFIX-INDEPENDENT (item C): a secret written under yesterday's prefix is still ours, so a
-    # config rename cannot orphan a live principal + secret.
-    assert svc._owns_secret_arn(
-        agent, "arn:aws:secretsmanager:us-east-1:000000000000:secret:"
-        "totally/different/prefix/rec-abc-AbC123"
+    assert svc._secrets.owns_secret_arn(
+        agent, "arn:aws:secretsmanager:us-east-1:000000000000:secret:totally/different/prefix/rec-abc-AbC123"
     )
 
     for hostile in (
-        _agent_secret_arn("rec-abc123"),   # id EXTENDS ours
-        _agent_secret_arn("rec-ab"),       # id is a PREFIX of ours
-        _agent_secret_arn("../rec-abc"),   # traversal segment — a DIFFERENT literal SM name
+        _agent_secret_arn("rec-abc123"),
+        _agent_secret_arn("rec-ab"),
+        _agent_secret_arn("../rec-abc"),
         _agent_secret_arn("./rec-abc"),
-        WS_SECRET_ARN,                     # the tenant's own workspace credential
-        # Right segment, but not a Secrets Manager secret ARN at all.
+        WS_SECRET_ARN,
         "arn:aws:ssm:us-east-1:000000000000:parameter:agp/rec-abc",
         "rec-abc",
         "",
     ):
-        assert not svc._owns_secret_arn(agent, hostile), hostile
+        assert not svc._secrets.owns_secret_arn(agent, hostile), hostile
 
 
 def test_the_ownership_check_is_injective_for_dash_bearing_ids():
@@ -1834,17 +1628,16 @@ def test_the_ownership_check_is_injective_for_dash_bearing_ids():
     short = _make_agent(agent_id="rec-agent")
     longer = _make_agent(agent_id="rec-agent-a")
 
-    assert svc._owns_secret_arn(short, _agent_secret_arn("rec-agent"))
-    assert svc._owns_secret_arn(longer, _agent_secret_arn("rec-agent-a"))
-    # Neither may claim the other's.
-    assert not svc._owns_secret_arn(short, _agent_secret_arn("rec-agent-a"))
-    assert not svc._owns_secret_arn(longer, _agent_secret_arn("rec-agent"))
+    assert svc._secrets.owns_secret_arn(short, _agent_secret_arn("rec-agent"))
+    assert svc._secrets.owns_secret_arn(longer, _agent_secret_arn("rec-agent-a"))
+    assert not svc._secrets.owns_secret_arn(short, _agent_secret_arn("rec-agent-a"))
+    assert not svc._secrets.owns_secret_arn(longer, _agent_secret_arn("rec-agent"))
 
 
 @pytest.mark.asyncio
 async def test_a_prefix_change_does_not_orphan_an_agents_own_principal(sp_secret_gate_on):
-    """ITEM C, executed. Before the fix: after a prefix change the agent stopped recognising its
-    own secret — re-provision minted a SECOND service principal, the old secret stayed live and
+    """Before ownership became prefix-independent, a prefix change made the agent stop recognising
+    its own secret: re-provision minted a second service principal, the old secret stayed live and
     unreferenced, the old principal kept CAN_USE, and teardown refused to delete the agent's own
     secret and then dropped the pointer, so nothing named the leak."""
     from services.databricks_identity_service import DatabricksIdentityService
@@ -1856,27 +1649,28 @@ async def test_a_prefix_change_does_not_orphan_an_agents_own_principal(sp_secret
     agent = _make_agent()
 
     old_svc = DatabricksIdentityService(
-        databricks=db, registry=registry, secrets_client=secrets,
+        databricks=db,
+        registry=registry,
+        secrets_client=secrets,
         secret_prefix="agp-old/databricks-agent-sp/",
     )
     await old_svc.provision_databricks_runtime(agent, tenant)
     original_arn = agent.databricks_sp_secret_arn
     original_sp = agent.databricks_sp_id
 
-    # The deploy changes DATABRICKS_TENANT_SECRET_PREFIX; the RECORD is unchanged.
     new_svc = DatabricksIdentityService(
-        databricks=db, registry=registry, secrets_client=secrets,
+        databricks=db,
+        registry=registry,
+        secrets_client=secrets,
         secret_prefix="agp-new/databricks-agent-sp/",
     )
     await new_svc.provision_databricks_runtime(agent, tenant)
 
-    # Still ONE principal and ONE credential — the agent recognised its own state.
     assert len([c for c in db.calls if c[0] == "create_service_principal"]) == 1
     assert len([c for c in db.calls if c[0] == "create_service_principal_secret"]) == 1
     assert agent.databricks_sp_id == original_sp
     assert agent.databricks_sp_secret_arn == original_arn
 
-    # ...and teardown can still delete the agent's OWN secret through the new prefix.
     await new_svc.delete_databricks_runtime(agent, tenant)
     assert secrets.deleted == [original_arn]
 
@@ -1897,6 +1691,7 @@ async def test_a_body_naming_another_owner_is_not_resumability_state(sp_secret_g
     agent = _make_agent()
     await svc.provision_databricks_runtime(agent, tenant)
 
+    assert agent.databricks_sp_secret_arn is not None
     key = secrets._resolve(agent.databricks_sp_secret_arn)
     body = json.loads(secrets.store[key])
     body["agent_id"] = "rec-someone-else"
@@ -1906,7 +1701,6 @@ async def test_a_body_naming_another_owner_is_not_resumability_state(sp_secret_g
         await svc.provision_databricks_runtime(agent, tenant)
 
     assert "SCIM id" in str(err.value)
-    # No second credential was minted for a principal AGP can no longer identify.
     assert len([c for c in db.calls if c[0] == "create_service_principal_secret"]) == 1
 
 
@@ -1945,17 +1739,14 @@ async def test_a_foreign_arn_is_a_discarded_claim_not_a_teardown_failure():
     assert secrets.deleted == []
     assert WS_SECRET_ARN in secrets.store
     assert agent.databricks_sp_secret_arn is None
-    # ITEM E: BOTH fields are dropped. Clearing only the ARN left ``databricks_sp_id`` holding
-    # another agent's principal, and the surviving-principal log line is T12's orphan-list
-    # source — it would have named someone else's live SP as this agent's residue.
     assert agent.databricks_sp_id is None
 
 
 @pytest.mark.asyncio
 async def test_a_foreign_pointer_is_never_reported_as_this_agents_orphan(caplog):
-    """ITEM E, the consequence. The surviving-principal line is the source for T12's orphan list,
-    so reporting another agent's SP under this agent's id would send an operator to delete a LIVE
-    principal belonging to a different agent."""
+    """The surviving-principal line is the source of the orphan list, so reporting another agent's
+    SP under this agent's id would send an operator to delete a live principal belonging to a
+    different agent."""
     svc, _db, _s, _r = _make_service()
     agent = _make_agent(
         agent_id="rec-agent-b",
@@ -1972,21 +1763,6 @@ async def test_a_foreign_pointer_is_never_reported_as_this_agents_orphan(caplog)
     assert agent.databricks_sp_id is None
 
 
-# ===========================================================================
-# E29/T10 — the Databricks runtime-status producer
-#
-# `AgentIdentityService.runtime_status` dispatches a Databricks-governed agent here. The
-# producer answers into the SAME closed six-value union AgentCore answers into, and — like
-# its AgentCore sibling — it NEVER raises: a read surface that 5xx'd on a denying control
-# plane would blank the fleet view, which is the dishonesty E28 existed to fix.
-#
-# Two rules are pinned by execution below, not by reading:
-#   1. "unknown" is DISTINCT from "failed". An unreachable/denying Databricks workspace is
-#      not a broken agent.
-#   2. Only a SAFE CODE is surfaced. A Databricks error body, workspace path, or token must
-#      never reach `detail`.
-# ===========================================================================
-
 def _runtime_status(svc, agent, tenant=None, stage=None):
     """Call the SYNC producer the way the route's threadpool does (no running loop)."""
     return svc.runtime_status(agent, tenant=tenant, stage=stage)
@@ -1996,8 +1772,6 @@ def _app(state, *, container="status", url=APP_URL):
     record = {"name": APP_NAME, "url": url, container: {"state": state}}
     return record
 
-
-# -- the mapping ------------------------------------------------------------
 
 @pytest.mark.parametrize(
     "state,expected",
@@ -2009,8 +1783,6 @@ def _app(state, *, container="status", url=APP_URL):
         ("UPDATING", "updating"),
         ("CRASHED", "failed"),
         ("ERROR", "failed"),
-        # Deliberate or ambiguous non-serving states. The union has no slot for them and
-        # "failed" would page an on-call for an agent somebody switched off on purpose.
         ("STOPPED", "unknown"),
         ("STOPPING", "unknown"),
         ("DELETING", "unknown"),
@@ -2027,16 +1799,15 @@ def test_the_app_state_maps_into_the_closed_union(state, expected):
 
 
 def test_every_produced_status_is_a_member_of_the_closed_union():
-    """The union is CLOSED (models/agent.RUNTIME_STATUSES) and the frontend mirrors it with no
-    default branch, so a 7th value here breaks the compiler on the other side. Executed over
-    every state this producer knows plus a state it does not, so a future mapping entry that
-    invents a value fails offline."""
+    """The union is CLOSED (models/agent.RUNTIME_STATUSES). Executed over every state this
+    producer knows plus a state it does not, so a future mapping entry that invents a value
+    fails offline."""
     from models.agent import RUNTIME_STATUSES
-    from services.databricks_identity_service import _APP_STATE_TO_RUNTIME_STATUS
+    from services.databricks_runtime_status import _APP_STATE_TO_RUNTIME_STATUS
 
     assert set(_APP_STATE_TO_RUNTIME_STATUS.values()) <= set(RUNTIME_STATUSES)
 
-    for state in list(_APP_STATE_TO_RUNTIME_STATUS) + ["SOME_STATE_DATABRICKS_ADDS_LATER"]:
+    for state in [*_APP_STATE_TO_RUNTIME_STATUS, "SOME_STATE_DATABRICKS_ADDS_LATER"]:
         db = _FakeDatabricks(apps=[_app(state)])
         svc, _db, _s, _r = _make_service(databricks=db)
         assert _runtime_status(svc, _make_agent(), _make_tenant()).status in RUNTIME_STATUSES
@@ -2078,17 +1849,14 @@ def test_a_missing_state_container_is_unknown_not_failed():
 
 
 def test_the_state_is_read_from_app_status_when_that_is_the_container_name():
-    """Research §2.1 marks the app record's field names UNVERIFIED (T12 pins them live), so the
-    producer reads BOTH plausible containers — the same two-key tolerance discovery's
-    ``url``/``app_url`` handling already uses. Reading only one would report a live agent as
-    "unknown" for a field-name difference."""
+    """The app record's field names are unverified, so the producer reads both plausible
+    containers, the same two-key tolerance discovery's ``url``/``app_url`` handling uses. Reading
+    only one would report a live agent as "unknown" for a field-name difference."""
     db = _FakeDatabricks(apps=[_app("RUNNING", container="app_status")])
     svc, _db, _s, _r = _make_service(databricks=db)
 
     assert _runtime_status(svc, _make_agent(), _make_tenant()).status == "ready"
 
-
-# -- never raises -----------------------------------------------------------
 
 def test_no_runtime_handle_is_not_deployed_with_zero_databricks_calls():
     """A registered-but-inert record is a fact we already hold locally — asking Databricks
@@ -2116,9 +1884,8 @@ def test_an_app_no_workspace_lists_is_not_deployed():
 
 @pytest.mark.parametrize("failing_call", ["mint_m2m_token", "list_apps"])
 def test_a_databricks_error_degrades_to_unknown_with_a_safe_code(failing_call):
-    """Rule 1. A denying or unreachable workspace is AMBIGUOUS — the agent may be perfectly
-    healthy behind a rotated credential. Reporting "failed" would state a conclusion the
-    evidence does not support."""
+    """A denying or unreachable workspace is ambiguous: the agent may be healthy behind a rotated
+    credential. Reporting "failed" would state a conclusion the evidence does not support."""
     db = _FakeDatabricks()
     db.raise_on[failing_call] = DatabricksError(
         "Databricks rejected the request (list apps, status 403)", kind="forbidden"
@@ -2132,7 +1899,7 @@ def test_a_databricks_error_degrades_to_unknown_with_a_safe_code(failing_call):
 
 
 def test_the_upstream_error_message_never_reaches_the_detail():
-    """Rule 2. C-2 composes a safe message, but this layer does not depend on that: it reads
+    """The client composes a safe message, but this layer does not depend on that: it reads
     ``.kind`` only, because ``detail`` is rendered in a UI."""
     db = _FakeDatabricks()
     db.raise_on["list_apps"] = DatabricksError(
@@ -2203,9 +1970,7 @@ def test_an_unresolvable_credential_is_unknown_not_failed():
     raises ``ProvisioningError`` for the provisioning path; the STATUS path must absorb it."""
     svc, db, _s, _r = _make_service()
 
-    result = _runtime_status(
-        svc, _make_agent(), _make_tenant(sp_client_secret_arn="")
-    )
+    result = _runtime_status(svc, _make_agent(), _make_tenant(sp_client_secret_arn=""))
 
     assert result.status == "unknown"
     assert db.calls == []
@@ -2223,8 +1988,6 @@ def test_an_unexpected_collaborator_fault_is_unknown_not_a_raise():
     assert result.status == "unknown"
     assert "boom" not in (result.detail or "")
 
-
-# -- shape ------------------------------------------------------------------
 
 def test_the_result_carries_the_agent_id_the_stage_and_no_arn():
     """``runtime_arn`` stays None for a Databricks agent: it is an ARN field that the delete
@@ -2261,9 +2024,7 @@ def test_an_explicit_stage_probes_only_that_stage():
             sp_client_secret_arn=WS_SECRET_ARN,
         ),
     }
-    db = _FakeDatabricks(
-        apps_by_workspace={other_url: [_app("RUNNING")], WORKSPACE_URL: []}
-    )
+    db = _FakeDatabricks(apps_by_workspace={other_url: [_app("RUNNING")], WORKSPACE_URL: []})
     svc, _db, _s, _r = _make_service(databricks=db)
     tenant = _make_tenant(stages=stages)
 
@@ -2309,9 +2070,7 @@ def test_with_no_stage_asked_the_hosting_workspace_is_the_reported_stage():
             sp_client_secret_arn=WS_SECRET_ARN,
         ),
     }
-    db = _FakeDatabricks(
-        apps_by_workspace={other_url: [_app("RUNNING")], WORKSPACE_URL: []}
-    )
+    db = _FakeDatabricks(apps_by_workspace={other_url: [_app("RUNNING")], WORKSPACE_URL: []})
     svc, _db, _s, _r = _make_service(databricks=db)
 
     result = _runtime_status(svc, _make_agent(), _make_tenant(stages=stages))
@@ -2366,9 +2125,7 @@ def test_a_non_databricks_agent_is_refused_by_the_producer_not_answered():
     listing — a reading of the wrong runtime is worse than no reading."""
     svc, db, _s, _r = _make_service()
 
-    result = _runtime_status(
-        svc, _make_agent(platform=Platform.AWS_BEDROCK), _make_tenant()
-    )
+    result = _runtime_status(svc, _make_agent(platform=Platform.AWS_BEDROCK), _make_tenant())
 
     assert result.status == "unknown"
     assert db.calls == []
@@ -2379,6 +2136,7 @@ def test_a_deleted_tenant_that_RAISES_on_lookup_is_unknown_not_a_500():
     None. Catching only ``ProvisioningError`` here would therefore let the MOST LIKELY
     missing-tenant case in production escape a method whose whole contract is that it never
     raises, turning a deleted tenant into a 500 that blanks the fleet view."""
+
     class _TenantError(Exception):
         pass
 
@@ -2392,15 +2150,11 @@ def test_a_deleted_tenant_that_RAISES_on_lookup_is_unknown_not_a_500():
     assert db.calls == []
 
 
-# -- fix round 1 ------------------------------------------------------------
-
 def test_mixed_evidence_is_unknown_not_not_deployed():
-    """FIX ROUND 1 (F1). One workspace ANSWERED EMPTY and another FAILED, while the app is in
-    fact RUNNING on the one that failed. ``not_deployed`` is a POSITIVE claim that nothing is
-    running, so it needs a COMPLETE negative result — a workspace nobody could read is not a
-    workspace with nothing in it. Reporting "not_deployed|dev" here would have told an operator
-    their live agent was undeployed, which is the exact conflation this module's docstring
-    forbids (an unreachable control plane is not an absent runtime)."""
+    """One workspace answered empty and another failed, while the app is in fact running on the
+    one that failed. ``not_deployed`` is a positive claim that nothing is running, so it needs a
+    complete negative result: a workspace nobody could read is not a workspace with nothing in
+    it. Reporting "not_deployed|dev" here would tell an operator their live agent was undeployed."""
     other_url = "https://dbc-other.cloud.databricks.com"
     stages = {
         "dev": DatabricksStageConfig(
@@ -2415,15 +2169,10 @@ def test_mixed_evidence_is_unknown_not_not_deployed():
             workspace_id="0",
             account_id=ACCOUNT_ID,
             sp_client_id="ws-sp-client-id",
-            # Unreadable: the read of THIS workspace fails, and it is the one really hosting
-            # the app — the case that makes a premature "not_deployed" a lie.
             sp_client_secret_arn="",
         ),
     }
-    # dev answers, and answers EMPTY. prod would have listed the RUNNING app.
-    db = _FakeDatabricks(
-        apps_by_workspace={WORKSPACE_URL: [], other_url: [_app("RUNNING")]}
-    )
+    db = _FakeDatabricks(apps_by_workspace={WORKSPACE_URL: [], other_url: [_app("RUNNING")]})
     svc, _db, _s, _r = _make_service(databricks=db)
 
     result = _runtime_status(svc, _make_agent(), _make_tenant(stages=stages))
@@ -2437,9 +2186,8 @@ def test_mixed_evidence_is_unknown_not_not_deployed():
 
 
 def test_a_complete_negative_sweep_is_still_not_deployed():
-    """The other half of F1: when EVERY workspace answers and none lists the app, the negative
-    result is complete and ``not_deployed`` is the honest, useful answer. The fix must not have
-    turned a real absence into a permanent "unknown"."""
+    """When every workspace answers and none lists the app, the negative result is complete and
+    ``not_deployed`` is the honest answer; a real absence must not become a permanent "unknown"."""
     other_url = "https://dbc-other.cloud.databricks.com"
     stages = {
         "dev": DatabricksStageConfig(
@@ -2478,36 +2226,19 @@ def test_an_explicit_stage_that_fails_is_unknown_not_not_deployed():
     assert "forbidden" in (result.detail or "")
 
 
-# ===========================================================================
-# FINAL REVIEW (Critical) — DELETE /agents/{id} tears the Databricks side down
-#
-# `delete_databricks_runtime` had ZERO production callers, so deleting a Databricks agent left
-# a LIVE federation-policy audience entry on the CUSTOMER's Databricks account plus a live
-# service principal. The E23 repo cascade cannot reach these agents (repo materialization pins
-# `platform=aws_bedrock`), so the teardown dispatches from the route a Databricks agent
-# actually travels — by platform, mirroring provision/reprovision.
-#
-# The two items are ASYMMETRIC on purpose and both halves are pinned below:
-#   • the federation AUDIENCE is BLOCKING — it is the customer's live trust state, and the
-#     record is the only thing that still names which audience to withdraw;
-#   • the SP secret / service principal are NON-BLOCKING — ours, in our account, reported by
-#     id, and gating the row on them would be the `_NON_BLOCKING_ITEMS` mistake E28C paid for.
-# ===========================================================================
-
 def _delete_client(agent, databricks=None, identity=None):
-    """`_reprovision_client` plus seeded Databricks + Entra identity singletons.
+    """`_reprovision_client` plus seeded Databricks and Entra identity singletons.
 
-    Seeded on the MODULE (not via `patch`) for the same reason the registry is: the route
-    reaches the collaborators through `get_databricks_identity_service()` /
-    `get_identity_service()`, and pinning the singletons proves the WIRED path rather than
-    a patched stand-in of it. `identity` defaults to a no-op mock whose `delete_identity`
-    succeeds (livefix-8: the delete route tears the Entra app down too).
+    Seeded on the module (not via `patch`) for the same reason the registry is: the route reaches
+    the collaborators through `get_databricks_identity_service()` / `get_identity_service()`, and
+    pinning the singletons proves the wired path rather than a patched stand-in of it. `identity`
+    defaults to a no-op mock whose `delete_identity` succeeds (the delete route tears the Entra
+    app down too). The registry's `delete` answers with the real record because
+    `response_model=Agent` validates what the route returns.
     """
     import api.routes.agents as agents_module
 
     client, svc = _reprovision_client(agent)
-    # `response_model=Agent` validates what the route returns, so the registry's `delete` must
-    # answer with a real record rather than a MagicMock.
     svc.delete.return_value = agent
     agents_module._databricks_identity_svc = databricks
     if identity is None:
@@ -2535,12 +2266,9 @@ async def test_deleting_a_databricks_agent_removes_the_federation_audience(repro
     resp = client.delete("/api/v1/agents/rec-abc123")
 
     assert resp.status_code == 200
-    # The account-level trust entry is GONE from the customer's policy (both forms —
-    # the GUID provisioning appends, and the legacy api:// URI pre-livefix-6 records left)...
     assert ("ensure_federation_audience", "agent-app-guid", False) in db.calls
     assert ("ensure_federation_audience", AGENT_AUDIENCE, False) in db.calls
     assert db.audiences == set()
-    # ...and only THEN was the record removed.
     registry.delete.assert_called_once_with("rec-abc123")
 
 
@@ -2567,23 +2295,19 @@ def test_deleting_an_sp_secret_agent_deletes_its_service_principal_secret(reprov
 
     assert resp.status_code == 200
     assert secrets.deleted == [agent_arn_secret]
-    # sp_secret mode never touches the account-level policy.
     assert not any(c[0] == "ensure_federation_audience" for c in db.calls)
     registry.delete.assert_called_once_with("rec-abc123")
 
 
 def test_deleting_an_agent_tears_down_its_entra_identity_before_the_record(reprovision_env):
-    """E29 livefix-8 (found live in B6.1): the direct delete route left the per-agent Entra
-    app+SP orphaned — `delete_identity` was wired only into the E23 REPO cascade, and a
-    Databricks agent has no repo, so nothing would ever remove its identity. The route
-    tears the Entra identity down BEFORE the registry delete (the record is the only thing
-    naming the app ids) — since E36/T16 as the registered-agent cascade's ``identity``
-    line-item, with the OBO provider split into its own leg (``include_obo_provider=False``
-    is what stops a second delete of the resource that leg already reported)."""
+    """The direct delete route once left the per-agent Entra app and SP orphaned: ``delete_identity``
+    was wired only into the repo cascade, and a Databricks agent has no repo. The route tears the
+    Entra identity down before the registry delete (the record is the only thing naming the app
+    ids) as the registered-agent cascade's ``identity`` line item, with the OBO provider split
+    into its own leg (``include_obo_provider=False`` stops a second delete of the resource that
+    leg already reported)."""
     identity = MagicMock()
     identity.delete_identity = AsyncMock(return_value=None)
-    # No Databricks residue (binding_mode=None) — the Entra teardown must run even for an
-    # agent the Databricks half has nothing to do for.
     agent = _make_agent(binding_mode=None)
 
     client, registry = _delete_client(agent, identity=identity)
@@ -2595,13 +2319,12 @@ def test_deleting_an_agent_tears_down_its_entra_identity_before_the_record(repro
 
 
 def test_a_failed_entra_teardown_is_reported_and_the_record_still_goes(reprovision_env, caplog):
-    """The E36/T16 semantics, which SUPERSEDE livefix-8's blocking arm: the registered-agent
-    cascade's ``identity`` leg is best-effort — a Graph outage is REPORTED (one ``[teardown]``
-    line per resource; that log IS the operator's reclaim instruction) and the record still
-    goes, because trapping the row behind the very orphan the operator was trying to reclaim
-    helps nobody and every leg is idempotent. The Databricks residue leg stays the ONE
-    blocking exception (see the audience test below): that is the customer's live trust
-    state, not the platform's own directory object."""
+    """The registered-agent cascade's ``identity`` leg is best-effort: a Graph outage is reported
+    (one ``[teardown]`` line per resource, the operator's reclaim instruction) and the record
+    still goes, because trapping the row behind the orphan the operator was trying to reclaim
+    helps nobody and every leg is idempotent. The Databricks residue leg stays the one blocking
+    exception (the audience test below): the customer's live trust state, not the platform's own
+    directory object."""
     identity = MagicMock()
     identity.delete_identity = AsyncMock(side_effect=RuntimeError("graph down"))
     agent = _make_agent(binding_mode=None)
@@ -2633,16 +2356,15 @@ async def test_a_failed_audience_removal_fails_the_delete_and_keeps_the_record(r
 
     assert resp.status_code == 502
     registry.delete.assert_not_called()
-    # Actionable, and it never leaks the upstream body — only who can act.
     assert "not deleted" in resp.json()["detail"]
     assert "account admin" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
 async def test_a_failed_secret_delete_still_deletes_the_record(reprovision_env):
-    """The NON-BLOCKING half, and the asymmetry's whole point. A Secrets Manager fault no
-    operator retry addresses must NOT trap the DDB row (the E28C exec-role lesson) — the secret
-    is ours, in our account, and it reports itself for reclamation."""
+    """The non-blocking half, and the asymmetry's whole point. A Secrets Manager fault no operator
+    retry addresses must not trap the record: the secret is ours, in our account, and it reports
+    itself for reclamation."""
     agent_arn_secret = _agent_secret_arn("rec-abc123")
     secrets = _FakeSecrets(store={agent_arn_secret: json.dumps({"client_secret": "x"})})
     secrets.raise_on_delete = True
@@ -2737,14 +2459,88 @@ def test_teardown_is_gated_on_platform_not_on_the_governed_predicate(reprovision
     from models.agent import is_databricks_governed_agent
 
     agent = _make_agent(binding_mode="federation", runtime_handle=None)
-    assert not is_databricks_governed_agent(agent)  # the governed gate would skip it
+    assert not is_databricks_governed_agent(agent)
 
     databricks = MagicMock()
-    databricks.delete_databricks_runtime = AsyncMock(return_value=None)
+    databricks.remove_databricks_artifact = AsyncMock(return_value=None)
 
     client, registry = _delete_client(agent, databricks=databricks)
     resp = client.delete("/api/v1/agents/rec-abc123")
 
     assert resp.status_code == 200
-    databricks.delete_databricks_runtime.assert_awaited_once()
+    databricks.remove_databricks_artifact.assert_awaited_once()
+    assert databricks.remove_databricks_artifact.await_args.args[1].kind == "federation_audience"
+    registry.delete.assert_called_once_with("rec-abc123")
+
+
+@pytest.mark.asyncio
+async def test_provisioning_persists_the_resolved_bound_stage(reprovision_env):
+    """Provisioning records which workspace stage hosts the agent, so the invoke resolver never has
+    to re-derive it from an Apps hostname (which carries none). The default tenant has one stage,
+    ``dev``, the stage ``_resolve_stage_and_app`` matches the app in."""
+    tenant = _make_tenant()
+    svc, _db, _s, registry = _make_service(tenants=_FakeTenants(tenant))
+    agent = _make_agent(binding_mode="federation")
+
+    await svc.provision_databricks_runtime(agent, tenant)
+
+    assert agent.bound_stage == "dev"
+    assert registry.persist_identity.call_args.args[0].bound_stage == "dev"
+
+
+def test_bound_stage_round_trips_through_the_envelope_and_absent_is_none():
+    """Additive envelope key: a record carrying it round-trips, and an older envelope that lacks it
+    hydrates as None, which sends the invoke resolver to its heuristic."""
+    agent = _make_agent(binding_mode="federation")
+    agent.bound_stage = "prod"
+    env = agent.to_envelope()
+    assert env["bound_stage"] == "prod"
+
+    record = {
+        "recordId": "rec-abc123",
+        "name": "Claims Triage DE",
+        "description": "",
+        "status": "APPROVED",
+        "createdAt": "2026-08-19T00:00:00+00:00",
+        "updatedAt": "2026-08-19T00:00:00+00:00",
+    }
+    assert Agent.from_record(record, env).bound_stage == "prod"
+    legacy = {k: v for k, v in env.items() if k != "bound_stage"}
+    assert Agent.from_record(record, legacy).bound_stage is None
+
+
+class _FakeArtifactAdapter:
+    """A minimal PlatformAdapter double: it enumerates a fixed artifact list and records
+    removals, so the route's per-policy arms can be exercised without a real platform."""
+
+    def __init__(self, artifacts):
+        self._artifacts = artifacts
+        self.removed = []
+
+    def named_artifacts(self, agent):
+        return list(self._artifacts)
+
+    async def remove_artifact(self, agent, artifact):
+        self.removed.append(artifact)
+
+
+def test_a_never_touch_artifact_is_skipped_and_the_record_still_goes(reprovision_env, monkeypatch, caplog):
+    """The reserved third policy (no artifact carries it today — the enum member + this route arm
+    exist so the GCP shared-provider case is not first written under pressure). A NEVER_TOUCH
+    artifact is SKIPPED with its reason: never removed, and the record still deletes."""
+    import api.routes.agents as agents_module
+
+    fake = _FakeArtifactAdapter(
+        [Artifact(kind="shared_provider", ref="shared", policy=ArtifactPolicy.NEVER_TOUCH)]
+    )
+    monkeypatch.setattr(agents_module, "status_adapter", lambda agent: fake)
+
+    agent = _make_agent(binding_mode=None)
+    client, registry = _delete_client(agent)
+    with caplog.at_level(logging.INFO, logger="api.routes.agents"):
+        resp = client.delete("/api/v1/agents/rec-abc123")
+
+    assert resp.status_code == 200
+    assert fake.removed == []
+    assert "item=shared_provider outcome=skipped reason=never_touch" in caplog.text
     registry.delete.assert_called_once_with("rec-abc123")

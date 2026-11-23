@@ -1,47 +1,16 @@
-"""Pull-request verbs on a repository (E28/T14 — design D14+D15, contract C2).
+"""Pull-request verbs on a repository, in two layers.
 
-TWO LAYERS, and the split is the point.
+Layer 1 is the service over an ``httpx.MockTransport``: which endpoint each verb calls, how a
+GitHub PR object is projected onto :class:`~models.repository.PullRequestView`, and which failures
+become which kind. Layer 2 is the routes on ``repositories_router`` against a mocked
+``verify_entra_token`` with the services as ``MagicMock`` module globals: the gate, the
+404-not-403 contract, and the invariant that the only credential reaching the service is the linked
+human's token. No boto3, no live AWS, no live GitHub.
 
-**Layer 1 — the service** (:mod:`services.github_pr_service`) over an ``httpx.MockTransport``,
-the ``test_github_repo_service`` idiom. It owns the provider conversation: which endpoint each
-verb calls, how a GitHub PR object is PROJECTED onto :class:`~models.repository.PullRequestView`,
-and which failures become which ``.kind``.
-
-**Layer 2 — the routes** on the existing ``repositories_router``, the
-``test_projects_role_gating`` harness verbatim (real ``require_role`` /
-``current_principal`` / ``get_tenant_ctx`` / ``get_project_ctx`` against a mocked
-``verify_entra_token``; the services as ``MagicMock``s on the module globals). It owns
-composition: the gate, the 404-not-403 contract, and — the invariant this whole task exists
-for — that the ONLY credential reaching the service is the E27B LINKED HUMAN's token.
-
-The load-bearing invariants, and why each is pinned rather than assumed:
-
-1. **NO APP-TOKEN FALLBACK, on any path (D15).** AGP holds an org-scoped App installation
-   token that can open and approve PRs as *itself*. If a missing/broken user link ever fell
-   back to it, AGP would approve a human's PR on their behalf — which silently defeats the
-   self-approval refusal below, because the App is never the author. So: the service module
-   must not even be able to reach an App token (asserted over its source), and the route must
-   refuse rather than retry (asserted by call count on the connection service).
-2. **A self-approval is REFUSED WITH A REASON, before GitHub is called.** GitHub answers 422
-   for a review on your own PR; discovering it there would mean the affordance was offered.
-   ``can_approve`` is computed from the linked human's own login, and ``approve`` refuses
-   locally — with NO second attempt under any other credential.
-3. **A MISSING GRANT IS A HIDDEN TAB, NOT A 500.** The org's App installation may not carry
-   ``pull_requests: write`` (it is a manual per-org grant and GitHub does not retro-apply a
-   manifest change). GitHub answers ``403`` for that, and the route maps it to ONE fixed
-   literal the frontend resolves to a hidden tab. An unmapped kind — a 500 — would render a
-   broken tab instead of no tab.
-4. **A merge failure surfaces a SAFE HINT ONLY.** Fixed literals keyed off the status code;
-   the provider body never crosses, because it can echo attacker-influenced content and this
-   epic has already had to truncate one field for carrying an AWS account id.
-5. **``mergeable`` is only ever trusted as ``False``.** It is typed three-valued, but the LIST
-   endpoint this tab reads — ``GET /repos/{o}/{r}/pulls`` — OMITS the key entirely (proven live;
-   only ``GET /pulls/{n}`` computes it), and the projection folds an omitted key and GitHub's own
-   in-flight ``null`` into one ``None``. So "never asked" and "still computing" are deliberately
-   not tellable apart, and no surface may claim either. What holds is the direction that matters:
-   absent is never ``False``, because that reading suppresses a merge that would have worked.
-
-No boto3, no live AWS, no live GitHub.
+The load-bearing invariants: no App-token fallback on any path (the service module cannot even
+reach one, and the route refuses rather than retries); a self-approval is refused with a reason
+before GitHub is called; a missing ``pull_requests`` grant is a hidden tab, never a 500; a merge
+failure surfaces a fixed hint only; ``mergeable`` is trusted only as ``False``.
 """
 
 from __future__ import annotations
@@ -49,35 +18,29 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from models.project import Project, ProjectDetail
 from models.repository import Repository
-from services.github_pr_service import GitHubPrError, GitHubPrService
+from services.github_pr_service import GitHubPrDuplicateError, GitHubPrError, GitHubPrService
+
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
 FIXED_TS = "2026-07-31T00:00:00+00:00"
 VIEWER_LOGIN = "lars-svensson"
-
-
-# ===========================================================================
-# Layer 1 — the service, over httpx.MockTransport
-# ===========================================================================
+ACCOUNT_SHAPED = "111122223333"
 
 
 def _pr_payload(**over) -> dict:
-    """A GitHub PR object, trimmed to the keys the projection reads.
-
-    **``mergeable`` IS DELIBERATELY ABSENT**, because that is the shape live GitHub produces on
-    the path this fixture mostly models. ``GET /repos/{o}/{r}/pulls`` — the LIST read behind the
-    tab — omits the key entirely; only ``GET /pulls/{n}`` computes it. Supplying ``True`` here by
-    default made every list test assert against a body GitHub never sends, and that fiction is
-    what let a per-row "still being checked" hint ship and then say so on every row forever.
-    Tests modelling a SINGLE-PR body pass ``mergeable=`` explicitly."""
+    """A GitHub PR object trimmed to the keys the projection reads. ``mergeable`` is absent
+    because the list endpoint omits it; tests modelling a single-PR body pass it explicitly."""
     payload = {
         "number": 7,
         "title": "Raise the claim-triage threshold",
@@ -102,9 +65,6 @@ def _ok(payload):
     return handler
 
 
-# --- the projection --------------------------------------------------------
-
-
 def test_list_projects_the_provider_object_onto_the_view():
     calls = []
 
@@ -125,15 +85,10 @@ def test_list_projects_the_provider_object_onto_the_view():
     assert row.author == "jorge"
     assert row.head_sha == "3f9a1c2b4d5e6f7a8b9c"
     assert row.url == "https://github.com/acme/claims-triage/pull/7"
-    # `None`, not `True` — the LIST endpoint does not send `mergeable` at all, and this fixture
-    # now models that. Proven live: the list body omits the key while `GET /pulls/{n}` answers
-    # `mergeable: true, mergeable_state: "clean"` for the same pull request.
     assert row.mergeable is None
 
 
 def test_the_user_token_is_the_only_authorization_sent():
-    """The token is a per-request Bearer header, the ``github_repo_service`` idiom — and it is
-    the LINKED HUMAN's. Nothing else authenticates the call."""
     seen = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -148,13 +103,27 @@ def test_the_user_token_is_the_only_authorization_sent():
 
 
 def test_a_merged_pr_reports_merged_not_closed():
-    """GitHub's ``state`` is only ``open``/``closed`` — a merged PR is ``closed`` there. Showing
-    a shipped PR as merely "closed" loses the one distinction that matters on this surface."""
-    rows = _svc(
-        _ok([_pr_payload(state="closed", merged_at="2026-07-31T09:00:00Z")])
-    ).list_pull_requests("acme", "r", "t", viewer_login=VIEWER_LOGIN)
+    rows = _svc(_ok([_pr_payload(state="closed", merged_at="2026-07-31T09:00:00Z")])).list_pull_requests(
+        "acme", "r", "t", viewer_login=VIEWER_LOGIN
+    )
 
     assert rows[0].state == "merged"
+
+
+def test_merge_commit_sha_only_once_merged():
+    """GitHub fills ``merge_commit_sha`` on an open PR too (its test merge commit), which no build
+    ever runs, so it is reported only once ``merged_at`` is set."""
+    merged, open_ = _svc(
+        _ok(
+            [
+                _pr_payload(state="closed", merged_at="2026-07-31T09:00:00Z", merge_commit_sha="abc123"),
+                _pr_payload(number=8, merge_commit_sha="testmerge999"),
+            ]
+        )
+    ).list_pull_requests("acme", "r", "t", viewer_login=VIEWER_LOGIN)
+
+    assert merged.merge_commit_sha == "abc123"
+    assert open_.merge_commit_sha is None
 
 
 def test_a_genuinely_closed_pr_stays_closed():
@@ -167,27 +136,15 @@ def test_a_genuinely_closed_pr_stays_closed():
 
 @pytest.mark.parametrize("payload", [{}, {"mergeable": None}], ids=["absent", "explicit-null"])
 def test_an_absent_and_an_explicit_null_mergeable_both_project_to_none(payload):
-    """Neither is ``False``, and — the point of this test — the two are INDISTINGUISHABLE after
-    projection, on purpose.
-
-    ``_project`` folds anything non-boolean to ``None``, so a body that omitted the key (what the
-    LIST endpoint always sends) and one that answered ``null`` (a single-PR read whose async
-    computation is still in flight) become one value. That fold is why no surface may render "the
-    provider is still working it out": nothing downstream can tell that case from "nobody ever
-    asked". What IS still guaranteed is the direction that matters — never ``False``, because
-    claiming a clean pull request cannot be merged is the one reading that suppresses a button
-    that would have worked."""
-    rows = _svc(_ok([_pr_payload(**payload)])).list_pull_requests(
-        "acme", "r", "t", viewer_login=VIEWER_LOGIN
-    )
+    """The two are indistinguishable after projection on purpose, so no surface can claim "the
+    provider is still working it out"; what holds is that neither is ``False``."""
+    rows = _svc(_ok([_pr_payload(**payload)])).list_pull_requests("acme", "r", "t", viewer_login=VIEWER_LOGIN)
 
     assert rows[0].mergeable is None
     assert rows[0].mergeable is not False
 
 
 def test_a_single_pr_read_still_carries_a_real_mergeable():
-    """The field is not dead: ``GET /pulls/{n}`` — the read behind create/approve/merge — DOES
-    compute it, and there ``True``/``False`` are truthful. Only the list path's silence is."""
     view = _svc(_ok(_pr_payload(mergeable=True))).create_pull_request(
         "acme", "r", "t", viewer_login=VIEWER_LOGIN, title="t", head="h", base=None, body=None
     )
@@ -202,21 +159,15 @@ def test_a_single_pr_read_still_carries_a_real_mergeable():
 
 
 def test_a_pr_with_no_author_object_reads_as_absent_never_as_the_viewer():
-    """A deleted GitHub account leaves ``user: null``. Defaulting the author to the VIEWER would
-    make ``can_approve`` false for a PR they did not write; defaulting it to any other login
-    would assert an identity nobody established. Absent is the honest projection."""
-    rows = _svc(_ok([_pr_payload(user=None)])).list_pull_requests(
-        "acme", "r", "t", viewer_login=VIEWER_LOGIN
-    )
+    """A deleted GitHub account leaves ``user: null``; with no author there is nobody to be, so
+    nothing establishes a self-approval."""
+    rows = _svc(_ok([_pr_payload(user=None)])).list_pull_requests("acme", "r", "t", viewer_login=VIEWER_LOGIN)
 
     assert rows[0].author == ""
-    # And with no author there is nobody to be, so nothing establishes a self-approval.
     assert rows[0].can_approve is True
 
 
 def test_a_malformed_row_is_skipped_not_crashed():
-    """A provider list whose entries are not objects must not 500 the whole tab. One unusable
-    row is dropped; the readable ones are still served."""
     rows = _svc(_ok(["nonsense", _pr_payload(), {"no": "number"}])).list_pull_requests(
         "acme", "r", "t", viewer_login=VIEWER_LOGIN
     )
@@ -225,32 +176,22 @@ def test_a_malformed_row_is_skipped_not_crashed():
 
 
 def test_a_non_list_body_is_empty_not_an_exception():
-    rows = _svc(_ok({"message": "surprise"})).list_pull_requests(
-        "acme", "r", "t", viewer_login=VIEWER_LOGIN
-    )
+    rows = _svc(_ok({"message": "surprise"})).list_pull_requests("acme", "r", "t", viewer_login=VIEWER_LOGIN)
 
     assert rows == []
 
 
-# --- can_approve (D15) ----------------------------------------------------
-
-
 def test_can_approve_is_false_when_the_linked_human_is_the_author():
-    """THE headline refusal. GitHub refuses a review on your own PR, and AGP acts AS the human —
-    so the refusal is stated before the affordance is offered, not discovered as a 422."""
     rows = _svc(_ok([_pr_payload(user={"login": VIEWER_LOGIN})])).list_pull_requests(
         "acme", "r", "t", viewer_login=VIEWER_LOGIN
     )
 
     assert rows[0].can_approve is False
     assert rows[0].approve_blocked_reason
-    # A REASON, not an error — the UI states it calmly. And it names the actual cause.
     assert "own" in rows[0].approve_blocked_reason.lower()
 
 
 def test_the_author_comparison_is_case_insensitive():
-    """GitHub logins are case-insensitive, so ``Lars-Svensson`` and ``lars-svensson`` are one
-    human. A case-sensitive compare would OFFER a self-approval the provider then 422s."""
     rows = _svc(_ok([_pr_payload(user={"login": VIEWER_LOGIN.upper()})])).list_pull_requests(
         "acme", "r", "t", viewer_login=VIEWER_LOGIN
     )
@@ -259,8 +200,7 @@ def test_the_author_comparison_is_case_insensitive():
 
 
 def test_a_closed_or_merged_pr_cannot_be_approved_either():
-    """An affordance whose every click is refused is not an affordance: GitHub takes no review
-    on a closed PR. Stated as its own reason, distinct from the self-approval one."""
+    """Its own reason, and one that does not read as the self-approval one."""
     for over in [{"state": "closed"}, {"state": "closed", "merged_at": "2026-07-31T09:00:00Z"}]:
         rows = _svc(_ok([_pr_payload(**over)])).list_pull_requests(
             "acme", "r", "t", viewer_login=VIEWER_LOGIN
@@ -271,9 +211,6 @@ def test_a_closed_or_merged_pr_cannot_be_approved_either():
 
 
 def test_an_unknown_viewer_login_refuses_rather_than_permits():
-    """A blank viewer login means AGP does not know WHO it would be acting as. Permitting the
-    approve then risks exactly the self-approval this refuses — so absent standing is refused,
-    the fail-closed direction."""
     rows = _svc(_ok([_pr_payload()])).list_pull_requests("acme", "r", "t", viewer_login="")
 
     assert rows[0].can_approve is False
@@ -281,8 +218,6 @@ def test_an_unknown_viewer_login_refuses_rather_than_permits():
 
 
 def test_approve_refuses_a_self_approval_without_calling_the_review_endpoint():
-    """No second attempt, under ANY credential. The refusal happens before the write, and the
-    review endpoint is never reached — which is what makes 'no App-token retry' observable."""
     calls = []
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -295,7 +230,22 @@ def test_approve_refuses_a_self_approval_without_calling_the_review_endpoint():
         )
 
     assert ei.value.kind == "self_approval"
-    # Read the PR to decide — then STOP. No review POST, and nothing retried.
+    assert calls == [("GET", "/repos/acme/claims-triage/pulls/7")]
+
+
+def test_approve_refuses_a_closed_pull_request_as_not_approvable():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append((req.method, req.url.path))
+        return httpx.Response(200, json=_pr_payload(state="closed"))
+
+    with pytest.raises(GitHubPrError) as ei:
+        _svc(handler).approve_pull_request(
+            "acme", "claims-triage", 7, "ghu_user_token", viewer_login=VIEWER_LOGIN
+        )
+
+    assert ei.value.kind == "not_approvable"
     assert calls == [("GET", "/repos/acme/claims-triage/pulls/7")]
 
 
@@ -314,16 +264,11 @@ def test_approve_posts_a_review_for_someone_elses_pr():
     )
 
     assert ("POST", "/repos/acme/claims-triage/pulls/7/reviews") in calls
-    # The answer is a FRESH read, so the caller sees the PR as it now is rather than as the
-    # optimistic copy the client sent.
     assert calls[-1] == ("GET", "/repos/acme/claims-triage/pulls/7")
     assert view.number == 7
 
 
 def test_approve_maps_the_providers_own_self_review_refusal_too():
-    """Belt and braces: if the local check were ever bypassed (a login AGP could not resolve,
-    say), GitHub's own 422 must still read as the same refusal — never as a server fault."""
-
     def handler(req: httpx.Request) -> httpx.Response:
         if req.method == "POST":
             return httpx.Response(422, json={"message": "Can not approve your own pull request"})
@@ -333,9 +278,6 @@ def test_approve_maps_the_providers_own_self_review_refusal_too():
         _svc(handler).approve_pull_request("acme", "r", 7, "t", viewer_login="someone-else")
 
     assert ei.value.kind == "self_approval"
-
-
-# --- create ---------------------------------------------------------------
 
 
 def test_create_posts_the_title_head_and_base():
@@ -370,9 +312,8 @@ def test_create_posts_the_title_head_and_base():
 
 
 def test_create_omits_base_entirely_when_the_caller_named_none():
-    """NO stage-shaped default (D8): a tenant's branch set is open, so an omitted base means
-    'the repository's own default branch' — resolved by the PROVIDER, never guessed here. A
-    literal default would be the same hardcode the design forbids one layer down."""
+    """An omitted base means the repository's own default branch, resolved by the provider; an
+    absent body is absent, not an empty comment."""
     seen = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -384,14 +325,10 @@ def test_create_omits_base_entirely_when_the_caller_named_none():
     )
 
     assert "base" not in seen["body"]
-    # An absent body is absent, not an empty string GitHub would render as a blank comment.
     assert "body" not in seen["body"]
 
 
 def test_create_maps_a_duplicate_pr_to_conflict():
-    """A PR for that branch pair already exists — an ordinary state the UI renders, never a
-    server fault."""
-
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(
             422, json={"errors": [{"message": "A pull request already exists for acme:x."}]}
@@ -406,16 +343,8 @@ def test_create_maps_a_duplicate_pr_to_conflict():
 
 
 def test_create_maps_no_commits_between_the_branches_to_its_own_kind():
-    """The 422 an operator meets by ACCIDENT — opening a PR from a branch that is not ahead.
-
-    Found live: this bucketed into ``conflict``, whose copy told the operator a pull request may
-    already exist and the branch may have moved. Neither was true (the repo had zero PRs), so the
-    surface asserted two causes it had never established. Its own kind is what lets the UI state
-    the one cause GitHub actually gave.
-
-    Note WHERE GitHub says it: ``errors[].message``, not ``message`` — which is why
-    ``_message_of`` concatenates both. A matcher reading only ``message`` would see nothing here
-    and silently fall back to the generic bucket, restoring the defect."""
+    """GitHub states it in ``errors[].message``, not ``message``; the classification crosses and
+    the body text does not."""
 
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -432,12 +361,8 @@ def test_create_maps_no_commits_between_the_branches_to_its_own_kind():
         )
 
     assert ei.value.kind == "no_commits"
-    # …and it still carries no provider text: the classification crosses, the body does not.
     assert "main" not in str(ei.value)
     assert "dev" not in str(ei.value)
-
-
-# --- merge ----------------------------------------------------------------
 
 
 def test_merge_puts_to_the_merge_endpoint_and_returns_the_fresh_view():
@@ -473,9 +398,7 @@ def test_merge_maps_each_provider_refusal_to_its_own_kind(status, kind):
 
 
 def test_a_merge_failure_never_carries_the_provider_body():
-    """SAFE HINT ONLY. A provider body can echo attacker-influenced content, and this epic has
-    already had to truncate a field for carrying an AWS account id."""
-    secret_ish = "Head branch was modified by 111122223333/acme"
+    secret_ish = f"Head branch was modified by {ACCOUNT_SHAPED}/acme"
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.method == "PUT":
@@ -487,20 +410,11 @@ def test_a_merge_failure_never_carries_the_provider_body():
 
     text = str(ei.value)
     assert secret_ish not in text
-    assert "111122223333" not in text
-    # …and it is still a usable hint, not an empty string.
+    assert ACCOUNT_SHAPED not in text
     assert len(text) > 10
 
 
-# --- the capability probe (A3) --------------------------------------------
-
-
 def test_a_403_on_the_list_is_the_missing_grant_signal():
-    """The org's App installation may not carry ``pull_requests: write`` — a MANUAL per-org
-    grant that GitHub does not retro-apply from a manifest change. GitHub answers 403
-    ("Resource not accessible by integration"), and that is the signal the frontend resolves to
-    a HIDDEN tab. It must be its own kind, distinguishable from every other failure."""
-
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"message": "Resource not accessible by integration"})
 
@@ -521,9 +435,6 @@ def test_a_404_on_the_list_is_not_found_not_a_missing_grant():
 
 
 def test_a_transport_failure_is_a_provider_error_and_names_no_url():
-    """A transport exception's args can carry a URL with auth material, so only the exception
-    TYPE crosses — the ``github_repo_service`` / ``github_user_oauth`` rule."""
-
     def handler(req: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("failed to connect to https://x?token=ghu_leak")
 
@@ -536,7 +447,6 @@ def test_a_transport_failure_is_a_provider_error_and_names_no_url():
 
 
 def test_no_error_message_anywhere_carries_the_token():
-    """Every failure path, one assertion: the credential is never folded into a message."""
     token = "ghu_super_secret_value"
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -558,21 +468,9 @@ def test_no_error_message_anywhere_carries_the_token():
         assert "ghu_" not in str(ei.value)
 
 
-# --- the structural no-App-token guard ------------------------------------
-
-
 def test_the_service_module_cannot_reach_an_app_token():
-    """NO APP-TOKEN FALLBACK, made structural rather than promised (D15).
-
-    AGP holds an org-scoped App installation token that can open and approve PRs as *itself*.
-    If this module could reach one, a broken user link could silently fall back to it — and
-    since the App is never the author, the self-approval refusal above would be bypassed
-    entirely: AGP would approve a human's own PR on their behalf.
-
-    So the module takes its token as a PARAMETER and has no way to mint or load one. Asserted
-    over the RAW source (no lowercasing, no comment stripping — a normalization step is how a
-    guard stops seeing what it guards), because an import added later is exactly the change a
-    reviewer would have to catch by eye."""
+    """Asserted over the raw source, because an import added later is exactly the change a
+    reviewer would otherwise have to catch by eye."""
     src = Path("src/services/github_pr_service.py").read_text()
     assert len(src) > 500, "read the real module, not an empty file"
     for forbidden in [
@@ -588,36 +486,117 @@ def test_the_service_module_cannot_reach_an_app_token():
         assert forbidden not in src, f"github_pr_service reaches an App-token seam: {forbidden}"
 
 
-# ===========================================================================
-# Layer 2 — the routes on repositories_router
-# ===========================================================================
+@pytest.mark.parametrize(
+    "kind,status,detail",
+    [
+        ("capability_missing", 403, "pull requests are not enabled for this organization"),
+        ("not_found", 404, "pull request not found"),
+        ("self_approval", 409, "you cannot approve your own pull request"),
+        ("not_approvable", 409, "this pull request cannot be approved"),
+        ("not_mergeable", 409, "this pull request cannot be merged yet"),
+        ("conflict", 409, "GitHub declined the request for this pull request"),
+        ("no_commits", 409, "there are no commits between these branches"),
+        ("provider_error", 502, "GitHub request failed"),
+    ],
+)
+def test_each_kind_renders_its_fixed_detail(kind, status, detail):
+    err = GitHubPrError(f"merge conflict in acme/claims-triage at {ACCOUNT_SHAPED}", kind=kind)
+    assert (err.status_code, err.detail, err.code) == (status, detail, f"github_pr.{kind}")
+    assert ACCOUNT_SHAPED not in str(err.detail)
 
 
-@pytest.fixture(autouse=True)
-def reset_modules():
-    import sys
+def _kinds_declared_in(source: str) -> set[str]:
+    """Every ``kind`` value the module source can produce: an explicit ``kind="…"`` argument at
+    a call site, or the ``kind`` parameter default on ``GitHubPrError.__init__``. Read from the
+    parse tree, so prose mentioning a kind contributes nothing."""
+    tree = ast.parse(source)
+    kinds = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "kind":
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                kinds.add(node.value.value)
+        elif isinstance(node, ast.arguments):
+            named = [*node.posonlyargs, *node.args, *node.kwonlyargs]
+            padding = [None] * (len(node.posonlyargs) + len(node.args) - len(node.defaults))
+            defaults = [*padding, *node.defaults, *node.kw_defaults]
+            for arg, default in zip(named, defaults, strict=True):
+                if arg.arg == "kind" and isinstance(default, ast.Constant) and isinstance(default.value, str):
+                    kinds.add(default.value)
+    return kinds
 
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.projects",
-        "api.routes.users",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
+
+def test_every_kind_the_service_can_produce_is_a_table_row_and_vice_versa():
+    """Compared mechanically in both directions: a new kind with no row would be a ``TypeError``
+    at the raise site, and a row no kind produces is dead copy that reads as live."""
+    source = Path("src/services/github_pr_service.py").read_text()
+    assert len(source) > 500, "read the real module, not an empty file"
+
+    produced = _kinds_declared_in(source)
+    mapped = set(GitHubPrError.kinds)
+
+    assert produced, "the extractor found no kinds at all — it has stopped seeing the module"
+    assert produced - mapped == set(), f"service kinds with no table row: {produced - mapped}"
+    assert mapped - produced == set(), f"table rows no service kind produces: {mapped - produced}"
 
 
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("DEBUG", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
+def test_that_guard_cannot_be_satisfied_by_PROSE_mentioning_a_kind():
+    prose_only = '''
+"""A docstring naming kind="ghost_from_the_docstring" and ``kind`` generally."""
+# A comment naming kind="ghost_from_the_comment".
+value = "kind=ghost_in_a_plain_string"
+'''
+    assert _kinds_declared_in(prose_only) == set()
+
+    assert _kinds_declared_in('raise GitHubPrError("x", kind="real_at_a_call_site")') == {
+        "real_at_a_call_site"
+    }
+    assert _kinds_declared_in('def __init__(self, m, kind: str = "real_as_a_default"): pass') == {
+        "real_as_a_default"
+    }
+    assert _kinds_declared_in('reason = "not_a_kind_at_all"') == set()
+
+
+def test_the_kind_is_keyword_only_and_checked_against_the_table_at_construction():
+    """A positional kind cannot be written at all, and a kind outside the table fails at the raise
+    site rather than shipping as an unmapped 502."""
+    untyped: Any = GitHubPrError
+    with pytest.raises(TypeError):
+        untyped("x", "conflict")
+    with pytest.raises(TypeError, match="new_kind"):
+        GitHubPrError("x", kind="new_kind")
+
+    assert GitHubPrError("x", kind="conflict").kind == "conflict"
+    assert GitHubPrError("x").kind == "provider_error"
+
+
+def test_a_duplicate_pr_422_is_its_own_conflict_subclass():
+    """Studio tells "a PR already exists" from every other 422; the kind is unchanged."""
+
+    def dup(req):
+        return httpx.Response(
+            422,
+            json={
+                "message": "Validation Failed",
+                "errors": [{"message": "A pull request already exists for acme:studio/x."}],
+            },
+        )
+
+    with pytest.raises(GitHubPrDuplicateError) as exc:
+        _svc(dup).create_pull_request(
+            "acme", "r", "t", viewer_login=VIEWER_LOGIN, title="t", head="studio/x", base=None, body=None
+        )
+    assert exc.value.kind == "conflict"
+
+    def other(req):
+        return httpx.Response(
+            422, json={"message": "Validation Failed", "errors": [{"message": "head invalid"}]}
+        )
+
+    with pytest.raises(GitHubPrError) as exc:
+        _svc(other).create_pull_request(
+            "acme", "r", "t", viewer_login=VIEWER_LOGIN, title="t", head="studio/x", base=None, body=None
+        )
+    assert exc.value.kind == "conflict" and not isinstance(exc.value, GitHubPrDuplicateError)
 
 
 def _project(id="prj-1", tenant_id="default"):
@@ -709,10 +688,9 @@ def _link(login=VIEWER_LOGIN):
 
 @pytest.fixture
 def wired(entra_settings):
-    """The four collaborators the PR routes compose, as MagicMocks on the module globals.
-
-    Defaults are the HAPPY path — a visible project, a repo under it, a live GitHub link, and
-    a PR service that answers — so each test perturbs exactly one of them."""
+    """The four collaborators the PR routes compose, as MagicMocks on the module globals, on the
+    happy path: a visible project, a repo under it, a live GitHub link and a PR service that
+    answers. Each test perturbs exactly one."""
     import api.routes.projects as projects_module
 
     project_svc = MagicMock()
@@ -744,27 +722,28 @@ def wired(entra_settings):
     }
 
 
-def _client(wired, *, project_role="maintainer", is_global=False):
-    import api.routes.projects as projects_module
+def _client(wired, *, project_role: str | None = "maintainer", is_global=False):
+    import api.routes.repositories as repositories_module
     import api.routes.users as users_module
+    from core.errors import install_error_handlers
 
     users_module._tenant_resolver = _FakeTenantResolver(_tenant_context())
     users_module._project_resolver = _FakeProjectResolver(
         _project_context(is_global=is_global, role=project_role)
     )
     app = FastAPI()
-    app.include_router(projects_module.repositories_router, prefix="/api/v1")
+    install_error_handlers(app)
+    app.include_router(repositories_module.repositories_router, prefix="/api/v1")
     return TestClient(app, headers={"Authorization": "Bearer fake-token"})
 
 
-def _call(wired, method, path, body=None, *, project_role="maintainer", is_global=False):
+def _call(wired, method, path, body=None, *, project_role: str | None = "maintainer", is_global=False):
     client = _client(wired, project_role=project_role, is_global=is_global)
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims()
-    ), patch("api.routes.connections.get_connection_service", return_value=wired["connection"]), patch(
-        "api.routes.github_link.get_github_link_service", return_value=wired["link"]
-    ), patch(
-        "api.routes.projects.get_pr_service", return_value=wired["pr"]
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims()),
+        patch("api.routes.connections.get_connection_service", return_value=wired["connection"]),
+        patch("api.routes.github_link.get_github_link_service", return_value=wired["link"]),
+        patch("api.routes.repositories.get_pr_service", return_value=wired["pr"]),
     ):
         return getattr(client, method)(path, **({"json": body} if body is not None else {}))
 
@@ -778,7 +757,7 @@ CREATE_BODY = {"title": "t", "head": "feature/x"}
 def _view(**over):
     from models.repository import PullRequestView
 
-    payload = {
+    payload: dict[str, Any] = {
         "number": 7,
         "title": "Raise the threshold",
         "state": "open",
@@ -791,18 +770,15 @@ def _view(**over):
     return PullRequestView(**payload)
 
 
-# --- the paths match the pinned client calls (A1) -------------------------
-
-
 def test_the_four_routes_are_mounted_at_the_pinned_paths():
-    """C2 + A1: these four paths are what ``client.ts``'s ``pullRequestsApi`` already calls.
-    They 404'd until this task mounted them; if a path here drifts, the frontend 404s again and
-    nothing else notices."""
-    import api.routes.projects as projects_module
+    """These four paths are what the frontend's ``pullRequestsApi`` calls; a drift here 404s the
+    frontend and nothing else notices."""
+    import api.routes.repositories as repositories_module
 
     mounted = {
         (m, r.path)
-        for r in projects_module.repositories_router.routes
+        for r in repositories_module.repositories_router.routes
+        if isinstance(r, APIRoute)
         for m in getattr(r, "methods", set())
     }
     assert ("GET", "/repositories/{repo_id}/pull-requests") in mounted
@@ -812,40 +788,39 @@ def test_the_four_routes_are_mounted_at_the_pinned_paths():
 
 
 def test_create_answers_201():
-    import api.routes.projects as projects_module
+    import api.routes.repositories as repositories_module
 
     route = next(
         r
-        for r in projects_module.repositories_router.routes
+        for r in repositories_module.repositories_router.routes
         if getattr(r, "path", "") == "/repositories/{repo_id}/pull-requests"
         and "POST" in getattr(r, "methods", set())
     )
+    assert isinstance(route, APIRoute)
     assert route.status_code == 201
 
 
 def test_the_four_pr_routes_carry_a_gate_identical_to_the_routers_existing_read():
-    """Mechanical, not by eye. ``GET /repositories`` is the sibling already on this router; two
-    reads of one resource must not carry different guards, because whichever is looser IS the
-    gate (D3 — guards compose on one handler, never clone a route to change one). A hand-copied
-    gate is exactly how a pair drifts."""
-    import api.routes.projects as projects_module
+    """Two reads of one resource must not carry different guards, because whichever is looser is
+    the gate; compared mechanically against ``GET /repositories``."""
+    import api.routes.repositories as repositories_module
     from core.rbac import Role
 
     def deps(path, method):
         route = next(
             r
-            for r in projects_module.repositories_router.routes
+            for r in repositories_module.repositories_router.routes
             if getattr(r, "path", "") == path and method in getattr(r, "methods", set())
         )
+        assert isinstance(route, APIRoute)
         out = []
         for d in route.dependant.dependencies:
+            assert d.call is not None
             captured = tuple(c.cell_contents for c in (d.call.__closure__ or ()))
             out.append((d.name, d.call.__qualname__, captured))
         return out
 
     existing = deps("/repositories", "GET")
-    # Guards this against a vacuous pass: the existing read really does carry all four halves,
-    # and the role half really did capture OPERATOR.
     assert len(existing) == 4
     assert [d[0] for d in existing] == ["principal", "ctx", "pctx", "_"]
     assert existing[3][2] == (Role.OPERATOR,)
@@ -859,13 +834,9 @@ def test_the_four_pr_routes_carry_a_gate_identical_to_the_routers_existing_read(
         assert deps(path, method) == existing, f"{method} {path} carries a different gate"
 
 
-# --- the gate --------------------------------------------------------------
-
-
 def test_a_foreign_tenants_repo_is_byte_identically_absent(wired):
-    """404-not-403: a repo whose parent project belongs to another tenant must look ABSENT, and
-    identically so to a truly-missing id — a 403 would confirm it exists. And no provider call
-    happens before the gate has run."""
+    """A repo in another tenant looks absent, identically to a missing id, and no credential is
+    resolved and no provider call happens before the gate has run."""
     wired["project"].get_project.return_value = ProjectDetail(
         project=_project(tenant_id="ten-other"), repositories=[]
     )
@@ -879,7 +850,6 @@ def test_a_foreign_tenants_repo_is_byte_identically_absent(wired):
     assert foreign.json() == missing.json()
     assert foreign.json()["detail"] == "Repository not found"
     wired["pr"].list_pull_requests.assert_not_called()
-    # …and no credential was even resolved for a repo the caller may not see.
     wired["link"].get_user_bearer_token.assert_not_called()
 
 
@@ -893,13 +863,11 @@ def test_a_repo_whose_project_vanished_is_absent_not_a_500(wired):
 
 
 def test_reading_the_list_needs_viewer_and_writing_needs_maintainer(wired):
-    """A read is a VIEWER act; opening, approving and merging a PR are MAINTAINER acts — the
-    same threshold ``retry`` carries, and deliberately NOT promote's strict OWNER: a merge to
-    the default branch registers a prod CANDIDATE, which still needs an OWNER's promote. So
-    this cannot be a bypass of the prod gate."""
+    """The same threshold ``retry`` carries, not promote's strict OWNER: a merge registers a prod
+    candidate that still needs an OWNER's promote."""
     wired["pr"].list_pull_requests.return_value = [_view()]
     wired["pr"].create_pull_request.return_value = _view()
-    wired["role"].has_role_rows.return_value = True  # governed ⇒ no §3 fallback
+    wired["role"].has_role_rows.return_value = True
 
     assert _call(wired, "get", LIST_URL, project_role="viewer").status_code == 200
     for method, url, body in [
@@ -913,8 +881,6 @@ def test_reading_the_list_needs_viewer_and_writing_needs_maintainer(wired):
 
 
 def test_a_viewer_cannot_reach_the_provider_at_all(wired):
-    """The refusal lands BEFORE the credential is resolved and before GitHub is called — a
-    403 that has already opened a PR is not a refusal."""
     wired["role"].has_role_rows.return_value = True
 
     _call(wired, "post", LIST_URL, CREATE_BODY, project_role="viewer")
@@ -931,13 +897,7 @@ def test_a_platform_admin_needs_no_project_role(wired):
     assert resp.status_code == 200
 
 
-# --- NO APP-TOKEN FALLBACK, at the composition layer ----------------------
-
-
 def test_the_only_credential_that_reaches_the_service_is_the_linked_users(wired):
-    """Composition-layer half of the D15 invariant. The service takes its token as a parameter;
-    THIS asserts which token the route actually hands it, and that the App-token seam
-    (``ConnectionService.get_bearer_token``) is never touched on any PR path."""
     wired["pr"].list_pull_requests.return_value = [_view()]
 
     assert _call(wired, "get", LIST_URL).status_code == 200
@@ -949,40 +909,38 @@ def test_the_only_credential_that_reaches_the_service_is_the_linked_users(wired)
 
 
 def test_a_missing_link_refuses_and_does_NOT_retry_under_an_app_token(wired):
-    """The refusal this whole task is shaped around. A human with no GitHub link cannot act as
-    themselves — so AGP does nothing, rather than acting as ITSELF. Falling back to the App
-    token would let AGP approve a human's own PR (the App is never the author), which silently
-    defeats the self-approval refusal entirely."""
-    from services.github_user_link import GitHubLinkError
-
-    wired["link"].get_user_bearer_token.side_effect = GitHubLinkError("no row", kind="not_found")
+    """A human with no GitHub link cannot act as themselves, so AGP does nothing rather than
+    acting as itself: the route reads the caller's link rows, finds none for this connection and
+    refuses before any token is resolved."""
+    wired["link"].list_for_principal.return_value = []
 
     resp = _call(wired, "get", LIST_URL)
 
     assert resp.status_code == 409
     assert "GitHub account" in resp.json()["detail"]
-    # NOT retried under any other credential, and the provider was never reached.
+    wired["link"].get_user_bearer_token.assert_not_called()
     wired["connection"].get_bearer_token.assert_not_called()
     wired["pr"].list_pull_requests.assert_not_called()
 
 
 def test_a_revoked_link_refuses_the_same_way(wired):
-    from services.github_user_link import GitHubLinkError
+    from models.github_link import LinkStatus
 
-    wired["link"].get_user_bearer_token.side_effect = GitHubLinkError(
-        "revoked", kind="link_revoked"
-    )
+    revoked = _link()
+    revoked.status = LinkStatus.UNLINKED
+    wired["link"].list_for_principal.return_value = [revoked]
 
     resp = _call(wired, "get", LIST_URL)
 
     assert resp.status_code == 409
+    assert "GitHub account" in resp.json()["detail"]
+    wired["link"].get_user_bearer_token.assert_not_called()
     wired["connection"].get_bearer_token.assert_not_called()
 
 
 def test_the_viewer_login_comes_from_the_link_row_not_from_the_caller(wired):
-    """``can_approve`` is decided against WHO AGP is acting as, and that is the GitHub login on
-    the E27B link row — a provider currency. It is never derived from the Entra principal, which
-    is a different currency with no mapping to it (E27A §6)."""
+    """``can_approve`` is decided against the GitHub login on the link row, a provider currency,
+    never derived from the Entra principal."""
     wired["pr"].list_pull_requests.return_value = [_view()]
 
     _call(wired, "get", LIST_URL)
@@ -991,26 +949,37 @@ def test_the_viewer_login_comes_from_the_link_row_not_from_the_caller(wired):
 
 
 def test_a_link_on_another_org_is_not_used_for_this_one(wired):
-    """A human may link several orgs. The row for THIS repo's connection is the only one whose
-    login may decide ``can_approve`` — reading another org's login would compare a stranger."""
+    """A link to another org is not a link for this connection: the caller is refused as unlinked and
+    the other org's login never becomes the viewer."""
     other = _link(login="someone-else")
     other.connection_id = "conn-other"
     wired["link"].list_for_principal.return_value = [other]
     wired["pr"].list_pull_requests.return_value = [_view()]
 
-    _call(wired, "get", LIST_URL)
+    resp = _call(wired, "get", LIST_URL)
 
-    assert wired["pr"].list_pull_requests.call_args.kwargs["viewer_login"] == ""
+    assert resp.status_code == 409
+    wired["link"].get_user_bearer_token.assert_not_called()
+    wired["pr"].list_pull_requests.assert_not_called()
 
 
-# --- the capability refusal is a HIDDEN tab, not a 500 (A3) ---------------
+def test_a_vanished_connection_is_the_tabs_502_not_the_connection_tables_404(wired):
+    """The project's connection is gone, so AGP cannot address the provider: the service's
+    ``connection_unavailable`` row, the same 502 "GitHub request failed" the tab keys on, never the
+    connection domain's 404; no token is resolved and GitHub is never reached."""
+    from services.connection_service import ConnectionError
+
+    wired["connection"].get_connection.side_effect = ConnectionError("gone", kind="not_found")
+
+    resp = _call(wired, "get", LIST_URL)
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "GitHub request failed", "code": "github_pr.connection_unavailable"}
+    wired["link"].get_user_bearer_token.assert_not_called()
+    wired["pr"].list_pull_requests.assert_not_called()
 
 
 def test_a_missing_org_grant_is_a_mapped_403_never_a_500(wired):
-    """The org's App installation does not carry ``pull_requests: write`` — a MANUAL per-org
-    grant GitHub does not retro-apply. It must answer ONE fixed literal the frontend resolves
-    to a HIDDEN tab. An unmapped kind would be a 500, which renders a BROKEN tab instead of no
-    tab — and a broken tab is the outcome the requirement names."""
     wired["pr"].list_pull_requests.side_effect = GitHubPrError("nope", kind="capability_missing")
 
     resp = _call(wired, "get", LIST_URL)
@@ -1020,15 +989,8 @@ def test_a_missing_org_grant_is_a_mapped_403_never_a_500(wired):
 
 
 def test_every_service_kind_is_mapped_so_none_reaches_an_unhandled_500(wired):
-    """The mapping is EXHAUSTIVE by test. An UNMAPPED kind escapes as an unhandled 500, and on
-    the list read that is precisely the crash the hidden-tab requirement forbids.
-
-    ``provider_error`` is deliberately the ONE kind that answers 5xx, and it answers **502** —
-    the house idiom (``github_link.py``'s ``_ERROR_STATUS``) for "the upstream failed". That is
-    honest and is not the failure this requirement is about: a real GitHub outage is not a
-    missing grant, and reporting it as a client-side state would tell the operator the tab is
-    unavailable when it is GitHub that is down. What must never be 5xx is the CAPABILITY
-    refusal, asserted separately above and re-asserted here."""
+    """``provider_error`` is deliberately the one 5xx (a real GitHub outage is not a missing
+    grant); the capability refusal is never 5xx."""
     expected = {
         "capability_missing": 403,
         "not_found": 404,
@@ -1043,163 +1005,23 @@ def test_every_service_kind_is_mapped_so_none_reaches_an_unhandled_500(wired):
         wired["pr"].list_pull_requests.side_effect = GitHubPrError("x", kind=kind)
         resp = _call(wired, "get", LIST_URL)
         assert resp.status_code == status, f"{kind} answered {resp.status_code}"
-        # An UNMAPPED kind would fall through to the same fixed 502 as provider_error, which
-        # would make this table vacuous — so assert the mapping really discriminates.
         assert resp.json()["detail"], kind
-    # The hidden-tab case specifically: never 5xx, whatever else changes here.
     assert expected["capability_missing"] < 500
 
 
-# --- the mechanical kind ↔ mapping guard ----------------------------------
-
-
-def _kinds_declared_in(source: str) -> "set[str]":
-    """Every ``kind`` VALUE the given module source can actually produce.
-
-    Reads the PARSE TREE, not the text. That choice is the whole guard: E28 shipped five
-    source-as-text guards that their own explanatory comment defeated, because a comment quoting
-    the forbidden string satisfied the substring search. A comment cannot be a ``keyword`` node,
-    so prose mentioning a kind — including this docstring — contributes nothing.
-
-    THREE producing forms, because the module uses all three:
-
-    1. An explicit ``kind="…"`` argument at a call site.
-    2. The ``kind`` PARAMETER DEFAULT on ``GitHubPrError.__init__`` — a raise that passes no kind
-       still produces that value, so a guard blind to it would miss a renamed default.
-    3. Strings assigned to a local named ``kind``, which is how ``approve_pull_request`` picks
-       between ``self_approval`` and ``not_approvable`` with a conditional expression before
-       passing ``kind=kind``. The first version of this guard saw only forms 1 and 2 and reported
-       ``not_approvable`` as a dead mapping entry — a false accusation, and proof that a
-       narrower extractor is not a safer one."""
-    tree = ast.parse(source)
-    kinds = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.keyword) and node.arg == "kind":
-            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                kinds.add(node.value.value)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(t, ast.Name) and t.id == "kind" for t in targets):
-                for inner in ast.walk(node.value) if node.value is not None else []:
-                    if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
-                        kinds.add(inner.value)
-        elif isinstance(node, ast.arguments):
-            named = [*node.posonlyargs, *node.args, *node.kwonlyargs]
-            defaults = [
-                *([None] * (len(node.posonlyargs) + len(node.args) - len(node.defaults))),
-                *node.defaults,
-                *node.kw_defaults,
-            ]
-            for arg, default in zip(named, defaults):
-                if (
-                    arg.arg == "kind"
-                    and isinstance(default, ast.Constant)
-                    and isinstance(default.value, str)
-                ):
-                    kinds.add(default.value)
-    return kinds
-
-
-def test_every_kind_the_service_can_produce_has_a_route_mapping_and_vice_versa():
-    """The mapping above is EXHAUSTIVE by hand, and that is not enough on its own.
-
-    ``_raise_pr_error`` does ``_PR_ERROR.get(err.kind, _PR_ERROR["provider_error"])``, so a NEW
-    service kind with no entry does not fail loudly — it silently becomes the 502 "GitHub request
-    failed", which the frontend renders as "GitHub could not be reached. Nothing was changed."
-    That is a fresh honesty defect of exactly the class this task removed: a surface stating a
-    cause nobody established. The hand-maintained table in the test above would still pass,
-    because it only checks the kinds it happens to list.
-
-    So the two sets are compared MECHANICALLY, in both directions. The reverse direction matters
-    too: a mapping entry no kind produces is dead copy that reads as live."""
-    import api.routes.projects as projects_module
-
-    source = Path("src/services/github_pr_service.py").read_text()
-    assert len(source) > 500, "read the real module, not an empty file"
-
-    produced = _kinds_declared_in(source)
-    mapped = set(projects_module._PR_ERROR)
-
-    assert produced, "the extractor found no kinds at all — it has stopped seeing the module"
-    assert produced - mapped == set(), (
-        f"service kinds with no _PR_ERROR entry (they silently become a 502): {produced - mapped}"
-    )
-    assert mapped - produced == set(), (
-        f"_PR_ERROR entries no service kind produces: {mapped - produced}"
-    )
-
-
-def test_that_guard_cannot_be_satisfied_by_PROSE_mentioning_a_kind():
-    """The failure mode that defeated five of E28's guards, asserted against directly.
-
-    A comment or docstring quoting a kind must contribute NOTHING — otherwise documenting a kind
-    would be indistinguishable from producing one, and the guard above would pass on a module
-    that only talks about the kind it forgot to map. Also pins the two forms that DO count, so
-    the extractor cannot regress to matching nothing at all (a guard that sees nothing passes
-    everything)."""
-    prose_only = '''
-"""A docstring naming kind="ghost_from_the_docstring" and ``kind`` generally."""
-# A comment naming kind="ghost_from_the_comment".
-value = "kind=ghost_in_a_plain_string"
-'''
-    assert _kinds_declared_in(prose_only) == set()
-
-    assert _kinds_declared_in('raise GitHubPrError("x", kind="real_at_a_call_site")') == {
-        "real_at_a_call_site"
-    }
-    assert _kinds_declared_in('def __init__(self, m, kind: str = "real_as_a_default"): pass') == {
-        "real_as_a_default"
-    }
-    # Form 3 — the conditional local ``approve_pull_request`` actually uses. Both arms count:
-    # either can reach the raise, so seeing only one would report the other as dead copy.
-    assert _kinds_declared_in('kind = "left_arm" if flag else "right_arm"') == {
-        "left_arm",
-        "right_arm",
-    }
-    # …and a string assigned to some OTHER name is not a kind.
-    assert _kinds_declared_in('reason = "not_a_kind_at_all"') == set()
-
-
-def test_the_kind_cannot_be_passed_POSITIONALLY_so_the_guard_has_no_SECOND_DOOR():
-    """``kind`` is keyword-only, which is what makes the guard above STRUCTURALLY complete.
-
-    The extractor sees ``kind=`` keywords, the parameter default, and strings assigned to a local
-    named ``kind``. It cannot see ``GitHubPrError("x", "new_kind")`` — with a positional-capable
-    signature that is ordinary Python, the extractor returns ``set()`` for it, the guard passes,
-    and the unmapped kind silently ships the 502 "GitHub request failed" on a request GitHub
-    answered perfectly well. That is the exact honesty defect the guard exists to prevent,
-    reachable through a door the guard does not watch.
-
-    Closing it at the signature is stronger than teaching the extractor a fourth form: the
-    positional call cannot be written at all, so the three forms are exhaustive by construction
-    rather than by convention."""
-    with pytest.raises(TypeError):
-        GitHubPrError("x", "new_kind")  # type: ignore[misc]
-
-    # The keyword form is unaffected — every call site in src/ and tests/ uses it.
-    assert GitHubPrError("x", kind="new_kind").kind == "new_kind"
-    # …and the default still applies when omitted.
-    assert GitHubPrError("x").kind == "provider_error"
-
-
 def test_the_detail_never_echoes_the_service_message(wired):
-    """FIXED literals keyed off ``.kind`` — never ``str(err)``, the repo-wide rule. A provider
-    message must not become an HTTP body."""
     wired["pr"].list_pull_requests.side_effect = GitHubPrError(
-        "merge conflict in acme/claims-triage at 111122223333", kind="conflict"
+        f"merge conflict in acme/claims-triage at {ACCOUNT_SHAPED}", kind="conflict"
     )
 
     resp = _call(wired, "get", LIST_URL)
 
-    assert "111122223333" not in resp.json()["detail"]
+    assert ACCOUNT_SHAPED not in resp.json()["detail"]
     assert "acme" not in resp.json()["detail"]
 
 
 def test_a_self_approval_is_refused_with_a_reason_and_no_retry(wired):
-    """D15 at the route: a 409 the UI states calmly, and NOTHING retried underneath it."""
-    wired["pr"].approve_pull_request.side_effect = GitHubPrError(
-        "own PR", kind="self_approval"
-    )
+    wired["pr"].approve_pull_request.side_effect = GitHubPrError("own PR", kind="self_approval")
 
     resp = _call(wired, "post", APPROVE_URL)
 
@@ -1211,26 +1033,20 @@ def test_a_self_approval_is_refused_with_a_reason_and_no_retry(wired):
 
 def test_a_merge_refusal_surfaces_a_safe_hint(wired):
     wired["pr"].merge_pull_request.side_effect = GitHubPrError(
-        "Head branch was modified by 111122223333", kind="not_mergeable"
+        f"Head branch was modified by {ACCOUNT_SHAPED}", kind="not_mergeable"
     )
 
     resp = _call(wired, "post", MERGE_URL)
 
     assert resp.status_code == 409
     detail = resp.json()["detail"]
-    assert "111122223333" not in detail
+    assert ACCOUNT_SHAPED not in detail
     assert detail == "this pull request cannot be merged yet"
 
 
-# --- the happy paths ------------------------------------------------------
-
-
 def test_the_list_returns_the_view_shape_the_client_declares(wired):
-    """Field-for-field the shape ``client.ts:1056-1074`` declares (A1) — the pin. A field
-    renamed here is a field the frontend silently reads as ``undefined``."""
-    wired["pr"].list_pull_requests.return_value = [
-        _view(approve_blocked_reason=None, mergeable=None)
-    ]
+    """Field for field the shape the frontend declares; a renamed field reads as ``undefined``."""
+    wired["pr"].list_pull_requests.return_value = [_view(approve_blocked_reason=None, mergeable=None)]
 
     resp = _call(wired, "get", LIST_URL)
 
@@ -1245,15 +1061,14 @@ def test_the_list_returns_the_view_shape_the_client_declares(wired):
         "can_approve",
         "approve_blocked_reason",
         "mergeable",
+        "merge_commit_sha",
     }
 
 
 def test_create_forwards_the_body_and_answers_201(wired):
     wired["pr"].create_pull_request.return_value = _view()
 
-    resp = _call(
-        wired, "post", LIST_URL, {"title": "t", "head": "feature/x", "base": "release", "body": "b"}
-    )
+    resp = _call(wired, "post", LIST_URL, {"title": "t", "head": "feature/x", "base": "release", "body": "b"})
 
     assert resp.status_code == 201
     kwargs = wired["pr"].create_pull_request.call_args.kwargs
@@ -1291,9 +1106,8 @@ def test_the_pr_number_is_a_path_param_the_route_forwards(wired):
 
 
 def test_the_org_and_repo_name_come_from_the_records_never_the_caller(wired):
-    """The provider coordinates are RESOLVED server-side from the repository record and its
-    project's connection. Accepting either from the caller would make this a
-    write-to-any-repo primitive under a human's own token."""
+    """Accepting either from the caller would make this a write-to-any-repo primitive under a
+    human's own token."""
     wired["pr"].list_pull_requests.return_value = [_view()]
 
     _call(wired, "get", LIST_URL)

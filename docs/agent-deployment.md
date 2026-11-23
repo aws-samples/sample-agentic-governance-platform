@@ -33,6 +33,11 @@ calling repository owns the agent it named, and that the image tag belongs to th
 registry is shared by every agent, so the tag is the only boundary between them. Deployment state is
 kept per agent and per stage, so a production deployment cannot quietly mutate the dev runtime.
 
+This path is **AWS-only**, and the platform says so rather than trying. A deployment named against a
+Databricks tenant is refused: a Databricks-governed agent already runs in the customer's workspace, and
+the platform governs it there instead of building a runtime for it — see
+[Databricks account onboarding](databricks-onboarding.md).
+
 ## Why GitHub can never deploy
 
 GitHub holds no long-lived AWS key and no platform user's credential. It can ask for a short-lived,
@@ -91,6 +96,12 @@ you what happened after that.
   deployment's infrastructure definitions. Changing either is a platform update, and it must be
   rolled out before the next push; a commit in the agent's repository cannot change how that agent is
   deployed. Until the rollout happens, deployments keep running the previous instructions.
+- **GitHub can only tell the platform if it knows the address.** The request in step 3 goes to the
+  `AGP_API_URL` Actions variable, which the platform writes on every repository it creates from the
+  `agp_api_url` Terraform setting — the API Gateway URL plus `/api/v1`, filled in by a second apply
+  (step 4 of the root README). Left empty, creating the repository fails at its "Set repository CI
+  variables" step and names the setting; before 2026-10-14 the failure was silent — the image was
+  pushed and nothing was deployed.
 - **Only dev deploys automatically.** There is no approval queue, no scheduled release, and no
   automatic promotion on green. Every production release needs a project owner at a console.
 - **Recording the runtime's address is the one write that must not fail**, so the build treats it as

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Re-register the genuinely-wired AGP registry records into the NEW ``agent-registry``
-namespace (Epic 32, Task 8).
+namespace.
 
 THIS IS A LIVE-WRITE CONTROLLER STEP. It is not run by automation: the controller runs it
 once, under explicit authorisation, and only after a ``--dry-run`` pass has been read. In
@@ -40,7 +40,7 @@ AWS moved the Registry off the ``bedrock-agentcore`` namespace onto its own
 migration tool mints NEW recordIds — and in AGP the ``recordId`` IS the agent's identity
 across FIVE external systems (the Entra identifier URI ``api://agp-agent-<id>``, the
 DynamoDB mirror rows, the ECR image-tag prefixes, the Cedar policy-engine names, and the
-Langfuse project names). Rather than rewrite all five to chase a remapped id, E32
+Langfuse project names). Rather than rewrite all five to chase a remapped id, the platform
 RE-REGISTERS only the records that carry real wiring, so each one gets a FRESH,
 self-consistent identity, and re-seeds the demo data from ``seed_agents.py`` /
 ``seed_mcp_servers.py``.
@@ -60,14 +60,14 @@ duplicates whose replacements are already APPROVED.
 
 THE ONE PLACE BOTH NAMESPACES COEXIST
 -------------------------------------
-READS come from the OLD namespace through an explicit ``boto3.client(
+READS come from the OLD namespace through an explicit ``core.aws_clients.client(
 "bedrock-agentcore-control")`` built right here (:func:`read_old_records`), using the OLD
 record schema: ``descriptors.custom.inlineContent`` for agents and
 ``descriptors.mcp.server.inlineContent`` / ``descriptors.mcp.tools.inlineContent`` for MCP
 servers, with ``descriptorType`` still a discrete ``ListRegistryRecords`` kwarg.
 
 WRITES go through AGP's OWN service layer (``AgentRegistryService`` /
-``McpServerRegistryService``), which E32 Tasks 2-3 already pointed at
+``McpServerRegistryService``), which are already pointed at
 ``agent-registry-control`` and the new ``data``/``mcpServer`` descriptor shape. Those
 services are NOT repointed by this script, and no second write path is built: the whole
 value of driving the service layer is that the new records are written by the exact code
@@ -98,11 +98,11 @@ this script contains no call to ``apply_agent_mcp_grant`` or ``delete_agent_app`
 path. Why each one cannot work from here follows directly from the section above:
 
   - ``--apply-grants`` — ``services.agent_mcp_grant.apply_agent_mcp_grant(agent, mcp)``
-    (E7/E9) uses ``agent.entra_sp_id`` as the Graph grant principal. ``entra_sp_id`` is
+    uses ``agent.entra_sp_id`` as the Graph grant principal. ``entra_sp_id`` is
     SERVICE-WRITTEN by ``provision()`` and is not a field on ``AgentCreate``, so a record
     created here can NEVER carry one: every grant would be skipped, 100% of the time.
   - ``--delete-old-apps`` — ``services.graph_service.GraphService.delete_agent_app(
-    entra_app_id=…, entra_sp_id=…)`` (E23) would delete the superseded app while the
+    entra_app_id=…, entra_sp_id=…)`` would delete the superseded app while the
     replacement record has no identity at all. That is not a race it might win; it is the
     certain destruction of the only working identity for that wiring.
 
@@ -153,51 +153,12 @@ import sys
 
 logger = logging.getLogger("reregister_records")
 
-# OLD-namespace record constants. ``descriptorType`` was a discrete ListRegistryRecords
-# kwarg before E32 (the new namespace replaced it with a structured ``filters`` list and
-# renamed the concept to ``recordType``) — the READ path here must use the OLD spelling.
 _OLD_DESCRIPTOR_TYPE = {"agent": "CUSTOM", "mcp": "MCP"}
-
-# The governance envelope key inside an MCP record's server.json. Unchanged by E32.
 _ENVELOPE_KEY = "com.agp/governance"
-
-# Native statuses that are never re-registered. A DEPRECATED record is by definition
-# superseded; the ones live today are pre-rebrand duplicates of already-APPROVED records.
 _DROPPED_STATUSES = {"DEPRECATED"}
-
-# The envelope keys that constitute "real wiring" (the build_plan gate).
 _WIRING_KEYS = ("entra_app_id", "agent_arn", "runtime_arn", "gateway_arn")
-
-# Tenant for a record whose envelope predates multi-tenancy (E24) — matches the seeds.
 _DEFAULT_TENANT = "default"
 
-# Envelope keys that must NEVER be replayed onto the new record. The Entra identity block
-# is SERVICE-WRITTEN and belongs to the app registration this run supersedes; copying it
-# would point the new record at an app that is about to be deleted. (They are not fields
-# on AgentCreate/McpServerCreate either, so pydantic would drop them — this list is the
-# explicit statement of intent, not the enforcement.)
-_IDENTITY_KEYS = (
-    "entra_app_id",
-    "entra_api_app_id",
-    "entra_sp_id",
-    "entra_app_audience",
-    "invoker_role_id",
-    "admin_role_id",
-    "identity_status",
-    "oauth2_credential_provider_name",
-    "cedar_policy_engine_id",
-    "cedar_policy_engine_arn",
-    "cedar_enforcement_mode",
-    "langfuse_project_id",
-    "langfuse_key_secret_name",
-    "gateway_id",
-    "gateway_url",
-)
-
-# The two refused flags. Both name post-create work this script structurally cannot do,
-# because `service.create()` provisions no identity (the hook is route-level — see the
-# module docstring). They exit 2 (this script's usage-error code) with the real procedure
-# rather than running and warning, which is what previously hid the defect.
 _APPLY_GRANTS_REFUSAL = (
     "--apply-grants is REFUSED and does nothing. apply_agent_mcp_grant() needs the NEW "
     "record's entra_sp_id as its Graph principal, and a record created through the service "
@@ -221,10 +182,6 @@ _REFUSAL_PROCEDURE = (
 )
 
 
-# ---------------------------------------------------------------------------
-# OLD-namespace read path (explicit bedrock-agentcore-control client)
-# ---------------------------------------------------------------------------
-
 def read_old_records(
     registry_id: str,
     kind: str,
@@ -237,29 +194,32 @@ def read_old_records(
     Returns the ``GetRegistryRecord`` responses with the parsed governance envelope added
     under ``_envelope`` (plus ``_server_json`` / ``_tools`` for MCP records). This is the
     ONLY function in the codebase that still talks to the old namespace, hence the
-    explicit ``boto3.client("bedrock-agentcore-control")`` — the services are pointed at
+    explicit ``core.aws_clients.client("bedrock-agentcore-control")`` — the services are pointed at
     ``agent-registry-control`` and must stay there.
 
     ``control_client`` is injectable so the offline tests never construct a real client.
     boto3 is imported lazily so importing this module needs no AWS credentials.
+    ``descriptorType`` is the OLD namespace's discrete ``ListRegistryRecords`` kwarg (the new
+    one takes a structured ``filters`` list and calls the concept ``recordType``).
 
-    A record whose payload is missing or non-JSON is LOGGED AND SKIPPED — one malformed
-    record must not abort the read of the other 30.
+    A record whose payload is missing or non-JSON, or whose read fails, is LOGGED AND
+    SKIPPED — one malformed record must not abort the read of the other 30.
     """
+    from botocore.exceptions import BotoCoreError, ClientError
+
     if kind not in _OLD_DESCRIPTOR_TYPE:
         raise ValueError(f"kind must be 'agent' or 'mcp', got {kind!r}")
 
     ctl = control_client
     if ctl is None:
-        import boto3
+        from core.aws_clients import client
 
-        ctl = boto3.client("bedrock-agentcore-control", region_name=region)
+        ctl = client("bedrock-agentcore-control", region=region)
 
     record_ids: list[str] = []
     kwargs = {
         "registryId": registry_id,
         "maxResults": 100,
-        # OLD spelling — a discrete kwarg, not a structured filter (see module docstring).
         "descriptorType": _OLD_DESCRIPTOR_TYPE[kind],
     }
     while True:
@@ -271,9 +231,7 @@ def read_old_records(
             break
         kwargs["nextToken"] = token
 
-    logger.info(
-        "read %d %s record id(s) from OLD registry %s", len(record_ids), kind, registry_id
-    )
+    logger.info("read %d %s record id(s) from OLD registry %s", len(record_ids), kind, registry_id)
 
     records: list[dict] = []
     for record_id in record_ids:
@@ -285,10 +243,8 @@ def read_old_records(
                 server_json, tools = _parse_old_mcp_payload(resp)
                 resp["_server_json"] = server_json
                 resp["_tools"] = tools
-                resp["_envelope"] = (
-                    server_json.get("_meta", {}).get(_ENVELOPE_KEY) or {}
-                )
-        except Exception as exc:  # noqa: BLE001 — skip the bad record, keep the run alive
+                resp["_envelope"] = server_json.get("_meta", {}).get(_ENVELOPE_KEY) or {}
+        except (AttributeError, BotoCoreError, ClientError, KeyError, TypeError, ValueError) as exc:
             logger.warning("  skip %s: could not read/parse the record: %s", record_id, exc)
             continue
         records.append(resp)
@@ -320,10 +276,6 @@ def _parse_old_mcp_payload(resp: dict) -> tuple[dict, list]:
     return server_json, tools
 
 
-# ---------------------------------------------------------------------------
-# Plan construction (pure — no AWS, no services)
-# ---------------------------------------------------------------------------
-
 def build_plan(records: list[dict], kind: str) -> list[dict]:
     """Keep only the records that carry REAL WIRING; skip the rest with a logged reason.
 
@@ -335,12 +287,15 @@ def build_plan(records: list[dict], kind: str) -> list[dict]:
     Returns one plan entry per kept record::
 
         {"old_id", "name", "kind", "envelope"[, "purpose"][, "server_json", "tools"]}
+
+    The native ``displayName`` is preferred and ``name`` is the fallback, so a record
+    written before the display name existed still resolves. For agents ``purpose`` is the
+    NATIVE record description; for MCP servers description / version / endpoint live in
+    server.json, with the tools alongside it.
     """
     plan: list[dict] = []
     for record in records:
         old_id = record.get("recordId") or ""
-        # E32 added the native displayName and our writes populate both; prefer it and
-        # fall back to `name` so a record written before the migration still resolves.
         name = record.get("displayName") or record.get("name") or ""
         envelope = record.get("_envelope") or {}
         status = record.get("status")
@@ -372,10 +327,8 @@ def build_plan(records: list[dict], kind: str) -> list[dict]:
             "envelope": envelope,
         }
         if kind == "agent":
-            # `purpose` is the NATIVE record description, not an envelope key.
             entry["purpose"] = record.get("description") or ""
         else:
-            # description / version / endpoint live in server.json, tools alongside it.
             entry["server_json"] = record.get("_server_json") or {}
             entry["tools"] = record.get("_tools") or []
 
@@ -385,10 +338,6 @@ def build_plan(records: list[dict], kind: str) -> list[dict]:
     logger.info("plan: %d of %d %s record(s) will be re-registered", len(plan), len(records), kind)
     return plan
 
-
-# ---------------------------------------------------------------------------
-# Create-payload builders (pure pydantic — no AWS)
-# ---------------------------------------------------------------------------
 
 def _drop_none(fields: dict) -> dict:
     """Drop null values so the model's own defaults apply (an explicit ``None`` would fail
@@ -402,8 +351,10 @@ def _build_agent_create(entry: dict):
 
     Carries the governance metadata and the RESOURCE HANDLES verbatim (``agent_arn`` /
     ``agent_arns`` name runtimes that did not move namespaces). Deliberately omits the
-    Entra identity block (``_IDENTITY_KEYS``) — the new record gets a FRESH identity, from
-    the manual re-provision step — and ``mcp_server_ids``, because the old ids name
+    SERVICE-WRITTEN Entra identity block (``entra_app_id``, ``entra_sp_id``, the role ids,
+    ``identity_status``, the Cedar and Langfuse handles) — it belongs to the app registration
+    this run supersedes, and the new record gets a FRESH identity from the manual
+    re-provision step — and ``mcp_server_ids``, because the old ids name
     OLD-namespace MCP records; the grants are re-applied by hand afterwards (see the module
     docstring).
     """
@@ -425,7 +376,6 @@ def _build_agent_create(entry: dict):
             "origin": envelope.get("origin"),
             "endpoint_url": envelope.get("endpoint_url"),
             "auth_type": envelope.get("auth_type"),
-            # Resource handles — verbatim; these runtimes did not move.
             "agent_arn": envelope.get("agent_arn"),
             "agent_arns": envelope.get("agent_arns"),
             "published": envelope.get("published"),
@@ -440,7 +390,8 @@ def _build_mcp_create(entry: dict):
 
     ``gateway_arn`` / ``runtime_arn`` are copied BYTE-IDENTICALLY: creating an MCP record
     only REFERENCES the gateway, so the new record points at the SAME live gateway and its
-    (unmoved) Cedar policy engine keeps enforcing.
+    (unmoved) Cedar policy engine keeps enforcing. OLD tools use the MCP wire spelling
+    ``inputSchema``; ``McpTool``'s field is ``input_schema``.
     """
     from models.mcp_server import McpServerCreate
 
@@ -449,7 +400,6 @@ def _build_mcp_create(entry: dict):
     remotes = server_json.get("remotes") or []
     endpoint_url = remotes[0].get("url") if remotes and isinstance(remotes[0], dict) else None
 
-    # OLD tools use the MCP wire spelling `inputSchema`; McpTool's field is `input_schema`.
     tools = [
         {
             "name": tool.get("name"),
@@ -473,7 +423,6 @@ def _build_mcp_create(entry: dict):
             "endpoint_url": endpoint_url,
             "version": server_json.get("version"),
             "available_tools": tools,
-            # Resource handles — verbatim; the gateway/runtime did not move.
             "gateway_arn": envelope.get("gateway_arn"),
             "runtime_arn": envelope.get("runtime_arn"),
             "published": envelope.get("published"),
@@ -483,10 +432,6 @@ def _build_mcp_create(entry: dict):
     )
     return McpServerCreate(**fields)
 
-
-# ---------------------------------------------------------------------------
-# The driver
-# ---------------------------------------------------------------------------
 
 def reregister(
     plan: list[dict],
@@ -532,7 +477,6 @@ def reregister(
 
         row = {"old_id": old_id, "new_id": None, "name": name, "kind": kind, "status": "failed"}
 
-        # -- build the payload (pure pydantic; safe in dry-run) ---------------
         try:
             if kind == "agent":
                 payload = _build_agent_create(entry)
@@ -540,13 +484,12 @@ def reregister(
                 payload = _build_mcp_create(entry)
             else:
                 raise ValueError(f"unknown kind {kind!r} (expected 'agent' or 'mcp')")
-        except Exception as exc:  # noqa: BLE001 — report + continue
+        except (KeyError, TypeError, ValueError) as exc:
             logger.error("  %s %r: could not build the create payload: %s", kind, name, exc)
             results.append(row)
             continue
 
         if dry_run:
-            # ZERO WRITES. Nothing below this branch touches a collaborator.
             logger.info(
                 "  [dry-run] WOULD create %s %r (from old id %s) — handles: %s",
                 kind,
@@ -558,7 +501,6 @@ def reregister(
             results.append(row)
             continue
 
-        # -- LIVE: create through the service layer --------------------------
         service = agent_service if kind == "agent" else mcp_service
         try:
             created = service.create(payload, created_by="e32-reregister")
@@ -567,8 +509,8 @@ def reregister(
             row["status"] = "skipped-exists"
             results.append(row)
             continue
-        except Exception as exc:  # noqa: BLE001 — log + continue, don't abort the run
-            logger.error("  failed to create %s %r: %s — continuing", kind, name, exc)
+        except Exception as exc:
+            logger.exception("  failed to create %s %r: %s — continuing", kind, name, exc)
             results.append(row)
             continue
 
@@ -594,10 +536,6 @@ def _handles_summary(envelope: dict) -> str:
     return ", ".join(f"{key}={envelope[key]}" for key in _WIRING_KEYS if envelope.get(key))
 
 
-# ---------------------------------------------------------------------------
-# Summary table
-# ---------------------------------------------------------------------------
-
 def print_summary(results: list[dict], *, dry_run: bool) -> None:
     """Print the old id → new id table to STDOUT (logs go to stderr)."""
     print()
@@ -617,8 +555,6 @@ def print_summary(results: list[dict], *, dry_run: bool) -> None:
     if dry_run:
         print("DRY RUN — nothing was written. Re-run with --live to re-register.")
         return
-    # A created record has NO Entra identity yet (see the module docstring), so the run is
-    # not finished when this script exits. Name the next step where the operator is looking.
     if any(row["status"] == "created" for row in results):
         print(
             "NEXT (manual, once per NEW ID above): POST /api/v1/agents/{new_id}/reprovision "
@@ -627,10 +563,6 @@ def print_summary(results: list[dict], *, dry_run: bool) -> None:
             "only then delete the superseded OLD Entra app registrations."
         )
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -677,13 +609,13 @@ def parse_args(argv=None):
         "--agent-registry-id",
         default=None,
         help="The OLD (bedrock-agentcore) AGENT registry id to read from. Required for "
-             "--kind agent/both. No settings fallback — settings names the NEW registry.",
+        "--kind agent/both. No settings fallback — settings names the NEW registry.",
     )
     parser.add_argument(
         "--mcp-registry-id",
         default=None,
         help="The OLD (bedrock-agentcore) MCP registry id to read from. Required for "
-             "--kind mcp/both. No settings fallback — settings names the NEW registry.",
+        "--kind mcp/both. No settings fallback — settings names the NEW registry.",
     )
     parser.add_argument(
         "--region",
@@ -694,36 +626,34 @@ def parse_args(argv=None):
         "--apply-grants",
         action="store_true",
         help="REFUSED (exit 2). Grants need the NEW record's entra_sp_id, which this "
-             "script can never produce: it drives the service layer, and identity is "
-             "provisioned by a route-level background task. Re-provision each new record "
-             "(POST /api/v1/agents/{id}/reprovision), then apply grants from the UI/API.",
+        "script can never produce: it drives the service layer, and identity is "
+        "provisioned by a route-level background task. Re-provision each new record "
+        "(POST /api/v1/agents/{id}/reprovision), then apply grants from the UI/API.",
     )
     parser.add_argument(
         "--delete-old-apps",
         action="store_true",
         help="REFUSED (exit 2). The new record has no Entra identity when this script "
-             "finishes, so deleting the superseded app would destroy the only working "
-             "identity. Re-provision, re-grant, and only then delete the old apps.",
+        "finishes, so deleting the superseded app would destroy the only working "
+        "identity. Re-provision, re-grant, and only then delete the old apps.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging.")
     return parser.parse_args(argv)
 
 
 def _build_services(region: str):
-    """Construct the two registry services, which Tasks 2-3 pointed at the NEW namespace.
+    """Construct the two registry services, which are pointed at the NEW namespace.
 
-    The DESTINATION registry ids come from settings (so no id is baked into this file).
-    Imported lazily so importing this module triggers no Settings() validation.
+    The DESTINATION registries come from settings, NAME plus optional id, exactly as the
+    running backend constructs them (so no id is baked into this file): the id settings are
+    normally EMPTY, the platform resolves each registry by name at first use, and an
+    explicitly set ``*_REGISTRY_ID`` still wins as an override. Imported lazily so importing
+    this module triggers no Settings() validation.
     """
     from core.config import settings
     from services.agent_registry_service import AgentRegistryService
     from services.mcp_server_service import McpServerRegistryService
 
-    # NAME + optional id, exactly as the running backend constructs these. The id settings are
-    # now normally EMPTY — the platform resolves each registry by name at first use, so nothing
-    # populates them any more — and passing the name is what keeps this script pointed at the
-    # same destination registries the platform writes to. An explicitly-set *_REGISTRY_ID still
-    # wins, since the service treats it as an override.
     agent_service = AgentRegistryService(
         registry_id=getattr(settings, "AGENT_REGISTRY_ID", ""),
         registry_name=getattr(settings, "AGENT_REGISTRY_NAME", ""),
@@ -738,6 +668,7 @@ def _build_services(region: str):
 
 
 def main(argv=None) -> int:
+    """MCP servers are re-registered before agents because an agent's grants reference MCP records."""
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -747,11 +678,6 @@ def main(argv=None) -> int:
 
     dry_run = not args.live
 
-    # REFUSALS FIRST — before any registry id validation, before any client is built, and
-    # before a single AWS or Graph call. Both flags name work this script structurally
-    # cannot do (see the module docstring): they are kept only so that an operator working
-    # from an older runbook is told the correct procedure instead of getting an argparse
-    # "unrecognized arguments" error. There is no implementation behind either one.
     if args.apply_grants or args.delete_old_apps:
         if args.apply_grants:
             logger.error("%s", _APPLY_GRANTS_REFUSAL)
@@ -760,8 +686,6 @@ def main(argv=None) -> int:
         logger.error("%s", _REFUSAL_PROCEDURE)
         return 2
 
-    # MCP servers run BEFORE agents: an agent's grants reference MCP records, so the MCPs
-    # must exist in the new registry first.
     kinds = ["mcp", "agent"] if args.kind == "both" else [args.kind]
     sources = {"agent": args.agent_registry_id, "mcp": args.mcp_registry_id}
     missing = [kind for kind in kinds if not sources[kind]]
@@ -785,13 +709,10 @@ def main(argv=None) -> int:
         args.region,
     )
 
-    # Services are built AFTER validation so a misconfigured invocation constructs no
-    # client at all. In dry-run they are built but never called (the zero-writes contract
-    # lives in reregister(), and the tests assert it on the mocks).
     try:
         agent_service, mcp_service = _build_services(args.region)
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        logger.error("could not construct the registry services: %s", exc)
+    except Exception as exc:
+        logger.exception("could not construct the registry services: %s", exc)
         return 1
 
     results: list[dict] = []
@@ -808,8 +729,8 @@ def main(argv=None) -> int:
                     mcp_service=mcp_service,
                 )
             )
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        logger.error("re-registration failed: %s", exc)
+    except Exception as exc:
+        logger.exception("re-registration failed: %s", exc)
         logger.error(
             "Check that: (1) AWS credentials carry BOTH the old bedrock-agentcore "
             "registry read permissions and the new agent-registry write permissions; "

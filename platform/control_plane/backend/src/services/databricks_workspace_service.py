@@ -1,39 +1,22 @@
-"""The ONE Databricks REST client (E29/T2 — contract C-2).
+"""The one Databricks REST client: token minting, the federated-token exchange, two paginated
+listings, the app-permissions surface (read, additive grant, asserting replace), one SCIM create
+and the account federation policy's audience list. Plain ``httpx`` over a handful of endpoints;
+every request shape is pinned by ``tests/test_databricks_workspace_service.py`` against a fake
+that answers 400 to a drifted form.
 
-Databricks' governed surface is small enough that a whole SDK dependency would be worse than a
-handful of documented request shapes: token minting, the federated-token exchange, two paginated
-listings, the app-permissions surface (read, additive grant, and the asserting replace design §3A
-needs), one SCIM create, and the account federation policy's audience
-list. So this module is plain ``httpx`` over a handful of endpoints, and its request shapes are the
-product — every one of them is pinned by ``tests/test_databricks_workspace_service.py`` against a
-fake that answers 400 to a drifted form.
+Credentials are parameters, never fetched here: this service reads no Secrets Manager entry and
+holds no state, so an adapter cannot widen its own authority, and ``probe_capabilities`` takes
+plain values rather than a ``Tenant``.
 
-DESIGN — credentials are PARAMETERS, never fetched here (contract C-2). This service reads no
-Secrets Manager entry and holds no state: the caller (``tenant_service`` / the provisioning half)
-resolves a workspace's SP secret and passes it in. That is what keeps an adapter from widening its
-own authority, and it is why ``probe_capabilities`` takes plain values rather than a ``Tenant`` —
-which ALSO keeps this task independent of T1's model work (pinned by test).
+A Databricks error body is not safe to propagate: a ``PERMISSION_DENIED`` message names workspace
+paths and principal ids, and an OIDC failure can echo the form back. Every non-2xx becomes a
+``DatabricksError`` whose ``.message`` is composed here from the method, the path and the status,
+and whose ``.kind`` is a code matched against ``_SAFE_KIND``. No secret, JWT, token or upstream
+body reaches a message or a log line.
 
-SECURITY — a Databricks error body is not safe to propagate. A real ``PERMISSION_DENIED`` message
-names workspace paths and principal ids, and an OIDC failure can echo the form back. So every
-non-2xx becomes a ``DatabricksError`` whose ``.message`` is composed HERE from the method, the
-path, and the status, and whose ``.kind`` is a code matched against ``_SAFE_KIND``
-(``^[A-Za-z_]{1,64}$``) — the ``agent_identity_service._safe_probe_detail`` idiom. No secret, JWT,
-token, or upstream body ever reaches a message or a log line.
-
-DEFENSIVE READS — the Apps response field names (``url``, ``oauth2_app_client_id``, the app's
-dedicated service-principal id) are UNVERIFIED against a published schema — the E29 live test is
-what pins the real one. The listings therefore key on ``name`` ONLY, skip a
-record that lacks it (with a logged safe code, never a ``KeyError``), and pass every other field
-through untouched. A discovery listing that crashes on one odd record is worse than one that
-reports the rest.
-
-Mechanics (proven in the E29 live test): Apps and
-serving-endpoint listings require an authenticated workspace client; the federation policy's
-RFC 8693 exchange REQUIRES ``client_id`` for service-principal policies but PROHIBITS it for
-account-wide ones; token acquisition is ``client_credentials`` over HTTP Basic; ACLs are
-level-based; account and workspace hosts differ, and ``apps list`` visibility follows app
-permissions.
+The Apps response field names (``url``, ``oauth2_app_client_id``, the app's service-principal id)
+are read defensively: the listings key on ``name`` only, skip a record that lacks it with a
+counted log line, and pass every other field through untouched.
 """
 
 from __future__ import annotations
@@ -41,80 +24,63 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from typing import Optional, Sequence
+from typing import Literal, Optional, Sequence
 from urllib.parse import quote
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# Explicit timeout on every call. httpx will happily wait forever on some transports, and an
-# unbounded Databricks read would pin a uvicorn worker on a customer's slow workspace.
+# httpx waits without bound on some transports unless every call carries a timeout.
 _HTTP_TIMEOUT_SECONDS = 10.0
 
-# Hard bound on a paginated listing. The exit condition is upstream-controlled, so a workspace
-# that never stops handing out page tokens must not be able to spin a request slot forever.
+# The exit condition of a paginated listing is upstream-controlled.
 _MAX_PAGES = 100
 
-# Databricks' AWS account console — the host for account-level APIs (federation policies,
-# account SPs). NOT a customer value and NOT derivable from the workspace URL (research §5.1),
-# so it is a default the caller may override (Azure/GCP hosts, and tests' fake).
+# Databricks' AWS account console: per-cloud, and not derivable from a workspace URL.
 _DEFAULT_ACCOUNT_HOST = "https://accounts.cloud.databricks.com"
 
-_TOKEN_PATH = "/oidc/v1/token"
+_TOKEN_PATH = "/oidc/v1/token"  # noqa: S105 — a URL path, not a credential; expires 2027-10-23; added E49A-50A/T12
 _APPS_PATH = "/api/2.0/apps"
 _SERVING_ENDPOINTS_PATH = "/api/2.0/serving-endpoints"
 _APP_PERMISSIONS_PATH = "/api/2.0/permissions/apps"
 _SCIM_SERVICE_PRINCIPALS_PATH = "/api/2.0/preview/scim/v2/ServicePrincipals"
 
-# The per-SP OAuth secret sub-resource. PINNED LIVE 2026-08-11 (B2.5): the workspace host
-# serves it under an ``/accounts/`` prefix — ``/api/2.0/accounts/servicePrincipals/{id}/
-# credentials/secrets`` returned 200 with ``{id, secret, secret_hash, status, expire_time}``
-# (secret lifetime ~2 years), while the previously-inferred un-prefixed path 404s. It is a
-# ``{}``-template rather than a prefix so the SCIM id is quoted into ONE segment.
+# The workspace host serves the per-SP secret mint under an ``/accounts/`` prefix; the un-prefixed
+# path 404s. A template so the SCIM id is quoted into one segment.
 _SP_SECRETS_PATH_TEMPLATE = "/api/2.0/accounts/servicePrincipals/{sp_id}/credentials/secrets"
 
 _SCOPE_ALL_APIS = "all-apis"
 _GRANT_CLIENT_CREDENTIALS = "client_credentials"
-_GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
-_SUBJECT_TOKEN_TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt"
+_GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"  # noqa: S105 — an OAuth grant-type URN, not a credential; expires 2027-10-23; added E49A-50A/T12
+_SUBJECT_TOKEN_TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt"  # noqa: S105 — an OAuth token-type URN, not a credential; expires 2027-10-23; added E49A-50A/T12
 
 _SCIM_SP_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:ServicePrincipal"
 _PERMISSION_CAN_USE = "CAN_USE"
 _PERMISSION_CAN_MANAGE = "CAN_MANAGE"
 
-# The three principal kinds an app ACL entry can name, and the response/request key each uses.
-# ONE map, read in both directions (``_ACL_KEY_BY_KIND`` writes, its inverse normalizes reads),
-# so ``get_app_permissions`` and the ``set_app_permissions`` that follows it can never disagree
-# about what a "user" is keyed on. NOTE the scope: ``grant_app_can_use`` keeps its own legacy
-# UUID heuristic for ``kind="group"`` (back-compat), so the invariant covers get/set only.
-_ACL_KEY_BY_KIND = {
-    "user": "user_name",
-    "group": "group_name",
-    "service_principal": "service_principal_name",
+AccessDriftKind = Literal["user", "group", "service_principal"]
+_KIND_BY_ACL_KEY: dict[str, AccessDriftKind] = {
+    "user_name": "user",
+    "group_name": "group",
+    "service_principal_name": "service_principal",
 }
-_KIND_BY_ACL_KEY = {key: kind for kind, key in _ACL_KEY_BY_KIND.items()}
+_ACL_KEY_BY_KIND: dict[str, str] = {kind: key for key, kind in _KIND_BY_ACL_KEY.items()}
 
-# The app ACL vocabulary is CLOSED (research §4). Ranked, because a write shape keeps one level
-# per principal and the strongest must win — a collapse that downgraded a CAN_MANAGE would cost
-# AGP the permission its next write needs.
+# The app ACL vocabulary is closed. Ranked, because a write shape keeps one level per principal
+# and the strongest must win.
 _APP_LEVEL_RANK = {_PERMISSION_CAN_USE: 1, _PERMISSION_CAN_MANAGE: 2}
 
-# The workspace admins group. Design §3A: platform admins stay above the governance layer, so
-# every asserted ACL carries their ``CAN_MANAGE`` — see ``set_app_permissions``.
 _ADMINS_GROUP = "admins"
 _ADMINS_ENTRY = {"principal": _ADMINS_GROUP, "kind": "group", "level": _PERMISSION_CAN_MANAGE}
 
-# Entra's issuer form is ``https://login.microsoftonline.com/{tenantId}/v2.0`` (research §3.3);
-# its presence on an account federation policy is what makes "Entra identities are federated
-# into this account" an honest claim rather than a guess.
+# Entra's issuer form is ``https://login.microsoftonline.com/{tenantId}/v2.0``.
 _ENTRA_ISSUER_MARKER = "login.microsoftonline.com"
 
-# A ``.kind`` may only ever be a short opaque code — see the module docstring. Underscore is
-# allowed because Databricks' own codes are SCREAMING_SNAKE (``PERMISSION_DENIED``).
+# Databricks' own error codes are SCREAMING_SNAKE, hence the underscore.
 _SAFE_KIND = re.compile(r"^[A-Za-z_]{1,64}$")
 
-# Fallback kinds by HTTP status, used when the body carries no usable code.
+# The kind by HTTP status when the body carries no usable code.
 _KIND_BY_STATUS = {
     400: "bad_request",
     401: "unauthorized",
@@ -124,24 +90,14 @@ _KIND_BY_STATUS = {
     429: "rate_limited",
 }
 
-# A UUID-shaped principal is a service principal's application id; anything else is a group
-# name (research §4's ACL entry shapes). Guessing wrong would 400 loudly, not grant silently.
+# A UUID-shaped principal is a service principal's application id; anything else is a group name.
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 def _is_entra_policy(policy: dict) -> bool:
-    """Is this federation policy issued by Entra? The ONE predicate both scan sites share.
-
-    A policy whose ``oidc_policy`` is not a dict is treated as not-an-Entra-policy rather than
-    inspected: ``(p.get("oidc_policy") or {}).get(...)`` raised a bare ``AttributeError`` on a
-    string/list/int value, which escaped ``ensure_federation_audience`` unmapped and — worse — hit
-    ``probe_capabilities`` AFTER it had already set ``account_admin=True``, so a malformed policy
-    crashed a probe whose entire contract is "never raise". Skipping is also the honest reading: a
-    shape we cannot parse is not evidence of Entra federation.
-
-    This lives at module level because the two callers MUST agree. When they disagreed,
-    ``ensure_federation_audience`` wrote to a policy that ``probe_capabilities`` was not reporting on.
-    """
+    """Whether a federation policy is Entra-issued. A policy whose ``oidc_policy`` is not a dict is
+    not Entra rather than inspected. ``ensure_federation_audience`` and ``probe_capabilities``
+    share this one predicate so they can never disagree on which policy they act on."""
     oidc = policy.get("oidc_policy")
     if not isinstance(oidc, dict):
         return False
@@ -149,28 +105,14 @@ def _is_entra_policy(policy: dict) -> bool:
 
 
 def _to_write_shape(entries: list[dict]) -> list[dict]:
-    """Collapse READ-shaped ACL entries into a shape that is safe to PUT.
+    """Collapse read-shaped ACL entries into a shape that is safe to PUT.
 
-    :meth:`DatabricksWorkspaceService.get_app_permissions` is deliberately flattening and
-    deliberately inclusive of inherited grants — right for the drift diff, WRONG as a write body.
-    Two things must happen before any read is re-asserted:
-
-    * ONE entry per (principal, kind), strongest level wins. A principal holding two levels reads
-      as two entries, and a PUT naming the same principal twice is undocumented upstream: last-wins
-      would DOWNGRADE (e.g. the tenant SP from ``CAN_MANAGE`` to an inherited ``CAN_USE``, costing
-      AGP the permission its next write needs), a 400 would make revoke unusable on that app.
-    * INHERITED entries are dropped. §3A distinguishes direct entries (assertable, strippable) from
-      what AGP cannot remove; re-PUTting an inherited level converts it into a permanent DIRECT
-      grant — a durability widening the drift probe would then report forever.
-    * An OUT-OF-VOCABULARY level is dropped here, loudly. :meth:`set_app_permissions` refuses one
-      (the vocabulary is closed, research §4), so leaving it in the write shape made every revoke
-      on that app raise ``acl_entry_invalid`` FOREVER — blaming the caller's composition for
-      something the workspace reported. A replace genuinely cannot preserve a level the client may
-      not transmit, so dropping is the only honest option; the warning is what makes it a chosen
-      behavior rather than a silent one.
-
-    Module level, not a method, because every read-modify-write path (revoke today, §3A's
-    re-assert next) must collapse identically or they drift apart."""
+    One entry per (principal, kind), strongest level wins: a PUT naming the same principal twice
+    is undocumented upstream and last-wins would downgrade. Inherited entries are dropped:
+    re-PUTting one converts it into a permanent direct grant. A level outside the closed
+    vocabulary is dropped with a warning: ``set_app_permissions`` refuses it, and leaving it in
+    would make every revoke on that app fail for something the workspace reported. Module level
+    because every read-modify-write path must collapse identically."""
     collapsed: dict[tuple[str, str], dict] = {}
     dropped = 0
     for entry in entries:
@@ -189,7 +131,6 @@ def _to_write_shape(entries: list[dict]) -> list[dict]:
         ):
             collapsed[key] = dict(entry)
     if dropped:
-        # A count and a safe label only — an ACL entry names customer principals.
         logger.warning(
             "[databricks] app ACL write shape: dropped %d entr(y/ies) at a permission level this "
             "client may not transmit; the re-asserted list will not carry them",
@@ -198,10 +139,34 @@ def _to_write_shape(entries: list[dict]) -> list[dict]:
     return list(collapsed.values())
 
 
+def _acl_record(record: object) -> tuple[str, AccessDriftKind, list[tuple[str, bool]]] | None:
+    """One ACL record as ``(principal, kind, [(level, inherited), ...])``."""
+    if not isinstance(record, dict):
+        return None
+    principal, kind = "", None
+    for key, candidate_kind in _KIND_BY_ACL_KEY.items():
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            principal, kind = value, candidate_kind
+            break
+    permissions = record.get("all_permissions")
+    if kind is None or not isinstance(permissions, list):
+        return None
+    levels: list[tuple[str, bool]] = []
+    for permission in permissions:
+        level = permission.get("permission_level") if isinstance(permission, dict) else None
+        if isinstance(level, str) and level:
+            levels.append((level, bool(permission.get("inherited"))))
+    return (principal, kind, levels) if levels else None
+
+
 class DatabricksError(Exception):
-    """A Databricks operation failed. Carries a SAFE ``.message`` (never a token, secret, JWT, or
-    upstream body) plus a ``.kind`` code callers map to a fixed HTTP status + fixed detail —
-    the ``connection_service.ConnectionError`` idiom."""
+    """A Databricks operation failed. ``message`` is composed by this module and safe to show:
+    never a token, a secret, a JWT or an upstream body. ``kind`` is a short code: one of this
+    module's fixed kinds, the upstream error code when it matches ``_SAFE_KIND``, or a word for
+    the status. A plain exception, not an ``AppError``: the kinds are an open set of upstream
+    codes that callers read as a diagnostic, and the service that called Databricks translates
+    one into its own kind where the meaning is known."""
 
     def __init__(self, message: str, kind: str) -> None:
         super().__init__(message)
@@ -215,14 +180,14 @@ def _origin(url: str) -> str:
 
 
 def _safe_kind(resp: httpx.Response) -> str:
-    """The safest ``.kind`` derivable from a response: the upstream error CODE when it is a bare
-    code, else a fixed per-status word. Never the upstream MESSAGE, which names paths, principals,
-    and sometimes the request form."""
+    """The safest ``.kind`` derivable from a response: the upstream error code when it is a bare
+    code, else a fixed per-status word. Never the upstream message, which names paths, principals
+    and sometimes the request form. REST APIs use ``error_code``; the OIDC token endpoint uses
+    ``error``."""
     code = ""
     with contextlib.suppress(Exception):
         body = resp.json()
         if isinstance(body, dict):
-            # REST APIs use ``error_code``; the OIDC token endpoint uses ``error``.
             raw = body.get("error_code") or body.get("error") or ""
             if isinstance(raw, str):
                 code = raw.strip().lower()
@@ -236,11 +201,11 @@ def _safe_kind(resp: httpx.Response) -> str:
 
 
 class DatabricksWorkspaceService:
-    """Token minting, discovery listings, grants, SCIM SPs, and federation audiences.
+    """Token minting, discovery listings, grants, SCIM SPs and federation audiences.
 
     ``http_client`` is injectable (tests pass a ``MockTransport`` client); when absent, each call
-    opens a fresh timed ``httpx.AsyncClient`` — the ``langfuse_metrics_service`` idiom, which is
-    safe here because every route runs on the uvicorn loop.
+    opens a fresh timed ``httpx.AsyncClient``, which is safe because every route runs on the
+    uvicorn loop.
     """
 
     def __init__(
@@ -252,42 +217,29 @@ class DatabricksWorkspaceService:
         self._injected_client = http_client
         self._account_host = _origin(account_host)
 
-    # ------------------------------------------------------------------ #
-    # HTTP plumbing
-    # ------------------------------------------------------------------ #
     @contextlib.asynccontextmanager
     async def _client(self):
         """Yield the injected (caller-owned) client, or a fresh per-call timed one."""
         if self._injected_client is not None:
             yield self._injected_client
-        else:  # pragma: no cover — the live path; unit tests always inject.
+        else:
             async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
                 yield client
 
     async def _request(self, method: str, url: str, *, what: str, **kwargs) -> dict:
-        """One request → its JSON body, or ``DatabricksError``.
+        """One request to its JSON body, or ``DatabricksError``.
 
-        ``what`` is a fixed caller-supplied label (e.g. ``"list apps"``) used to build the safe
-        message; nothing from ``kwargs`` or the response body ever reaches it. A transport failure
-        is ``unreachable``; unparseable JSON is ``bad_response``.
-
-        The except clause names three types, not one: ``httpx.InvalidURL`` and the bare
-        ``ValueError`` httpx raises for an unroutable URL are NOT ``httpx.HTTPError`` subclasses,
-        so an empty or malformed ``workspace_url`` (a plausible half-configured tenant record)
-        escaped this boundary raw as ``ValueError: unknown url type`` — a 500 with an
-        httpx-internal message instead of a safe, mapped error."""
+        ``what`` is a fixed caller-supplied label (``"list apps"``) used to build the safe
+        message; nothing from ``kwargs`` or the response reaches it. A transport failure is
+        ``unreachable``; ``httpx.InvalidURL`` and the bare ``ValueError`` httpx raises for an
+        unroutable URL, neither an ``HTTPError``, are ``bad_request_url``; unparseable JSON is
+        ``bad_response``."""
         try:
             async with self._client() as client:
-                resp = await client.request(
-                    method, url, timeout=_HTTP_TIMEOUT_SECONDS, **kwargs
-                )
+                resp = await client.request(method, url, timeout=_HTTP_TIMEOUT_SECONDS, **kwargs)
         except httpx.HTTPError:
-            # The exception text can contain the URL but never a credential; even so, only a
-            # fixed message is surfaced.
             logger.warning("[databricks] transport failure on %s", what)
-            raise DatabricksError(
-                f"Databricks was unreachable ({what})", kind="unreachable"
-            ) from None
+            raise DatabricksError(f"Databricks was unreachable ({what})", kind="unreachable") from None
         except (httpx.InvalidURL, ValueError):
             logger.warning("[databricks] malformed request URL on %s", what)
             raise DatabricksError(
@@ -296,9 +248,7 @@ class DatabricksWorkspaceService:
 
         if resp.status_code >= 400:
             kind = _safe_kind(resp)
-            logger.warning(
-                "[databricks] %s failed with status %s (%s)", what, resp.status_code, kind
-            )
+            logger.warning("[databricks] %s failed with status %s (%s)", what, resp.status_code, kind)
             raise DatabricksError(
                 f"Databricks rejected the request ({what}, status {resp.status_code})",
                 kind=kind,
@@ -318,21 +268,12 @@ class DatabricksWorkspaceService:
     def _access_token(body: dict, what: str) -> str:
         token = body.get("access_token")
         if not isinstance(token, str) or not token:
-            raise DatabricksError(
-                f"Databricks returned no access token ({what})", kind="bad_response"
-            )
+            raise DatabricksError(f"Databricks returned no access token ({what})", kind="bad_response")
         return token
 
-    # ------------------------------------------------------------------ #
-    # Tokens
-    # ------------------------------------------------------------------ #
-    async def mint_m2m_token(
-        self, workspace_url: str, client_id: str, client_secret: str
-    ) -> str:
-        """OAuth M2M: a service principal's ``client_id``/``client_secret`` → a workspace token.
-
-        The credentials go as HTTP Basic (research §3.7's ``--user`` form), never as form fields,
-        so they stay out of any body that could be logged by an intermediary."""
+    async def mint_m2m_token(self, workspace_url: str, client_id: str, client_secret: str) -> str:
+        """Mint a workspace token from a service principal's client credentials, sent as HTTP
+        Basic so they stay out of any body an intermediary could log."""
         return self._access_token(
             await self._request(
                 "POST",
@@ -345,11 +286,9 @@ class DatabricksWorkspaceService:
         )
 
     async def exchange_federated_token(self, workspace_url: str, subject_jwt: str) -> str:
-        """RFC 8693 token exchange: an Entra JWT → a Databricks token (research §3.2).
-
-        Sends NO ``client_id``. That is not an omission: ``client_id`` is REQUIRED for a
-        service-principal federation policy and PROHIBITED for the account-wide policy this path
-        uses, and sending it turns a working exchange into ``invalid_request``. Pinned by test."""
+        """RFC 8693 token exchange: an Entra JWT for a Databricks token. Sends no ``client_id``:
+        it is required for a service-principal federation policy and prohibited for the
+        account-wide policy this path uses, where sending it fails as ``invalid_request``."""
         return self._access_token(
             await self._request(
                 "POST",
@@ -373,23 +312,14 @@ class DatabricksWorkspaceService:
         *,
         account_host: Optional[str] = None,
     ) -> str:
-        """Mint an ACCOUNT-scoped token (research §3.2's account token endpoint). Account-level
-        APIs — federation policies, account SPs — do not accept a workspace token.
+        """Mint an account-scoped token; account-level APIs (federation policies, account SPs)
+        refuse a workspace token.
 
-        PUBLIC since E29/T6. ``ensure_federation_audience`` REQUIRES an account token and this is
-        the only place one is minted, so while this was private its only caller had to reach
-        through the underscore. The old name is kept as an alias below.
-
-        ``account_host`` overrides the instance default for THIS CALL. The account console host
-        is per-cloud and NOT derivable from the workspace URL (research §5.1), and a tenant
-        records its cloud per stage — so the caller that knows the cloud passes the host, rather
-        than every caller having to construct a second client to talk to Azure or GCP. It goes
-        through ``_origin`` so a trailing slash cannot produce a ``//`` path.
-
-        ``account_id`` is quoted for the same reason ``app_name`` is: it is a stored tenant-record
-        field, and unquoted it is a path, not an identifier. ``a1/../../accounts/other/...``
-        retargeted this ACCOUNT-ADMIN token mint at a different Databricks account — the highest-
-        privilege call in the module aimed by a config value."""
+        ``account_host`` overrides the instance default for this call: the console host is
+        per-cloud and not derivable from the workspace URL, and the caller that knows the
+        tenant's cloud passes it. ``account_id`` is a stored tenant-record value, so it is quoted
+        into one path segment; unquoted, ``a1/../../accounts/other/...`` retargeted this mint at
+        another account."""
         host = _origin(account_host) if account_host else self._account_host
         path = f"/oidc/accounts/{quote(account_id, safe='')}/v1/token"
         return self._access_token(
@@ -403,28 +333,11 @@ class DatabricksWorkspaceService:
             "mint account token",
         )
 
-    # Back-compat alias: ``probe_capabilities`` below (and any caller written against the
-    # pre-T6 private name) keeps working. One line, so the two names cannot drift.
-    _mint_account_token = mint_account_token
-
-    # ------------------------------------------------------------------ #
-    # Discovery listings (paginated, defensively read)
-    # ------------------------------------------------------------------ #
-    async def _list_paginated(
-        self, url: str, token: str, *, key: str, what: str
-    ) -> list[dict]:
-        """Page a Databricks list endpoint via ``next_page_token`` and return the named records.
-
-        Each record is kept ONLY if it carries a ``name`` — the one field both listings are keyed
-        on. Everything else (the unverified ``url`` / ``oauth2_app_client_id`` / SP id) is passed
-        through untouched: this layer never indexes a field it has not confirmed exists.
-
-        Two loop bounds, because the exit condition is entirely upstream-controlled: a workspace
-        that echoes a CONSTANT ``next_page_token`` (or cycles a few) would spin this coroutine
-        forever, holding a request slot and growing ``records`` without limit. A repeated token is
-        caught immediately by ``seen``; ``_MAX_PAGES`` catches the slower cycle. Both surface
-        ``pagination_overflow`` rather than silently truncating, since a truncated inventory
-        presented as complete is a governance lie."""
+    async def _list_paginated(self, url: str, token: str, *, key: str, what: str) -> list[dict]:
+        """Page a list endpoint via ``next_page_token`` and return the records that carry a
+        ``name``; every other field passes through untouched. A repeated page token or more than
+        ``_MAX_PAGES`` pages is ``pagination_overflow``, never a truncated inventory presented as
+        complete."""
         records: list[dict] = []
         page_token: Optional[str] = None
         seen: set[str] = set()
@@ -462,22 +375,19 @@ class DatabricksWorkspaceService:
                 )
             seen.add(page_token)
         if skipped:
-            # A safe code only — never the record, which may carry customer paths.
             logger.info("[databricks] %s: skipped %d record(s) with no name", what, skipped)
         return records
 
     async def list_apps(self, workspace_url: str, token: str) -> list[dict]:
-        """List Databricks Apps — the primary agent-hosting shape (research §2.1).
-
-        Note for callers: ``apps list`` visibility follows app permissions (§5.3), so a
-        discovery SP with no app grants legitimately sees an EMPTY list rather than an error."""
+        """List Databricks Apps. ``apps list`` visibility follows app permissions, so a discovery
+        SP with no app grants sees an empty list rather than an error."""
         return await self._list_paginated(
             f"{_origin(workspace_url)}{_APPS_PATH}", token, key="apps", what="list apps"
         )
 
     async def list_serving_endpoints(self, workspace_url: str, token: str) -> list[dict]:
-        """List Model Serving endpoints — the secondary agent shape (research §2.2). ``CAN VIEW``
-        suffices to list, so AGP's discovery credential can be genuinely read-only."""
+        """List Model Serving endpoints; ``CAN VIEW`` suffices, so the discovery credential can
+        be read-only."""
         return await self._list_paginated(
             f"{_origin(workspace_url)}{_SERVING_ENDPOINTS_PATH}",
             token,
@@ -485,16 +395,10 @@ class DatabricksWorkspaceService:
             what="list serving endpoints",
         )
 
-    # ------------------------------------------------------------------ #
-    # Grants + service principals
-    # ------------------------------------------------------------------ #
     def _app_permissions_url(self, workspace_url: str, app_name: str) -> str:
-        """The app's permissions URL. ``app_name`` is quoted with ``safe=''`` (the
-        ``connection_verify`` idiom) because it is upstream-controlled — it arrives from a
-        discovery listing, not from AGP. Unquoted, ``"../../secrets"`` resolved to
-        ``/api/2.0/secrets`` and ``"a?x=1"`` injected a query string: a name in a listing became a
-        choice of endpoint. It is one helper, not four copies, so the four methods that build this
-        URL cannot drift apart on the quoting."""
+        """The app's permissions URL. ``app_name`` arrives from a discovery listing, so it is
+        quoted into one path segment: unquoted, ``../../secrets`` resolved to another endpoint
+        and ``a?x=1`` injected a query string."""
         return f"{_origin(workspace_url)}{_APP_PERMISSIONS_PATH}/{quote(app_name, safe='')}"
 
     async def grant_app_can_use(
@@ -505,26 +409,15 @@ class DatabricksWorkspaceService:
         service_principal_or_group: str,
         kind: str = "group",
     ) -> None:
-        """Additively grant ``CAN_USE`` on an app — the level required to call its ``/api/``
-        routes (§3.6).
+        """Additively grant ``CAN_USE`` on an app (PATCH), the level required to call its
+        ``/api/`` routes; ``set_app_permissions`` is the replacing write.
 
-        PATCH, and additive on purpose: this is the *incremental* write (one new grant on an
-        already-asserted app). The replacing write is :meth:`set_app_permissions` — design §3A
-        makes assert-by-PUT the takeover semantic for an AGP-governed app, so "PUT would silently
-        revoke the customer's grants" is no longer an argument against PUT existing here; it is
-        the reason the two are separate methods with separate names. Use PATCH to add a grant,
-        PUT to assert the whole list.
-
-        ``kind`` selects the ACL key (``user`` → ``user_name``, ``group`` → ``group_name``,
-        ``service_principal`` → ``service_principal_name``). §3A's per-user mirror needs
-        ``user``: a UPN is not UUID-shaped, so without an explicit kind it would be written as a
-        group name and grant the person nothing. The DEFAULT ``"group"`` keeps the original
-        behavior exactly — a UUID-shaped principal is still read as a service principal's
-        application id — so every pre-T13a call site is unchanged."""
+        ``kind`` selects the ACL key. The default ``"group"`` keeps the heuristic the earlier
+        callers rely on: a UUID-shaped principal is a service principal's application id,
+        anything else a group name. A per-user grant passes ``kind="user"``, since a UPN is not
+        UUID-shaped and would otherwise be written as a group name."""
         principal = (service_principal_or_group or "").strip()
         if kind == "group":
-            # Legacy heuristic, retained for the existing callers: a UUID-shaped principal is an
-            # application id, anything else a group name (research §4).
             key = "service_principal_name" if _UUID.match(principal) else "group_name"
         else:
             key = _ACL_KEY_BY_KIND.get(kind, "group_name")
@@ -532,38 +425,20 @@ class DatabricksWorkspaceService:
             "PATCH",
             self._app_permissions_url(workspace_url, app_name),
             what="grant app permission",
-            json={
-                "access_control_list": [
-                    {key: principal, "permission_level": _PERMISSION_CAN_USE}
-                ]
-            },
+            json={"access_control_list": [{key: principal, "permission_level": _PERMISSION_CAN_USE}]},
             headers={"Authorization": f"Bearer {token}"},
         )
 
-    async def get_app_permissions(
-        self, workspace_url: str, token: str, app_name: str
-    ) -> list[dict]:
-        """Read an app's ACL as flat ``{"principal", "kind", "level", "inherited"}`` entries.
+    async def get_app_permissions(self, workspace_url: str, token: str, app_name: str) -> list[dict]:
+        """Read an app's ACL as flat ``{"principal", "kind", "level", "inherited"}`` entries, one
+        per (principal, level): Databricks reports one record per principal carrying an
+        ``all_permissions[]`` array.
 
-        This is the read half of design §3A: the returned list is what the drift probe diffs
-        against the Entra assignment list, and what a revoke re-composes from. Databricks reports
-        one record per principal carrying an ``all_permissions[]`` array, so a principal holding
-        two levels yields TWO entries — flattening here means no caller has to know that shape.
-
-        INHERITED permissions are reported as they arrive, not filtered: an entry AGP cannot
-        remove still grants access, and hiding it would make the drift report a comfortable lie.
-        They are FLAGGED (``"inherited": bool``) because that is the one thing a write path must
-        know — see :func:`_to_write_shape`, which drops them rather than materializing them as
-        permanent direct grants. A level reported both directly and by inheritance is one entry,
-        flagged direct: the direct grant is the one AGP can strip.
-
-        DEFENSIVE READS, same rule as the listings: a record that is not a dict, names no
-        recognised principal key, or carries no readable level is SKIPPED with a counted log line
-        — never a ``KeyError``. A drift probe that dies on one odd ACL record reports nothing
-        about the rest. The skip is logged at WARNING, not info: a caller that re-asserts this list
-        would write back a list missing those records, i.e. "I could not parse this" becomes
-        "I deleted this", so the line must be loud enough to find afterwards. Duplicate
-        (principal, level) pairs collapse, so a repeated level cannot inflate a diff."""
+        Inherited permissions are reported and flagged, not filtered: an entry AGP cannot remove
+        still grants access, and the write path (``_to_write_shape``) is what drops them. A level
+        reported both directly and by inheritance is one entry, flagged direct. An unreadable
+        record is skipped with a counted warning, loud because a caller that re-asserts this list
+        would write back a list missing those records."""
         body = await self._request(
             "GET",
             self._app_permissions_url(workspace_url, app_name),
@@ -575,86 +450,39 @@ class DatabricksWorkspaceService:
         seen: dict[tuple[str, str, str], dict] = {}
         skipped = 0
         for record in raw if isinstance(raw, list) else []:
-            if not isinstance(record, dict):
+            parsed = _acl_record(record)
+            if parsed is None:
                 skipped += 1
                 continue
-            principal, kind = "", ""
-            for key, candidate_kind in _KIND_BY_ACL_KEY.items():
-                value = record.get(key)
-                if isinstance(value, str) and value:
-                    principal, kind = value, candidate_kind
-                    break
-            permissions = record.get("all_permissions")
-            if not principal or not isinstance(permissions, list):
-                skipped += 1
-                continue
-            levels = 0
-            for permission in permissions:
-                if not isinstance(permission, dict):
-                    continue
-                level = permission.get("permission_level")
-                if not isinstance(level, str) or not level:
-                    continue
-                levels += 1
-                inherited = bool(permission.get("inherited"))
-                key3 = (principal, kind, level)
-                kept = seen.get(key3)
+            principal, kind, levels = parsed
+            for level, inherited in levels:
+                key = (principal, kind, level)
+                kept = seen.get(key)
                 if kept is not None:
-                    # Same level twice: a DIRECT report wins over an inherited one.
                     if not inherited:
                         kept["inherited"] = False
                     continue
-                entry = {
-                    "principal": principal,
-                    "kind": kind,
-                    "level": level,
-                    "inherited": inherited,
-                }
-                seen[key3] = entry
+                entry = {"principal": principal, "kind": kind, "level": level, "inherited": inherited}
+                seen[key] = entry
                 entries.append(entry)
-            if not levels:
-                skipped += 1
         if skipped:
-            # A count and a safe label only — an ACL record names customer principals.
-            logger.warning(
-                "[databricks] read app permissions: skipped %d unreadable ACL record(s)", skipped
-            )
+            logger.warning("[databricks] read app permissions: skipped %d unreadable ACL record(s)", skipped)
         return entries
 
     async def set_app_permissions(
         self, workspace_url: str, token: str, app_name: str, entries: list[dict]
     ) -> None:
-        """ASSERT an app's ACL: PUT the caller's full list, replacing whatever was there.
+        """Assert an app's ACL: PUT the caller's full write-shaped list, replacing what was there.
 
-        Design §3A's takeover write. Replacement is the POINT — pre-existing direct entries are
-        how a workspace owner grants access around AGP, and an asserted app is one whose list AGP
-        owns. The caller composes the entries (``{"principal", "kind", "level"}``, the shape
-        :meth:`get_app_permissions` returns); this method only translates and guards.
-
-        THE GUARD: an entries list without ``admins`` at ``CAN_MANAGE`` is REFUSED
-        (``acl_missing_admins``) before any request is issued. A PUT that drops it locks the
-        workspace admins out of their own app, and the next write needs ``CAN_MANAGE`` — so the
-        mistake is unrecoverable through AGP, which is exactly the class of bug a client library
-        should refuse to transmit rather than report afterwards. §3A also requires admins to
-        remain above the governance layer, so the guard and the design invariant are the same
-        line. An entry naming ``admins`` at a LOWER level does not satisfy it.
-
-        An unrecognised ``kind`` is refused too: silently defaulting it to a group name would
-        write a grant to a principal nobody named. So is an unrecognised ``level``: the app ACL
-        vocabulary is closed (``CAN_USE``/``CAN_MANAGE``, research §4), and a composer bug that
-        wrote ``CAN_MANAGE`` on a mirrored USER entry would hand that person the ability to rewrite
-        the app's ACL and un-govern the agent. This method is the last chokepoint before the wire.
-
-        The caller is expected to pass a WRITE-shaped list — one entry per (principal, kind), no
-        inherited entries. :func:`_to_write_shape` produces it from a read; this method does not
-        collapse, because a PUT body that silently differed from what the caller composed is the
-        opposite of an assert. It does REFUSE a list that names the same principal twice
-        (``acl_entry_invalid``) — refusing is not rewriting. A PUT naming a principal twice is
-        undocumented upstream: last-wins could seat that principal at whichever record arrives
-        last, or 400 the whole assert and leave the app unasserted. The caller's own composer is
-        the likely source (a user holding two Entra app-role assignments), so the client refuses to
-        transmit rather than report afterwards — the same discipline as the admins guard. Users are
-        compared case-insensitively, matching :meth:`revoke_app_can_use`."""
+        Refused before any request is issued: a list without ``admins`` at ``CAN_MANAGE``
+        (``acl_missing_admins``; dropping it locks the workspace admins out of their own app and
+        the next write needs ``CAN_MANAGE``, so the mistake is unrecoverable through AGP); an
+        entry with no principal, an unrecognised kind or a level outside ``CAN_USE`` /
+        ``CAN_MANAGE`` (``acl_entry_invalid``; defaulting a kind would grant a principal nobody
+        named, and the vocabulary is closed); a list naming the same principal twice
+        (``acl_entry_invalid``; undocumented upstream), users compared case-insensitively. This
+        method translates and guards; it does not collapse, because a PUT body that differed from
+        what the caller composed is the opposite of an assert."""
         if not any(
             e.get("principal") == _ADMINS_GROUP
             and e.get("kind") == "group"
@@ -674,8 +502,7 @@ class DatabricksWorkspaceService:
             level = str(entry.get("level") or "")
             if not key or not principal or level not in _APP_LEVEL_RANK:
                 raise DatabricksError(
-                    "an app ACL entry names no usable principal, kind, or level "
-                    "(assert app permissions)",
+                    "an app ACL entry names no usable principal, kind, or level (assert app permissions)",
                     kind="acl_entry_invalid",
                 )
             identity = (key, principal.casefold() if key == "user_name" else principal)
@@ -697,38 +524,17 @@ class DatabricksWorkspaceService:
     async def revoke_app_can_use(
         self, workspace_url: str, token: str, app_name: str, principal: str, kind: str
     ) -> None:
-        """Remove one principal's entries from an app's ACL — read-modify-PUT.
+        """Remove one principal's entries from an app's ACL by read-modify-PUT: the permissions
+        API has no single-entry DELETE.
 
-        There is no single-entry DELETE on the permissions API, so removal is necessarily
-        "re-assert the list without it". Matching is on the (principal, kind) PAIR, never the
-        name alone: a group and a user can share a string, and revoking the user by name would
-        silently strip the group of the same name — widening one person's revoke to everyone in
-        it.
-
-        A ``user`` principal is matched CASE-INSENSITIVELY. Databricks usernames are email/UPN
-        shaped and case-insensitive in practice, while §3A feeds Entra's ``mail`` — which commonly
-        returns ``Lars.Svensson@example.com`` where Databricks reports the lowercased form. Exact
-        equality there is the §3A bypass itself: the revoke would match nothing, re-PUT the
-        unchanged list, report success, and leave the person holding ``CAN_USE`` on the app.
-
-        A revoke that matches nothing still succeeds (see idempotence) but LOGS A WARNING. Silent
-        idempotence is correct behavior; a blind success is not worth having when one line
-        distinguishes "already gone" from "never matched".
-
-        The freshly-read list is collapsed to write shape (:func:`_to_write_shape`) before the
-        re-PUT: the read is flattening and inherited-inclusive by design, and PUTting that back
-        verbatim would duplicate a multi-level principal in one body and turn inherited grants into
-        permanent direct ones.
-
-        Idempotent: a principal that already holds nothing still re-PUTs the freshly-read list,
-        because §3A's revoke must stay retryable after a half-completed write and the desired
-        state ("this principal has no grant") is what the caller asked for, not "a change
-        happened".
-
-        The ``admins`` ``CAN_MANAGE`` entry is ensured, not merely preserved: if the read reports
-        none (a workspace that stripped it, or a record the defensive read skipped),
-        :meth:`set_app_permissions`' guard would refuse every re-PUT and revoke would be
-        permanently unusable on that app. Putting it back is the §3A invariant anyway."""
+        Matching is on the (principal, kind) pair, never the name alone, so revoking a user never
+        strips a group of the same name. A ``user`` is matched case-insensitively: Databricks
+        reports lowercased UPNs where Entra's ``mail`` may not be, and an exact match would
+        re-PUT the list unchanged and report success. A revoke that matches no removable entry
+        still re-asserts the list (idempotent, so it stays retryable) and warns. The read is
+        collapsed to write shape first, and the ``admins`` ``CAN_MANAGE`` entry is ensured so the
+        next assert is not refused; the warning that admins were added is decided from the
+        pre-collapse read, because Databricks commonly reports that grant as inherited."""
         current = await self.get_app_permissions(workspace_url, token, app_name)
 
         def _matches(entry: dict) -> bool:
@@ -741,7 +547,6 @@ class DatabricksWorkspaceService:
 
         removable = sum(1 for e in current if _matches(e) and not e.get("inherited"))
         if not removable:
-            # A count and a safe label only — never the principal, which is customer data.
             logger.warning(
                 "[databricks] revoke app permission: matched no removable %s entry; "
                 "re-asserting the list unchanged",
@@ -757,16 +562,7 @@ class DatabricksWorkspaceService:
             )
 
         if not any(_is_admins_can_manage(e) for e in remaining):
-            # The WARNING is decided from ``current`` — the PRE-collapse read, inherited included —
-            # not from ``remaining``. Databricks commonly reports the admins group's CAN_MANAGE as
-            # INHERITED, which the collapse drops; deciding from ``remaining`` would fire this on
-            # EVERY revoke, drowning the one event it exists for (a workspace that really stripped
-            # admins) in routine noise.
             if not any(_is_admins_can_manage(e) for e in current):
-                # WARNING, not info: on a workspace that deliberately stripped the admins group's
-                # explicit CAN_MANAGE, this revoke ADDS a grant nobody asked for. §3A asserts the
-                # entry anyway (and without it the guard would refuse every re-PUT, making revoke
-                # permanently unusable on that app) — but a takeover is loud, never silent.
                 logger.warning(
                     "[databricks] revoke app permission: ADDED the missing admins CAN_MANAGE entry "
                     "to the asserted ACL"
@@ -774,16 +570,11 @@ class DatabricksWorkspaceService:
             remaining.insert(0, dict(_ADMINS_ENTRY))
         await self.set_app_permissions(workspace_url, token, app_name, remaining)
 
-    async def create_service_principal(
-        self, workspace_url: str, token: str, display_name: str
-    ) -> dict:
-        """Create a workspace service principal via SCIM (research §2.4) and return
-        ``{"id", "application_id"}``.
-
-        Secret creation is deliberately NOT here: a per-SP secret is a Secrets-Manager-owned
-        lifecycle (Global Constraints), and one method that both creates an identity and hands
-        back a credential is the shape that leaks. Both fields are read defensively — SCIM
-        responses vary by preview revision — so a missing one is ``""``, never a ``KeyError``."""
+    async def create_service_principal(self, workspace_url: str, token: str, display_name: str) -> dict:
+        """Create a workspace service principal via SCIM and return ``{"id", "application_id"}``,
+        both read defensively (``""`` when absent; SCIM responses vary by preview revision).
+        Secret creation is a separate method, so no caller of "create me an SP" holds a credential
+        it did not ask for."""
         body = await self._request(
             "POST",
             f"{_origin(workspace_url)}{_SCIM_SERVICE_PRINCIPALS_PATH}",
@@ -800,32 +591,16 @@ class DatabricksWorkspaceService:
             "application_id": str(body.get("applicationId") or ""),
         }
 
-    async def create_service_principal_secret(
-        self, workspace_url: str, token: str, sp_id: str
-    ) -> dict:
-        """Mint an OAuth secret for an existing service principal. Returns
+    async def create_service_principal_secret(self, workspace_url: str, token: str, sp_id: str) -> dict:
+        """Mint an OAuth secret for an existing service principal and return
         ``{"secret", "secret_hash", "id"}``.
 
-        ``sp_id`` is the SCIM **id** (the ``"id"`` key of :meth:`create_service_principal`), NOT
-        the ``application_id``. The two are different identifiers for the same principal and only
-        the SCIM id addresses this sub-resource; passing the application id yields a 404 that
-        reads like "the service principal does not exist". Quoted with ``safe=''`` for the same
-        reason every other path segment here is: it is a stored value, and unquoted a segment is
-        a choice of endpoint.
-
-        SECURITY — this is the ONE method in this module that returns a live credential, and it
-        is deliberately separate from :meth:`create_service_principal`: a single method that both
-        creates an identity and hands back its secret is the shape that leaks, because every
-        caller of "create me an SP" then holds a credential it did not ask for. The returned
-        ``secret`` is a plain value the CALLER must place in Secrets Manager immediately; nothing
-        here logs it, stores it, or puts it in an error (``_request`` composes messages from the
-        method, path and status only, so the 4xx path cannot echo it either).
-
-        ``secret`` is required — a response without one is ``bad_response``, never an empty
-        string, because an empty secret persisted as though it were real produces a service
-        principal that can never authenticate and a record that claims it can. ``secret_hash``
-        and ``id`` are read defensively (missing → ``""``): they are useful for correlation, not
-        load-bearing."""
+        ``sp_id`` is the SCIM ``id`` (the ``"id"`` of ``create_service_principal``), not the
+        ``application_id``: only the SCIM id addresses this sub-resource, and the application id
+        404s as "the service principal does not exist". The returned ``secret`` is the one live
+        credential this module hands back; the caller places it in Secrets Manager and nothing
+        here logs or stores it. A response without a secret is ``bad_response``, never an empty
+        string persisted as though it were real."""
         path = _SP_SECRETS_PATH_TEMPLATE.format(sp_id=quote(sp_id, safe=""))
         body = await self._request(
             "POST",
@@ -837,8 +612,7 @@ class DatabricksWorkspaceService:
         secret = body.get("secret")
         if not isinstance(secret, str) or not secret:
             raise DatabricksError(
-                "Databricks returned no service-principal secret (create service principal "
-                "secret)",
+                "Databricks returned no service-principal secret (create service principal secret)",
                 kind="bad_response",
             )
         return {
@@ -847,21 +621,15 @@ class DatabricksWorkspaceService:
             "id": str(body.get("id") or ""),
         }
 
-    # ------------------------------------------------------------------ #
-    # Federation policy audiences
-    # ------------------------------------------------------------------ #
     def _policies_url(self, account_host: str, account_id: str) -> str:
-        """The account's federation-policy collection URL. ``account_id`` is quoted (see
-        ``_mint_account_token``): unquoted it could retarget these account-level reads and writes
-        at another customer's account."""
+        """The account's federation-policy collection URL; ``account_id`` is quoted for the same
+        reason as in ``mint_account_token``."""
         return (
             f"{_origin(account_host) or self._account_host}"
             f"/api/2.0/accounts/{quote(account_id, safe='')}/federationPolicies"
         )
 
-    async def _list_federation_policies(
-        self, account_host: str, account_id: str, token: str
-    ) -> list[dict]:
+    async def _list_federation_policies(self, account_host: str, account_id: str, token: str) -> list[dict]:
         body = await self._request(
             "GET",
             self._policies_url(account_host, account_id),
@@ -880,40 +648,21 @@ class DatabricksWorkspaceService:
         *,
         present: bool,
     ) -> None:
-        """Idempotently add or remove audience(s) on the account-wide federation policy.
+        """Idempotently add or remove audience(s) on the account's Entra federation policy: one
+        read, at most one PATCH, and no PATCH at all when the desired state already holds.
 
-        ``audience`` may be one string or a sequence of them; EITHER WAY the policy is read
-        once and PATCHed at most once (E29 livefix-7: teardown removes both audience forms —
-        the client-id GUID and the legacy api:// URI — and two back-to-back single-audience
-        calls tripped the account API's rate limit live, reporting failure over a removal
-        that had already succeeded).
-
-        Idempotent in BOTH directions, and the no-op is a genuine no-op — an audience already in
-        the desired state issues NO PATCH at all (pinned by call count), so re-running provisioning
-        cannot append a duplicate entry or churn a policy other tenants share.
-
-        ``present=True`` with no policy on the account is an ERROR, not a create: this method has
-        no issuer, no subject claim, and no JWKS to invent one with, and guessing would produce a
-        trust statement nobody authored. ``present=False`` with no policy is a no-op — the desired
-        state already holds.
-
-        THE POLICY IS SELECTED BY ISSUER, never by position. An account may hold up to 20 policies
-        (research §3.2) and an enterprise plausibly federates Okta for humans alongside Entra;
-        ``policies[0]`` wrote AGP's audience onto whichever happened to be first, which in that
-        setup means editing Okta's trust statement while ``probe_capabilities`` reports on the
-        Entra one. The same ``_ENTRA_ISSUER_MARKER`` discrimination is used in both places so they
-        can never disagree. Two Entra policies is ``federation_policy_ambiguous`` — with no
-        subject-claim or audience hint to choose on, guessing would edit shared trust state on a
-        coin flip.
-
-        LOST UPDATE (accepted, documented): audiences are read then written, and the Databricks
-        federation-policy API offers NO ETag, version, or If-Match concurrency token, so there is
-        no CAS to use — a concurrent writer between the GET and the PATCH loses its change. The
-        blast radius is bounded on purpose: the PATCH body is the freshly-read list plus exactly
-        this call's one addition or removal (never a reconstructed or defaulted list), so a lost
-        update can drop a *concurrent* edit but can never drop audiences this call read. AGP's
-        provisioning is sequential per tenant, which is the assumption this relies on; if that ever
-        changes, this needs an external lock rather than a retry."""
+        ``audience`` is one string or a sequence; a multi-form removal is one call because two
+        back-to-back single-audience calls tripped the account API's rate limit. ``present=True``
+        with no Entra policy is ``federation_policy_missing`` (this method has no issuer or JWKS
+        to invent one with); ``present=False`` with none is a no-op. The policy is selected by
+        issuer, never by position, since an account may federate Okta beside Entra; two Entra
+        policies is ``federation_policy_ambiguous``. An ``audiences`` field that is not a list of
+        strings is ``federation_policy_unreadable``: writing would replace account-level trust
+        state with a list this method did not read. The federation-policy API offers no ETag or
+        If-Match, so a concurrent writer between the GET and the PATCH loses its change; the
+        PATCH body is the freshly read list plus this call's one delta, so a lost update can
+        never drop an audience this call read. That is accepted because the platform provisions
+        sequentially per tenant; if that ever changes, the fix is an external lock, not a retry."""
         policies = await self._list_federation_policies(account_host, account_id, token)
         entra = [p for p in policies if _is_entra_policy(p)]
         if not entra:
@@ -932,21 +681,11 @@ class DatabricksWorkspaceService:
         policy = entra[0]
         policy_id = str(policy.get("policy_id") or "")
         if not policy_id:
-            raise DatabricksError(
-                "the Databricks federation policy has no id", kind="bad_response"
-            )
+            raise DatabricksError("the Databricks federation policy has no id", kind="bad_response")
 
-        oidc = policy.get("oidc_policy") if isinstance(policy.get("oidc_policy"), dict) else {}
-        raw_audiences = oidc.get("audiences")
-        # A missing or wrong-shaped ``audiences`` must NOT read as "empty". The field name is
-        # inferred from the CLI examples, not from a loaded reference page (research §3.2), so a
-        # singular ``audience`` or a bare string would have made ``current == []`` and turned this
-        # method into "replace the customer's audience list with one element" — silent deletion of
-        # account-level trust state. Refusing to write is the only safe reading of a shape we
-        # cannot parse.
-        if not isinstance(raw_audiences, list) or not all(
-            isinstance(a, str) for a in raw_audiences
-        ):
+        oidc = policy.get("oidc_policy")
+        raw_audiences = oidc.get("audiences") if isinstance(oidc, dict) else None
+        if not isinstance(raw_audiences, list) or not all(isinstance(a, str) for a in raw_audiences):
             raise DatabricksError(
                 "the Databricks federation policy's audience list could not be read",
                 kind="federation_policy_unreadable",
@@ -974,9 +713,6 @@ class DatabricksWorkspaceService:
             headers={"Authorization": f"Bearer {token}"},
         )
 
-    # ------------------------------------------------------------------ #
-    # Capability probe (plain values, fail-closed)
-    # ------------------------------------------------------------------ #
     async def probe_capabilities(
         self,
         workspace_url: str,
@@ -986,55 +722,47 @@ class DatabricksWorkspaceService:
         account_admin_client_id: Optional[str] = None,
         account_admin_secret: Optional[str] = None,
     ) -> dict:
-        """What can AGP actually DO on this tenant? Returns
-        ``{"can_discover", "account_admin", "user_sync"}``.
+        """What AGP can do on this tenant: ``{"can_discover", "account_admin", "user_sync"}``,
+        from plain values and fail-closed: every branch catches its ``DatabricksError`` and
+        answers False, because a capability flag is a promise the UI makes.
 
-        Plain values, no tenant model — C-2's binding, so this stays callable before T1 lands.
-
-        FAIL-CLOSED: every branch is wrapped independently and NEVER raises. A capability flag is
-        a promise made to the UI ("connect a Databricks tenant" shows the user what each grant
-        unlocks — research §5.3), and the honest answer to "the probe blew up" is False, not an
-        error page and not an optimistic True.
-
-        - ``can_discover`` — mint a workspace M2M token and read a listing. Apps first;
-          serving endpoints as the fallback, because ``apps list`` returns nothing for an SP with
-          no app grants (§5.3), which would otherwise read as "discovery is broken".
-        - ``account_admin`` — only probed when the SEPARATE, optional account-admin credentials
-          are supplied (Tier 3 in §5.3 is a deliberately distinct grant): mint an account token
-          and list federation policies.
-        - ``user_sync`` — True only when an account policy's issuer is an Entra issuer (§3.3),
-          i.e. Entra identities really are federated in. Everything else is False.
-        """
+        ``can_discover``: mint a workspace token and read a listing, apps first and serving
+        endpoints when apps answered nothing readable (``apps list`` returns nothing for an SP
+        with no app grants). ``account_admin``: probed only when the separate account-admin
+        credentials are supplied; mint an account token and list federation policies.
+        ``user_sync``: True only when a listed policy's issuer is Entra's."""
         caps = {"can_discover": False, "account_admin": False, "user_sync": False}
 
         try:
             token = await self.mint_m2m_token(workspace_url, client_id, client_secret)
-        except Exception:
-            logger.info("[databricks] capability probe: workspace token mint failed")
+        except DatabricksError as err:
+            logger.info("[databricks] capability probe: workspace token mint failed (%s)", err.kind)
             token = ""
 
         if token:
             try:
                 await self.list_apps(workspace_url, token)
                 caps["can_discover"] = True
-            except Exception:
+            except DatabricksError as apps_err:
                 try:
                     await self.list_serving_endpoints(workspace_url, token)
                     caps["can_discover"] = True
-                except Exception:
-                    logger.info("[databricks] capability probe: no readable listing")
+                except DatabricksError as endpoints_err:
+                    logger.info(
+                        "[databricks] capability probe: no readable listing (%s, %s)",
+                        apps_err.kind,
+                        endpoints_err.kind,
+                    )
 
         if account_admin_client_id and account_admin_secret:
             try:
-                account_token = await self._mint_account_token(
+                account_token = await self.mint_account_token(
                     account_id, account_admin_client_id, account_admin_secret
                 )
-                policies = await self._list_federation_policies(
-                    self._account_host, account_id, account_token
-                )
+                policies = await self._list_federation_policies(self._account_host, account_id, account_token)
                 caps["account_admin"] = True
                 caps["user_sync"] = any(_is_entra_policy(p) for p in policies)
-            except Exception:
-                logger.info("[databricks] capability probe: account-admin probe failed")
+            except DatabricksError as err:
+                logger.info("[databricks] capability probe: account-admin probe failed (%s)", err.kind)
 
         return caps

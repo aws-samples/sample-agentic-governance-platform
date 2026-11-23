@@ -1,28 +1,39 @@
-"""Test that Entra-related settings are declared and load from env vars."""
+"""Entra-related settings are declared, default to Entra and load from env vars."""
 
-import os
+import sys
 
 import pytest
 
 
+def _fresh_settings_class():
+    """The class imported fresh, past the module-level singleton."""
+    sys.modules.pop("core.config", None)
+    from core.config import Settings
+
+    return Settings
+
+
 def test_settings_has_auth_provider_default():
-    """AUTH_PROVIDER defaults to 'entra' — Entra is the sole auth provider."""
-    # Force fresh import to avoid cached singleton
-    if "core.config" in __import__("sys").modules:
-        del __import__("sys").modules["core.config"]
-    # Clear any AUTH_PROVIDER from environment for this test
+    """AUTH_PROVIDER defaults to 'entra'; `_env_file=None` keeps a developer's .env out of the default."""
     monkey = pytest.MonkeyPatch()
     monkey.delenv("AUTH_PROVIDER", raising=False)
     try:
-        from core.config import Settings
-
-        # _env_file=None disables loading from .env / .env.local so the test
-        # exercises the pure code default, not whatever a developer's local
-        # env file says.
-        s = Settings(_env_file=None)
+        s = _fresh_settings_class()(_env_file=None)
         assert s.AUTH_PROVIDER == "entra"
     finally:
         monkey.undo()
+
+
+def test_settings_ignores_env_file_keys_that_belong_to_sibling_tools(tmp_path):
+    """The shared `.env` carries the frontend's and the infra scripts' variables too; an unknown key
+    must not break backend startup."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("VITE_API_BASE=http://localhost\nAPP_NAME=From file\n")
+
+    s = _fresh_settings_class()(_env_file=env_file)
+
+    assert s.APP_NAME == "From file"
+    assert not hasattr(s, "VITE_API_BASE")
 
 
 def test_settings_loads_entra_fields_from_env(monkeypatch):
@@ -40,12 +51,7 @@ def test_settings_loads_entra_fields_from_env(monkeypatch):
     monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
     monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
 
-    # Force fresh import
-    if "core.config" in __import__("sys").modules:
-        del __import__("sys").modules["core.config"]
-    from core.config import Settings
-
-    s = Settings()
+    s = _fresh_settings_class()()
     assert s.AUTH_PROVIDER == "entra"
     assert s.ENTRA_TENANT_ID == "tenant-uuid"
     assert s.ENTRA_AUDIENCE == "api://agp"

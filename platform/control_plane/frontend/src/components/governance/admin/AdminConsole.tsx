@@ -1,13 +1,5 @@
-// AdminConsole — the standalone admin hub at /admin (Epic 15). It owns the page
-// chrome (heading + tab bar) and an internal tab registry (ADMIN_CONSOLE_TABS);
-// today the single tab is "Marketplace Approvals", whose body is the existing
-// MarketplaceAdmin panel (wrapper-trimmed, behavior unchanged). Adding a future
-// admin tool = append a registry entry + a body case below. The console
-// self-gates (role_level >= 2 via useUser) — the route is convenience, not a
-// security boundary; the backend admin routes are the real ADMIN gate.
-
 import { useState } from 'react';
-import { useUser } from '../../../contexts/UserContext';
+import { useUser } from '../../../contexts/useUser';
 import { ADMIN_CONSOLE_TABS } from './adminConsoleTabs';
 import MarketplaceAdmin from '../marketplace/MarketplaceAdmin';
 import UsersAdmin from './UsersAdmin';
@@ -21,7 +13,6 @@ export default function AdminConsole() {
 
   const [activeKey, setActiveKey] = useState<string>(ADMIN_CONSOLE_TABS[0].key);
 
-  // -- non-admin cosmetic gate ----------------------------------------------
   if (!isAdmin) {
     return (
       <div className="min-h-[calc(100vh-4rem)] relative">
@@ -42,8 +33,6 @@ export default function AdminConsole() {
       <div className="relative max-w-7xl mx-auto px-6 py-6">
         <h1 className="text-xl font-semibold text-slate-900">Admin</h1>
 
-        {/* Pill tab bar (Marketplace.tsx idiom: active tint + shadow-sm pill,
-            transition-colors only, no scale/translate motion). */}
         <div className="flex items-center gap-1 p-1 mt-4 bg-slate-100/80 rounded-xl w-fit overflow-x-auto">
           {ADMIN_CONSOLE_TABS.map((tab) => (
             <button
@@ -56,7 +45,6 @@ export default function AdminConsole() {
           ))}
         </div>
 
-        {/* Active tab body. */}
         <div className="mt-4">
           {activeKey === 'marketplace-approvals' && <MarketplaceAdmin />}
           {activeKey === 'users' && <UsersAdmin />}

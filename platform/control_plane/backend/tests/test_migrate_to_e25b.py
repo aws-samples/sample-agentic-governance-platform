@@ -1,52 +1,45 @@
-"""Offline tests for ``scripts/migrate_to_e25b.py`` (E25B migration orchestrator).
+"""Offline tests for ``scripts/migrate_to_e25b.py`` (the cross-account migration orchestrator).
 
 Pure-logic tests via injected in-memory fakes (NO moto, NO boto3, NO live GitHub/AWS):
 ``run()`` takes the six services as parameters, so no AWS/GitHub client is ever
 constructed here. Every test injects an explicit ``account_id``/``region`` so STS is
 NEVER called (there is no hardcoded account anywhere — the real run derives it from the
-caller's credentials). Mirrors ``test_seed_default_tenant.py``'s fakes/idioms and the
-``sys.path`` shim that makes ``scripts.<mod>`` importable.
+caller's credentials). Mirrors ``test_seed_default_tenant.py``'s fakes/idioms; the backend
+dir goes on ``sys.path`` so ``scripts.<mod>`` is importable.
 
 Coverage (task brief):
   1. ``--dry-run`` makes ZERO mutating calls (no repo overwrite, no tenant/agent writes).
   2. Step 2: the per-org overwrite loop calls ``rollout(template_names=[], overwrite=True,
      overwrite_infra=True)`` for each connection and counts an org as done ONLY when the
-     infra item's action is ``overwritten``/``created`` (E28D — ``overwrite_infra`` is what
-     forces the infra repo, and a ``skipped`` must not be reported as a success). The fake's
+     infra item's action is ``overwritten``/``created`` (``overwrite_infra`` is what forces
+     the infra repo, and a ``skipped`` must not be reported as a success). The fake's
      signature is pinned to the real service's so the same drift cannot hide again.
   3. Step 3: deployed runtimes (non-empty ``agent_arn``) are detected + reported;
      no build is triggered; runtimes without an ARN are ignored.
-  4. Idempotency: a second real run performs the same (delete+recreate) overwrite and
-     the tenant step writes nothing new.
-  5. Config resolution: the E25B-only values (connections table, secret prefix,
-     runtime-module bucket/key) resolve the seed way (CLI > infra files > derivation).
+  4. Idempotency: a second real run performs the same overwrite and the tenant step
+     writes nothing new.
+  5. Config resolution: this migration's own values (connections table, secret prefix,
+     runtime-module bucket/key) resolve the seed way (CLI > tfvars > derivation).
 """
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any
 
-# Backend dir on sys.path makes `scripts` importable as a namespace package (same shim
-# as test_seed_default_tenant.py). Both scripts are import-safe (stdlib-only at top,
-# everything else lazily imported).
 _BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-import scripts.migrate_to_e25b as mig  # noqa: E402 — after sys.path shim
-import scripts.seed_default_tenant as seed  # noqa: E402
+mig = importlib.import_module("scripts.migrate_to_e25b")
+seed = importlib.import_module("scripts.seed_default_tenant")
 
 GROUP_ID = "11111111-2222-3333-4444-555555555555"
-# Injected account/region — arbitrary test values, NOT any real environment's.
 ACCOUNT_ID = "111122223333"
 REGION = "eu-central-1"
-
-
-# ---------------------------------------------------------------------------
-# In-memory fakes (no AWS, no GitHub) — seed fakes reused for the tenant step.
-# ---------------------------------------------------------------------------
 
 
 class FakeTenantService:
@@ -130,17 +123,13 @@ class FakeRolloutService:
         )
         if connection_id in self._explode_on:
             raise RuntimeError("boom")
-        return _RolloutResult(
-            [SimpleNamespace(name=mig.INFRA_REPO_NAME, action=self._action, reason=None)]
-        )
+        return _RolloutResult([SimpleNamespace(name=mig.INFRA_REPO_NAME, action=self._action, reason=None)])
 
 
 def _agent(rid, *, name=None, agent_arn=None, tenant_id="default"):
-    # tenant_id defaults to "default" so the chained seed step does NOT stamp it —
-    # keeping the Step-3 runtime-report tests focused on report-only behavior.
-    return SimpleNamespace(
-        id=rid, name=name or f"name-{rid}", agent_arn=agent_arn, tenant_id=tenant_id
-    )
+    """``tenant_id`` defaults to ``"default"`` so the chained seed step does not stamp it,
+    keeping the Step-3 runtime-report tests focused on report-only behaviour."""
+    return SimpleNamespace(id=rid, name=name or f"name-{rid}", agent_arn=agent_arn, tenant_id=tenant_id)
 
 
 def _conn(cid, org):
@@ -172,11 +161,6 @@ def _run(svcs, *, dry_run=False, account_id=ACCOUNT_ID, region=REGION):
     )
 
 
-# ---------------------------------------------------------------------------
-# 1. --dry-run — zero mutating calls
-# ---------------------------------------------------------------------------
-
-
 def test_dry_run_makes_no_mutating_calls(capsys):
     rollout = FakeRolloutService()
     svcs = _services(
@@ -189,43 +173,31 @@ def test_dry_run_makes_no_mutating_calls(capsys):
     rc = _run(svcs, dry_run=True)
 
     assert rc == 0
-    # Step 1 (tenant/seed): nothing written.
     assert svcs["tenant_service"].upsert_calls == 0
     assert "default" not in svcs["tenant_service"].store
     assert svcs["project_service"].save_calls == []
-    # Agent-registry stamp path stayed silent (a2 has tenant_id=None, so the seed's
-    # would-stamp path is exercised; dry-run must persist nothing).
     assert svcs["agent_service"].persist_calls == []
-    # Step 2: rollout NEVER called in dry-run (it deletes+recreates a real repo).
     assert rollout.calls == []
     out = capsys.readouterr().out
     assert "org-one -> would-overwrite" in out
     assert "org-two -> would-overwrite" in out
-    # Step 3 still reports (read-only in both modes).
     assert "MUST be RE-PUSHED" in out
-    # Operator ordering is unmissable.
     assert "terraform apply FIRST" in out
 
 
-# ---------------------------------------------------------------------------
-# 2. Step 2 — per-org overwrite loop
-# ---------------------------------------------------------------------------
-
-
 def test_real_run_overwrites_infra_repo_per_org(capsys):
+    """One rollout per connection, each forcing ONLY the infra repo. ``overwrite_infra`` is
+    the flag that actually forces it; ``overwrite`` governs TEMPLATE repos only, so without
+    it the script's CORE job is a silent no-op (every existing repo comes back "skipped")."""
     rollout = FakeRolloutService(action="overwritten")
     svcs = _services(conns=[_conn("c1", "org-one"), _conn("c2", "org-two")], rollout=rollout)
 
     rc = _run(svcs)
 
     assert rc == 0
-    # One rollout per connection, each forcing ONLY the infra repo.
     assert [c.connection_id for c in rollout.calls] == ["c1", "c2"]
     assert all(c.template_names == [] for c in rollout.calls)
     assert all(c.overwrite is True for c in rollout.calls)
-    # E28D — ``overwrite_infra`` is the flag that actually forces the infra repo; ``overwrite``
-    # governs TEMPLATE repos only and no longer reaches it. Without this the script's CORE job
-    # is a silent no-op (every existing agp-runtime-infra comes back "skipped").
     assert all(c.overwrite_infra is True for c in rollout.calls)
     out = capsys.readouterr().out
     assert "org-one -> overwritten" in out
@@ -236,7 +208,7 @@ def test_real_run_overwrites_infra_repo_per_org(capsys):
 def test_the_fake_rollout_signature_matches_the_real_service():
     """The fake above is signature-PINNED to ``RolloutService.rollout``.
 
-    This is the E28D/T7 ``spec=`` lesson generalized — but one step further, because ``spec=``
+    This is the ``spec=`` lesson generalized — but one step further, because ``spec=``
     would not have caught THIS bug: ``MagicMock(spec=RolloutService)`` checks attribute NAMES
     only, so a fake that accepted the old ``(template_names, overwrite)`` shape while the real
     service grew ``overwrite_infra`` still passes a ``spec=`` mock. Only comparing the
@@ -262,7 +234,7 @@ def test_a_skipped_infra_item_is_NOT_counted_as_a_success(capsys):
 
     ``skipped`` is exactly what a rollout that forgot ``overwrite_infra=True`` returns for an
     existing repo — the failure mode this script must never report as done. It exits nonzero and
-    says so, instead of printing "overwrote 1/1" over an org whose module is still pre-E25B.
+    says so, instead of printing "overwrote 1/1" over an org whose module is still the old one.
     """
     rollout = FakeRolloutService(action="skipped")
     svcs = _services(conns=[_conn("c1", "org-one")], rollout=rollout)
@@ -298,9 +270,7 @@ def test_a_missing_infra_item_is_NOT_counted_as_a_success(capsys):
 
 def test_a_created_infra_item_counts_as_done(capsys):
     """``created`` (the repo was absent) is as valid an outcome as ``overwritten``."""
-    svcs = _services(
-        conns=[_conn("c1", "org-one")], rollout=FakeRolloutService(action="created")
-    )
+    svcs = _services(conns=[_conn("c1", "org-one")], rollout=FakeRolloutService(action="created"))
     rc = _run(svcs)
     assert rc == 0
     out = capsys.readouterr().out
@@ -322,18 +292,12 @@ def test_step2_one_org_failure_continues_and_returns_nonzero(capsys):
 
     rc = _run(svcs)
 
-    assert rc == 1  # failure surfaced in the exit code
-    # Both orgs were attempted (log-and-continue).
+    assert rc == 1
     assert [c.connection_id for c in rollout.calls] == ["c1", "c2"]
     out = capsys.readouterr().out
     assert "bad-org -> failed" in out
     assert "good-org -> overwritten" in out
     assert "(1 failure(s))" in out
-
-
-# ---------------------------------------------------------------------------
-# 3. Step 3 — detect + report deployed runtimes (report-only)
-# ---------------------------------------------------------------------------
 
 
 def test_deployed_runtimes_reported_no_build_triggered(capsys):
@@ -349,14 +313,11 @@ def test_deployed_runtimes_reported_no_build_triggered(capsys):
 
     assert rc == 0
     out = capsys.readouterr().out
-    # Only the two with a non-empty agent_arn are reported.
     assert "2 deployed runtime(s)" in out
     assert "agent_id='a1'" in out and "arn:aws:...:runtime/a1" in out
     assert "agent_id='a3'" in out
-    assert "'a2'" not in out  # undeployed agent is not reported
+    assert "'a2'" not in out
     assert "MUST be RE-PUSHED" in out
-    # No agent write path was invoked by the runtime report (persist_identity only from
-    # the chained seed stamp — these agents already have no missing tenant_id anyway).
     assert svcs["agent_service"].persist_calls == []
 
 
@@ -367,19 +328,12 @@ def test_no_deployed_runtimes_reports_nothing(capsys):
     assert "no deployed runtimes found" in capsys.readouterr().out
 
 
-# ---------------------------------------------------------------------------
-# 4. Idempotency — a second real run re-overwrites (same result), no new writes
-# ---------------------------------------------------------------------------
-
-
 def test_second_run_is_idempotent(capsys):
     rollout = FakeRolloutService()
     svcs = _services(conns=[_conn("c1", "org-one")], rollout=rollout)
 
     assert _run(svcs) == 0
     assert _run(svcs) == 0
-    # Tenant created exactly once; the overwrite ran on both passes (delete+recreate is
-    # idempotent — same end state), which is the intended repeatable behavior.
     assert svcs["tenant_service"].upsert_calls == 1
     assert [c.connection_id for c in rollout.calls] == ["c1", "c1"]
 
@@ -395,16 +349,10 @@ def test_run_chains_seed_tenant_step():
     assert tenant.entra_group_ids == [GROUP_ID]
 
 
-# ---------------------------------------------------------------------------
-# 5. Config resolution — E25B-only values (seed precedence rules reused)
-# ---------------------------------------------------------------------------
-
-# ``terraform.tfvars`` is the only config file the seed's resolver reads — the ``.env``
-# leg was removed in E34/T10, so a stray ``infrastructure/.env`` is ignored entirely.
 _FULL_TFVARS = (
     'aws_region   = "us-east-1"\n'
     'project_name = "agp"\n'
-    'environment  = "dev"\n'
+    'environment  = "test-fixture"\n'
     'agent_registry_id = "RegAgents"\n'
 )
 
@@ -414,7 +362,7 @@ def _write_infra(tmp_path, tfvars_text=None, stray_env_text=None):
     infra.mkdir()
     if tfvars_text is not None:
         (infra / "terraform.tfvars").write_text(tfvars_text, encoding="utf-8")
-    if stray_env_text is not None:  # written only to prove it has no effect
+    if stray_env_text is not None:
         (infra / ".env").write_text(stray_env_text, encoding="utf-8")
     return infra
 
@@ -426,7 +374,7 @@ def _fake_sts(monkeypatch, account: str) -> None:
     built from it. No credentials, no network (conftest's guard fails any real STS call)."""
 
     class _Boto3:
-        def client(self, service):
+        def client(self, service, **kwargs):
             assert service == "sts"
             return SimpleNamespace(get_caller_identity=lambda: {"Account": account})
 
@@ -434,7 +382,7 @@ def _fake_sts(monkeypatch, account: str) -> None:
 
 
 def _args(infra_dir, **overrides):
-    base = dict(
+    base: dict[str, Any] = dict(
         infra_dir=str(infra_dir),
         region=None,
         account_id=None,
@@ -455,25 +403,23 @@ def _args(infra_dir, **overrides):
 
 def test_e25b_config_derives_connections_and_state_bucket(tmp_path, monkeypatch):
     """No CLI overrides ⇒ connections table + state bucket derive from Terraform's rule
-    (last-6 of the CALLER's account, which the seed's resolver takes from STS)."""
+    (last-6 of the CALLER's account, which the seed's resolver takes from STS). A stray
+    ``infrastructure/.env`` cannot move a single resolved value."""
     _fake_sts(monkeypatch, "111122223333")
     infra = _write_infra(
         tmp_path,
         tfvars_text=_FULL_TFVARS,
-        # A phantom infrastructure/.env cannot move a single resolved value (E34/T10).
         stray_env_text="AWS_REGION=eu-west-1\nRUNTIME_MODULE_BUCKET=stray-bucket\n",
     )
 
     cfg = mig._resolve_e25b_config(_args(infra))
 
-    # Shared (seed) values still present.
     assert cfg["region"] == "us-east-1"
     assert cfg["account_id"] == "111122223333"
-    assert cfg["tenants_table"] == "agp-cp-dev-223333-tenants"
-    # E25B-only derived values (Terraform naming rule + backend/default fallbacks).
-    assert cfg["connections_table"] == "agp-cp-dev-223333-connections"
+    assert cfg["tenants_table"] == "agp-cp-test-fixture-223333-tenants"
+    assert cfg["connections_table"] == "agp-cp-test-fixture-223333-connections"
     assert cfg["connections_secret_prefix"] == mig.DEFAULT_CONNECTIONS_SECRET_PREFIX
-    assert cfg["runtime_module_bucket"] == "agp-cp-dev-223333-tf-state"
+    assert cfg["runtime_module_bucket"] == "agp-cp-test-fixture-223333-tf-state"
     assert cfg["runtime_module_key"] == mig.DEFAULT_RUNTIME_MODULE_KEY
 
 
@@ -497,9 +443,7 @@ def test_e25b_config_tfvars_values_win_over_derivation(tmp_path, monkeypatch):
 
 def test_e25b_config_cli_beats_the_tfvars(tmp_path, monkeypatch):
     _fake_sts(monkeypatch, "111122223333")
-    infra = _write_infra(
-        tmp_path, tfvars_text=_FULL_TFVARS + 'runtime_module_bucket = "file-bucket"\n'
-    )
+    infra = _write_infra(tmp_path, tfvars_text=_FULL_TFVARS + 'runtime_module_bucket = "file-bucket"\n')
 
     cfg = mig._resolve_e25b_config(
         _args(
@@ -516,9 +460,12 @@ def test_e25b_config_cli_beats_the_tfvars(tmp_path, monkeypatch):
     assert cfg["connections_secret_prefix"] == "cli/prefix/"
 
 
-# ---------------------------------------------------------------------------
-# 6. main() guardrails
-# ---------------------------------------------------------------------------
+def test_default_connections_secret_prefix_matches_the_backend_default():
+    """The script carries the backend default as a literal so it needs no Settings object;
+    the two must not drift apart."""
+    from core.config import Settings
+
+    assert mig.DEFAULT_CONNECTIONS_SECRET_PREFIX == Settings.model_fields["CONNECTIONS_SECRET_PREFIX"].default
 
 
 def test_main_requires_group_id(monkeypatch):

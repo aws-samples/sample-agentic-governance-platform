@@ -37,51 +37,25 @@ from typing import Any
 
 import requests
 
-# ===========================================================================
-# Microsoft Entra / Graph constants
-# ===========================================================================
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Microsoft Graph's own application id. This is the same GUID in every tenant —
-# unlike Graph's service principal OBJECT id, which is per-tenant and must always
-# be looked up rather than hardcoded.
+# Microsoft Graph's application id, the same in every tenant; its service principal's object id is
+# per-tenant and is looked up:
+# https://learn.microsoft.com/en-us/troubleshoot/azure/entra/entra-id/governance/verify-first-party-apps-sign-in
 GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
 
-# The three app roles the platform authorizes against. These VALUES are the
-# contract: the backend reads them out of the access token, so they are fixed
-# here and are not configurable.
+# The role values the backend reads out of the access token: a contract between the two, not a preference.
 PLATFORM_ROLES = ("Platform.Admin", "Platform.Operator", "Platform.Viewer")
 
-# The single delegated scope the backend exposes and the frontend requests.
+# The one delegated scope the backend exposes and the frontend requests.
 SCOPE_NAME = "Access.Default"
 
-# The command line's defaults, and contracts rather than preferences: the audience
-# is the string the deployment's own variable defaults to and the setup guide's
-# examples use, and the two display names are what that guide tells an operator to
-# look for in the portal. A plain hyphen in both, never a dash that looks like one.
 DEFAULT_AUDIENCE = "api://agp"
 DEFAULT_BACKEND_NAME = "AGP - Backend Graph Client"
 DEFAULT_SPA_NAME = "AGP - Frontend"
 
-# The same name as the guide's own examples spell it: with an em dash. The frontend
-# registration is matched on its display name and nothing else — it exposes no API,
-# so it has no identifier URI — which means a one-character spelling difference is
-# the difference between reusing a tenant's registration and silently creating a
-# SECOND one beside it. A tenant built by hand from the guide has to be FOUND, so a
-# run that accepted the default above looks for this spelling too. A name the
-# operator passed with --spa-name is used exactly as given: guessing a second
-# spelling for a name somebody chose would adopt a registration they never named.
 DEFAULT_SPA_NAME_VARIANT = "AGP — Frontend"
 
-# The six Microsoft Graph APPLICATION permissions the backend needs to manage
-# per-agent app registrations and their role assignments on the operator's behalf.
-#
-# These GUIDs are stable across tenants, but the script still prefers to resolve
-# them from the tenant's own Microsoft Graph service principal (whose ``appRoles``
-# collection maps each ``value`` to its id) and uses this table only as a
-# fallback. Reading them back is self-correcting: it fails loudly and precisely if
-# a permission has been renamed or is unavailable in the tenant, whereas a stale
-# hardcoded GUID would be accepted by Graph and grant the wrong thing silently.
 GRAPH_APP_PERMISSIONS: dict[str, str] = {
     "Application.ReadWrite.All": "1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9",
     "AppRoleAssignment.ReadWrite.All": "06b708a9-e830-4db3-a914-8e69da51d44f",
@@ -91,20 +65,13 @@ GRAPH_APP_PERMISSIONS: dict[str, str] = {
     "Directory.Read.All": "7ab1d382-f21e-4acd-a863-ba3e13f7da61",
 }
 
-# Graph reports a duplicate consent or role assignment as a generic bad request
-# whose CODE is indistinguishable from a real failure, so the message is the only
-# discriminator. Both phrasings below have been observed in practice.
+# Graph answers a duplicate consent or role assignment with a 400 whose message is the only discriminator.
 ALREADY_EXISTS_SUBSTRINGS = ("already exists", "permission entry already")
 
-# The statuses an already-exists error can arrive with. It is a 400 in practice,
-# which is exactly why status alone cannot classify it.
 _ALREADY_EXISTS_STATUSES = frozenset({400, 409})
 
-# The display name attached to the backend's client secret. Purely descriptive —
-# it is what an administrator sees in the portal's certificates-and-secrets list.
-_SECRET_DISPLAY_NAME = "agp-backend (24 months)"
+_SECRET_DISPLAY_NAME = "agp-backend (24 months)"  # noqa: S105 — the secret's display name in the portal, not a credential; expires 2027-10-23; added E49A-50A/T19
 
-# Human-readable names and descriptions for the three app roles, keyed by value.
 _ROLE_DETAILS: dict[str, tuple[str, str]] = {
     "Platform.Admin": ("Platform Admin", "Full platform administration."),
     "Platform.Operator": (
@@ -114,9 +81,8 @@ _ROLE_DETAILS: dict[str, tuple[str, str]] = {
     "Platform.Viewer": ("Platform Viewer", "Read-only access."),
 }
 
-# The Azure CLI command that yields the access token. ``--resource-type ms-graph``
-# is the documented form and resolves the correct Graph endpoint per cloud, so the
-# script keeps working in sovereign clouds without a hardcoded hostname.
+# ``--resource-type ms-graph`` resolves the Graph endpoint per cloud, so no hostname is hardcoded:
+# https://learn.microsoft.com/en-us/cli/azure/account#az-account-get-access-token
 _AZ_TOKEN_COMMAND = (
     "az",
     "account",
@@ -127,66 +93,26 @@ _AZ_TOKEN_COMMAND = (
     "json",
 )
 
-# How long to wait for that command. Generous because the CLI's cold start is
-# slow, but finite: the call captures both streams, so a CLI stalled on a wedged
-# token cache or an unreachable login endpoint would otherwise present as a dead
-# terminal with nothing printed at all.
 _AZ_TIMEOUT_SECONDS = 60
 
-# One message for every shape of unusable token response, because they are one
-# thing to the operator: the CLI answered something this script cannot read.
 _UNREADABLE_TOKEN_GUIDANCE = (
-    "The Azure CLI's token response is missing or could not be read: it needs an "
+    "The Azure CLI's token response is missing or could not be read: it needs an "  # noqa: S105 — an operator message, not a credential; expires 2027-10-23; added E49A-50A/T19
     "access token, a tenant id, and a numeric 'expires_on'. Confirm 'az account "
     "show' reports the expected tenant, then re-run."
 )
 
-# ===========================================================================
-# Retry policy for directory replication
-# ===========================================================================
-# A newly created application object is returned immediately, but it takes time to
-# replicate across the directory. Any call that REFERENCES a just-created object
-# transiently fails until replication catches up:
-#   - creating a service principal for the new application -> 400 Request_BadRequest
-#     ("The appId 'X' ... does not reference a valid application object") or 404.
-#   - patching that freshly created service principal        -> 404.
-#   - granting consent whose resource is that principal      -> 404.
-#
-# 400 being retriable is the unusual half of this policy and it is not optional:
-# the service-principal create for an unreplicated application fails with 400, so
-# a policy that retries only 404 and 5xx flakes on a clean run.
-#
-# WINDOW: replication is usually seconds but can take up to about a minute under
-# load. Eleven attempts with a linear per-attempt delay capped at eight seconds
-# gives sleeps of 1,2,3,4,5,6,7,8,8,8 = 52 seconds; the eleventh attempt does not
-# sleep, it reports the failure. Throttling is the one case that can wait longer,
-# because a 429's ``Retry-After`` is obeyed up to its own ceiling below: a server
-# that keeps asking for the maximum imposes ten such waits, 600 seconds. Either
-# way the window is bounded, never unbounded.
 _RETRY_ATTEMPTS = 11
 _RETRY_BASE_DELAY_SECONDS = 1.0
 _RETRY_MAX_DELAY_SECONDS = 8.0
 
-# The ceiling for a wait the SERVER asked for, deliberately separate from the
-# schedule's eight seconds. Clamping ``Retry-After`` down to the schedule would put
-# every retry inside the very window the server asked the client to wait out, so a
-# "back off for 30 seconds" would burn all eleven attempts in 80 seconds and fail a
-# call that waiting would have completed. This ceiling only stops an absurd header
-# (an hour) from being obeyed literally.
 _RETRY_AFTER_MAX_SECONDS = 60.0
 
-# Statuses worth retrying: the two replication shapes, throttling, and the
-# transient server-side errors. Note what is NOT here — 403 in particular.
+# 400 is retried because Graph answers a create that references a not-yet-replicated application
+# with 400, not only 404; 403 is absent, a missing directory role is never transient.
 _RETRIABLE_STATUSES = frozenset({400, 404, 429, 500, 502, 503, 504})
 
-# How long to wait for a single Graph response before giving up on it. Generous,
-# because a request that hangs forever is worse than one that fails and retries.
 _HTTP_TIMEOUT_SECONDS = 30
 
-# What a 403 actually means here, spelled out. The signed-in account HAS the API
-# permissions — the Azure CLI's own delegated permissions are what the token
-# carries — so a refusal is about the account's DIRECTORY ROLES and nothing else.
-# Saying "grant more scopes" would send the operator somewhere with no fix in it.
 _DIRECTORY_ROLE_GUIDANCE = (
     "Microsoft Entra refused the request. The signed-in account is missing a "
     "required DIRECTORY ROLE: creating app registrations and granting tenant-wide "
@@ -197,9 +123,6 @@ _DIRECTORY_ROLE_GUIDANCE = (
 )
 
 
-# ===========================================================================
-# Errors
-# ===========================================================================
 class PreflightError(RuntimeError):
     """The script cannot start: the Azure CLI is missing, nobody is signed in, or
     its output could not be read. Distinct from a Graph failure because there is
@@ -239,9 +162,6 @@ class AlreadyExists(GraphError):
     """
 
 
-# ===========================================================================
-# Token acquisition
-# ===========================================================================
 @dataclass
 class AzToken:
     """An access token for Microsoft Graph, plus the two facts that come free with
@@ -265,7 +185,7 @@ def get_az_token() -> AzToken:
     ``expiresOn``, which is local time and would misread in any non-UTC timezone.
     """
     try:
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 — fixed argv from _AZ_TOKEN_COMMAND, az resolved with shutil.which; expires 2027-10-23; added E49A-50A/T19
             _az_command(),
             capture_output=True,
             text=True,
@@ -279,8 +199,6 @@ def get_az_token() -> AzToken:
             "sign in with 'az login' as a tenant administrator."
         ) from err
     except subprocess.TimeoutExpired:
-        # Not chained: TimeoutExpired carries the partial stdout it managed to
-        # capture, and stdout is the one stream that carries the access token.
         raise PreflightError(
             f"The Azure CLI did not answer within {_AZ_TIMEOUT_SECONDS} seconds. "
             "Run 'az account get-access-token --resource-type ms-graph -o json' by "
@@ -288,8 +206,6 @@ def get_az_token() -> AzToken:
         ) from None
 
     if completed.returncode != 0:
-        # By far the most common cause is not being signed in, so lead with the
-        # fix and keep the CLI's own words as supporting detail.
         raise PreflightError(
             "Could not get an access token from the Azure CLI. Sign in as a "
             "tenant administrator with 'az login' (add '--tenant <tenant-id>' if "
@@ -306,11 +222,6 @@ def get_az_token() -> AzToken:
             "hand to see what it says."
         ) from err
 
-    # The whole read is guarded together, the numeric coercion included. A payload
-    # that is not a JSON object, a missing field, and an ``expires_on`` that is not
-    # a number are all the same failure to the operator, and all three have to
-    # arrive as a PreflightError: a raw TypeError or ValueError here would be a
-    # traceback rather than the one thing this function promises to give.
     try:
         access_token = payload["accessToken"]
         tenant_id = payload["tenant"]
@@ -321,9 +232,7 @@ def get_az_token() -> AzToken:
     if not access_token or not tenant_id:
         raise PreflightError(_UNREADABLE_TOKEN_GUIDANCE)
 
-    return AzToken(
-        access_token=access_token, tenant_id=tenant_id, expires_on=expires_on
-    )
+    return AzToken(access_token=access_token, tenant_id=tenant_id, expires_on=expires_on)
 
 
 def _az_command() -> tuple[str, ...]:
@@ -344,9 +253,6 @@ def _az_command() -> tuple[str, ...]:
     return (shutil.which("az") or _AZ_TOKEN_COMMAND[0], *_AZ_TOKEN_COMMAND[1:])
 
 
-# ===========================================================================
-# Graph transport
-# ===========================================================================
 class GraphClient:
     """A small synchronous Microsoft Graph client with one shared retry policy.
 
@@ -362,7 +268,6 @@ class GraphClient:
         self._token = token
         self._session = session if session is not None else requests.Session()
 
-    # --- public verbs ------------------------------------------------------
     def get(self, path: str, params: dict | None = None) -> dict:
         """GET ``path`` and return the parsed body."""
         return _json_body(self._request("GET", path, params=params))
@@ -384,7 +289,6 @@ class GraphClient:
         """
         self._request("PATCH", path, json_body=payload)
 
-    # --- the one retry policy ---------------------------------------------
     def _request(
         self,
         method: str,
@@ -395,7 +299,7 @@ class GraphClient:
     ) -> Any:
         """Issue one Graph request, retrying only the transient shapes.
 
-        Classification order is load-bearing:
+        Each response is classified in this order, before any retry decision:
 
         1. **Already-exists first.** A duplicate grant arrives as a 400, so if the
            retry decision came first it would retry an operation that has already
@@ -432,12 +336,6 @@ class GraphClient:
                     timeout=_HTTP_TIMEOUT_SECONDS,
                 )
             except requests.exceptions.RequestException as err:
-                # A proxy, a captive portal, a VPN drop, a TLS-inspecting
-                # middlebox or the timeout above all land here. Only the exception
-                # CLASS is surfaced, and the chain is severed deliberately: the
-                # exception holds the PreparedRequest, whose headers carry the
-                # bearer token, so chaining it would put the token one traceback
-                # frame away from the terminal.
                 if attempt == _RETRY_ATTEMPTS:
                     raise GraphError(
                         0,
@@ -463,8 +361,7 @@ class GraphClient:
                 raise GraphAuthError(
                     status,
                     code,
-                    f"{_DIRECTORY_ROLE_GUIDANCE} Microsoft Graph reported: "
-                    f"{message or 'no details'}",
+                    f"{_DIRECTORY_ROLE_GUIDANCE} Microsoft Graph reported: {message or 'no details'}",
                 )
 
             if status not in _RETRIABLE_STATUSES or attempt == _RETRY_ATTEMPTS:
@@ -472,9 +369,7 @@ class GraphClient:
 
             time.sleep(_retry_delay(attempt, response))
 
-        # Unreachable: the loop either returns a success or raises on the final
-        # attempt. Kept so the function has no implicit ``None`` return path.
-        raise GraphError(500, "retry_exhausted")  # pragma: no cover
+        raise GraphError(500, "retry_exhausted")
 
 
 def _scheduled_delay(attempt: int) -> float:
@@ -498,8 +393,6 @@ def _retry_delay(attempt: int, response: Any) -> float:
     if response.status_code == 429:
         retry_after = response.headers.get("Retry-After")
         try:
-            # Graph sends seconds. The header also permits an HTTP date, which is
-            # not worth parsing here — the schedule is a fine fallback.
             requested = int(retry_after)
         except (TypeError, ValueError):
             return _scheduled_delay(attempt)
@@ -543,9 +436,6 @@ def _json_body(response: Any) -> dict:
     return body if isinstance(body, dict) else {}
 
 
-# ===========================================================================
-# Payload builders
-# ===========================================================================
 def new_guid() -> str:
     """Mint an identifier for a scope or an app role.
 
@@ -586,56 +476,42 @@ def backend_app_payload(
     """
     return {
         "displayName": name,
-        # Single tenant. This is also the default, but the tenancy of an identity
-        # boundary is too important to leave implicit.
         "signInAudience": "AzureADMyOrg",
         "identifierUris": [audience],
         "api": {
-            # Version 2 tokens, which is what the frontend's library expects — and
-            # what exempts the short identifier URI above from the tenant policy
-            # that would otherwise require a verified-domain URI. It has to be in
-            # the create body: by the time it could be patched, the identifier URI
-            # has already been rejected.
             "requestedAccessTokenVersion": 2,
             "oauth2PermissionScopes": [
                 {
                     "id": scope_id,
                     "value": SCOPE_NAME,
-                    # "User" is the portal's "Admins and users". "Admin" would
-                    # make every sign-in wait on an administrator.
+                    # "User" is the portal's "Admins and users":
+                    # https://learn.microsoft.com/en-us/graph/api/resources/permissionscope
                     "type": "User",
                     "isEnabled": True,
                     "adminConsentDisplayName": "Access AGP",
                     "adminConsentDescription": (
-                        "Allows the app to call the AGP API on behalf of the "
-                        "signed-in user."
+                        "Allows the app to call the AGP API on behalf of the signed-in user."
                     ),
                     "userConsentDisplayName": "Access AGP",
-                    "userConsentDescription": (
-                        "Allows the app to call the AGP API on your behalf."
-                    ),
+                    "userConsentDescription": ("Allows the app to call the AGP API on your behalf."),
                 }
             ],
         },
-        # Iterating the constant rather than the argument keeps the order stable
-        # and guarantees all three roles are present.
         "appRoles": [
             {
                 "id": role_ids[value],
                 "value": value,
                 "displayName": _ROLE_DETAILS[value][0],
                 "description": _ROLE_DETAILS[value][1],
-                # "User" is the portal's "Users/Groups": these are assigned to
-                # people, not to other applications.
+                # "User" is the portal's "Users/Groups", people rather than applications:
+                # https://learn.microsoft.com/en-us/graph/api/resources/approle
                 "allowedMemberTypes": ["User"],
                 "isEnabled": True,
             }
             for value in PLATFORM_ROLES
         ],
-        # Declaration only: this drives the consent screen and nothing else. The
-        # permissions do nothing until consent is actually granted, which is a
-        # separate call. "Role" means an application permission; "Scope" would
-        # mean delegated, and the backend acts on its own here.
+        # "Role" is an application permission and "Scope" a delegated one:
+        # https://learn.microsoft.com/en-us/graph/api/resources/resourceaccess
         "requiredResourceAccess": [
             {
                 "resourceAppId": GRAPH_APP_ID,
@@ -648,10 +524,6 @@ def backend_app_payload(
                 ],
             }
         ],
-        # Asking for the secret inline is the only way to ever read it: the
-        # generated value comes back in this call's response and Graph will not
-        # disclose it again afterwards. No end date — Graph defaults to two years,
-        # which is the lifetime the setup guide assumes.
         "passwordCredentials": [{"displayName": _SECRET_DISPLAY_NAME}],
     }
 
@@ -674,14 +546,7 @@ def spa_app_payload(name: str, backend_app_id: str, scope_id: str) -> dict:
     return {
         "displayName": name,
         "signInAudience": "AzureADMyOrg",
-        # The empty object is load-bearing, not a placeholder: it registers the
-        # single-page-application platform, which is what selects the
-        # authorization-code-with-PKCE flow and a client that needs no secret.
-        # Omit it and the registration has no platform at all, leaving the
-        # deployment's callback URL nowhere to be added later.
         "spa": {"redirectUris": []},
-        # "Scope" means delegated: the frontend calls the backend AS the
-        # signed-in user, never on its own behalf.
         "requiredResourceAccess": [
             {
                 "resourceAppId": backend_app_id,
@@ -691,15 +556,6 @@ def spa_app_payload(name: str, backend_app_id: str, scope_id: str) -> dict:
     }
 
 
-# ===========================================================================
-# Dry-run vocabulary
-# ===========================================================================
-# A dry run performs the reads and the existence checks and then prints the
-# mutations it would send. The identifiers of objects that do not exist yet cannot
-# be known, so they are rendered as these names: a plan that says
-# ``principalId: <backend-sp-id>`` is readable, whereas one that says ``null`` or
-# that crashes on a missing key is not. Every one of them starts with "<", which is
-# what the output block keys off to refuse to print it as a config value.
 BACKEND_APP_PLACEHOLDER = "<backend-app-id>"
 BACKEND_APP_OBJECT_PLACEHOLDER = "<backend-app-object-id>"
 BACKEND_SP_PLACEHOLDER = "<backend-sp-id>"
@@ -707,25 +563,16 @@ SPA_APP_PLACEHOLDER = "<spa-app-id>"
 SPA_APP_OBJECT_PLACEHOLDER = "<spa-app-object-id>"
 SPA_SP_PLACEHOLDER = "<spa-sp-id>"
 
-# What the output block prints in place of a value only a real run can produce.
-# Deliberately not one of the names above: pasted into a config file it is obvious
-# nonsense, which is the point — a dry run's block is a preview, not a result.
 UNKNOWN_UNTIL_REAL_RUN = "<created-on-real-run>"
 
-# What it prints for the secret of a registration that already existed. Microsoft
-# Entra discloses a client secret only in the response that created it, so on a
-# re-run there is nothing to print and the value already in the deployment's
-# configuration is still the right one.
-EXISTING_SECRET = "<existing secret — cannot be re-read>"
+EXISTING_SECRET = "<existing secret — cannot be re-read>"  # noqa: S105 — the output marker for a secret no run can re-read, not a credential; expires 2027-10-23; added E49A-50A/T19
 
-# The properties every application lookup needs: enough to reuse the registration
-# and to compare it against what this setup expects, and nothing else.
-_APPLICATION_SELECT = (
-    "id,appId,displayName,identifierUris,api,appRoles,requiredResourceAccess,spa"
-)
+OUTCOME_CREATED = "created"
+OUTCOME_ROTATED = "rotated"
+OUTCOME_EXISTING = "existing"
 
-# The properties a service-principal lookup needs. ``appRoleAssignmentRequired`` is
-# here because it is compared on a re-run and never repaired.
+_APPLICATION_SELECT = "id,appId,displayName,identifierUris,api,appRoles,requiredResourceAccess,spa"
+
 _SERVICE_PRINCIPAL_SELECT = "id,appId,appRoleAssignmentRequired"
 
 
@@ -824,9 +671,6 @@ def _indented(text: str, prefix: str = "  ") -> str:
     return "\n".join(f"{prefix}{line}" for line in text.splitlines())
 
 
-# ===========================================================================
-# Reads
-# ===========================================================================
 @dataclass
 class Context:
     """The facts about the tenant and the operator that the rest of the run needs.
@@ -867,9 +711,7 @@ def resolve_context(client: GraphClient) -> Context:
             "reports the expected user and tenant, then re-run."
         )
 
-    organization = _first(
-        client.get("/organization", params={"$select": "id,displayName,verifiedDomains"})
-    )
+    organization = _first(client.get("/organization", params={"$select": "id,displayName,verifiedDomains"}))
     graph_sp = _first(
         client.get(
             "/servicePrincipals",
@@ -909,11 +751,7 @@ def _initial_domain(organization: dict, me_upn: str) -> str:
     The last resort is the signed-in account's own domain suffix, which is right
     for a member administrator and wrong for a guest — hence last.
     """
-    domains = [
-        domain
-        for domain in (organization.get("verifiedDomains") or [])
-        if isinstance(domain, dict)
-    ]
+    domains = [domain for domain in (organization.get("verifiedDomains") or []) if isinstance(domain, dict)]
     for domain in domains:
         if domain.get("isInitial") and domain.get("name"):
             return str(domain["name"])
@@ -931,15 +769,9 @@ def _permission_ids(graph_sp: dict) -> dict[str, str]:
         for role in graph_sp.get("appRoles") or []
         if isinstance(role, dict) and role.get("id") and role.get("value")
     }
-    return {
-        name: by_value.get(name) or fallback
-        for name, fallback in GRAPH_APP_PERMISSIONS.items()
-    }
+    return {name: by_value.get(name) or fallback for name, fallback in GRAPH_APP_PERMISSIONS.items()}
 
 
-# ===========================================================================
-# Existence lookups
-# ===========================================================================
 def find_backend(client: GraphClient, audience: str) -> dict | None:
     """The existing backend registration, matched on its identifier URI.
 
@@ -960,9 +792,7 @@ def find_backend(client: GraphClient, audience: str) -> dict | None:
     return matches[0] if matches else None
 
 
-def find_spa(
-    client: GraphClient, name: str, *, variants: tuple[str, ...] = ()
-) -> dict | None:
+def find_spa(client: GraphClient, name: str, *, variants: tuple[str, ...] = ()) -> dict | None:
     """The existing frontend registration, matched on its display name.
 
     The display name is all there is: this registration exposes no API, so it has
@@ -980,7 +810,6 @@ def find_spa(
     that share one name.
     """
     matches: list[dict] = []
-    # dict.fromkeys: ordered, and a variant equal to the name is not queried twice.
     for candidate in dict.fromkeys((name, *variants)):
         matches.extend(
             _values(
@@ -994,9 +823,7 @@ def find_spa(
             )
         )
     if len(matches) > 1:
-        found = ", ".join(
-            sorted({repr(str(app.get("displayName") or "")) for app in matches})
-        )
+        found = ", ".join(sorted({repr(str(app.get("displayName") or "")) for app in matches}))
         raise PreflightError(
             f"{len(matches)} app registrations in this tenant answer to the frontend "
             f"name {name!r} ({found}), and a display name is the only way to identify "
@@ -1030,9 +857,6 @@ def _first(body: dict) -> dict:
     return values[0] if values else {}
 
 
-# ===========================================================================
-# Drift comparison
-# ===========================================================================
 def compare_backend(app: dict, audience: str) -> list[str]:
     """Compare an existing backend registration against what this setup expects.
 
@@ -1052,15 +876,8 @@ def compare_backend(app: dict, audience: str) -> list[str]:
 
     uris = [str(uri) for uri in app.get("identifierUris") or []]
     if audience not in uris:
-        lines.append(
-            f"identifier URI: expected {audience}, found "
-            f"{', '.join(uris) if uris else 'none'}"
-        )
+        lines.append(f"identifier URI: expected {audience}, found {', '.join(uris) if uris else 'none'}")
     elif len(uris) > 1:
-        # A registration that was renamed keeps the old URI beside the new one. Both
-        # are legal and only one is the audience this deployment is configured for,
-        # so a token issued for either of the others is refused by the backend as a
-        # wrong audience — with an error that names the URI and not the cause.
         others = ", ".join(uri for uri in uris if uri != audience)
         lines.append(
             f"identifier URI: expected only {audience}, found {len(uris)} on the "
@@ -1084,11 +901,7 @@ def compare_backend(app: dict, audience: str) -> list[str]:
     }
     lines.extend(_compare_entry("delegated scope", SCOPE_NAME, scopes.get(SCOPE_NAME)))
 
-    roles = {
-        str(role.get("value")): role
-        for role in app.get("appRoles") or []
-        if isinstance(role, dict)
-    }
+    roles = {str(role.get("value")): role for role in app.get("appRoles") or [] if isinstance(role, dict)}
     for value in PLATFORM_ROLES:
         lines.extend(_compare_entry("app role", value, roles.get(value)))
 
@@ -1096,16 +909,11 @@ def compare_backend(app: dict, audience: str) -> list[str]:
     for entry in app.get("requiredResourceAccess") or []:
         if isinstance(entry, dict) and entry.get("resourceAppId") == GRAPH_APP_ID:
             declared.update(
-                str(item.get("id"))
-                for item in entry.get("resourceAccess") or []
-                if isinstance(item, dict)
+                str(item.get("id")) for item in entry.get("resourceAccess") or [] if isinstance(item, dict)
             )
     for name, permission_id in GRAPH_APP_PERMISSIONS.items():
         if permission_id not in declared:
-            lines.append(
-                f"Microsoft Graph permission {name}: expected in "
-                "requiredResourceAccess, found none"
-            )
+            lines.append(f"Microsoft Graph permission {name}: expected in requiredResourceAccess, found none")
 
     return lines
 
@@ -1147,9 +955,7 @@ def compare_spa(app: dict, backend_app_id: str, scope_id: str | None) -> list[st
         resources.add(str(entry.get("resourceAppId") or ""))
         if entry.get("resourceAppId") == backend_app_id:
             granted.update(
-                str(item.get("id"))
-                for item in entry.get("resourceAccess") or []
-                if isinstance(item, dict)
+                str(item.get("id")) for item in entry.get("resourceAccess") or [] if isinstance(item, dict)
             )
 
     if backend_app_id not in resources:
@@ -1179,9 +985,6 @@ def _compare_entry(kind: str, value: str, entry: dict | None) -> list[str]:
     return []
 
 
-# ===========================================================================
-# The output block
-# ===========================================================================
 def render_output(
     *,
     tenant_id: str,
@@ -1203,7 +1006,7 @@ def render_output(
     them. Paste-ready blocks first, caveats after, because an operator reads top to
     bottom and the two blocks are why they ran this.
 
-    ``secret_outcome`` is ``"created"``, ``"rotated"`` or ``"existing"`` — what this
+    ``secret_outcome`` is ``OUTCOME_CREATED``, ``OUTCOME_ROTATED`` or ``OUTCOME_EXISTING`` — what this
     run did, or what a dry run has already worked out a real run WOULD do, about the
     backend's client secret. It is passed in rather than inferred from ``secret``
     because a dry run holds no secret in any of the three cases, and telling an
@@ -1295,7 +1098,7 @@ def _secret_cell(secret: str | None, secret_outcome: str) -> str:
     """
     if secret:
         return secret
-    if secret_outcome == "existing":
+    if secret_outcome == OUTCOME_EXISTING:
         return EXISTING_SECRET
     return UNKNOWN_UNTIL_REAL_RUN
 
@@ -1309,7 +1112,7 @@ def _secret_note(secret: str | None, secret_outcome: str, dry_run: bool) -> list
             "disclose it again, so no later run of this script can recover it. Copy",
             "it into secrets.auto.tfvars now.",
         ]
-    if dry_run and secret_outcome == "existing":
+    if dry_run and secret_outcome == OUTCOME_EXISTING:
         return [
             "The backend app registration already exists, so a real run will NOT",
             "create a secret — and the existing one cannot be read back, by this",
@@ -1317,7 +1120,7 @@ def _secret_note(secret: str | None, secret_outcome: str, dry_run: bool) -> list
             "secrets.auto.tfvars. To add a second, valid alongside the first, re-run",
             "with --rotate-secret.",
         ]
-    if dry_run and secret_outcome == "rotated":
+    if dry_run and secret_outcome == OUTCOME_ROTATED:
         return [
             "Nothing was created, so there is no secret yet. A real run with",
             "--rotate-secret adds a SECOND secret to the existing backend",
@@ -1360,9 +1163,6 @@ def _runner_note(me_upn: str, admin_assigned: bool, dry_run: bool) -> list[str]:
     ]
 
 
-# ===========================================================================
-# The flow
-# ===========================================================================
 @dataclass
 class RunState:
     """What the run has done so far, so a failure can still report it.
@@ -1394,9 +1194,7 @@ class RunState:
     drift: list[str] = field(default_factory=list)
 
 
-def _run(
-    client: GraphClient, executor: Executor, args: argparse.Namespace, state: RunState
-) -> int:
+def _run(client: GraphClient, executor: Executor, args: argparse.Namespace, state: RunState) -> int:
     """Do the whole setup, in the one order the dependencies allow.
 
     The order is not a preference. A service principal cannot be created before the
@@ -1406,69 +1204,18 @@ def _run(
     previous ones returned, never from the arguments.
     """
     context = resolve_context(client)
-    print(
-        f"Signed in as {context.me_upn or 'an unknown account'}, "
-        f"in tenant {context.tenant_id}."
-    )
+    print(f"Signed in as {context.me_upn or 'an unknown account'}, in tenant {context.tenant_id}.")
     if executor.dry_run:
         print(
-            "Dry run: reading the tenant and printing every change a real run would "
-            "make. Nothing is written."
+            "Dry run: reading the tenant and printing every change a real run would make. Nothing is written."
         )
 
-    # --- the backend registration ------------------------------------------
-    found = find_backend(client, args.audience)
-    if found is None and args.rotate_secret:
-        raise PreflightError(
-            "--rotate-secret adds a secret to a backend app registration that "
-            f"already exists, and no registration in this tenant answers to "
-            f"{args.audience}. Re-run without --rotate-secret to create it: the "
-            "create response is where a first secret comes from."
-        )
-
-    if found is not None:
-        print(f"reusing the backend app registration {found.get('displayName')!r}")
-        state.backend_app = found
-        state.drift.extend(compare_backend(found, args.audience))
-        scope_id = _scope_id(found)
-        role_ids = _role_ids(found)
-        # Decided here, before anything is sent, so a dry run predicts the same
-        # branch a real run with these arguments would take.
-        secret_outcome = "rotated" if args.rotate_secret else "existing"
-        if args.rotate_secret:
-            state.secret = _add_secret(executor, found)
-    else:
-        secret_outcome = "created"
-        scope_id = new_guid()
-        role_ids = {value: new_guid() for value in PLATFORM_ROLES}
-        payload = backend_app_payload(
-            args.backend_name,
-            args.audience,
-            scope_id,
-            role_ids,
-            context.permission_ids,
-        )
-        created = executor.apply(
-            "create the backend app registration", "POST", "/applications", payload
-        )
-        state.backend_created = True
-        state.backend_app = _created_or_planned(
-            executor,
-            created,
-            payload,
-            BACKEND_APP_OBJECT_PLACEHOLDER,
-            BACKEND_APP_PLACEHOLDER,
-            "backend app registration",
-        )
-        state.secret = _secret_text(created)
+    scope_id, role_ids, secret_outcome = _ensure_backend(client, executor, args, state, context)
 
     backend = state.backend_app or {}
     backend_app_id = str(backend.get("appId") or BACKEND_APP_PLACEHOLDER)
-    # Read back rather than echoed: what the tenant holds is what the deployment
-    # has to be told, even when the two disagree.
     audience = _matched_uri(backend, args.audience)
 
-    # --- its service principal ---------------------------------------------
     state.backend_sp_id, existing_sp = _ensure_service_principal(
         executor,
         client,
@@ -1479,9 +1226,6 @@ def _run(
     )
     state.backend_sp_created = existing_sp is None
     if existing_sp is None:
-        # Only ever on a principal this run created. Requiring assignment makes an
-        # unassigned user fail at sign-in with a message about the assignment,
-        # instead of getting a token that quietly refuses every later call.
         executor.apply(
             "require role assignment on the backend service principal",
             "PATCH",
@@ -1494,7 +1238,6 @@ def _run(
             "found false — anyone in the tenant can sign in until it is set"
         )
 
-    # --- admin consent for the six application permissions -----------------
     for name, permission_id in context.permission_ids.items():
         executor.apply(
             f"grant admin consent for {name}",
@@ -1505,13 +1248,9 @@ def _run(
                 "resourceId": context.graph_sp_id,
                 "appRoleId": permission_id,
             },
-            # The existing grant IS the desired end state, and nothing is read back
-            # from the response, so re-sending and tolerating the duplicate is
-            # cheaper and more certain than reading the six existing assignments.
             tolerate_existing=True,
         )
 
-    # --- the frontend registration -----------------------------------------
     spa = find_spa(
         client,
         args.spa_name,
@@ -1544,8 +1283,6 @@ def _run(
             SPA_APP_PLACEHOLDER,
             "frontend app registration",
         )
-        # A create whose answer was lost and was then re-found came back through the
-        # lookup, so its principal has to be looked for too.
         spa_lookup = not landed
 
     spa_app = state.spa_app or {}
@@ -1560,9 +1297,8 @@ def _run(
     )
     state.spa_sp_created = existing_spa_sp is None
 
-    # --- admin consent for the delegated scope ------------------------------
-    # Both sides are service principal OBJECT ids, and the scope is named by its
-    # value rather than in its identifier-URI form.
+    # Both ids are service principal object ids and the scope goes by its value:
+    # https://learn.microsoft.com/en-us/graph/api/resources/oauth2permissiongrant
     executor.apply(
         "grant admin consent for the frontend's delegated scope",
         "POST",
@@ -1576,9 +1312,7 @@ def _run(
         tolerate_existing=True,
     )
 
-    # --- the runner's own role ----------------------------------------------
-    # On the BACKEND principal. The same call against the frontend one answers a
-    # perfectly happy 201 and is a silent no-op: the role never reaches any token.
+    # On the backend principal: the same call on the frontend's answers 201 and the role reaches no token.
     admin_role_id = role_ids.get("Platform.Admin")
     if admin_role_id:
         executor.apply(
@@ -1592,8 +1326,6 @@ def _run(
             },
             tolerate_existing=True,
         )
-        # Only here: after the call came back. Every other order of these two lines
-        # lets the output block claim it assigned somebody it did not.
         state.admin_assigned = True
     else:
         state.drift.append(
@@ -1618,6 +1350,60 @@ def _run(
         )
     )
     return 0
+
+
+def _ensure_backend(
+    client: GraphClient, executor: Executor, args: argparse.Namespace, state: RunState, context: Context
+) -> tuple[str | None, dict[str, str], str]:
+    """Find or create the backend registration and record it on ``state``.
+
+    Returns the delegated scope's identifier (``None`` when an existing registration does not expose
+    it), the app role identifiers by value, and the secret outcome, decided before anything is sent so
+    a dry run predicts the branch a real run would take: ``OUTCOME_CREATED`` with the secret read off
+    the create response, ``OUTCOME_ROTATED`` when ``--rotate-secret`` adds one to a found registration,
+    ``OUTCOME_EXISTING`` otherwise.
+    """
+    found = find_backend(client, args.audience)
+    if found is None and args.rotate_secret:
+        raise PreflightError(
+            "--rotate-secret adds a secret to a backend app registration that "
+            f"already exists, and no registration in this tenant answers to "
+            f"{args.audience}. Re-run without --rotate-secret to create it: the "
+            "create response is where a first secret comes from."
+        )
+
+    if found is not None:
+        print(f"reusing the backend app registration {found.get('displayName')!r}")
+        state.backend_app = found
+        state.drift.extend(compare_backend(found, args.audience))
+        scope_id = _scope_id(found)
+        role_ids = _role_ids(found)
+        secret_outcome = OUTCOME_ROTATED if args.rotate_secret else OUTCOME_EXISTING
+        if args.rotate_secret:
+            state.secret = _add_secret(executor, found)
+    else:
+        secret_outcome = OUTCOME_CREATED
+        scope_id = new_guid()
+        role_ids = {value: new_guid() for value in PLATFORM_ROLES}
+        payload = backend_app_payload(
+            args.backend_name,
+            args.audience,
+            scope_id,
+            role_ids,
+            context.permission_ids,
+        )
+        created = executor.apply("create the backend app registration", "POST", "/applications", payload)
+        state.backend_created = True
+        state.backend_app = _created_or_planned(
+            executor,
+            created,
+            payload,
+            BACKEND_APP_OBJECT_PLACEHOLDER,
+            BACKEND_APP_PLACEHOLDER,
+            "backend app registration",
+        )
+        state.secret = _secret_text(created)
+    return scope_id, role_ids, secret_outcome
 
 
 def _ensure_service_principal(
@@ -1653,9 +1439,7 @@ def _ensure_service_principal(
             print(f"reusing the {description} ({existing.get('id')})")
             return str(existing.get("id") or placeholder), existing
 
-    created = executor.apply(
-        f"create the {description}", "POST", "/servicePrincipals", {"appId": app_id}
-    )
+    created = executor.apply(f"create the {description}", "POST", "/servicePrincipals", {"appId": app_id})
     sp_id = str((created or {}).get("id") or "")
     if sp_id:
         return sp_id, None
@@ -1682,9 +1466,7 @@ def _create_spa(
     """
     try:
         return (
-            executor.apply(
-                "create the frontend app registration", "POST", "/applications", payload
-            ),
+            executor.apply("create the frontend app registration", "POST", "/applications", payload),
             True,
         )
     except GraphError as err:
@@ -1789,11 +1571,7 @@ def _scope_id(app: dict) -> str | None:
     """
     api = app.get("api") if isinstance(app.get("api"), dict) else {}
     for scope in api.get("oauth2PermissionScopes") or []:
-        if (
-            isinstance(scope, dict)
-            and scope.get("value") == SCOPE_NAME
-            and scope.get("id")
-        ):
+        if isinstance(scope, dict) and scope.get("value") == SCOPE_NAME and scope.get("id"):
             return str(scope["id"])
     return None
 
@@ -1837,10 +1615,7 @@ def _report_drift(lines: list[str]) -> None:
     if not lines:
         return
     print()
-    print(
-        "Drift report — what this tenant already holds differs from what this setup "
-        "expects:"
-    )
+    print("Drift report — what this tenant already holds differs from what this setup expects:")
     for line in lines:
         print(f"  - {line}")
     print(
@@ -1945,15 +1720,14 @@ def _describe(err: GraphError) -> str:
     return f"{message} ({detail})"
 
 
-# ===========================================================================
-# The command line
-# ===========================================================================
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line.
 
     Five flags, and the defaults are contracts: the audience and both display names
     are the values the setup guide and the deployment's own variables use, so a run
-    with no flags produces a paste-ready output block.
+    with no flags produces a paste-ready output block. ``--spa-name`` has no argparse default so that
+    ``spa_name_given`` records whether the operator named the frontend registration; only the accepted
+    default also matches the setup guide's em-dash spelling of the same name.
     """
     parser = argparse.ArgumentParser(
         prog="setup_entra.py",
@@ -1994,16 +1768,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--spa-name",
-        # No argparse default, and the default is applied below instead, because
-        # whether the operator NAMED the frontend registration or accepted this
-        # script's name is a distinction the lookup needs and argparse's own default
-        # erases: only the accepted default also looks for the setup guide's em-dash
-        # spelling. Nothing about the parsed value changes — see ``spa_name_given``.
         default=None,
-        help=(
-            "display name for the frontend app registration "
-            f"(default: {DEFAULT_SPA_NAME})"
-        ),
+        help=(f"display name for the frontend app registration (default: {DEFAULT_SPA_NAME})"),
     )
     parser.add_argument(
         "--rotate-secret",
@@ -2015,9 +1781,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     args = parser.parse_args(argv)
-    # ``spa_name_given`` is the fact argparse cannot keep, and the lookup needs it: a
-    # name the operator chose is used exactly as typed, while the accepted default
-    # also matches the setup guide's em-dash spelling of the same name.
     args.spa_name_given = args.spa_name is not None
     if args.spa_name is None:
         args.spa_name = DEFAULT_SPA_NAME

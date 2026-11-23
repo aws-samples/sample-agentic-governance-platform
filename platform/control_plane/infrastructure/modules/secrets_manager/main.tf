@@ -18,8 +18,9 @@
  */
 
 resource "aws_secretsmanager_secret" "graph_client_secret" {
-  name        = "${var.name_prefix}/graph-client-secret"
-  description = "Client secret for the AGP backend Graph client app registration. Used by FastAPI to authenticate to Microsoft Graph via OAuth client credentials."
+  name                    = "${var.name_prefix}/graph-client-secret"
+  description             = "Client secret for the AGP backend Graph client app registration. Used by FastAPI to authenticate to Microsoft Graph via OAuth client credentials."
+  recovery_window_in_days = var.ephemeral ? 0 : 30
 
   tags = merge(var.tags, {
     project    = "agp"

@@ -1,14 +1,12 @@
-"""Template rollout + reconcile route tests (E22/T5, rebuilt in E28C/T3).
+"""Template rollout + reconcile route tests.
 
 Exercises the REAL require_role/current_principal path against a mocked
 verify_entra_token (no live Entra) and a FAKE RolloutService patched onto the
 connections router's module-level ``_rollout_svc`` (no live GitHub / AWS). Mirrors
 test_connections_routes.py for the app/client + admin/non-admin auth-override idiom.
 
-E28C/T3 adds the ADOPT route and closes two honesty holes in the mapping: ``kind="validation"``
-used to be FLATTENED to 502 on the reconcile route (a permanent caller error reported as a
-retryable platform fault), and there was no 409 kind at all — "already registered" had nowhere
-to land.
+``RolloutError`` renders through its table: ``validation`` is a 422 on every route (never flattened
+to a retryable 502) and ``conflict`` is the 409 "already registered" lands on.
 """
 
 from unittest.mock import MagicMock, patch
@@ -18,8 +16,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from services.github_template_service import TemplateView
+from services.infra_template_registry import SEED_INFRA_TEMPLATES
 from services.template_rollout_service import (
-    INFRA_REPO_NAME,
+    DEFAULT_INFRA_TEMPLATE_ID,
     ReconcileItem,
     ReconcileView,
     RolloutError,
@@ -27,39 +26,18 @@ from services.template_rollout_service import (
     RolloutResultItem,
 )
 
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
-@pytest.fixture(autouse=True)
-def reset_modules():
-    import sys
-
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.connections",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_BACKEND_CLIENT_ID", "backend-client-id")
-    monkeypatch.setenv("ENTRA_SPA_CLIENT_ID", "spa-client-id")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
+RUNTIME_REPO = next(s["repo_name"] for s in SEED_INFRA_TEMPLATES if s["id"] == DEFAULT_INFRA_TEMPLATE_ID)
 
 
 def _build_client(fake_svc):
     import api.routes.connections as connections_module
+    from core.errors import install_error_handlers
 
-    connections_module._rollout_svc = fake_svc  # the lazy RolloutService singleton
+    connections_module._rollout_svc = fake_svc
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(connections_module.router, prefix="/api/v1")
     return TestClient(app)
 
@@ -84,8 +62,6 @@ def _headers():
     return {"Authorization": "Bearer fake-token"}
 
 
-# --- reconcile happy path: 200, three-state rows + the forced infra row ------
-
 def _view():
     return ReconcileView(
         templates=[
@@ -105,7 +81,7 @@ def _view():
             ),
         ],
         infra_repo=ReconcileItem(
-            name=INFRA_REPO_NAME,
+            name=RUNTIME_REPO,
             origin="seed",
             state="seed_absent",
             default_branch=None,
@@ -127,21 +103,18 @@ def test_reconcile_returns_view_admin(entra_settings):
     assert rows["strands-agentcore"]["head_sha"] == "abc123"
     assert rows["their-template"]["state"] == "unregistered_present"
     assert rows["their-template"]["head_sha"] is None
-    assert body["infra_repo"]["name"] == INFRA_REPO_NAME
+    assert body["infra_repo"]["name"] == RUNTIME_REPO
     assert body["infra_repo"]["state"] == "seed_absent"
-    # The DDB-only boolean is gone from the wire shape, not renamed alongside it.
     assert "exists_in_org" not in rows["strands-agentcore"]
     assert "selectable" not in rows["strands-agentcore"]
     s.reconcile.assert_called_once_with("conn-1")
 
 
-# --- rollout happy path: 200, per-item actions -------------------------------
-
 def test_rollout_returns_result_admin(entra_settings):
     result = RolloutResult(
         items=[
             RolloutResultItem("strands-agentcore", "created"),
-            RolloutResultItem(INFRA_REPO_NAME, "created"),
+            RolloutResultItem(RUNTIME_REPO, "created"),
         ]
     )
     s = _svc_with(rollout={"return_value": result})
@@ -156,7 +129,7 @@ def test_rollout_returns_result_admin(entra_settings):
     body = resp.json()
     names = {i["name"]: i["action"] for i in body["items"]}
     assert names["strands-agentcore"] == "created"
-    assert names[INFRA_REPO_NAME] == "created"
+    assert names[RUNTIME_REPO] == "created"
     s.rollout.assert_called_once_with(
         "conn-1",
         template_names=["strands-agentcore"],
@@ -166,7 +139,7 @@ def test_rollout_returns_result_admin(entra_settings):
 
 
 def test_rollout_body_carries_the_two_consents_separately(entra_settings):
-    """E28D wire split: ``overwrite`` is the TEMPLATE consent, ``overwrite_infra`` the infra
+    """``overwrite`` is the TEMPLATE consent, ``overwrite_infra`` the infra
     repo's own. A body that sets only ``overwrite`` must reach the service with
     ``overwrite_infra=False`` — the narrowing is on the wire, not just in the service."""
     s = _svc_with(rollout={"return_value": RolloutResult()})
@@ -182,7 +155,7 @@ def test_rollout_body_carries_the_two_consents_separately(entra_settings):
         "conn-1",
         template_names=["strands-agentcore"],
         overwrite=True,
-        overwrite_infra=False,   # NOT inherited from ``overwrite``
+        overwrite_infra=False,  # NOT inherited from ``overwrite``
     )
 
 
@@ -198,12 +171,8 @@ def test_rollout_infra_consent_is_settable_on_its_own(entra_settings):
             headers=_headers(),
         )
     assert resp.status_code == 200
-    s.rollout.assert_called_once_with(
-        "conn-1", template_names=[], overwrite=False, overwrite_infra=True
-    )
+    s.rollout.assert_called_once_with("conn-1", template_names=[], overwrite=False, overwrite_infra=True)
 
-
-# --- RBAC: both routes require ADMIN (403 for a viewer) ----------------------
 
 def test_reconcile_viewer_forbidden(entra_settings):
     s = _svc_with(reconcile={"return_value": _view()})
@@ -227,12 +196,8 @@ def test_rollout_operator_forbidden(entra_settings):
     s.rollout.assert_not_called()
 
 
-# --- error mapping: unknown template → 404 fixed literal ---------------------
-
 def test_rollout_unknown_template_404(entra_settings):
-    s = _svc_with(
-        rollout={"side_effect": RolloutError("Unknown base template 'x'", kind="not_found")}
-    )
+    s = _svc_with(rollout={"side_effect": RolloutError("Unknown base template 'x'", kind="not_found")})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.post(
@@ -245,9 +210,7 @@ def test_rollout_unknown_template_404(entra_settings):
 
 
 def test_rollout_validation_is_422_not_502(entra_settings):
-    s = _svc_with(
-        rollout={"side_effect": RolloutError("Invalid template name", kind="validation")}
-    )
+    s = _svc_with(rollout={"side_effect": RolloutError("Invalid template name", kind="validation")})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.post(
@@ -258,15 +221,10 @@ def test_rollout_validation_is_422_not_502(entra_settings):
     assert resp.status_code == 422
 
 
-# --- reconcile error honesty: validation is 422 here TOO ----------------------
-
-
 def test_reconcile_validation_is_422_not_flattened_to_502(entra_settings):
     """The route used to catch ``(RolloutError, GitHubRepoError)`` and answer 502 for BOTH, so a
     malformed connection id — permanent, unretryable — told the console to retry."""
-    s = _svc_with(
-        reconcile={"side_effect": RolloutError("Invalid connection id", kind="validation")}
-    )
+    s = _svc_with(reconcile={"side_effect": RolloutError("Invalid connection id", kind="validation")})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.get("/api/v1/admin/connections/conn%231/rollout/reconcile", headers=_headers())
@@ -276,16 +234,11 @@ def test_reconcile_validation_is_422_not_flattened_to_502(entra_settings):
 def test_reconcile_store_fault_is_still_502(entra_settings):
     """The guard on the test above: a genuine fault must NOT become a 422, or the console would
     stop retrying something a retry could fix."""
-    s = _svc_with(
-        reconcile={"side_effect": RolloutError("Could not read the catalog", kind="rollout_error")}
-    )
+    s = _svc_with(reconcile={"side_effect": RolloutError("Could not read the catalog", kind="rollout_error")})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.get("/api/v1/admin/connections/conn-1/rollout/reconcile", headers=_headers())
     assert resp.status_code == 502
-
-
-# --- adopt: 200 TemplateView / 404 / 409 / 422 --------------------------------
 
 
 def test_adopt_returns_the_template_view_admin(entra_settings):
@@ -309,7 +262,6 @@ def test_adopt_returns_the_template_view_admin(entra_settings):
     assert resp.status_code == 200
     assert resp.json()["name"] == "their-template"
     assert resp.json()["description"] == "ours now"
-    # ``created_by`` comes from the VALIDATED principal, never from the body.
     s.adopt.assert_called_once_with(
         "conn-1",
         repo_name="their-template",
@@ -319,9 +271,7 @@ def test_adopt_returns_the_template_view_admin(entra_settings):
 
 
 def test_adopt_repo_not_found_is_404(entra_settings):
-    s = _svc_with(
-        adopt={"side_effect": RolloutError("Repository not found", kind="repo_not_found")}
-    )
+    s = _svc_with(adopt={"side_effect": RolloutError("Repository not found", kind="repo_not_found")})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.post(
@@ -330,14 +280,57 @@ def test_adopt_repo_not_found_is_404(entra_settings):
             headers=_headers(),
         )
     assert resp.status_code == 404
-    # NOT the rollout path's "Unknown base template" — a different fact needs a different literal.
     assert resp.json()["detail"] == "Repository not found in the org"
 
 
-def test_adopt_already_registered_is_409(entra_settings):
+def test_adopt_response_is_joined_with_the_infra_catalog(entra_settings):
+    """ADOPT is the THIRD route returning a ``TemplateView``, and it must return the SAME view the
+    list and patch routes do.
+
+    Adopt's own contract is that "an adopted template is indistinguishable from an uploaded one on
+    every downstream surface" — which is false if this response alone reports the default
+    ``build_kind`` while ``GET /github-templates`` reports the joined one for the same template.
+    Today an adopted record carries the DEFAULT chain, so the values coincide and the bug is
+    invisible; this pins the behavior with a NON-default infra record so it stays true when adopt
+    learns to take an ``infra_template_id``.
+    """
+    import api.routes.github_templates as gh_module
+    from services.infra_template_registry import InfraTemplateRecord
+
     s = _svc_with(
-        adopt={"side_effect": RolloutError("Already registered", kind="conflict")}
+        adopt={"return_value": TemplateView(name="their-template", infra_template_id="agentcore-harness")}
     )
+    client = _build_client(s)
+    gh_module._infra_registry = MagicMock()
+    gh_module._infra_registry.list.return_value = [
+        InfraTemplateRecord(
+            id="agentcore-harness",
+            name="AgentCore Harness",
+            platform="databricks",
+            iac_type="agentcore_harness",
+            build_kind="config",
+            repo_name="agp-harness-infra",
+            module_source="harness-module/agentcore_harness.zip",
+            connection_id="conn-1",
+            created_at="2026-08-06T00:00:00+00:00",
+        )
+    ]
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        resp = client.post(
+            "/api/v1/admin/connections/conn-1/templates/adopt",
+            json={"repo_name": "their-template"},
+            headers=_headers(),
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["build_kind"] == "config"
+    assert body["platform"] == "databricks"
+    assert body["infra_template_id"] == "agentcore-harness"
+    gh_module._infra_registry.list.assert_called_once_with("conn-1")
+
+
+def test_adopt_already_registered_is_409(entra_settings):
+    s = _svc_with(adopt={"side_effect": RolloutError("Already registered", kind="conflict")})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.post(
@@ -350,9 +343,7 @@ def test_adopt_already_registered_is_409(entra_settings):
 
 
 def test_adopt_invalid_name_is_422(entra_settings):
-    s = _svc_with(
-        adopt={"side_effect": RolloutError("Invalid repository name", kind="validation")}
-    )
+    s = _svc_with(adopt={"side_effect": RolloutError("Invalid repository name", kind="validation")})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.post(
@@ -374,3 +365,22 @@ def test_adopt_operator_forbidden(entra_settings):
         )
     assert resp.status_code == 403
     s.adopt.assert_not_called()
+
+
+def test_reconcile_carries_infra_seeds_and_the_seed_rows_infra_id(entra_settings):
+    """The compare view needs the seeds the roll-out upserts first and each seed
+    row's declared infra, or it under-lists the infra repos the roll-out creates."""
+    view = _view()
+    view.templates[0].infra_template_id = "agentcore-gateway"
+    view.infra_seeds = [
+        {k: s[k] for k in ("id", "name", "description", "platform", "iac_type", "build_kind", "repo_name")}
+        for s in SEED_INFRA_TEMPLATES
+    ]
+    client = _build_client(_svc_with(reconcile={"return_value": view}))
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        body = client.get("/api/v1/admin/connections/conn-1/rollout/reconcile", headers=_headers()).json()
+    rows = {r["name"]: r for r in body["templates"]}
+    assert rows["strands-agentcore"]["infra_template_id"] == "agentcore-gateway"
+    assert rows["their-template"]["infra_template_id"] is None
+    assert [s["repo_name"] for s in body["infra_seeds"]] == [s["repo_name"] for s in SEED_INFRA_TEMPLATES]
+    assert all("module_source" not in s for s in body["infra_seeds"])

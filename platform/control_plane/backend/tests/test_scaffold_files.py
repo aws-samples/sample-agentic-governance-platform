@@ -1,14 +1,10 @@
-"""Unit tests for the scaffold fs-walk helper (E20, E28D/T2).
+"""Unit tests for the scaffold fs-walk helper.
 
-Guards the pure ``collect_scaffold_files`` reader after its old home
-(``test_template_rollout_service.py``) was deleted: it must read a scaffold dir into
-``{relpath: bytes}`` and skip build/cache artifacts (``__pycache__`` dirs, ``.pyc`` files).
-
-E28D/T2 turns the module's own rule into a fence. The header says "anything the scaffold's
-.gitignore lists must ALSO be named here" and nothing enforced it, which is how ``uv.lock``
-(304 KB) came to ship into every materialized customer repo. The parity test below reads the
-template's real ``.gitignore`` and fails the next time a line is added there without a matching
-skip entry.
+``collect_scaffold_files`` must read a scaffold dir into ``{relpath: bytes}`` and skip build and
+cache artifacts. The module's own rule, that anything the scaffold's ``.gitignore`` lists must also
+be named in the skip sets, is a fence here: the parity test reads the template's real ``.gitignore``
+and fails the next time a line is added there without a matching skip entry, the gap through which
+``uv.lock`` once shipped into every materialized repo.
 """
 
 from pathlib import Path
@@ -21,12 +17,7 @@ from services.scaffold_files import (
     collect_scaffold_files,
 )
 
-# Resolve relative to this test file so it works regardless of pytest's cwd:
-# tests/ -> backend/ -> control_plane/ -> agent-templates/...
-TEMPLATE_GITIGNORE = (
-    Path(__file__).resolve().parents[2]
-    / "agent-templates/strands-agentcore/.gitignore"
-)
+TEMPLATE_GITIGNORE = Path(__file__).resolve().parents[2] / "agent-templates/strands-agentcore/.gitignore"
 
 
 def test_collect_scaffold_files_reads_tree_and_skips_artifacts(tmp_path: Path):
@@ -34,7 +25,6 @@ def test_collect_scaffold_files_reads_tree_and_skips_artifacts(tmp_path: Path):
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "mod.py").write_bytes(b"x = 1\n")
 
-    # Build/cache artifacts that must be skipped.
     (tmp_path / "__pycache__").mkdir()
     (tmp_path / "__pycache__" / "app.cpython-311.pyc").write_bytes(b"\x00cached")
     (tmp_path / "sub" / "mod.pyc").write_bytes(b"\x00cached")
@@ -45,14 +35,13 @@ def test_collect_scaffold_files_reads_tree_and_skips_artifacts(tmp_path: Path):
         "app.py": b"print('hi')\n",
         "sub/mod.py": b"x = 1\n",
     }
-    # No skipped artifact leaked in.
     assert not any(k.endswith(".pyc") or "__pycache__" in k for k in files)
 
 
 def test_packaging_output_dirs_are_pruned(tmp_path: Path):
     """A ``build/`` or ``dist/`` dir holds a STALE COPY of the agent source.
 
-    Worse in kind than the E28B ``.ruff_cache`` leak: cache files are inert noise, but
+    Worse in kind than a ``.ruff_cache`` leak: cache files are inert noise, but
     ``build/lib/main.py`` is plausible source code landing in a customer's repo, shadowing the
     real ``src/``. Any host that has ever run ``python -m build`` / ``uv build`` leaves one.
     """
@@ -70,11 +59,12 @@ def test_packaging_output_dirs_are_pruned(tmp_path: Path):
 
 
 def test_uv_lock_is_not_collected(tmp_path: Path):
-    """``uv.lock`` is 304 KB nothing installs from — the image build runs ``pip install .``.
+    """``uv.lock`` is 304 KB nothing installs from — the image build installs from ``constraints.txt``.
 
-    Shipping it claims a lockfile discipline the platform elsewhere documents it does not have
-    (the promotion surface records the build as non-reproducible: floating base image, ranged
-    deps, no lockfile). Skipping it also makes the template's ``.gitignore`` and this module agree.
+    Shipping it claims a lock the build does not read: the install pins every dependency through
+    the template's ``constraints.txt``, and the promotion surface records the build as
+    non-reproducible because the base image tag still floats. Skipping it also makes the
+    template's ``.gitignore`` and this module agree.
     """
     (tmp_path / "pyproject.toml").write_bytes(b"[project]\nname = 'agent'\n")
     (tmp_path / "uv.lock").write_bytes(b"version = 1\n")
@@ -82,7 +72,6 @@ def test_uv_lock_is_not_collected(tmp_path: Path):
     files = collect_scaffold_files(tmp_path)
 
     assert "uv.lock" not in files
-    # The narrow skip must not take the sibling manifest the build actually reads.
     assert "pyproject.toml" in files
 
 
@@ -133,15 +122,11 @@ def uncovered_gitignore_entries(gitignore_text: str) -> "list[str]":
         entry = raw.strip()
         if not entry or entry.startswith(("#", "!")):
             continue
-        dir_only = entry.endswith("/")  # read the marker BEFORE normalising it away
+        dir_only = entry.endswith("/")
         entry = entry.removeprefix("**/").lstrip("/").rstrip("/")
         if not entry:
             continue
-        covered = (
-            _covered_as_dir(entry)
-            if dir_only
-            else _covered_as_dir(entry) or _covered_as_file(entry)
-        )
+        covered = _covered_as_dir(entry) if dir_only else _covered_as_dir(entry) or _covered_as_file(entry)
         if not covered:
             uncovered.append(f"{entry}/" if dir_only else entry)
     return uncovered
@@ -172,19 +157,15 @@ def test_gitignore_parity_parser_matches_walk_semantics():
     Both halves matter: a false alarm teaches devs to add dead skip entries, and a false
     negative is the very class of gap (``uv.lock``) this fence exists to catch.
     """
-    # Already honoured by the walk — the same rule written three ways. Must NOT be flagged.
     assert uncovered_gitignore_entries("build\n/build\n**/build/\n/dist/\n") == []
     assert uncovered_gitignore_entries("**/__pycache__/\n*.egg-info/\n*.pyc\n") == []
 
-    # Directory-ONLY entries need a DIR skip; uv.lock is a FILE skip, so `uv.lock/` is a gap.
     assert uncovered_gitignore_entries("uv.lock/\n") == ["uv.lock/"]
     assert uncovered_gitignore_entries("uv.lock\n") == []
 
-    # Genuinely uncovered lines are reported; the *<suffix> glob form is the only glob honoured.
     assert uncovered_gitignore_entries("coverage.xml\n") == ["coverage.xml"]
     assert uncovered_gitignore_entries("*.log\n") == ["*.log"]
     assert uncovered_gitignore_entries("build-*.tar\n") == ["build-*.tar"]
     assert uncovered_gitignore_entries("secrets/config.json\n") == ["secrets/config.json"]
 
-    # Noise lines carry no rule.
     assert uncovered_gitignore_entries("# a comment\n\n  \n!keep.me\n/\n") == []

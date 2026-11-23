@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Seed the ``default`` tenant + bulk-stamp ``tenant_id="default"`` (E24, Task 9).
+"""Seed the ``default`` tenant and bulk-stamp ``tenant_id="default"`` onto legacy records.
 
-This is the one-shot multi-tenancy migration for pre-E24 data. It is a USER /
-CONTROLLER step: without ``--dry-run`` it makes live AWS calls (DynamoDB via
-``TenantService``/``ProjectService``, Bedrock AgentCore registries via
+This is the one-shot multi-tenancy migration for data written before tenants existed. It is
+a USER / CONTROLLER step: without ``--dry-run`` it makes live AWS calls (DynamoDB via
+``TenantService``/``ProjectService``, the registries via
 ``AgentRegistryService``/``McpServerRegistryService``) and therefore needs AWS
 credentials plus the provisioned registry ids. What it does:
 
@@ -16,22 +16,24 @@ credentials plus the provisioned registry ids. What it does:
      script runs with, never checked-in config; validated against the tenant
      model's 12-digit rule before any write>``,
      ``aws_region=<--region arg, else the infra files' AWS_REGION/aws_region —
-     there is deliberately NO hardcoded account or region>``. In ``--dry-run`` an
+     there is no hardcoded account or region>``. In ``--dry-run`` an
      unreachable STS degrades to the placeholder ``<caller-account>`` in the plan
      output (dry-run works without cloud access; the region comes from the infra
      files, readable offline); a real run fails fast with a clear error instead.
+     A default tenant that already exists but is UNWIRED (empty ECR URI and deploy
+     role on both stages) is re-wired in place when the run carries wiring values;
+     an already-wired tenant, or a run with no wiring values, leaves it untouched.
   2. **Bulk-stamp agents + MCP servers** — list each registry; every record whose
      ``tenant_id`` is missing (None/absent) is stamped ``"default"`` and re-written
      through the service's existing envelope-write path (``persist_identity`` —
-     ``AgentUpdate``/``McpServerUpdate`` deliberately omit ``tenant_id``, so
-     ``update()`` cannot carry it; ``persist_identity`` writes the full governance
-     envelope, which includes ``tenant_id`` since E24/T4).
+     ``AgentUpdate``/``McpServerUpdate`` omit ``tenant_id``, so ``update()`` cannot
+     carry it; ``persist_identity`` writes the full governance envelope, ``tenant_id``
+     included).
   3. **Bulk-stamp projects** — list projects; any record missing ``tenant_id`` is
-     re-saved with ``tenant_id="default"``. NOTE: ``ProjectService``'s read path
-     already hydrates legacy stored records as ``tenant_id="default"`` (E24/T6
-     ``_hydrate_project``), so against the real service this step usually finds
-     nothing to stamp — the hydration is the durable fallback and this pass is the
-     belt to that suspenders.
+     re-saved with ``tenant_id="default"``. ``ProjectService``'s read path already
+     hydrates legacy stored records as ``tenant_id="default"`` (``ProjectStore.hydrate_project``),
+     so against the real service this step usually finds nothing to stamp — the
+     hydration is the durable fallback and this pass is the belt to that suspenders.
   4. Print a per-resource summary (``stamped/total``). Re-running stamps nothing
      (idempotent): the tenant already exists and every record already carries a
      ``tenant_id``.
@@ -54,11 +56,12 @@ Runtime config comes from the INFRASTRUCTURE folder, not the backend's own setti
   4. a hard error naming the sources tried, for every required value: region,
      account, agent registry id, tenants + projects table names. The MCP registry
      id stays optional — when unresolved, MCP servers are skipped with a warning.
+     ``agent_registry_id`` in ``terraform.tfvars`` is not named as a source: the root
+     variable no longer exists, so setting it there only draws an undeclared-variable
+     warning from Terraform.
 
-There is deliberately NO ``infrastructure/.env`` leg (removed in E34/T10). That file
-was a phantom config surface: nothing in the repo writes one, no setup step creates
-one, and it merely shadowed tfvars keys under a per-key precedence no reader could
-see. Anything it could have carried belongs on the command line instead.
+An ``infrastructure/.env`` is not read; anything it could have carried belongs on the
+command line instead.
 
 Failure envelope: one record failing to stamp is logged and skipped (the rest of the
 migration proceeds); the exit code is then 1. An unresolved MCP registry id is
@@ -93,34 +96,15 @@ from pathlib import Path
 
 logger = logging.getLogger("seed_default_tenant")
 
-# --- default-tenant contract (E24 spec §6 / task brief) ------------------------
 DEFAULT_TENANT_ID = "default"
 DEFAULT_TENANT_NAME = "Default-Platform"
 DEFAULT_TENANT_LOB = "Platform"
-
-# Dry-run placeholders when the caller's account/region cannot be resolved offline.
 ACCOUNT_PLACEHOLDER = "<caller-account>"
 REGION_PLACEHOLDER = "<caller-region>"
-
-# Env fallback for the tenant's Entra group when --group-id is not passed.
 GROUP_ID_ENV_VAR = "DEFAULT_TENANT_GROUP_ID"
-
-# --- infra config (source of truth) --------------------------------------------
-# Runtime config is read from the INFRASTRUCTURE folder's terraform.tfvars, never the
-# backend's own settings. The script lives at backend/scripts/, so the infra dir is the
-# sibling of backend/ (this is a path computation only — nothing is read at import).
 DEFAULT_INFRA_DIR = Path(__file__).resolve().parents[2] / "infrastructure"
-
-# The dynamodb module names its tables "${name_prefix}-tenants"/"${name_prefix}-projects"
-# (infrastructure/modules/dynamodb/main.tf); the root main.tf builds
-# name_prefix = "${project_name}-cp-${environment}-${substr(account_id, -6, 6)}".
 TENANTS_TABLE_SUFFIX = "tenants"
 PROJECTS_TABLE_SUFFIX = "projects"
-
-# The table names are derived from tfvars' ``project_name``/``environment``, because
-# Terraform computes name_prefix from those variables ONLY — they are what actually
-# named the deployed tables. The account is not in that file at all: it comes from the
-# caller's STS identity, never from checked-in config.
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
@@ -131,13 +115,11 @@ def _parse_tfvars_file(path: Path) -> dict:
     gracefully — including multi-line blocks — as are comments (full-line and
     inline after a value) and anything else that doesn't parse. Stdlib only."""
     values: dict = {}
-    block_depth = 0  # >0 while inside a skipped non-scalar block (e.g. ``tags = {``)
+    block_depth = 0
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if block_depth > 0:
-            block_depth += (
-                line.count("{") - line.count("}") + line.count("[") - line.count("]")
-            )
+            block_depth += line.count("{") - line.count("}") + line.count("[") - line.count("]")
             continue
         if not line or line.startswith("#") or line.startswith("//"):
             continue
@@ -147,19 +129,15 @@ def _parse_tfvars_file(path: Path) -> dict:
         if not sep or not _IDENT_RE.match(key) or not rhs:
             continue
         if rhs[0] in "{[":
-            # Non-scalar (map/list) — skip it; track braces so a multi-line block
-            # like ``tags = {`` is consumed until its closing ``}``.
-            block_depth = (
-                rhs.count("{") - rhs.count("}") + rhs.count("[") - rhs.count("]")
-            )
+            block_depth = rhs.count("{") - rhs.count("}") + rhs.count("[") - rhs.count("]")
             continue
         if rhs[0] == '"':
             end = rhs.find('"', 1)
             if end == -1:
-                continue  # unterminated string — can't parse, skip
+                continue
             value = rhs[1:end]
         else:
-            value = rhs.split("#", 1)[0].strip()  # drop inline comment
+            value = rhs.split("#", 1)[0].strip()
         if value:
             values[key.upper()] = value
     return values
@@ -170,8 +148,8 @@ def _load_infra_config(infra_dir) -> dict:
 
     ``terraform.tfvars`` is the ONLY config file consulted: it is the file Terraform
     itself read, so its ``project_name``/``environment`` are what named the deployed
-    resources. An ``infrastructure/.env`` is deliberately NOT read (E34/T10) — anything
-    it could carry belongs on the command line or in the ambient environment instead.
+    resources. An ``infrastructure/.env`` is not read; anything it could carry belongs on
+    the command line or in the ambient environment instead.
 
     A missing file simply contributes nothing. This file is READ-ONLY here."""
     tfvars_path = Path(infra_dir) / "terraform.tfvars"
@@ -209,25 +187,13 @@ def _resolve_runtime_config(args) -> dict:
     region = args.region or infra.get("AWS_REGION")
     if not region:
         raise RuntimeError(
-            f"Could not resolve the AWS region — tried --region and aws_region in "
-            f"{tfvars_path}."
+            f"Could not resolve the AWS region — tried --region and aws_region in {tfvars_path}."
         )
 
-    # Account: CLI > STS (inside _resolve_account_id) > hard error (in --dry-run an
-    # unreachable STS degrades to the placeholder instead). The infra folder is
-    # deliberately NOT a source: the script runs with AWS credentials, and those
-    # credentials already say which account it is acting on — reading it from a file
-    # only creates a second, silently-stale answer to a question the environment
-    # already answers, and this account is what DERIVES the table names below and is
-    # stamped onto the seeded tenant's stages.
     account_id = _resolve_account_id(args.account_id, dry_run=args.dry_run)
 
     agent_registry_id = args.agent_registry_id or infra.get("AGENT_REGISTRY_ID")
     if not agent_registry_id:
-        # `agent_registry_id in terraform.tfvars` is deliberately NOT named as a source
-        # here: the root variable was deleted, so setting it there makes `terraform apply`
-        # emit an undeclared-variable warning. Naming a source the operator should not be
-        # editing is worse than naming none — this flag is the honest answer.
         raise RuntimeError(
             "Could not resolve the agent registry id — tried --agent-registry-id. "
             "NOTE: AWS mints registry ids and the platform resolves the registry by NAME "
@@ -236,7 +202,6 @@ def _resolve_runtime_config(args) -> dict:
             "\"registries[?name=='agp-agents'].registryId\" --output text`."
         )
 
-    # Optional — an unresolved MCP registry means "skip MCP servers with a warning".
     mcp_registry_id = args.mcp_registry_id or infra.get("MCP_REGISTRY_ID")
 
     tenants_table = args.tenants_table or _derive_table_name(
@@ -285,15 +250,14 @@ def _resolve_account_id(explicit, *, dry_run: bool) -> str:
     account.
     """
     if explicit:
-        # An explicit but malformed --account-id is a caller error even in dry-run.
         return _validate_account_id(explicit)
-    try:
-        import boto3  # lazy — module import must not require boto3 or any env
+    from botocore.exceptions import BotoCoreError, ClientError
 
-        return _validate_account_id(
-            boto3.client("sts").get_caller_identity()["Account"]
-        )
-    except Exception as exc:  # noqa: BLE001 — any failure means "cannot derive"
+    from core.aws_clients import client
+
+    try:
+        account = client("sts").get_caller_identity()["Account"]
+    except (BotoCoreError, ClientError) as exc:
         if dry_run:
             logger.warning(
                 "STS unreachable (%s) — dry-run continues with %s.",
@@ -306,6 +270,7 @@ def _resolve_account_id(explicit, *, dry_run: bool) -> str:
             "or configure AWS credentials — the seed tenant's aws_account_dev/prod "
             "come from the caller's identity, never a hardcoded value."
         ) from exc
+    return _validate_account_id(account)
 
 
 def _resolve_region(explicit, *, dry_run: bool) -> str:
@@ -319,18 +284,18 @@ def _resolve_region(explicit, *, dry_run: bool) -> str:
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     if region:
         return region
-    try:
-        import boto3  # lazy — module import must not require boto3 or any env
+    from botocore.exceptions import BotoCoreError
 
-        region = boto3.session.Session().region_name
-    except Exception:  # noqa: BLE001 — no boto3/config just means "not resolved here"
+    from core.aws_clients import ambient_region
+
+    try:
+        region = ambient_region()
+    except BotoCoreError:
         region = None
     if region:
         return region
     if dry_run:
-        logger.warning(
-            "No AWS region configured — dry-run continues with %s.", REGION_PLACEHOLDER
-        )
+        logger.warning("No AWS region configured — dry-run continues with %s.", REGION_PLACEHOLDER)
         return REGION_PLACEHOLDER
     raise RuntimeError(
         "No AWS region configured — pass --region or set AWS_REGION/AWS_DEFAULT_REGION "
@@ -353,8 +318,7 @@ def _build_default_tenant(
     """Construct the seed ``Tenant`` (pure Pydantic — no AWS). Imported lazily so
     importing this module needs nothing beyond stdlib.
 
-    E25 reshape: the flat ``aws_account_dev``/``aws_account_prod``/``aws_region``
-    fields became a nested ``stages`` map. Both ``dev`` and ``prod`` point at the same
+    The tenant's stages are a nested map. Both ``dev`` and ``prod`` point at the same
     (deploy) account in a single-account install; the ECR URIs and push/deploy role
     ARNs are passed in by the operator on the command line (``--dev-ecr-uri`` and
     friends, read off the ``terraform output`` after apply) and default empty —
@@ -440,10 +404,14 @@ def _stamp_resource(service, label: str, list_records, write_record, *, dry_run:
             record.tenant_id = DEFAULT_TENANT_ID
             write_record(record)
             stamped += 1
-            logger.info("  stamped %s %r -> tenant_id=%r", label, getattr(record, "id", "?"), DEFAULT_TENANT_ID)
-        except Exception as exc:  # noqa: BLE001 — log + continue, don't abort the migration
+            logger.info(
+                "  stamped %s %r -> tenant_id=%r", label, getattr(record, "id", "?"), DEFAULT_TENANT_ID
+            )
+        except Exception as exc:
             failures += 1
-            logger.error("  failed to stamp %s %r: %s — continuing", label, getattr(record, "id", "?"), exc)
+            logger.exception(
+                "  failed to stamp %s %r: %s — continuing", label, getattr(record, "id", "?"), exc
+            )
     return stamped, len(records), failures
 
 
@@ -455,8 +423,8 @@ def run(
     agent_service,
     mcp_server_service,
     project_service,
-    account_id=None,
-    region=None,
+    account_id: str | None = None,
+    region: str | None = None,
     dev_ecr_uri="",
     prod_ecr_uri="",
     dev_deploy_role_arn="",
@@ -471,25 +439,17 @@ def run(
     ``account_id``/``region`` arrive already resolved by ``main()`` (CLI > infra
     files > STS); when ``None`` they fall back to the caller's environment (STS /
     region config), and only when a tenant will actually be created (an existing
-    tenant needs no AWS call). The ``*_ecr_uri`` / ``*_role_arn`` values are the E25
+    tenant needs no AWS call). The ``*_ecr_uri`` / ``*_role_arn`` values are the
     cross-account CICD wiring, supplied as CLI flags from the ``terraform output``
     of the apply that created them; they default empty.
+
+    The default tenant has three cases: absent → create; exists but UNWIRED (empty
+    deploy role and ECR URI on both stages, see ``_tenant_is_unwired``) and this run
+    carries wiring values → re-wire it in place, preserving its account, region and
+    group unless the run overrides them; exists and already wired, or the run carries
+    no wiring → leave it untouched, so a bare re-run stays a no-op and an operator's
+    changes are never overwritten.
     """
-    # 1) Seed the default tenant — three cases (I3 fix). The pre-I3 logic was
-    #    binary (create-if-absent, else skip), which left an UPGRADED install with
-    #    a pre-existing but UNWIRED default tenant (empty ECR/deploy-role stages) —
-    #    so new repos got empty CI vars and the first push failed. (The vars were
-    #    per-GitHub-Environment then; E28B/T7 makes them repository-level. Same failure.)
-    #    Now:
-    #      (a) ABSENT                         → create (as before);
-    #      (b) EXISTS but UNWIRED + this run
-    #          carries wiring values          → RE-WIRE it in place;
-    #      (c) EXISTS + already wired, OR the
-    #          run carries no wiring          → leave untouched (skip).
-    #    We only auto-wire a tenant that is PROVABLY untouched-by-wiring (both
-    #    stages have empty deploy-role AND ecr — see _tenant_is_unwired), so we
-    #    never overwrite operator changes; and only when this run actually carries
-    #    wiring values, so a bare re-run with no flags stays a no-op.
     existing_default = next(
         (t for t in tenant_service.list() if getattr(t, "id", None) == DEFAULT_TENANT_ID),
         None,
@@ -505,24 +465,23 @@ def run(
         )
     )
 
-    if existing_default is not None and not (
-        run_has_wiring and _tenant_is_unwired(existing_default)
-    ):
-        # Case (c): exists and either already wired or no wiring provided — skip.
+    if existing_default is not None and not (run_has_wiring and _tenant_is_unwired(existing_default)):
         tenant_status = "exists"
         logger.info("Tenant %r already exists — nothing to create.", DEFAULT_TENANT_ID)
     else:
-        rewiring = existing_default is not None  # case (b) vs case (a)
+        rewiring = existing_default is not None
         if rewiring:
-            # Preserve identity: reuse the EXISTING tenant's group/account/region
-            # unless the run explicitly supplied overrides (explicit intent wins).
             existing_stage = (getattr(existing_default, "stages", {}) or {}).get("dev")
             resolved_account = account_id or getattr(existing_stage, "account_id", None)
             resolved_region = region or getattr(existing_stage, "region", None)
-            resolved_group = (
-                group_id
-                or next(iter(getattr(existing_default, "entra_group_ids", []) or []), None)
+            resolved_group = group_id or next(
+                iter(getattr(existing_default, "entra_group_ids", []) or []), None
             )
+            if not (resolved_account and resolved_region and resolved_group):
+                raise RuntimeError(
+                    f"Tenant {DEFAULT_TENANT_ID!r} exists but carries no dev-stage account/region or "
+                    "no Entra group to preserve; pass --account-id, --region and --group-id to re-wire it."
+                )
         else:
             resolved_account = _resolve_account_id(account_id, dry_run=dry_run)
             resolved_region = _resolve_region(region, dry_run=dry_run)
@@ -562,7 +521,6 @@ def run(
                 resolved_region,
             )
 
-    # 2) Bulk-stamp each resource type via its existing write path.
     failures = 0
     a_stamped, a_total, a_fail = _stamp_resource(
         agent_service,
@@ -582,12 +540,11 @@ def run(
         project_service,
         "project",
         lambda: project_service.list_projects(),
-        lambda r: project_service._save_project(r),  # noqa: SLF001 — the service's own write path
+        lambda r: project_service._save_project(r),
         dry_run=dry_run,
     )
     failures = a_fail + m_fail + p_fail
 
-    # 3) Summary — stamped/total per resource type.
     summary = (
         f"tenant={tenant_status} "
         f"agents={a_stamped}/{a_total} "
@@ -619,9 +576,7 @@ def _build_services(config: dict):
     from services.project_service import ProjectService
     from services.tenant_service import TenantService
 
-    tenant_service = TenantService(
-        table_name=config["tenants_table"], region=config["region"]
-    )
+    tenant_service = TenantService(table_name=config["tenants_table"], region=config["region"])
 
     agent_service = AgentRegistryService(
         registry_id=config["agent_registry_id"],
@@ -790,8 +745,6 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Resolve the tenant's Entra group BEFORE importing settings — the script must
-    # not require full env config just to tell the caller what's missing.
     group_id = args.group_id or os.environ.get(GROUP_ID_ENV_VAR, "")
     if not group_id:
         logger.error(
@@ -800,14 +753,9 @@ def main(argv=None) -> int:
         )
         return 2
 
-    # Resolve runtime config from the infra folder (CLI > terraform.tfvars > derivation)
-    # and build the services from it — all here (not at module top) so importing
-    # this module never reads a file or triggers any AWS setup.
     try:
         config = _resolve_runtime_config(args)
-        tenant_service, agent_service, mcp_server_service, project_service = (
-            _build_services(config)
-        )
+        tenant_service, agent_service, mcp_server_service, project_service = _build_services(config)
         return run(
             group_id=group_id,
             dry_run=args.dry_run,
@@ -815,11 +763,7 @@ def main(argv=None) -> int:
             agent_service=agent_service,
             mcp_server_service=mcp_server_service,
             project_service=project_service,
-            account_id=(
-                None
-                if config["account_id"] == ACCOUNT_PLACEHOLDER
-                else config["account_id"]
-            ),
+            account_id=(None if config["account_id"] == ACCOUNT_PLACEHOLDER else config["account_id"]),
             region=config["region"],
             dev_ecr_uri=args.dev_ecr_uri,
             prod_ecr_uri=args.prod_ecr_uri,
@@ -828,8 +772,8 @@ def main(argv=None) -> int:
             dev_push_role_arn=args.dev_push_role_arn,
             prod_push_role_arn=args.prod_push_role_arn,
         )
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        logger.error("Seeding failed: %s", exc)
+    except Exception as exc:
+        logger.exception("Seeding failed: %s", exc)
         logger.error(
             "Runtime config comes from the INFRASTRUCTURE folder's terraform.tfvars "
             "(--infra-dir, default %s), not the backend's own settings — except the AWS "

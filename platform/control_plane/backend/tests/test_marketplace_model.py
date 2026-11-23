@@ -1,7 +1,8 @@
-"""Tests for the marketplace Pydantic models (E9 T1)."""
+"""Tests for the marketplace Pydantic models."""
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
@@ -11,6 +12,7 @@ from models.marketplace import (
     MarketplacePublication,
     ProductCard,
     ProductType,
+    ProductTypeCounts,
     PublishRequest,
     PublishRequestCreate,
     PublishRequestStatus,
@@ -35,9 +37,7 @@ def test_subscription_round_trips_through_json():
         created_at=FIXED_NOW,
         updated_at=FIXED_NOW,
     )
-    agent_round_tripped = Subscription.model_validate(
-        json.loads(agent_sub.model_dump_json())
-    )
+    agent_round_tripped = Subscription.model_validate(json.loads(agent_sub.model_dump_json()))
     assert agent_round_tripped == agent_sub
 
     mcp_sub = Subscription(
@@ -58,9 +58,7 @@ def test_subscription_round_trips_through_json():
         created_at=FIXED_NOW,
         updated_at=FIXED_NOW,
     )
-    mcp_round_tripped = Subscription.model_validate(
-        json.loads(mcp_sub.model_dump_json())
-    )
+    mcp_round_tripped = Subscription.model_validate(json.loads(mcp_sub.model_dump_json()))
     assert mcp_round_tripped == mcp_sub
 
 
@@ -75,8 +73,8 @@ def test_subscription_status_enum_values():
 
 
 def test_revoked_subscription_round_trips_with_revoke_fields():
-    # A revoked MCP sub carries the 3 new revoke audit fields AND keeps its original
-    # approval audit (decided_by/decided_at) — a revoke does NOT overwrite them.
+    """A revoked MCP subscription carries the revoke audit fields AND keeps its approval audit
+    (decided_by / decided_at): a revoke does not overwrite them."""
     sub = Subscription(
         id="mkt-rev0000001",
         product_type=ProductType.MCP,
@@ -103,13 +101,11 @@ def test_revoked_subscription_round_trips_with_revoke_fields():
     assert round_tripped.revoked_by == "admin2@acme.com"
     assert round_tripped.revoked_at == FIXED_NOW
     assert round_tripped.revoke_reason == "offboarding the agent"
-    # Approval audit untouched by the revoke.
     assert round_tripped.decided_by == "admin@acme.com"
     assert round_tripped.decided_at == FIXED_NOW
 
 
 def test_old_shape_subscription_without_revoke_fields_still_validates():
-    # An OLD DDB record (predating the revoke fields) must validate with None defaults.
     old_item = {
         "id": "mkt-old0000001",
         "product_type": "agent",
@@ -132,21 +128,19 @@ def test_revoke_request_validates_empty():
 
 
 def test_subscription_create_requires_product_fields():
-    created = SubscriptionCreate(product_type="agent", product_id="bp-x")
+    created = SubscriptionCreate(product_type=ProductType.AGENT, product_id="bp-x")
     assert created.product_type == ProductType.AGENT
     assert created.product_id == "bp-x"
 
     with pytest.raises(pytest.importorskip("pydantic").ValidationError):
-        SubscriptionCreate(product_type="agent")
+        SubscriptionCreate.model_validate({"product_type": "agent"})
 
 
 def test_product_card_defaults():
-    card = ProductCard(product_type="mcp", product_id="m1", name="N")
+    card = ProductCard(product_type=ProductType.MCP, product_id="m1", name="N")
     assert card.capabilities == []
     assert card.available is True
     assert card.my_status is None
-    # Agent datasheet fields are optional → None / empty-list by default, so records
-    # (and MCP cards) lacking them validate fine.
     assert card.owner_team is None
     assert card.sla_tier is None
     assert card.consumers is None
@@ -155,9 +149,9 @@ def test_product_card_defaults():
 
 
 def test_product_card_datasheet_round_trips():
-    """The agent DECLARED-datasheet fields survive a JSON round-trip with types (E33)."""
+    """The agent DECLARED-datasheet fields survive a JSON round-trip with types."""
     card = ProductCard(
-        product_type="agent",
+        product_type=ProductType.AGENT,
         product_id="agt-fnol",
         name="FNOL Agent",
         owner_team="Claims Automation",
@@ -182,35 +176,32 @@ def test_product_card_datasheet_round_trips():
 
 
 def test_product_card_drops_measured_telemetry_fields():
-    """E33 deleted the five INVENTED/measured fields — a declared datasheet cannot assert
-    uptime, latency, live status or ratings, so the card must not carry a home for them.
-    Asserted via ``hasattr`` (not a ValidationError) because pydantic's default
-    ``extra="ignore"`` silently DROPS an unknown kwarg rather than raising."""
-    card = ProductCard(
-        product_type="agent",
-        product_id="agt-fnol",
-        name="FNOL Agent",
-        uptime_30d="99.9%",
-        latency_p95_ms=540,
-        status="Operational",
-        rating=4.3,
-        rating_count=27,
+    """The five INVENTED/measured fields are deleted: a declared datasheet cannot assert uptime,
+    latency, live status or ratings, so the card must not carry a home for them. Asserted via
+    ``hasattr`` (not a ValidationError) because pydantic's default ``extra="ignore"`` silently
+    DROPS an unknown key rather than raising."""
+    card = ProductCard.model_validate(
+        {
+            "product_type": "agent",
+            "product_id": "agt-fnol",
+            "name": "FNOL Agent",
+            "uptime_30d": "99.9%",
+            "latency_p95_ms": 540,
+            "status": "Operational",
+            "rating": 4.3,
+            "rating_count": 27,
+        }
     )
     for gone in ("uptime_30d", "latency_p95_ms", "status", "rating", "rating_count"):
         assert not hasattr(card, gone), f"ProductCard still carries {gone}"
-    # And they are absent from the serialized read-model the frontend types.
     dumped = json.loads(card.model_dump_json())
     for gone in ("uptime_30d", "latency_p95_ms", "status", "rating", "rating_count"):
         assert gone not in dumped
 
 
-# ---------------------------------------------------------------------------
-# E33 — declared datasheet + publish request (contract C1)
-# ---------------------------------------------------------------------------
-
 def _datasheet(**overrides) -> Datasheet:
     """A minimal VALID datasheet (the 3 mandatory fields), overridable."""
-    fields = {
+    fields: dict[str, Any] = {
         "owner_team": "Claims Automation",
         "support_contact": "claims-automation@acme.com",
         "data_classification": "Confidential",
@@ -228,7 +219,7 @@ def test_datasheet_requires_the_three_mandatory_fields():
     assert _datasheet().owner_team == "Claims Automation"
 
     for missing in ("owner_team", "support_contact", "data_classification"):
-        payload = {
+        payload: dict[str, Any] = {
             "owner_team": "Claims Automation",
             "support_contact": "claims-automation@acme.com",
             "data_classification": "Confidential",
@@ -295,7 +286,6 @@ def test_publish_request_round_trips_through_json():
     assert again.datasheet.compliance == ["GDPR", "BaFin"]
     assert again.status == PublishRequestStatus.PENDING
     assert again.product_type == ProductType.AGENT
-    # Decision audit + the safe-literal error field default to None on a PENDING record.
     assert again.decided_by is None
     assert again.decided_at is None
     assert again.decision_reason is None
@@ -303,7 +293,7 @@ def test_publish_request_round_trips_through_json():
 
 
 def test_publish_request_carries_product_type_for_mcp():
-    """Amendment 1 (C9): publish is the ONE door for BOTH product types, so the record is
+    """Publish is the ONE door for BOTH product types, so the record is
     keyed by the (product_type, product_id) PAIR — an MCP request is indistinguishable from
     an agent one except for ``product_type``. The old agent-only ``agent_id``/``agent_name``
     names are gone (pydantic's default ``extra="ignore"`` would silently DROP them, which is
@@ -336,15 +326,17 @@ def test_publish_request_requires_product_type():
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        PublishRequest(
-            id="pub-nopt00001",
-            product_id="agt-1",
-            product_name="FNOL Agent",
-            datasheet=_datasheet(),
-            status=PublishRequestStatus.PENDING,
-            requested_by="oid-publisher-1",
-            created_at=FIXED_NOW,
-            updated_at=FIXED_NOW,
+        PublishRequest.model_validate(
+            {
+                "id": "pub-nopt00001",
+                "product_id": "agt-1",
+                "product_name": "FNOL Agent",
+                "datasheet": _datasheet(),
+                "status": PublishRequestStatus.PENDING,
+                "requested_by": "oid-publisher-1",
+                "created_at": FIXED_NOW,
+                "updated_at": FIXED_NOW,
+            }
         )
 
 
@@ -391,10 +383,9 @@ def test_publish_request_create_shape():
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        PublishRequestCreate(product_type="agent", product_id="agt-1")  # no datasheet
+        PublishRequestCreate.model_validate({"product_type": "agent", "product_id": "agt-1"})
     with pytest.raises(ValidationError):
-        # product_type is REQUIRED — the route must never have to guess the registry.
-        PublishRequestCreate(product_id="agt-1", datasheet=_datasheet())
+        PublishRequestCreate.model_validate({"product_id": "agt-1", "datasheet": _datasheet()})
     assert "agent_id" not in PublishRequestCreate.model_fields
 
 
@@ -448,14 +439,13 @@ def test_metrics_shape():
         rejected=0,
         failed=0,
         approval_rate=0.0,
-        by_type={},
+        by_type=ProductTypeCounts(agent=0, mcp=0),
         top_products=[],
     )
     assert metrics.total == 0
     assert metrics.approval_rate == 0.0
-    assert metrics.by_type == {}
+    assert metrics.by_type == ProductTypeCounts(agent=0, mcp=0)
     assert metrics.top_products == []
-    # `revoked` defaults to 0 so metrics built without it (old callers) still validate.
     assert metrics.revoked == 0
 
 
@@ -468,7 +458,7 @@ def test_metrics_accepts_revoked_count():
         failed=0,
         revoked=1,
         approval_rate=0.0,
-        by_type={},
+        by_type=ProductTypeCounts(agent=0, mcp=0),
         top_products=[],
     )
     assert metrics.revoked == 1

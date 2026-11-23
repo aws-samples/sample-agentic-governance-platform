@@ -366,3 +366,141 @@ resource "aws_dynamodb_table" "tenants" {
     Name = "${var.name_prefix}-tenants"
   })
 }
+
+# ============================================================================
+# Evals Table — eval run + promote-override index per repo (E42)
+# pk = REPO#<repo_id>, sk = RUN#<iso>#<run_id> | OVERRIDE#<iso>#<digest>.
+# Full run records live in the evals S3 bucket.
+# ============================================================================
+
+resource "aws_dynamodb_table" "evals" {
+  name         = "${var.name_prefix}-evals"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-evals"
+  })
+}
+
+# ============================================================================
+# Containment Table — kill-switch state, monitor, signals, sessions (E41)
+# pk = AGENT#<id>, sk = STATE | MONITOR | SIGNAL#<iso>#<span_id> | SESSION#<sid>;
+# pk = MONITORED / LEASE for the monitor index + leader lease. Mutable.
+# ============================================================================
+
+resource "aws_dynamodb_table" "containment" {
+  name                        = "${var.name_prefix}-containment"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  range_key                   = "sk"
+  deletion_protection_enabled = !var.ephemeral
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-containment"
+  })
+}
+
+# ============================================================================
+# Audit Table — append-only containment audit trail (E41)
+# pk = AGENT#<id>, sk = EVENT#<iso>#<uuid>. The ECS task may only Put/Get/Query
+# (explicit Deny on every mutation — see ecs module `ecs_task_audit`).
+# ============================================================================
+
+resource "aws_dynamodb_table" "audit" {
+  name                        = "${var.name_prefix}-audit"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  range_key                   = "sk"
+  deletion_protection_enabled = !var.ephemeral
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-audit"
+  })
+}
+
+# Resource-side Deny: binds EVERY principal (incl. roles the task role can assume or
+# mint), unlike the task-role Deny in the ecs module. Changing this policy is itself a
+# CloudTrail management event. Deny-only — access is still granted by identity policies.
+resource "aws_dynamodb_resource_policy" "audit" {
+  resource_arn = aws_dynamodb_table.audit.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AuditAppendOnly"
+        Effect    = "Deny"
+        Principal = "*"
+        Action = [
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:BatchWriteItem",
+          "dynamodb:PartiQLUpdate",
+          "dynamodb:PartiQLDelete"
+        ]
+        Resource = aws_dynamodb_table.audit.arn
+      }
+    ]
+  })
+}

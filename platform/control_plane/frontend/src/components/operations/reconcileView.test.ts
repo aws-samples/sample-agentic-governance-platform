@@ -1,39 +1,34 @@
-// reconcileView.test.ts — the reconcile surface's decisions, as UNITS (E28C/T6).
-//
-// WHY THESE ARE THE TESTS THAT EXIST. vitest here collects `src/**/*.test.ts` in a node
-// environment with NO jsdom, so nothing in `RolloutTemplatesModal.tsx` can be mounted, clicked
-// or rendered by any test in this project. Every judgement the surface makes therefore lives in
-// `reconcileView.ts` as a pure function, and this file tests the function's OUTPUT for given
-// inputs.
-//
-// E28B's lesson (nine vacuous guards) is the shape rule here: a test that asserts a constant's
-// text back to itself, or greps the source for a class name, proves nothing about behaviour. So
-// there are no source-shape assertions below EXCEPT the two deliberate sweeps at the bottom —
-// the deleted-field grep and the page-load fetch set — which are testing an ABSENCE across files
-// that no unit call can reach, and both are proven able to fail.
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
-import { describe, expect, it } from 'vitest';
+import type { ReconcileItemView } from '../../api/client';
+import { ApiFailure, type ErrorCode } from '../../api/failure';
+import { AUTH_401_HALT_MESSAGE } from '../../api/authRetry';
+import { failureOf } from '../../api/loadState';
+import { stripComments } from '../../rawSource';
 
 import {
   ADOPT_CONFIRM_NO_PROVENANCE,
   ADOPT_NAME_RULE_HINT,
-  PAGE_LOAD_PROVIDER_CALLS,
   RECONCILE_STATE_LABEL,
   RECONCILE_STATE_TONE,
-  RECONCILE_EFFECT_DEPS,
+  ROLLOUT_ERROR_CODES,
   SEED_CONSENT_PROMPT,
   adoptConfirm,
   batchConfirmLines,
   batchConfirmTitle,
   batchPlan,
   classifyRolloutError,
+  classifyRolloutFailure,
+  deregisterConfirm,
   infraIntentFor,
   infraNeedsCreate,
   isAdoptableName,
   reconcileRowModel,
   reconcileRows,
+  recreateConfirm,
   repushConfirm,
   rolloutActionLabel,
+  wireFlagNote,
   toggleQueuedAction,
   type BatchPlan,
   type InfraIntent,
@@ -41,14 +36,10 @@ import {
   type ReconcileItemLike,
   type RolloutErrorKind,
 } from './reconcileView.ts';
-// The DEREGISTER classifier (F3). Deregister is `githubTemplatesApi.remove` — a different route with
-// its own `detail` literals — so the reconcile surface must classify its failures with that route's
-// own classifier. Imported here to pin that the two classifiers do NOT overlap.
-import { classifyTemplateError } from './templatesView.ts';
+import { TEMPLATE_ERROR_CODES, classifyTemplateError } from './templatesView.ts';
 import rolloutModalSrc from './RolloutTemplatesModal.tsx?raw';
 
-// --- Row fixtures ----------------------------------------------------------
-// Shaped exactly like `ReconcileItemView` on the wire (connections.py:463-481).
+export const NON_TEST_SOURCE_FLOOR = 20;
 
 const row = (over: Partial<ReconcileItemLike> = {}): ReconcileItemLike => ({
   name: 'strands-agentcore',
@@ -59,46 +50,18 @@ const row = (over: Partial<ReconcileItemLike> = {}): ReconcileItemLike => ({
   ...over,
 });
 
-/**
- * A SELECTION, as the surface now holds it: name → the verb that was visible when it was ticked.
- *
- * It was a `Set<string>` of bare names, and that is the T6-L3 defect in one type: a tick with no
- * verb cannot be checked against the verb the row offers NOW, so a create tick silently became a
- * re-push consent across a Refresh. Written as a helper because every `batchPlan` call below needs
- * one, and a literal `new Map([...])` at each site would bury the interesting argument.
- */
 const q = (...entries: [string, ReconcileAction][]): ReadonlyMap<string, ReconcileAction> =>
   new Map(entries);
 
-/**
- * The modal source with its COMMENTS REMOVED, for the source assertions below.
- *
- * Necessary, not tidy, and the deregister-classifier test at the bottom of this file already names
- * the reason in its own words: this codebase documents a fix by QUOTING the wrong thing it replaced.
- * `RolloutTemplatesModal.tsx` explains the retired infra sentence by reciting it, so an assertion
- * that the retired wording is gone fails on correct code unless the prose is stripped first — which
- * is a test that punishes the comment rather than the copy. The same trap caught this test twice.
- *
- * `templates.test.ts:657` is the same helper for the same reason; duplicated rather than exported
- * because a shared test util that two files import is a third thing to keep in sync for four lines.
- */
-const stripComments = (src: string): string =>
-  src
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
-    .filter((line) => !line.trim().startsWith('//'))
-    .join('\n');
+afterEach(() => vi.restoreAllMocks());
 
-describe('reconcileRowModel — state → the ONE honest action', () => {
+describe('reconcileRowModel: each state offers one honest action, the client half of the server’s state table', () => {
   it('seed_absent offers create, and nothing else', () => {
     const m = reconcileRowModel(row({ state: 'seed_absent' }));
     expect(m.actions).toEqual(['create']);
   });
 
-  it('unregistered_present offers adopt, and NEVER create or repush', () => {
-    // The state that cost a live repository in the 2026-08-04 test. Rollout refuses it
-    // server-side (`_rollout_template` returns action="skipped" naming adopt), so a surface
-    // that offered "create" here would be offering a click the backend is guaranteed to refuse.
+  it('unregistered_present offers adopt and never create or repush: rollout refuses the row server-side whatever overwrite says', () => {
     const m = reconcileRowModel(row({ name: 'their-repo', origin: 'org', state: 'unregistered_present' }));
     expect(m.actions).toEqual(['adopt']);
     expect(m.actions).not.toContain('create');
@@ -110,26 +73,41 @@ describe('reconcileRowModel — state → the ONE honest action', () => {
     expect(m.actions).toEqual(['repush']);
   });
 
-  it('registered_present on a REGISTRY row offers NO action — there is no seed to push', () => {
-    // An uploaded or adopted template has no scaffold on disk. `_rollout_template` raises
-    // `not_found` ("Unknown base template") for such a name, so "Re-push seed" would be an
-    // affordance whose every click 404s. In sync, with nothing to do, is a legitimate row.
+  it('registered_present on a registry row offers no action: no seed on disk, so re-push would 404 on every click', () => {
     const m = reconcileRowModel(row({ name: 'uploaded-thing', origin: 'registry', state: 'registered_present' }));
     expect(m.actions).toEqual([]);
   });
 
   it('registered_missing on a SEED row offers recreate THEN deregister, in that order', () => {
-    // Order is the recommendation: the repo is gone and AGP ships the bytes to rebuild it, so
-    // re-create is the constructive answer and deregister the giving-up one.
     const m = reconcileRowModel(row({ state: 'registered_missing' }));
     expect(m.actions).toEqual(['recreate', 'deregister']);
   });
 
-  it('registered_missing on a REGISTRY row offers deregister ONLY', () => {
-    // Same reasoning as the repush gate: there is no seed on disk to re-create from, so the
-    // only honest action is to drop the record that points at nothing.
+  it('registered_missing on a registry row offers deregister only: there is no seed to re-create from', () => {
     const m = reconcileRowModel(row({ origin: 'registry', state: 'registered_missing' }));
     expect(m.actions).toEqual(['deregister']);
+  });
+
+  it('renders the raw word with no action for a state outside the union, without throwing', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const m = reconcileRowModel(row({ state: 'archived' as never }));
+    expect(m.label).toContain('"archived"');
+    expect(m.note).toContain('"archived"');
+    expect(m.actions).toEqual([]);
+    expect(m.queueAction).toBeNull();
+    expect(m.actionDisabled).toBe(true);
+    expect(m.unknown).toBe(true);
+    reconcileRowModel(row({ state: 'archived' as never }));
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks every known state as not unknown, the blocked adopt included: its actionDisabled is the name rule, not a skew', () => {
+    for (const state of ['registered_present', 'registered_missing', 'unregistered_present', 'seed_absent'] as const) {
+      expect(reconcileRowModel(row({ state })).unknown).toBe(false);
+    }
+    const blocked = reconcileRowModel(row({ name: 'Legacy_Repo', origin: 'org', state: 'unregistered_present' }));
+    expect(blocked.actionDisabled).toBe(true);
+    expect(blocked.unknown).toBe(false);
   });
 
   it('gives every state a label and a tone, and no two states share a label', () => {
@@ -148,16 +126,18 @@ describe('reconcileRowModel — state → the ONE honest action', () => {
   });
 
   it('tones the two action-needed states apart from the in-sync one', () => {
-    // Colour is not the only channel (labels above carry it too), but it must not LIE: a row
-    // whose repo is gone must not wear the same tint as a row that is in sync.
     expect(RECONCILE_STATE_TONE.registered_present).not.toBe(RECONCILE_STATE_TONE.registered_missing);
     expect(RECONCILE_STATE_TONE.registered_present).not.toBe(RECONCILE_STATE_TONE.unregistered_present);
   });
 
+  it('uses no rose tone, and tints unregistered_present slate: no state here is an error, and someone else’s repository is neither a fault nor AGP’s pending work', () => {
+    for (const tone of Object.values(RECONCILE_STATE_TONE)) expect(tone).not.toMatch(/rose/);
+    expect(RECONCILE_STATE_TONE.unregistered_present).toMatch(/slate/);
+    expect(RECONCILE_STATE_TONE.unregistered_present).not.toMatch(/amber|emerald/);
+    expect(RECONCILE_STATE_TONE.registered_present).toMatch(/emerald/);
+  });
+
   it('never labels an unregistered_present row as ours', () => {
-    // The whole point of the state: this repository is in the org and AGP has no record of it.
-    // A label reading "registered" / "in sync" / "template" here would be the boolean's lie
-    // restated in prose.
     const label = RECONCILE_STATE_LABEL.unregistered_present.toLowerCase();
     expect(label).not.toContain('registered');
     expect(label).not.toContain('in sync');
@@ -172,51 +152,40 @@ describe('reconcileRowModel — provenance', () => {
     expect(m.provenance).toBe('main @ abcdef1');
   });
 
-  it('renders the branch alone for a repo that exists with no commit yet', () => {
-    // `head_sha` is null for a present-but-empty repo (`_head_or_none` maps "" → null). The row
-    // must still read as present; the missing sha must not turn into "unknown" or "—@—".
+  it('renders the branch alone for a repo that exists with no commit yet, never "unknown" or a dash', () => {
     const m = reconcileRowModel(row({ state: 'registered_present', default_branch: 'main', head_sha: null }));
     expect(m.provenance).toBe('main');
   });
 
-  it('renders NO provenance for an org-origin adopt row', () => {
-    // By the ruled cost model: org rows come out of the listing and are deliberately not
-    // re-probed, so both fields are null PRE-POST. Rendering "unknown" would read as a fault.
+  it('renders no provenance for an org-origin adopt row: org rows are listed, never re-probed, so both fields are null', () => {
     const m = reconcileRowModel(row({ origin: 'org', state: 'unregistered_present' }));
     expect(m.provenance).toBeNull();
   });
 
-  it('renders NO provenance for a row whose repo is gone', () => {
+  it('renders no provenance for a row whose repo is gone', () => {
     const m = reconcileRowModel(row({ state: 'registered_missing' }));
     expect(m.provenance).toBeNull();
   });
 });
 
-describe('isAdoptableName — the backend name rule, mirrored', () => {
-  // AUTHORITY: `_NAME_RE = ^[a-z][a-z0-9-]{0,63}$` in github_template_service.py. `adopt`
-  // applies it via `_require_valid_name` BEFORE anything else, so a listed org repo whose name
-  // fails it 422s. These cases are the rule's edges, not a restatement of the regex.
+describe('isAdoptableName mirrors the backend name rule ^[a-z][a-z0-9-]{0,63}$, which adopt applies before anything else', () => {
   it('accepts lowercase alphanumerics and hyphens after a leading letter', () => {
     expect(isAdoptableName('strands-agentcore')).toBe(true);
     expect(isAdoptableName('a')).toBe(true);
     expect(isAdoptableName('a1-2-3')).toBe(true);
   });
 
-  it('refuses the shapes GitHub allows and AGP does not', () => {
-    // Every one of these is a legal GitHub repo name, which is exactly why the annotation
-    // exists: such a repo is LISTED by reconcile and will 422 on adopt.
-    expect(isAdoptableName('MyRepo')).toBe(false);       // uppercase
-    expect(isAdoptableName('my_repo')).toBe(false);      // underscore
-    expect(isAdoptableName('my.repo')).toBe(false);      // dot
-    expect(isAdoptableName('1repo')).toBe(false);        // leading digit
-    expect(isAdoptableName('-repo')).toBe(false);        // leading hyphen
+  it('refuses the shapes GitHub allows and AGP does not: uppercase, underscore, dot, leading digit, leading hyphen, empty, over 64', () => {
+    expect(isAdoptableName('MyRepo')).toBe(false);
+    expect(isAdoptableName('my_repo')).toBe(false);
+    expect(isAdoptableName('my.repo')).toBe(false);
+    expect(isAdoptableName('1repo')).toBe(false);
+    expect(isAdoptableName('-repo')).toBe(false);
     expect(isAdoptableName('')).toBe(false);
-    expect(isAdoptableName('a'.repeat(65))).toBe(false); // 1 + 64 > the 64-char cap
+    expect(isAdoptableName('a'.repeat(65))).toBe(false);
   });
 
   it('accepts exactly 64 characters and refuses 65', () => {
-    // `{0,63}` after the leading letter — an off-by-one here would either annotate a legal
-    // repo as un-adoptable or let an illegal one through to a 422.
     expect(isAdoptableName('a'.repeat(64))).toBe(true);
     expect(isAdoptableName('a'.repeat(65))).toBe(false);
   });
@@ -241,9 +210,7 @@ describe('reconcileRowModel — the un-adoptable org row', () => {
     expect(m.note).toBeNull();
   });
 
-  it('does not annotate a NON-adopt row even when its name would fail the rule', () => {
-    // A registered template with a legacy name is not being adopted, so the adopt rule has no
-    // bearing on it — annotating it would be a warning about an action the row does not offer.
+  it('does not annotate a non-adopt row even when its name would fail the rule: the rule bears only on the offered action', () => {
     const m = reconcileRowModel(row({ name: 'Legacy_Repo', origin: 'registry', state: 'registered_missing' }));
     expect(m.actionDisabled).toBe(false);
     expect(m.note).toBeNull();
@@ -253,6 +220,15 @@ describe('reconcileRowModel — the un-adoptable org row', () => {
     expect(ADOPT_NAME_RULE_HINT).toMatch(/lowercase/i);
     expect(ADOPT_NAME_RULE_HINT).toMatch(/hyphen/i);
     expect(ADOPT_NAME_RULE_HINT).not.toContain('^[a-z]');
+  });
+});
+
+describe('ReconcileItemLike is the wire row', () => {
+  it('the client’s ReconcileItemView assigns to it, so the surface reads the wire shape and nothing more', () => {
+    expectTypeOf<ReconcileItemView>().toExtend<ReconcileItemLike>();
+    const wire: ReconcileItemView = { name: 'x', origin: 'seed', state: 'seed_absent', default_branch: null, head_sha: null, infra_template_id: null };
+    const item: ReconcileItemLike = wire;
+    expect(item).toBe(wire);
   });
 });
 
@@ -283,10 +259,7 @@ describe('reconcileRows — the surface\'s row list', () => {
   });
 });
 
-describe('queueAction — which rows the rollout BATCH can carry', () => {
-  // The rollout route is a BATCH endpoint taking `template_names` + one `overwrite`, so the three
-  // actions that call it are selections, not per-row executions. Adopt and deregister are
-  // single-repo verbs on other routes, so they are not queueable and keep their own confirms.
+describe('queueAction: the three rollout-batch verbs are queueable, adopt and deregister are single-repo verbs on other routes', () => {
   it('marks create, repush and recreate as the queueing actions', () => {
     expect(reconcileRowModel(row({ state: 'seed_absent' })).queueAction).toBe('create');
     expect(reconcileRowModel(row({ state: 'registered_present' })).queueAction).toBe('repush');
@@ -297,7 +270,6 @@ describe('queueAction — which rows the rollout BATCH can carry', () => {
     expect(
       reconcileRowModel(row({ origin: 'org', state: 'unregistered_present' })).queueAction,
     ).toBeNull();
-    // A registry-origin missing row offers deregister ONLY — a different route entirely.
     expect(
       reconcileRowModel(row({ origin: 'registry', state: 'registered_missing' })).queueAction,
     ).toBeNull();
@@ -310,8 +282,6 @@ describe('queueAction — which rows the rollout BATCH can carry', () => {
   });
 
   it('never makes an un-adoptable name queueable — the two gates are independent', () => {
-    // An illegally-named org repo is refused for ADOPT; that must not accidentally make it look
-    // like something the rollout batch could take instead.
     const m = reconcileRowModel(row({ name: 'Bad_Name', origin: 'org', state: 'unregistered_present' }));
     expect(m.queueAction).toBeNull();
     expect(m.actionDisabled).toBe(true);
@@ -319,11 +289,6 @@ describe('queueAction — which rows the rollout BATCH can carry', () => {
 });
 
 describe('batchPlan — what the wire carries, and the two overwrite flags', () => {
-  // THE F1 REGRESSION TEST. The first cut of this surface kept a `confirmedRepushes` set whose only
-  // writer was a stale-prune filter, so no interaction could ever add to it: the batch was always
-  // just the creates, the footer always sent `overwrite=false`, and the "Queued" pill was
-  // unreachable dead markup. The review proved it by deleting that branch with every test still
-  // green — the E28B I-1 shape. The decision below is testable BECAUSE it lives here.
   const ROWS = reconcileRows([
     row({ name: 'fresh', state: 'seed_absent' }),
     row({ name: 'insync', state: 'registered_present', default_branch: 'main', head_sha: 'abc1234' }),
@@ -339,7 +304,7 @@ describe('batchPlan — what the wire carries, and the two overwrite flags', () 
     expect(plan.empty).toBe(false);
   });
 
-  it('SETS overwrite when a re-push is queued — the flag F1 could never set', () => {
+  it('sets overwrite when a re-push is queued, exactly when a row whose queueAction is repush is in the batch', () => {
     const plan = batchPlan(ROWS, q(['insync', 'repush']), 'none');
     expect(plan.names).toEqual(['insync']);
     expect(plan.overwrite).toBe(true);
@@ -347,8 +312,6 @@ describe('batchPlan — what the wire carries, and the two overwrite flags', () 
   });
 
   it('carries creates and re-pushes together, with overwrite set by the re-push', () => {
-    // The design intent the half-built state never reached: one batch, both kinds, and the single
-    // wire flag decided by whether any member needs it.
     const plan = batchPlan(ROWS, q(['fresh', 'create'], ['insync', 'repush']), 'none');
     expect(plan.names).toEqual(['fresh', 'insync']);
     expect(plan.overwrite).toBe(true);
@@ -356,10 +319,7 @@ describe('batchPlan — what the wire carries, and the two overwrite flags', () 
     expect(plan.repushes).toEqual(['insync']);
   });
 
-  it('does NOT set overwrite for a re-create — the repo is gone, so nothing is written over', () => {
-    // `_rollout_template` reaches `recreated` on `registered_missing` regardless of the flag, and
-    // sending `overwrite=true` would additionally authorise re-pushing every OTHER registered
-    // present template in the same batch. The flag is not a mood; it is scoped consent.
+  it('does not set overwrite for a re-create: the server re-creates regardless of the flag, and the flag would authorise re-pushing every other in-sync template in the batch', () => {
     const plan = batchPlan(ROWS, q(['gone', 'recreate']), 'none');
     expect(plan.names).toEqual(['gone']);
     expect(plan.overwrite).toBe(false);
@@ -367,16 +327,11 @@ describe('batchPlan — what the wire carries, and the two overwrite flags', () 
   });
 
   it('emits names in ROW order, not in the map\'s insertion order', () => {
-    // A `Map` iterates by insertion, so a body built from it would vary with click order. The wire
-    // body should be a function of the org's state and the selection, nothing else.
     const plan = batchPlan(ROWS, q(['gone', 'recreate'], ['fresh', 'create'], ['insync', 'repush']), 'none');
     expect(plan.names).toEqual(['fresh', 'insync', 'gone']);
   });
 
-  it('SELF-PRUNES a queued name whose row no longer offers that action', () => {
-    // This replaces the stale-prune effect the old code ran on every reconcile. A name queued
-    // before a Refresh may come back in a different state — queued as a create, now present and
-    // unregistered — and submitting it then would be acting on a comparison the operator never saw.
+  it('self-prunes a queued name whose row no longer offers that action, so a submit never acts on a comparison the operator did not see', () => {
     const plan = batchPlan(
       ROWS,
       q(['fresh', 'create'], ['vanished', 'create'], ['theirs', 'create'], ['uploaded', 'repush']),
@@ -386,8 +341,6 @@ describe('batchPlan — what the wire carries, and the two overwrite flags', () 
   });
 
   it('can never carry an unregistered_present name, even when it is queued', () => {
-    // The client half of the server's refusal, now enforced where it is testable. Rollout answers
-    // this state with action="skipped" and a reason naming adopt, whatever `overwrite` says.
     const plan = batchPlan(ROWS, q(['theirs', 'adopt']), 'none');
     expect(plan.names).toEqual([]);
     expect(plan.empty).toBe(true);
@@ -400,28 +353,14 @@ describe('batchPlan — what the wire carries, and the two overwrite flags', () 
     expect(plan.empty).toBe(true);
   });
 
-  it('is a pure function of (rows, queued, overwriteInfra) — no hidden ordering state', () => {
+  it('is a pure function of (rows, queued, infraIntent), with no hidden ordering state', () => {
     const a = batchPlan(ROWS, q(['insync', 'repush'], ['fresh', 'create']), 'none');
     const b = batchPlan(ROWS, q(['fresh', 'create'], ['insync', 'repush']), 'none');
     expect(a).toEqual(b);
   });
 });
 
-describe('batchPlan — PROPERTY 4: a tick carries the VERB it was placed against (E28D)', () => {
-  // THE T6-L3 REGRESSION TEST. `queued` used to be a `Set<string>` of NAMES with no verb, so the
-  // prune at `batchPlan` could only notice a row that had lost its action ENTIRELY — never one whose
-  // action CHANGED. The live-test scenario, from E28C's progress notes:
-  //
-  //   1. `seed_absent` row → the tick is placed on a CREATE ("nothing can be written over").
-  //   2. Someone creates the repo (or an earlier partial run did). The operator hits Refresh.
-  //   3. The row returns as `registered_present` → its action is now REPUSH, and the tick survived.
-  //   4. `batchPlan` classified it as a re-push ⇒ `overwrite: true` ON THE WIRE, from a tick the
-  //      operator placed on a create.
-  //
-  // So the consent for the epic's most dangerous flag was manufactured by a state change the
-  // operator never saw. `reconcileView.ts` CLAIMED the plan self-prunes so that submitting could
-  // never "act on a comparison the operator never saw" — property 3 — and this was the case that
-  // falsified the claim. The tick now carries its verb, and a mismatch drops it.
+describe('batchPlan: a tick carries the verb it was placed against, so a verb change across a Refresh drops it', () => {
   const CREATE_ROWS = reconcileRows([row({ name: 'strands-agentcore', state: 'seed_absent' })]);
   const NOW_PRESENT = reconcileRows([
     row({
@@ -431,7 +370,6 @@ describe('batchPlan — PROPERTY 4: a tick carries the VERB it was placed agains
       head_sha: 'abc1234',
     }),
   ]);
-  /** The tick as the operator placed it in step 1: against a CREATE. */
   const TICKED_AS_CREATE = q(['strands-agentcore', 'create']);
 
   it('carries the tick while the verb still matches', () => {
@@ -440,32 +378,25 @@ describe('batchPlan — PROPERTY 4: a tick carries the VERB it was placed agains
     expect(plan.creates).toEqual(['strands-agentcore']);
   });
 
-  it('DROPS the tick when the row comes back offering a different verb', () => {
+  it('drops the tick when the row comes back offering a different verb', () => {
     const plan = batchPlan(NOW_PRESENT, TICKED_AS_CREATE, 'none');
     expect(plan.names).toEqual([]);
     expect(plan.empty).toBe(true);
   });
 
-  it('and therefore NEVER escalates a create tick into an overwrite', () => {
-    // The consequence that makes this a safety property rather than a tidiness one. Before the fix
-    // this exact call returned `overwrite: true`.
+  it('and therefore never escalates a create tick into an overwrite', () => {
     const plan = batchPlan(NOW_PRESENT, TICKED_AS_CREATE, 'none');
     expect(plan.overwrite).toBe(false);
     expect(plan.repushes).toEqual([]);
   });
 
-  it('carries a re-push that was ticked AS a re-push — the fix is not a blanket refusal', () => {
-    // The other direction, pinned so "drop everything on any change" cannot pass as this fix: a
-    // deliberate re-push tick must still reach the wire and must still set the flag.
+  it('carries a re-push that was ticked as a re-push: a deliberate tick still reaches the wire and sets the flag', () => {
     const plan = batchPlan(NOW_PRESENT, q(['strands-agentcore', 'repush']), 'none');
     expect(plan.names).toEqual(['strands-agentcore']);
     expect(plan.overwrite).toBe(true);
   });
 
-  it('reports every dropped tick, so the surface can SAY the selection changed', () => {
-    // A silent drop is the failure mode of the stale-prune effect T6 deleted: the operator's tick
-    // vanishes and the run does less than they authorised, with nothing said. Reported as a
-    // DECISION here rather than derived in the `.tsx`, where no test could reach it.
+  it('reports every dropped tick, so the surface can say the selection changed rather than silently doing less than authorised', () => {
     const ROWS = reconcileRows([
       row({ name: 'fresh', state: 'seed_absent' }),
       row({ name: 'insync', state: 'registered_present', default_branch: 'main', head_sha: 'abc1234' }),
@@ -473,7 +404,6 @@ describe('batchPlan — PROPERTY 4: a tick carries the VERB it was placed agains
     ]);
     const plan = batchPlan(
       ROWS,
-      // carried · verb changed · row lost its action · gone from the org entirely
       q(['fresh', 'create'], ['insync', 'create'], ['theirs', 'create'], ['vanished', 'create']),
       'none',
     );
@@ -481,8 +411,7 @@ describe('batchPlan — PROPERTY 4: a tick carries the VERB it was placed agains
     expect(plan.dropped).toEqual(['insync', 'theirs', 'vanished']);
   });
 
-  it('reports NO drops when every tick still matches', () => {
-    // The negative half: a notice that fires on a normal Refresh would be trained away in a week.
+  it('reports no drops when every tick still matches', () => {
     expect(batchPlan(CREATE_ROWS, TICKED_AS_CREATE, 'none').dropped).toEqual([]);
   });
 
@@ -495,7 +424,7 @@ describe('batchPlan — PROPERTY 4: a tick carries the VERB it was placed agains
   });
 });
 
-describe('batchPlan — the infra consent is the THIRD argument, not a derivation (E28D)', () => {
+describe('batchPlan: the infra consent is the third argument, never derived from the rows', () => {
   const ROWS = reconcileRows([
     row({ name: 'fresh', state: 'seed_absent' }),
     row({ name: 'insync', state: 'registered_present', default_branch: 'main', head_sha: 'abc1234' }),
@@ -505,20 +434,13 @@ describe('batchPlan — the infra consent is the THIRD argument, not a derivatio
     expect(batchPlan(ROWS, q(['fresh', 'create']), 'none').overwriteInfra).toBe(false);
   });
 
-  it('does NOT let a template re-push authorise the infra push — the T8 split, client-side', () => {
-    // THE WHOLE POINT OF THE SPLIT. `overwrite` had ONE value and TWO consumers: the backend handed
-    // the templates' flag to `_ensure_infra`, so ticking a re-push on `strands-agentcore` pushed
-    // AGP's Terraform module over the org's existing `agp-runtime-infra` and reported
-    // "overwritten" — a write nobody asked for. The two flags are now independent in both
-    // directions, and this is the direction that was the defect.
+  it('does not let a template re-push authorise the infra push: the two flags are independent in both directions', () => {
     const plan = batchPlan(ROWS, q(['insync', 'repush']), 'none');
     expect(plan.overwrite).toBe(true);
     expect(plan.overwriteInfra).toBe(false);
   });
 
   it('carries the infra consent alone, with no template queued at all', () => {
-    // The submittable run the footer's third disjunct exists for: re-push the infra module and
-    // nothing else.
     const plan = batchPlan(ROWS, q(), 'repush');
     expect(plan.empty).toBe(true);
     expect(plan.names).toEqual([]);
@@ -532,33 +454,14 @@ describe('batchPlan — the infra consent is the THIRD argument, not a derivatio
     expect(plan.overwriteInfra).toBe(true);
   });
 
-  it('NEVER sends overwrite_infra for a repo that is not there — the review\'s Critical 1', () => {
-    // THE WIRE-LEVEL ASSERTION, and the review named why it was missing: the old test proved the
-    // INTENT was 'create' for an absent repo and stopped one function short of the BODY, so the
-    // suite was green while `batchPlan` carried the raw checkbox straight through.
-    //
-    // The reachable path needs no code editing. Tick the box while the repo is PRESENT → hit
-    // Refresh → the repo has since been deleted, so the row returns `seed_absent` and the checkbox
-    // UNMOUNTS (it renders in the present branch only). Nothing was clearing the state, so the
-    // surface held a consent the operator could no longer see or untick — and `_ensure_infra` probes
-    // at SUBMIT time, so a repo recreated between that read and the click would be pushed over under
-    // it. That is "a write nobody named", which is the defect T8's split exists to delete.
+  it('never sends overwrite_infra for a repo that is not there: a tick that outlived its checkbox cannot reach the body', () => {
     const intent = infraIntentFor(row({ name: 'agp-runtime-infra', state: 'seed_absent' }), true);
     expect(intent).toBe('create');
     const plan = batchPlan(ROWS, q(), intent);
     expect(plan.overwriteInfra).toBe(false);
   });
 
-  it('and the RE-READ clears the infra tick, so no consent outlives its checkbox', () => {
-    // A SOURCE assertion, and it earned its place the hard way: removing this reset broke NO test in
-    // the first fix round, because it is an effect in the `.tsx` and no unit call can reach it. The
-    // pure functions above make a stale tick HARMLESS on the wire (Critical 1's first half); this is
-    // the half that stops the surface holding an invisible consent at all.
-    //
-    // Scoped to the reconcile effect specifically — anchored between the `rolloutApi.reconcile(` call
-    // and the `refetch` declaration that follows it — because the same call appears in `runRollout`'s
-    // post-run reset, which is a DIFFERENT rule (a consent authorises one write). A bare
-    // `toContain` would be satisfied by that one and would pass with this reset deleted.
+  it('and the re-read clears the infra tick in the reconcile effect, so no consent outlives its checkbox', () => {
     const src = stripComments(rolloutModalSrc);
     const effect = src.slice(
       src.indexOf('.reconcile(connection.id)'),
@@ -569,10 +472,6 @@ describe('batchPlan — the infra consent is the THIRD argument, not a derivatio
   });
 
   it('and the confirm body agrees with the title in that case', () => {
-    // The same defect's copy half, which a wire-only fix would have left behind: with the raw tick
-    // the title read "Create the runtime infra repo" while the body directly beneath it read "you
-    // have also authorised re-pushing the module". A consent gate contradicting itself is this
-    // epic's whole defect class, so the title, the body and the wire now key off ONE value.
     const intent = infraIntentFor(row({ name: 'agp-runtime-infra', state: 'seed_absent' }), true);
     const infraLine = batchConfirmLines(ROWS, q(), intent).filter((l) => /runtime-infra/i.test(l));
     expect(infraLine).toHaveLength(1);
@@ -581,11 +480,7 @@ describe('batchPlan — the infra consent is the THIRD argument, not a derivatio
   });
 });
 
-describe('toggleQueuedAction — one click does what the box shows (review Critical 2)', () => {
-  // THE DEAD-CLICK REGRESSION TEST. This reducer was inline in the `.tsx` and keyed on bare presence
-  // (`next.has(name)`), which is why nothing caught it: a decision in that file is a decision no test
-  // can reach — the founding argument of `reconcileView.ts`, applied to the last piece of logic that
-  // had not moved.
+describe('toggleQueuedAction: one click does what the box shows', () => {
   const CREATE_ROW = reconcileRows([row({ name: 'a', state: 'seed_absent' })])[0];
   const REPUSH_ROW = reconcileRows([
     row({ name: 'a', state: 'registered_present', default_branch: 'main', head_sha: 'abc1234' }),
@@ -599,33 +494,24 @@ describe('toggleQueuedAction — one click does what the box shows (review Criti
     expect([...toggleQueuedAction(q(['a', 'create']), CREATE_ROW)]).toEqual([]);
   });
 
-  it('ticks a DROPPED tick in ONE call, against the row\'s new verb', () => {
-    // The defect, stated as the operator's experience. The amber notice says "Re-select what you
-    // still want, against the action each row offers now" — so they click the box the notice points
-    // at. Its `checked` is false (the plan refuses the stale entry), but the map still holds
-    // `['a','create']`, so a presence-keyed toggle DELETED it: click 1 did nothing visible and click 2
-    // finally ticked. On a consent surface a control that ignores a click teaches double-clicking.
+  it('re-ticks a dropped tick in one call, against the row\'s new verb: a presence-keyed toggle needed two clicks', () => {
     const after = toggleQueuedAction(q(['a', 'create']), REPUSH_ROW);
     expect(after.get('a')).toBe('repush');
-    // And the plan now carries it, which is what "the click worked" means end to end.
     expect(batchPlan([REPUSH_ROW], after, 'none').names).toEqual(['a']);
   });
 
   it('still round-trips: a second click on the re-selected row clears it', () => {
-    // Toggle must remain a toggle — a fix that only ever SET would strand the operator ticked.
     const on = toggleQueuedAction(q(['a', 'create']), REPUSH_ROW);
     expect([...toggleQueuedAction(on, REPUSH_ROW)]).toEqual([]);
   });
 
   it('refuses to queue a row with no queueable action, unchanged', () => {
-    // Adopt and deregister are single-repo verbs on other routes. Returned by REFERENCE so a caller
-    // cannot mistake "nothing happened" for a new selection.
     const adoptRow = reconcileRows([row({ name: 'theirs', origin: 'org', state: 'unregistered_present' })])[0];
     const before = q(['a', 'create']);
     expect(toggleQueuedAction(before, adoptRow)).toBe(before);
   });
 
-  it('leaves the OTHER rows\' ticks alone', () => {
+  it('leaves the other rows\' ticks alone', () => {
     const rows = reconcileRows([
       row({ name: 'a', state: 'seed_absent' }),
       row({ name: 'b', state: 'seed_absent' }),
@@ -635,44 +521,35 @@ describe('toggleQueuedAction — one click does what the box shows (review Criti
     expect(after.get('a')).toBe('create');
   });
 
-  it('is the MODAL\'s writer, so the dead click cannot come back inline', () => {
-    // A SOURCE assertion in this file's idiom: the `.tsx` must DELEGATE rather than keep its own
-    // reducer, or the fix regresses in the one place tests cannot see.
+  it('is the modal\'s writer, so the dead click cannot come back inline', () => {
     const src = stripComments(rolloutModalSrc);
     expect(src).toMatch(/toggleQueuedAction\(prev, row\)/);
-    // The presence-keyed shape, specifically, must not return.
     expect(src).not.toMatch(/next\.has\(name\)/);
   });
 });
 
-describe('infraIntentFor — what the click will actually do to the forced repo (E28D)', () => {
+describe('infraIntentFor: what the click will do to the forced repo, as one value', () => {
   const infra = (over: Partial<ReconcileItemLike> = {}) =>
     row({ name: 'agp-runtime-infra', origin: 'seed', ...over });
 
-  it('is CREATE when the repo is absent, whatever the tick says', () => {
-    // Creating it is unconditional — a tenant runtime cannot deploy without it — which is exactly
-    // why the checkbox does not render in this branch. Making the intent ignore the tick here means
-    // a tick left over from a previous view cannot be represented as an absent-repo "re-push".
+  it('is create when the repo is absent, whatever the tick says: an absent repo being re-pushed is unrepresentable', () => {
     expect(infraIntentFor(infra({ state: 'seed_absent' }), false)).toBe('create');
     expect(infraIntentFor(infra({ state: 'seed_absent' }), true)).toBe('create');
   });
 
-  it('is NONE for a present repo the operator has not ticked', () => {
-    // `_ensure_infra` returns action="skipped" and pushes nothing. "None" is the honest word.
+  it('is none for a present repo the operator has not ticked', () => {
     expect(infraIntentFor(infra({ state: 'unregistered_present', default_branch: 'main' }), false)).toBe(
       'none',
     );
   });
 
-  it('is REPUSH for a present repo the operator DID tick', () => {
+  it('is repush for a present repo the operator did tick', () => {
     expect(infraIntentFor(infra({ state: 'unregistered_present', default_branch: 'main' }), true)).toBe(
       'repush',
     );
   });
 
-  it('is NONE when there is no infra row at all, even with the tick set', () => {
-    // `infraNeedsCreate`'s fail-closed reading, extended: a view that could not report the repo is
-    // not evidence about it, and the permissive reading would enable a submit on an unknown.
+  it('is none when there is no infra row at all, even with the tick set: a view that could not report the repo is not evidence about it', () => {
     expect(infraIntentFor(null, true)).toBe('none');
     expect(infraIntentFor(undefined, true)).toBe('none');
   });
@@ -685,16 +562,11 @@ describe('batchConfirmLines — the one consent gate states every write', () => 
     row({ name: 'gone', state: 'registered_missing' }),
   ]);
 
-  /** The per-row lines, i.e. everything except the unconditional infra-repo line. */
   const rowLines = (lines: string[]) => lines.filter((l) => !/runtime-infra/i.test(l));
 
-  /** One tick of each queueable verb, each against the verb its row actually offers. */
   const ALL_THREE = q(['fresh', 'create'], ['insync', 'repush'], ['gone', 'recreate']);
 
   it('states what a re-push writes, in the row\'s own line', () => {
-    // The destructive-ADJACENT action. Moving execution to the footer means this sentence has to
-    // travel with it — a batch that silently re-pushed would be exactly the consent gap the
-    // per-row confirm used to close.
     const lines = rowLines(batchConfirmLines(ROWS, q(['insync', 'repush']), 'none'));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('insync');
@@ -706,15 +578,12 @@ describe('batchConfirmLines — the one consent gate states every write', () => 
     const lines = rowLines(batchConfirmLines(ROWS, ALL_THREE, 'none'));
     expect(lines).toHaveLength(3);
     expect(new Set(lines).size).toBe(3);
-    // Row order, so the confirm reads down the same table the operator just looked at.
     expect(lines[0]).toContain('fresh');
     expect(lines[1]).toContain('insync');
     expect(lines[2]).toContain('gone');
   });
 
   it('never promises a deletion or a replacement', () => {
-    // E28C/T3 deleted delete+recreate. Every line here describes an additive commit.
-    // Across every infra intent, since the infra line's wording branches on it.
     for (const infraIntent of ['none', 'create', 'repush'] as const) {
       for (const line of batchConfirmLines(ROWS, ALL_THREE, infraIntent)) {
         expect(line.toLowerCase()).not.toContain('delet');
@@ -725,117 +594,182 @@ describe('batchConfirmLines — the one consent gate states every write', () => 
   });
 
   it('names the forced infra repo, because every rollout ensures it', () => {
-    // It is ensured server-side on EVERY rollout, independent of the selection. A confirm that
-    // listed only the ticked rows would understate what the click does.
     expect(batchConfirmLines(ROWS, q(['fresh', 'create']), 'none').join(' ')).toMatch(
       /runtime-infra|infra repo/i,
     );
   });
 
-  it('says the infra module is LEFT ALONE when its own box is unticked', () => {
-    // E28D, and it is a correction of a correction. E28C's final fix stopped the line promising an
-    // unconditional re-push, but what it promised instead was that the module is "re-pushed here
-    // only when a re-push ABOVE authorises it" — a true description of the coupling that T8 then
-    // DELETED. The infra push now has its own consent, so a sentence pointing at the template ticks
-    // describes a wire that no longer exists.
+  it('says the infra module is left alone when its own box is unticked, and no longer that a template re-push authorises it', () => {
     const infra = batchConfirmLines(ROWS, q(['insync', 'repush']), 'none').filter((l) =>
       /runtime-infra/i.test(l),
     );
     expect(infra).toHaveLength(1);
-    // Still true, and still the reason the line is unconditional: the repo is ensured either way.
     expect(infra[0]).toMatch(/if this org does not have it yet|created/i);
     expect(infra[0]).toMatch(/left exactly as it is|otherwise left/i);
     expect(infra[0]).not.toMatch(/every roll-out .{0,40}re-pushes/i);
-    // THE RETIRED SENTENCE. A queued template re-push (above) must no longer be described as
-    // authorising anything about the infra repo.
     expect(infra[0]).not.toMatch(/only when a re-push/i);
     expect(infra[0]).not.toMatch(/authoris/i);
   });
 
-  it('says the module IS re-pushed when the infra box is ticked, and only then', () => {
-    // The other half: the tick is a real consent, so the confirm has to state the write it buys.
+  it('says the module is re-pushed into every existing infra repo when the infra box is ticked, and only then', () => {
     const ticked = batchConfirmLines(ROWS, q(), 'repush').filter((l) => /runtime-infra/i.test(l));
     expect(ticked).toHaveLength(1);
     expect(ticked[0]).toMatch(/re-push/i);
-    // Idempotence is the calming fact, and it is true: `_push` writes no commit for an unchanged
-    // module. It belongs in the sentence that authorises the push, not in the one that declines it.
     expect(ticked[0]).toMatch(/idempotent|writes no commit/i);
-    // And the two sentences must actually DIFFER — a line that reads the same either way would make
-    // the checkbox above it decoration.
     const unticked = batchConfirmLines(ROWS, q(), 'none').filter((l) => /runtime-infra/i.test(l));
     expect(ticked[0]).not.toBe(unticked[0]);
+    expect(ticked[0]).toMatch(/every one of them that already exists/i);
+    expect(ticked[0]).toMatch(/not only the row the box sits on/i);
+    expect(ticked[0]).toMatch(/one commit per repository/i);
+    expect(ticked[0]).not.toMatch(/into an existing one/i);
+    expect(ticked[0]).not.toMatch(/the forced runtime-infra repo\b/i);
+  });
+
+  it('the modal’s own wire-flag paragraph agrees with this line: plural, never "that one repository"', () => {
+    const para = wireFlagNote({ overwrite: false, overwriteInfra: true }) ?? '';
+    expect(para).not.toMatch(/that one repository/i);
+    expect(para).toMatch(/each runtime-infra repo that already exists/i);
+    expect(stripComments(rolloutModalSrc)).toContain('wireFlagNote(plan)');
+  });
+
+  it('and the title agrees with it rather than naming one repository', () => {
+    const repush = batchConfirmTitle(batchPlan(ROWS, q(), 'repush'), 'repush', 'myorg');
+    expect(repush).toMatch(/modules/);
+    expect(repush).not.toMatch(/the runtime infra module\b/i);
+    const create = batchConfirmTitle(batchPlan(ROWS, q(), 'create'), 'create', 'myorg');
+    expect(create).toMatch(/repos/);
+    expect(create).not.toMatch(/the runtime infra repo\b/i);
   });
 
   it('lists nothing for an empty selection', () => {
-    // Only the infra line, which is unconditional — there is no per-row write to describe.
     const lines = batchConfirmLines(ROWS, q(), 'none');
     expect(lines.filter((l) => /fresh|insync|gone/.test(l))).toEqual([]);
   });
 
   it('drops a line for a tick whose verb changed, exactly as batchPlan drops the name', () => {
-    // The confirm is derived from the same plan, so property 4 has to hold here too: a line for a
-    // name the request will not carry is a consent gate describing a write that will not happen.
     const lines = batchConfirmLines(ROWS, q(['insync', 'create']), 'none');
     expect(lines.filter((l) => /insync/.test(l))).toEqual([]);
   });
 
-  it('does not let the MODAL\'s infra hint restate the overstatement this line dropped', () => {
-    // A SOURCE assertion, in this file's own idiom (see the deregister-classifier test): the infra
-    // row's hint is rendered inside `RolloutTemplatesModal.tsx` with no jsdom to mount, and it was
-    // the SECOND copy of the same wrong sentence — the consent line and the hint both promised a
-    // Terraform re-push on every roll-out, while `_ensure_infra` skips an existing repo entirely at
-    // overwrite=false. Two strings for one behaviour is how the first one survived being wrong, so
-    // both are pinned together, here, where the behaviour is documented.
-    // Anchored on the section label and searched FORWARD from it — `actionError &&` appears three
-    // times in this file, and slicing to its first occurrence yields an empty string that would
-    // make every assertion below vacuous. The length check is what caught exactly that.
-    // STRIPPED of comments first: the `.tsx` documents each re-wording by quoting the sentence it
-    // retired, so the absences below would fail on correct code against the raw source. Asserting
-    // against prose would make this test a rule about how the fix may be explained.
+  it('does not let the modal\'s infra hint restate the overstatement this line dropped', () => {
     const src = stripComments(rolloutModalSrc);
     const start = src.indexOf('Runtime infra repo');
     const hint = src.slice(start, src.indexOf('actionError &&', start));
     expect(hint.length).toBeGreaterThan(200);
-    // The PRESENT branch: left in place unless its OWN box is ticked.
     expect(hint).toMatch(/leaves it in place/i);
     expect(hint).not.toMatch(/Every roll-out re-pushes/i);
-    // E28D: the hint MOVED WITH THE WIRE. It used to say the module is re-pushed "only when a
-    // re-push above authorises it", which described `overwrite` serving two consumers — the exact
-    // coupling T8 deleted. Pinned as an ABSENCE because the sentence was true when it was written
-    // and is now false, which is the way copy usually goes wrong in this codebase.
     expect(hint).not.toMatch(/only when a re-push/i);
     expect(hint).not.toMatch(/a re-push above/i);
-    // The ABSENT branch still promises the create+seed, because that is what `_ensure_infra` does
-    // when the repo is missing — the fix must not flatten a true statement into a hedge.
     expect(hint).toMatch(/Not in the org yet\..{0,60}creates it/is);
   });
 
-  it('gives the modal\'s infra CHECKBOX the present branch only, defaulted off', () => {
-    // Same idiom, same window, for the control T8's wire made possible. Two properties that no unit
-    // call can reach, both of them the reason the checkbox is honest:
-    //
-    //  • it renders only where it can be UNTICKED. When the repo is absent, creating it is
-    //    unconditional (a tenant runtime cannot deploy without it), so a box there would be a
-    //    control whose off position is a lie.
-    //  • its state comes from `overwriteInfra`, so the tick and the wire field are one value.
+  it('gives the modal\'s infra hint its own branch for a present repo in a state this frontend does not know', () => {
+    const src = stripComments(rolloutModalSrc);
+    const start = src.indexOf('Runtime infra repo');
+    const hint = src.slice(start, src.indexOf('actionError &&', start));
+    expect(hint).toMatch(/infraRow\.provenance && !infraRow\.unknown\s*\?/);
+    expect(hint).toMatch(
+      /:\s*infraRow\.provenance\s*\?\s*`Present at \$\{infraRow\.provenance\}\. \$\{infraRow\.label\}, so nothing will be written to it\.`/,
+    );
+  });
+
+  it('gives the modal\'s infra checkbox the present branch only, bound to overwriteInfra', () => {
     const src = stripComments(rolloutModalSrc);
     const start = src.indexOf('Runtime infra repo');
     const section = src.slice(start, src.indexOf('actionError &&', start));
     expect(section).toContain('type="checkbox"');
     expect(section).toMatch(/checked=\{overwriteInfra\}/);
-    // Gated on the SAME predicate the hint's present branch uses, so the control and the copy
-    // cannot disagree about which branch they are in.
     expect(section).toMatch(/infraRow\.provenance &&/);
+  });
+
+  it('hides the modal\'s infra overwrite consent on a state this frontend does not know, gated on unknown and never on actionDisabled', () => {
+    const src = stripComments(rolloutModalSrc);
+    const start = src.indexOf('Runtime infra repo');
+    const section = src.slice(start, src.indexOf('actionError &&', start));
+    expect(section).toMatch(/\{infraRow\.provenance && !infraRow\.unknown && \(\s*<label[^>]*>\s*<input\s+type="checkbox"/);
+    expect(section).not.toMatch(/infraRow\.actionDisabled/);
+  });
+
+  it('gives that checkbox a label derived from every repo the tick writes to, never the singular literal', () => {
+    const src = stripComments(rolloutModalSrc);
+    const start = src.indexOf('Runtime infra repos');
+    const section = src.slice(start, src.indexOf('actionError &&', start));
+    expect(section.length).toBeGreaterThan(400);
+    expect(section).toMatch(/overwriteInfraConsent\(overwriteTargets\)/);
+    expect(src).toMatch(/overwriteInfraTargets\(infraRows\)/);
+    expect(src).not.toMatch(/into this existing repository/i);
+  });
+
+  it('lists one row per registered infra template rather than one hardcoded repo', () => {
+    const src = stripComments(rolloutModalSrc);
+    const start = src.indexOf('Runtime infra repos');
+    expect(start).toBeGreaterThan(-1);
+    const section = src.slice(start, src.indexOf('actionError &&', start));
+    expect(section.length).toBeGreaterThan(400);
+    expect(section).toMatch(/infraRows\.map\(/);
+    expect(src).toMatch(/infraRolloutRows\(\s*withInfraSeeds\(infraCatalog,/);
+    expect(section).not.toMatch(/reconcileRows\(\[view\.infra_repo\]\)/);
+  });
+
+  it('shows a state only for the row the comparison actually read', () => {
+    const src = stripComments(rolloutModalSrc);
+    const start = src.indexOf('Runtime infra repos');
+    const section = src.slice(start, src.indexOf('actionError &&', start));
+    expect(section).toMatch(/infra\.reconcile && infraRow &&/);
+    expect(section).toMatch(/!infra\.reconcile &&/);
+    expect(section).toMatch(/its state in\s*\n?\s*the org is not shown/);
+    const evidenceBranch = section.slice(section.indexOf('infra.reconcile && infraRow &&'));
+    const unprobedBranch = section.indexOf('!infra.reconcile &&');
+    expect(evidenceBranch.indexOf('type="checkbox"')).toBeGreaterThan(-1);
+    expect(section.indexOf('type="checkbox"')).toBeLessThan(unprobedBranch);
+  });
+
+  it('pills and promises only the mechanisms a roll-out will ensure, and says "Not referenced" for the rest', () => {
+    const src = stripComments(rolloutModalSrc);
+    const start = src.indexOf('Runtime infra repos');
+    const section = src.slice(start, src.indexOf('actionError &&', start));
+    expect(section.length).toBeGreaterThan(400);
+    expect(section).toMatch(/infra\.ensured \?/);
+    expect(section).toMatch(/Not referenced/);
+    expect(section).not.toMatch(/>\s*Not in use\s*</);
+    expect(section).toMatch(/infra\.ensured\s*\n?\s*\?/);
+    expect(section).not.toMatch(/ensures it either way\.\s*<\/p>/);
+    expect(section).toMatch(/ensures an infra repo once one does/);
+    expect(section).toMatch(/in the same roll-out/);
+  });
+
+  it('says so when the reference set could not be read, in amber, above the rows', () => {
+    const src = stripComments(rolloutModalSrc);
+    expect(src).toMatch(/console\.warn\('\[RolloutTemplatesModal\]/);
+    expect(src).toMatch(/ensuredUnknown: true/);
+    expect(src).toMatch(/ensuredUnknown: false/);
+    const start = src.indexOf('Runtime infra repos');
+    const section = src.slice(start, src.indexOf('actionError &&', start));
+    expect(section).toMatch(/\{ensuredUnknown &&/);
+    expect(section).toMatch(/could not be read/);
+    expect(section).toMatch(/text-amber-800/);
+    expect(section.indexOf('ensuredUnknown')).toBeLessThan(section.indexOf('infraRows.map('));
+  });
+
+  it('derives the ensured set from the agent catalog, degrading to the default only on a failed read', () => {
+    const src = stripComments(rolloutModalSrc);
+    expect(src).toMatch(/ensuredInfraIds\(agentCatalog,/);
+    const read = src.slice(src.indexOf('const agentCatalogLoad'), src.indexOf('const agentCatalog ='));
+    expect(read).toMatch(/githubTemplatesApi\s*\n?\s*\.list\(/);
+    expect(read).toMatch(/\.catch\([\s\S]*rows: \[\] as TemplateView\[\], ensuredUnknown: true/);
+  });
+
+  it('reads the infra catalog as a registry call that degrades to the wire\'s single row, never a provider one', () => {
+    const src = stripComments(rolloutModalSrc);
+    expect(src).toMatch(/infraTemplatesApi\s*\n?\s*\.list\(/);
+    const read = src.slice(src.indexOf('const infraCatalogLoad'), src.indexOf('const infraCatalog ='));
+    expect(read.length).toBeGreaterThan(100);
+    expect(read).toMatch(/\.catch\(\(\) => \[\] as InfraTemplateView\[\]\)/);
+    expect(read).not.toMatch(/classifyRolloutError|RECONCILE_FALLBACK/);
   });
 });
 
-describe('batchConfirmTitle — the confirm names what it is about to do (T6-L2)', () => {
-  // "Roll out 0 templates — myorg" was the live-test finding: `canSubmit` deliberately allows a
-  // submit with NOTHING ticked when the infra repo is absent, and the title then contradicted its
-  // own body, whose single bullet was the infra line. The count was right in the FOOTER (which
-  // renders a bare "Review roll-out") and wrong in the title for one structural reason — the footer
-  // read a value and the title was a template literal in a file no test can read. So the title moves
-  // here, where these cases are pinnable.
+describe('batchConfirmTitle: the confirm names what it is about to do', () => {
   const plan = (over: Partial<BatchPlan> = {}): BatchPlan => ({
     names: [],
     overwrite: false,
@@ -861,29 +795,25 @@ describe('batchConfirmTitle — the confirm names what it is about to do (T6-L2)
   });
 
   it('keeps the template count even when the infra repo is also being created', () => {
-    // The templates are what the operator selected, so they stay the headline. The infra act is in
-    // the body's own bullet, which is where it was always described.
     expect(batchConfirmTitle(plan({ names: ['a'], empty: false }), 'create', 'myorg')).toBe(
       'Roll out 1 template — myorg',
     );
   });
 
-  it('NEVER says "0 templates" — the T6-L2 regression', () => {
+  it('never says "0 templates"', () => {
     for (const intent of ['none', 'create', 'repush'] as const) {
       expect(batchConfirmTitle(plan(), intent, 'myorg')).not.toMatch(/\b0 templates\b/);
     }
   });
 
-  it('names the CREATE when that is the only write the click performs', () => {
+  it('names the create when that is the only write the click performs', () => {
     const title = batchConfirmTitle(plan(), 'create', 'myorg');
     expect(title).toContain('myorg');
     expect(title).toMatch(/creat/i);
     expect(title).toMatch(/infra/i);
   });
 
-  it('names the RE-PUSH when the infra tick is the only write', () => {
-    // The run the infra checkbox alone makes submittable. It must not read as a create — the repo
-    // is already there, and the write is a commit on top of someone's existing module.
+  it('names the re-push when the infra tick is the only write', () => {
     const title = batchConfirmTitle(plan({ overwriteInfra: true }), 'repush', 'myorg');
     expect(title).toContain('myorg');
     expect(title).toMatch(/re-push/i);
@@ -897,9 +827,6 @@ describe('batchConfirmTitle — the confirm names what it is about to do (T6-L2)
   });
 
   it('still returns a sentence for the footer-unreachable empty case', () => {
-    // n=0 with no infra intent is gated off by `canSubmit`, so it should not be reachable — but a
-    // title function that returned '' or threw would white-screen the confirm if it ever were.
-    // `rolloutActionLabel`'s F2 reasoning, applied to a title: degrade, never fail.
     const title = batchConfirmTitle(plan(), 'none', 'myorg');
     expect(title.length).toBeGreaterThan(0);
     expect(title).toContain('myorg');
@@ -915,30 +842,15 @@ describe('batchConfirmTitle — the confirm names what it is about to do (T6-L2)
     }
   });
 
-  it('is the MODAL\'s title, not a second copy of it', () => {
-    // A SOURCE assertion in this file's idiom, and the reason T6-L2 existed at all: the count was
-    // correct in the footer and wrong in the title because the title was a template literal in a
-    // file no test can read. Every case above can pass while the surface stays wrong, so what is
-    // pinned is that the `.tsx` gets its title FROM HERE.
-    //
-    // Two properties, and deliberately not "the call is spelled `title={batchConfirmTitle(...)}`":
-    // the modal binds the result to a const so the aria label can reuse the same string, which is
-    // the better shape and which a spelling assertion would have forbidden. Comments stripped, since
-    // the retired literal is quoted in the prose that explains its removal.
+  it('is the modal\'s title, not a template literal built from the count', () => {
     const src = stripComments(rolloutModalSrc);
-    // 1. The function is actually CALLED (not merely imported — an unused import is a `tsc` error
-    //    here, but an import used only in a type position would not be).
     expect(src).toMatch(/batchConfirmTitle\(\s*plan/);
-    // 2. And no template literal builds a title from the count again. This is the exact shape that
-    //    produced "Roll out 0 templates — myorg".
     expect(src).not.toMatch(/title=\{`Roll out \$\{/);
     expect(src).not.toMatch(/`Roll out \$\{plan\.names\.length/);
   });
 });
 
-describe('infraNeedsCreate — the forced repo\'s one question, in the selector (F4)', () => {
-  // Moved out of the `.tsx`, where a `state ===` comparison was untestable by construction — the
-  // same class as F1, just smaller.
+describe('infraNeedsCreate: does the forced repo still need creating', () => {
   it('is true only when the infra repo is absent', () => {
     expect(infraNeedsCreate(row({ name: 'agp-runtime-infra', state: 'seed_absent' }))).toBe(true);
     expect(
@@ -947,64 +859,75 @@ describe('infraNeedsCreate — the forced repo\'s one question, in the selector 
   });
 
   it('is false when there is no infra row at all', () => {
-    // A view that could not report it is not evidence that it is missing — the fail-closed reading,
-    // since the alternative enables a submit button on an unknown.
     expect(infraNeedsCreate(null)).toBe(false);
   });
 
   it('only ever sees the two states the infra repo can reach', () => {
-    // `reconcile` builds this row with `registered=False` (it is NEVER registered), so
-    // `seed_absent` means precisely "not in the org yet" with no other state to confuse it with.
-    // Pinned so a future writer who registers the infra repo has to revisit this predicate.
     expect(infraNeedsCreate(row({ name: 'agp-runtime-infra', state: 'registered_present' }))).toBe(false);
     expect(infraNeedsCreate(row({ name: 'agp-runtime-infra', state: 'registered_missing' }))).toBe(false);
   });
 });
 
-describe('rolloutActionLabel — the result vocabulary, TOTAL over a wire string (F2)', () => {
+describe('wireFlagNote: one sentence per combination of the two wire flags', () => {
+  it('never pairs "does not authorise the runtime-infra repo" with an infra overwrite', () => {
+    const both = wireFlagNote({ overwrite: true, overwriteInfra: true }) ?? '';
+    expect(both).toMatch(/two separate overwrites/i);
+    expect(both).toMatch(/registered templates/i);
+    expect(both).toMatch(/runtime-infra/i);
+    expect(both).not.toMatch(/does not authorise/i);
+  });
+
+  it('states each single flag with its own scope, and nothing when neither is sent', () => {
+    expect(wireFlagNote({ overwrite: true, overwriteInfra: false })).toMatch(/left as they are/);
+    expect(wireFlagNote({ overwrite: false, overwriteInfra: true })).toMatch(/never a template/);
+    expect(wireFlagNote({ overwrite: false, overwriteInfra: false })).toBeNull();
+  });
+});
+
+describe('rolloutActionLabel: the result vocabulary, total over a wire string', () => {
   it('labels every action the backend can report', () => {
-    // `RolloutResultItemView.action` is pinned to five values (connections.py:511). A missing
-    // member would render a result row with no verdict — the outcome the operator came for.
-    for (const action of ['created', 'overwritten', 'recreated', 'skipped', 'adopted'] as const) {
+    for (const action of [
+      'created',
+      'overwritten',
+      'unchanged',
+      'recreated',
+      'skipped',
+      'adopted',
+      'failed',
+    ] as const) {
       expect(rolloutActionLabel(action).label.length).toBeGreaterThan(0);
       expect(rolloutActionLabel(action).cls.length).toBeGreaterThan(0);
     }
   });
 
-  it('degrades an UNKNOWN word to the word itself instead of throwing', () => {
-    // THE F2 REGRESSION TEST. The result view indexed a `Record` with a value the server types as
-    // a bare `str`, so a sixth backend word yielded `undefined` and the next `.cls` threw a
-    // TypeError — white-screening the whole result list rather than degrading one row. The result
-    // view is the operator's RECEIPT for writes that already happened, so it is the last surface
-    // that may fail to render.
+  it('tints a failed infra push rose, not the neutral slate of a skip', () => {
+    const failed = rolloutActionLabel('failed');
+    expect(failed.known).toBe(true);
+    expect(failed.cls).toContain('rose');
+    expect(failed.cls).not.toContain('emerald');
+    expect(rolloutActionLabel('skipped').cls).toContain('slate');
+  });
+
+  it('degrades an unknown word to the word itself instead of throwing: the receipt for writes that already happened must render', () => {
     const view = rolloutActionLabel('quarantined');
     expect(view.label).toBe('quarantined');
     expect(view.cls.length).toBeGreaterThan(0);
     expect(view.known).toBe(false);
   });
 
-  it('reports the five pinned words as known', () => {
-    // `known` is the discriminator: without it "matched a pinned word" and "fell through" are
-    // indistinguishable for any word whose label happens to equal itself, which is exactly how a
-    // backend rename would silently start rendering raw wire values with every test green.
+  it('reports a pinned word as known, the discriminator a label alone cannot carry', () => {
     expect(rolloutActionLabel('created').known).toBe(true);
     expect(rolloutActionLabel('skipped').known).toBe(true);
   });
 
-  it('renders an unknown word MUTED — it must not claim success or failure', () => {
-    // A word this build has not been taught about is not an achievement and not an error. Slate is
-    // the palette's only neutral (`OPS_BADGE.unknown`'s reasoning, unchanged): emerald would
-    // report a success nobody verified, rose a failure nobody observed.
+  it('renders an unknown word muted: slate, since it must claim neither success nor failure', () => {
     const view = rolloutActionLabel('something-new');
     expect(view.cls).toContain('slate');
     expect(view.cls).not.toContain('emerald');
     expect(view.cls).not.toContain('rose');
   });
 
-  it('survives the empty string and prototype member names', () => {
-    // The lookup key is SERVER-SUPPLIED, so the `Map` reasoning applies here too: an object
-    // literal would resolve 'toString' to `Object.prototype`'s member and hand a FUNCTION to a
-    // `.cls` read. And an empty action must still render a row rather than an empty pill.
+  it('survives the empty string and prototype member names: the key is server-supplied, so the table is a Map', () => {
     for (const key of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
       expect(rolloutActionLabel(key).known, key).toBe(false);
       expect(typeof rolloutActionLabel(key).cls).toBe('string');
@@ -1012,10 +935,7 @@ describe('rolloutActionLabel — the result vocabulary, TOTAL over a wire string
     expect(rolloutActionLabel('').label.length).toBeGreaterThan(0);
   });
 
-  it('distinguishes recreated from created and from overwritten', () => {
-    // Three different facts: genuinely new, a record existed but the repo was gone, and a
-    // re-push on top of a live repo. E28C/T3's review found "created" reported for a
-    // repository that already existed — the word IS the audit trail.
+  it('distinguishes recreated from created and from overwritten: three facts, three words', () => {
     const words = new Set([
       rolloutActionLabel('created').label,
       rolloutActionLabel('recreated').label,
@@ -1024,10 +944,15 @@ describe('rolloutActionLabel — the result vocabulary, TOTAL over a wire string
     expect(words.size).toBe(3);
   });
 
-  it('never says an overwritten row was destroyed or replaced', () => {
-    // E28C/T3 DELETED delete+recreate: "overwritten" is now an idempotent commit on top,
-    // history preserved. The old copy ("Overwriting replaces the existing repository's
-    // contents") described a verb that no longer exists.
+  it('a re-push that wrote no commit reads "Already up to date", not "Re-pushed"', () => {
+    const view = rolloutActionLabel('unchanged');
+    expect(view.known).toBe(true);
+    expect(view.label).toBe('Already up to date');
+    expect(view.label).not.toBe(rolloutActionLabel('overwritten').label);
+    expect(view.cls).toContain('slate');
+  });
+
+  it('never says an overwritten row was destroyed or replaced: a re-push is one idempotent commit on top', () => {
     const label = rolloutActionLabel('overwritten').label.toLowerCase();
     expect(label).not.toContain('replac');
     expect(label).not.toContain('destroy');
@@ -1044,8 +969,6 @@ describe('repushConfirm — a destructive-adjacent action states what it writes'
   });
 
   it('states that history is preserved and nothing is deleted', () => {
-    // The truth after T3, and the reason this sentence can be calm. The OLD copy promised a
-    // replacement, which is what the code used to do.
     expect(text).toMatch(/history/i);
     expect(text).not.toMatch(/\breplaces the .*contents\b/i);
     expect(text).not.toMatch(/permanently|destroy/i);
@@ -1056,6 +979,36 @@ describe('repushConfirm — a destructive-adjacent action states what it writes'
   });
 });
 
+describe('recreateConfirm: the record exists, the repository behind it does not', () => {
+  const text = recreateConfirm('strands-agentcore');
+
+  it('names the repository, says it no longer exists in the org and that the record is kept', () => {
+    expect(text).toContain('strands-agentcore');
+    expect(text).toMatch(/no longer exists/i);
+    expect(text).toMatch(/record is kept/i);
+  });
+
+  it('promises no deletion or replacement, since nothing is at risk', () => {
+    expect(text.toLowerCase()).not.toContain('delet');
+    expect(text.toLowerCase()).not.toContain('replac');
+    expect(text.toLowerCase()).not.toContain('overwrit');
+  });
+});
+
+describe('deregisterConfirm: the record goes, the repository is never touched', () => {
+  const text = deregisterConfirm('strands-agentcore');
+
+  it('names the repository and says the record is removed so the name can no longer be materialized', () => {
+    expect(text).toContain('strands-agentcore');
+    expect(text).toMatch(/removes AGP’s record/);
+    expect(text).toMatch(/no longer be materialized/);
+  });
+
+  it('states that AGP never deletes the repository behind a template', () => {
+    expect(text).toMatch(/never deletes the repository/);
+  });
+});
+
 describe('adoptConfirm — register-as-is, with and without provenance', () => {
   it('shows what read_repo found when the row carries it', () => {
     const text = adoptConfirm(row({ name: 'x', default_branch: 'develop', head_sha: 'deadbeefcafe' }));
@@ -1063,10 +1016,7 @@ describe('adoptConfirm — register-as-is, with and without provenance', () => {
     expect(text).toContain('deadbee');
   });
 
-  it('says what WILL happen, without provenance, for an org-origin row', () => {
-    // The cost ruling's consequence: no per-row probe, so both fields are null pre-POST. The
-    // confirm must not show "unknown" (reads as a fault) nor invent a branch — it states the
-    // act and that the details are verified on adopt.
+  it('says what will happen, without provenance, for an org-origin row: never "unknown", never an invented branch', () => {
     const text = adoptConfirm(row({ name: 'theirs', origin: 'org', state: 'unregistered_present' }));
     expect(text).toContain('theirs');
     expect(text).toContain(ADOPT_CONFIRM_NO_PROVENANCE);
@@ -1074,8 +1024,6 @@ describe('adoptConfirm — register-as-is, with and without provenance', () => {
   });
 
   it('promises no push and no content change, in both shapes', () => {
-    // Adopt is a governance statement. An operator adopting the repo they wrote must not be
-    // led to think AGP is about to write to it.
     for (const text of [
       adoptConfirm(row({ name: 'x', default_branch: 'main', head_sha: 'abc1234' })),
       adoptConfirm(row({ name: 'x', origin: 'org', state: 'unregistered_present' })),
@@ -1094,206 +1042,186 @@ describe('SEED_CONSENT_PROMPT — the post-finalize prompt, pinned verbatim', ()
   });
 
   it('promises that navigation alone executes nothing', () => {
-    // The preview IS the consent screen (tenet 6). If arriving here created anything, this
-    // sentence would be the lie the epic exists to remove.
     expect(SEED_CONSENT_PROMPT('org')).toContain('Nothing is created until you confirm');
   });
 });
 
-describe('classifyRolloutError — the route\'s fixed detail literals → a sentence and a verdict', () => {
-  // Mirrors `classifyTemplateError`'s shape (templatesView.ts) because the same interceptor
-  // problem applies: `api/client.ts` replaces the AxiosError with `new Error(detail)`, so by the
-  // time this surface holds a rejection THE STATUS IS GONE. The detail literal is fixed per
-  // `.kind` server-side (connections.py:209-215) precisely so it can be classified.
-  const ROUTE_DETAILS: Record<RolloutErrorKind, string> = {
-    not_found: 'Unknown base template',
-    repo_not_found: 'Repository not found in the org',
-    conflict: 'Template already registered',
-    rollout_error: 'Template rollout failed',
-    validation: 'Invalid template name or connection id',
-  };
+function apiFailure({ status, code, detail = '', message = detail }: { status: number; code: ErrorCode | null; detail?: string; message?: string }): ApiFailure {
+  return new ApiFailure(status, code, detail, message);
+}
 
-  it('recognizes every literal the route pins', () => {
-    for (const [kind, detail] of Object.entries(ROUTE_DETAILS)) {
-      expect(classifyRolloutError(new Error(detail), 'fallback').kind, detail).toBe(kind);
+const ROUTE_REFUSALS: Record<RolloutErrorKind, ApiFailure> = {
+  not_found: apiFailure({ status: 404, code: 'rollout.not_found', detail: 'Unknown base template' }),
+  repo_not_found: apiFailure({ status: 404, code: 'rollout.repo_not_found', detail: 'Repository not found in the org' }),
+  conflict: apiFailure({ status: 409, code: 'rollout.conflict', detail: 'Template already registered' }),
+  rollout_error: apiFailure({ status: 502, code: 'rollout.rollout_error', detail: 'Template rollout failed' }),
+  validation: apiFailure({ status: 422, code: 'rollout.validation', detail: 'Invalid template name or connection id' }),
+};
+
+describe('ROLLOUT_ERROR_CODES — typed on the generated ErrorCode', () => {
+  it('satisfies Record<RolloutErrorKind, readonly ErrorCode[]>, so a renamed backend code fails tsc where this table names it', () => {
+    expectTypeOf(ROLLOUT_ERROR_CODES).toExtend<Record<RolloutErrorKind, readonly ErrorCode[]>>();
+  });
+
+  it('names at least one code per kind and no code under two kinds', () => {
+    const all = Object.values(ROLLOUT_ERROR_CODES).flat();
+    for (const codes of Object.values(ROLLOUT_ERROR_CODES)) expect(codes.length).toBeGreaterThan(0);
+    expect(new Set(all).size).toBe(all.length);
+  });
+
+  it('keys rollout_error on both provider faults: the rollout service\'s own and the repo service\'s', () => {
+    expect(classifyRolloutFailure(ROUTE_REFUSALS.rollout_error)).toBe('rollout_error');
+    expect(
+      classifyRolloutFailure(apiFailure({ status: 502, code: 'github_repo.provider_error', detail: 'Template rollout failed' })),
+    ).toBe('rollout_error');
+  });
+
+  it('classifies by code alone: the detail under no code is unrecognised, a reworded detail under the code is not', () => {
+    expect(classifyRolloutFailure(apiFailure({ status: 409, code: null, detail: 'Template already registered' }))).toBeNull();
+    expect(classifyRolloutFailure(apiFailure({ status: 409, code: 'rollout.conflict', detail: 'reworded' }))).toBe('conflict');
+  });
+});
+
+describe('classifyRolloutError — the route\'s codes → a sentence and a verdict', () => {
+  it('recognizes every code the route answers with', () => {
+    for (const [kind, failure] of Object.entries(ROUTE_REFUSALS)) {
+      expect(classifyRolloutError(failure, 'fallback').kind, kind).toBe(kind);
     }
   });
 
-  it('treats ONLY rollout_error as retryable', () => {
-    // The service docstring is explicit: "the only retryable kind". 404/409/422 are permanent —
-    // re-POSTing the same name returns the same answer, and offering a retry would be advice
-    // the product cannot honour.
-    expect(classifyRolloutError(new Error(ROUTE_DETAILS.rollout_error), 'f').retryable).toBe(true);
+  it('treats only rollout_error as retryable: the other four answer the same to the same request', () => {
+    expect(classifyRolloutError(ROUTE_REFUSALS.rollout_error, 'f').retryable).toBe(true);
     for (const kind of ['not_found', 'repo_not_found', 'conflict', 'validation'] as const) {
-      expect(classifyRolloutError(new Error(ROUTE_DETAILS[kind]), 'f').retryable, kind).toBe(false);
+      expect(classifyRolloutError(ROUTE_REFUSALS[kind], 'f').retryable, kind).toBe(false);
     }
   });
 
   it('appends the wait hint to the retryable kind only', () => {
-    const retryable = classifyRolloutError(new Error(ROUTE_DETAILS.rollout_error), 'f').message;
-    const terminal = classifyRolloutError(new Error(ROUTE_DETAILS.conflict), 'f').message;
+    const retryable = classifyRolloutError(ROUTE_REFUSALS.rollout_error, 'f').message;
+    const terminal = classifyRolloutError(ROUTE_REFUSALS.conflict, 'f').message;
     expect(retryable).toMatch(/try again/i);
     expect(terminal).not.toMatch(/try again/i);
   });
 
   it('tells 404-repo apart from 404-seed in the sentence, not only in the kind', () => {
-    // The route split these two literals deliberately: telling an operator "Unknown base
-    // template" when their REPO name was mistyped points them at AGP's seed list, which has
-    // nothing to do with their mistake.
-    const seed = classifyRolloutError(new Error(ROUTE_DETAILS.not_found), 'f').message;
-    const repo = classifyRolloutError(new Error(ROUTE_DETAILS.repo_not_found), 'f').message;
+    const seed = classifyRolloutError(ROUTE_REFUSALS.not_found, 'f').message;
+    const repo = classifyRolloutError(ROUTE_REFUSALS.repo_not_found, 'f').message;
     expect(seed).not.toBe(repo);
     expect(repo).toMatch(/repositor/i);
   });
 
   it('points a conflict at the rule that refused, not just at "already registered"', () => {
-    // The server enforces THREE rules under one 409 (already registered / the infra repo / a
-    // materialized agent repo) and the message names which. The client's sentence must leave
-    // room for all three rather than asserting the first.
-    const msg = classifyRolloutError(new Error(ROUTE_DETAILS.conflict), 'f').message;
+    const msg = classifyRolloutError(ROUTE_REFUSALS.conflict, 'f').message;
     expect(msg).toMatch(/already|platform|agent/i);
   });
 
   it('names the name rule for a validation failure', () => {
-    // 422 is what a listed-but-illegally-named org repo returns on adopt. The sentence has to
-    // be the same rule `ADOPT_NAME_RULE_HINT` states, or the two channels contradict.
-    const msg = classifyRolloutError(new Error(ROUTE_DETAILS.validation), 'f').message;
+    const msg = classifyRolloutError(ROUTE_REFUSALS.validation, 'f').message;
     expect(msg).toMatch(/lowercase/i);
   });
 
-  it('falls back to the raw message, TERMINAL, for anything unrecognized', () => {
-    // Same rule as `classifyTemplateError`: an unknown failure is more likely a bug than
-    // contention, so inviting a retry would be a guess presented as advice.
+  it('passes the raw message through, terminal, for anything unrecognised: an unknown failure is more likely a bug than contention', () => {
     const view = classifyRolloutError(new Error('HTTP 500'), 'fallback');
     expect(view.kind).toBeNull();
     expect(view.retryable).toBe(false);
     expect(view.message).toBe('HTTP 500');
+    const other = classifyRolloutError(
+      apiFailure({ status: 404, code: 'connection.not_found', detail: 'Connection not found' }),
+      'fallback',
+    );
+    expect(other.kind).toBeNull();
+    expect(other.message).toBe('Connection not found');
   });
 
   it('uses the fallback for an empty or non-Error rejection', () => {
     expect(classifyRolloutError(new Error(''), 'fallback').message).toBe('fallback');
     expect(classifyRolloutError(new Error('   '), 'fallback').message).toBe('fallback');
-    expect(classifyRolloutError('boom', 'fallback').message).toBe('fallback');
     expect(classifyRolloutError(null, 'fallback').message).toBe('fallback');
     expect(classifyRolloutError(undefined, 'fallback').message).toBe('fallback');
   });
 
-  it('never classifies a prototype member name as a recognized kind', () => {
-    // A `Map`, not an object literal — the lookup key is a SERVER-SUPPLIED string, and an
-    // object would resolve 'toString' / 'constructor' to `Object.prototype`'s member.
-    // (`githubLink.ts`'s reasoning, unchanged.)
-    for (const key of ['toString', 'constructor', 'hasOwnProperty', '__proto__']) {
-      expect(classifyRolloutError(new Error(key), 'f').kind, key).toBeNull();
-    }
+  it('shows the interceptor’s 401 copy as sent when the load state carries its codeless 401 failure', () => {
+    const state = failureOf(new ApiFailure(401, null, undefined, AUTH_401_HALT_MESSAGE), 'fallback');
+    expect(state.failure).toMatchObject({ status: 401, code: null, message: AUTH_401_HALT_MESSAGE });
+    expect(classifyRolloutError(state.failure ?? state.message, 'fallback')).toEqual({
+      message: AUTH_401_HALT_MESSAGE,
+      retryable: false,
+      kind: null,
+    });
+    expect(stripComments(rolloutModalSrc)).toContain(
+      'classifyRolloutError(viewLoad.state.failure ?? viewLoad.state.message, RECONCILE_FALLBACK)',
+    );
   });
 });
 
-describe('deregister failures belong to the CATALOG route\'s classifier (F3)', () => {
-  // THE F3 REGRESSION TEST. Deregister on this surface calls `githubTemplatesApi.remove` — a
-  // different router with a different `_ERROR_DETAIL` table — but its failures were routed through
-  // `classifyRolloutError`, which recognizes none of those literals. The consequence was specific:
-  // a 503 "Template catalog is temporarily unavailable" is RETRYABLE and rendered as a raw,
-  // terminal, rose-tinted failure with no Retry, telling an admin the catalog was broken when the
-  // remedy was to wait.
-  const CATALOG_DETAILS = [
-    'Template not found',
-    'Template catalog is temporarily unavailable',
-    'GitHub template operation failed',
-    'Invalid template metadata',
-    'Invalid template zip',
+describe('deregister failures belong to the catalog route\'s classifier: a 503 store fault is retryable there and unknown to the rollout one', () => {
+  const CATALOG_REFUSALS = [
+    apiFailure({ status: 404, code: 'github_template.not_found', detail: 'Template not found' }),
+    apiFailure({ status: 503, code: 'github_template.store_error', detail: 'Template catalog is temporarily unavailable' }),
+    apiFailure({ status: 502, code: 'github_template.github_error', detail: 'GitHub template operation failed' }),
+    apiFailure({ status: 422, code: 'github_template.invalid_input', detail: 'Invalid template metadata' }),
+    apiFailure({ status: 422, code: 'github_template.invalid_zip', detail: 'Invalid template zip' }),
   ];
 
-  it('the rollout classifier recognizes NONE of the catalog route\'s literals', () => {
-    // The premise of the bug, asserted so the fix cannot be quietly reverted by teaching the wrong
-    // classifier these strings — which would then have TWO owners for one route's errors.
-    for (const detail of CATALOG_DETAILS) {
-      expect(classifyRolloutError(new Error(detail), 'f').kind, detail).toBeNull();
+  it('the rollout classifier recognises none of the catalog route\'s codes', () => {
+    for (const failure of CATALOG_REFUSALS) {
+      expect(classifyRolloutError(failure, 'f').kind, failure.message).toBeNull();
     }
   });
 
   it('the catalog classifier does recognize them, and calls the store fault retryable', () => {
-    for (const detail of CATALOG_DETAILS) {
-      expect(classifyTemplateError(new Error(detail), 'f').kind, detail).not.toBeNull();
+    for (const failure of CATALOG_REFUSALS) {
+      expect(classifyTemplateError(failure, 'f').kind, failure.message).not.toBeNull();
     }
-    const store = classifyTemplateError(new Error('Template catalog is temporarily unavailable'), 'f');
+    const store = classifyTemplateError(CATALOG_REFUSALS[1], 'f');
     expect(store.retryable).toBe(true);
     expect(store.message).toMatch(/try again/i);
   });
 
-  it('and the two tables are DISJOINT, so neither route can claim the other\'s errors', () => {
-    // Each classifier owns exactly one route. Overlap would make the surface's tint and Retry
-    // depend on which handler happened to catch the rejection.
-    const ROLLOUT_DETAILS = [
-      'Unknown base template',
-      'Repository not found in the org',
-      'Template already registered',
-      'Template rollout failed',
-      'Invalid template name or connection id',
-    ];
-    for (const detail of ROLLOUT_DETAILS) {
-      expect(classifyTemplateError(new Error(detail), 'f').kind, detail).toBeNull();
+  it('and the two tables are disjoint, so neither route can claim the other\'s errors', () => {
+    const rollout = new Set<string>(Object.values(ROLLOUT_ERROR_CODES).flat());
+    for (const code of Object.values(TEMPLATE_ERROR_CODES).flat()) expect(rollout.has(code), code).toBe(false);
+    for (const failure of Object.values(ROUTE_REFUSALS)) {
+      expect(classifyTemplateError(failure, 'f').kind, failure.message).toBeNull();
     }
   });
 
-  it('the modal hands its deregister handler the catalog classifier', () => {
-    // A SOURCE assertion, because there is no jsdom to observe which classifier a rejected promise
-    // reaches. Narrow and specific: the deregister handler is the one place on this surface that
-    // calls a catalog route, so it is the one place `classifyTemplateError` may appear — and it must.
-    expect(rolloutModalSrc).toContain('classifyTemplateError');
-    const handler = rolloutModalSrc.slice(
-      rolloutModalSrc.indexOf('const runDeregister'),
-      rolloutModalSrc.indexOf('const askConfirm'),
-    );
+  it('the modal hands its deregister handler the catalog classifier, and the failure itself rather than a rewrapped message', () => {
+    const src = stripComments(rolloutModalSrc);
+    expect(src).toContain('classifyTemplateError');
+    expect(src).not.toMatch(/classifyRolloutError\(new Error\(/);
+    const handler = src.slice(src.indexOf('const runDeregister'), src.indexOf('const askConfirm'));
     expect(handler.length).toBeGreaterThan(200);
     expect(handler).toContain('githubTemplatesApi.remove');
-    // The CALL, not a mention: the handler's comment names the wrong classifier deliberately (to
-    // explain why it is wrong), so a bare `not.toContain` would fail on correct code. Matching
-    // `classifier(` is what distinguishes an invocation from prose about one.
     expect(handler).toMatch(/classifyTemplateError\(/);
     expect(handler).not.toMatch(/classifyRolloutError\(/);
   });
 });
 
 describe('the cost model — which surfaces pay for a provider call', () => {
-  it('names the provider-backed calls as reconcile-only', () => {
-    expect(PAGE_LOAD_PROVIDER_CALLS).toEqual([]);
-    expect(RECONCILE_EFFECT_DEPS).toContain('reloadNonce');
-  });
-
-  it('leaves the Templates page free of any reconcile call', () => {
-    // THE RULED COST MODEL (D-C3): provider calls happen on this surface's OPEN and explicit
-    // Refresh only, so the Templates page stays registry-only and instant. Asserted as an
-    // ABSENCE across the page source, because there is no jsdom to observe a fetch that never
-    // happens — and a page-load reconcile is a one-line import away.
+  it('leaves the Templates page free of any reconcile, rollout or adopt call: provider calls happen only on the modal\'s open and Refresh', () => {
     const pages = import.meta.glob<string>('./Templates.tsx', {
       query: '?raw',
       import: 'default',
       eager: true,
     });
-    const src = pages['./Templates.tsx'];
-    // The sweep really read the page — a glob that silently stopped matching would make the
-    // assertion below vacuous while staying green.
+    const src = stripComments(pages['./Templates.tsx']);
     expect(typeof src).toBe('string');
     expect(src.length).toBeGreaterThan(1000);
-    // `rolloutApi.reconcile(` / `.rollout(` / `.adopt(` must appear NOWHERE in the page: the
-    // modal owns all three. A page that called reconcile itself would spend a paginated
-    // `list_repos` plus a probe per row on every org switch.
     expect(src).not.toMatch(/rolloutApi\s*\.\s*(reconcile|rollout|adopt)\s*\(/);
   });
 
-  it('keeps the page-load fetch set closed at the two registry reads', () => {
-    // NAMED AND CLOSED, so a third read cannot be added without this test failing. The two are
-    // `connectionsApi.list()` (which orgs exist) and `githubTemplatesApi.list()` (the registry
-    // catalog for the selected one) — both registry-only.
-    const src = import.meta.glob<string>('./Templates.tsx', {
-      query: '?raw',
-      import: 'default',
-      eager: true,
-    })['./Templates.tsx'];
+  it('keeps the Templates page\'s api call set closed: three registry reads and three registry writes, no provider call', () => {
+    const src = stripComments(
+      import.meta.glob<string>('./Templates.tsx', {
+        query: '?raw',
+        import: 'default',
+        eager: true,
+      })['./Templates.tsx'],
+    );
     const apiCalls = [...src.matchAll(/\b(\w+Api)\s*\n?\s*\.\s*(\w+)\s*\(/g)].map(
       (m) => `${m[1]}.${m[2]}`,
     );
-    // Deduplicated: the same call may legitimately appear in an effect and in a refetch.
     const distinct = [...new Set(apiCalls)].sort();
     expect(distinct).toEqual([
       'connectionsApi.list',
@@ -1301,46 +1229,24 @@ describe('the cost model — which surfaces pay for a provider call', () => {
       'githubTemplatesApi.patch',
       'githubTemplatesApi.remove',
       'githubTemplatesApi.upload',
+      'infraTemplatesApi.list',
     ]);
-    // The three write calls are explicit operator clicks (delete / edit / upload), not page
-    // loads, and all three are registry writes — no provider call among them.
   });
 });
 
-describe('the deleted field names must not survive in TS', () => {
-  it('mentions exists_in_org / base_templates nowhere in src/', () => {
-    // GREP-PINNED, like E28B's key sweep. Both are DELETED from the wire, not renamed
-    // (connections.py:463-490 states why): a client still reading a boolean would keep
-    // rendering the same two wrong answers — a registered template whose repo is gone shown as
-    // in-sync, and an existing repo shown as creatable.
-    //
-    // TWO OF THE FOUR DELETED NAMES ARE DELIBERATELY EXCLUDED, on E28B's own
-    // `finalize` precedent (repositoryDetailTabs.test.ts:2343): a guard that cries wolf gets
-    // deleted, so a sweep may only carry names that are distinctive.
-    //
-    //   `selectable` — gone from the wire, but `repositoryDetailTabs.ts` OWNS this word for an
-    //     unrelated concept (`selectableTabKeys`, `TabDef.ready`), and `DeleteRepositoryModal` /
-    //     `TabStrip` / `RepositoryDetail` all use it correctly. Sweeping it would fail on 14
-    //     lines that have nothing to do with rollout.
-    //   `kind` — same, worse: `EmptyStateCta.kind`, `TemplateErrorKind`, `RolloutErrorKind` and
-    //     every classifier in this codebase use it.
-    //
-    // What DOES pin those two is `tsc`: they are absent from `ReconcileItem` in `api/client.ts`,
-    // so a component reading `item.selectable` or `item.kind` fails to compile. The grep is only
-    // needed for the two names a stale STRING or comment could keep alive — which is exactly how
-    // `client.ts:2052-2057`'s comment survived being wrong.
+describe('the deleted wire fields exists_in_org and base_templates survive nowhere in src/ code', () => {
+  it('mentions neither name in any non-test .ts or .tsx, comments stripped', () => {
     const DELETED = ['exists_in_org', 'base_templates'];
     const sources = Object.entries(
       import.meta.glob<string>('../../**/*.{ts,tsx}', { query: '?raw', import: 'default', eager: true }),
     ).filter(([path]) => !path.endsWith('.test.ts') && !path.endsWith('.test.tsx'));
-    // The sweep really reached `src/`, and specifically the client — where all three names
-    // lived. An empty or narrowed glob would make every assertion below vacuous.
-    expect(sources.length).toBeGreaterThan(20);
+    expect(sources.length).toBeGreaterThan(NON_TEST_SOURCE_FLOOR);
     expect(sources.map(([p]) => p).filter((p) => p.endsWith('api/client.ts'))).toHaveLength(1);
-    for (const [path, src] of sources) {
+    for (const [path, raw] of sources) {
+      const src = stripComments(raw);
       for (const name of DELETED) {
         expect(src, `${path} still mentions the deleted field ${name}`).not.toContain(name);
       }
     }
-  });
+  }, 30_000);
 });

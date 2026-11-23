@@ -1,16 +1,15 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { mcpServersApi } from '../../api/client';
-import type { DataClassification, McpServer, McpServerCreate, McpServerKind, McpTool } from '../../api/client';
-import { useUser } from '../../contexts/UserContext';
+import { isApiFailure } from '../../api/failure';
+import type { DataClassification, McpServer, McpServerCreate, Kind, McpToolInput } from '../../api/client';
+import { useUser } from '../../contexts/useUser';
 import { resolveTenantName, tenantSelectOptions } from './tenantUi';
 import { useTenantDirectory } from './useTenantDirectory';
+import { WIZARD_GATEWAY_HINT } from './mcpRepoOwnership';
+import { classifyMcpCreateRefusal, requiredArnPresent } from './mcpServerRegistrationForm';
 
-// ---------------------------------------------------------------------------
-// Select option tables (mirror the enum labels used in McpServerCatalog / McpServerDetail)
-// ---------------------------------------------------------------------------
-
-const KIND_OPTIONS: { value: McpServerKind; label: string }[] = [
+const KIND_OPTIONS: { value: Kind; label: string }[] = [
   { value: 'standard', label: 'Standard (Runtime / external endpoint)' },
   { value: 'gateway', label: 'Gateway (AgentCore-managed)' },
   { value: 'runtime', label: 'Runtime (AgentCore Runtime-MCP)' },
@@ -25,7 +24,7 @@ const DATA_CLASS_OPTIONS: { value: DataClassification; label: string }[] = [
 
 const REGION_OPTIONS = ['DE', 'IT', 'FR', 'SE', 'EU'];
 
-const KIND_LABEL: Record<McpServerKind, string> = {
+const KIND_LABEL: Record<Kind, string> = {
   standard: 'Standard',
   gateway: 'Gateway',
   runtime: 'Runtime',
@@ -42,15 +41,10 @@ const STEPS = [
   { n: 6, label: 'Confirm' },
 ];
 
-// Shared field styling.
 const INPUT =
   'mt-1 w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500/40';
 const LABEL = 'text-xs uppercase tracking-wide text-slate-500 font-medium';
 
-// A single editable tool row. `uid` is a monotonic counter used as the React key
-// (stable across mid-list removals — avoids the index-key footgun). `schemaText` is
-// the raw JSON text the user types; it is parsed to an object on change (empty → `{}`).
-// `schemaError` is the inline parse/shape error, or null when the row's schema is valid.
 interface ToolRow {
   uid: number;
   name: string;
@@ -64,12 +58,11 @@ const nextToolUid = () => ++_toolUidCounter;
 
 const EMPTY_TOOL_ROW: ToolRow = { uid: 0, name: '', description: '', schemaText: '', schemaError: null };
 
-// Local draft of every editable field (strings — coerced to the McpServerCreate payload on submit).
 interface Draft {
   name: string;
   description: string;
   version: string;
-  kind: McpServerKind;
+  kind: Kind;
   endpoint_url: string;
   gateway_arn: string;
   runtime_arn: string;
@@ -99,8 +92,6 @@ const EMPTY_DRAFT: Draft = {
   tools: [],
 };
 
-// Parse a row's schema text into a validated JSON object. Empty text → `{}`.
-// Returns an error string when the text is not valid JSON or not an object.
 function parseSchema(text: string): { value: Record<string, unknown> | null; error: string | null } {
   const t = text.trim();
   if (!t) return { value: {}, error: null };
@@ -116,20 +107,16 @@ function parseSchema(text: string): { value: Record<string, unknown> | null; err
   return { value: parsed as Record<string, unknown>, error: null };
 }
 
-// A row contributes a tool only if it has a non-empty name. Fully-empty rows are dropped.
 function rowHasContent(r: ToolRow): boolean {
   return r.name.trim().length > 0;
 }
 
-// Omit empty optional strings so the backend applies its defaults. Required: name.
-// `kind` and `version` are always sent. `available_tools` is included only when at
-// least one row carries a (named) tool.
 function buildPayload(d: Draft): McpServerCreate {
   const trimmed = (s: string) => {
     const t = s.trim();
     return t.length ? t : undefined;
   };
-  const tools: McpTool[] = d.tools.filter(rowHasContent).map((r) => {
+  const tools: McpToolInput[] = d.tools.filter(rowHasContent).map((r) => {
     const { value } = parseSchema(r.schemaText);
     return {
       name: r.name.trim(),
@@ -158,8 +145,6 @@ function buildPayload(d: Draft): McpServerCreate {
 export default function McpServerRegistrationWizard() {
   const navigate = useNavigate();
 
-  // Tenant select source (E24): the caller's memberships, or the full admin
-  // directory for role_level >= 2 (degrades to memberships while it loads).
   const { user } = useUser();
   const isAdmin = (user?.role_level ?? 0) >= 2;
   const tenantDirectory = useTenantDirectory(isAdmin);
@@ -168,16 +153,12 @@ export default function McpServerRegistrationWizard() {
   const [step, setStep] = useState(1);
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
 
-  // Submission / result state.
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<McpServer | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // A name-collision (409) error is surfaced inline on step 1.
   const [nameError, setNameError] = useState<string | null>(null);
-  // A missing-ARN error is surfaced inline on step 2 (gateway/runtime require one).
   const [arnError, setArnError] = useState<string | null>(null);
 
-  // Post-create "submit for approval" state.
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -186,19 +167,9 @@ export default function McpServerRegistrationWizard() {
     setDraft((d) => ({ ...d, [key]: value }));
 
   const nameValid = draft.name.trim().length > 0;
-  // A gateway can only be provisioned if it carries a gateway_arn (the platform derives
-  // the gatewayId from the ARN to provision its Entra identity); a runtime needs runtime_arn.
-  // Standard servers are metadata-only — no ARN required. Empty is the hard gate (format is
-  // only a soft hint below) so a gateway can never be registered stuck at identity_status=none.
-  const arnValid =
-    (draft.kind !== 'gateway' || draft.gateway_arn.trim().length > 0) &&
-    (draft.kind !== 'runtime' || draft.runtime_arn.trim().length > 0);
-  // tenant_id is REQUIRED by the backend since E24 — gate Create on it.
+  const arnValid = requiredArnPresent(draft);
   const tenantValid = draft.tenant_id.length > 0;
-  // Confirm/Create is blocked while any row has invalid JSON.
   const hasInvalidTool = draft.tools.some((r) => r.schemaError !== null);
-
-  // -- tool-row editing -----------------------------------------------------
 
   const addTool = () =>
     setDraft((d) => ({ ...d, tools: [...d.tools, { ...EMPTY_TOOL_ROW, uid: nextToolUid() }] }));
@@ -216,8 +187,6 @@ export default function McpServerRegistrationWizard() {
         i === idx ? { ...r, schemaText: value, schemaError: parseSchema(value).error } : r,
       ),
     }));
-
-  // -- step nav -------------------------------------------------------------
 
   const arnErrorMessage = () =>
     draft.kind === 'runtime'
@@ -272,10 +241,7 @@ export default function McpServerRegistrationWizard() {
       setCreated(mcp);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to create the MCP server.';
-      // A duplicate name surfaces as a 409 → its detail message. Send the user back
-      // to step 1 with the message on the name field so they can rename. Any other
-      // error (incl. a 422 schema-validation rejection) surfaces in the error panel.
-      if (/already|exist|taken|409|duplicate/i.test(msg)) {
+      if (isApiFailure(err) && classifyMcpCreateRefusal(err) === 'name_taken') {
         setNameError(msg);
         setStep(1);
       } else {
@@ -299,8 +265,6 @@ export default function McpServerRegistrationWizard() {
       setSubmitting(false);
     }
   };
-
-  // -- success state --------------------------------------------------------
 
   if (created) {
     return (
@@ -358,8 +322,6 @@ export default function McpServerRegistrationWizard() {
     );
   }
 
-  // -- wizard ---------------------------------------------------------------
-
   return (
     <div className="min-h-[calc(100vh-4rem)] relative">
       <div className="relative max-w-2xl mx-auto px-6 py-10">
@@ -374,7 +336,6 @@ export default function McpServerRegistrationWizard() {
           Bring an MCP server under governance — give it an owner, a classification, and declare its tools.
         </p>
 
-        {/* Step indicator */}
         <nav aria-label="Progress" className="mt-6 mb-6">
           <ol className="flex items-center gap-2">
             {STEPS.map((s, i) => {
@@ -408,7 +369,6 @@ export default function McpServerRegistrationWizard() {
         </nav>
 
         <div className={`${CARD} p-6`}>
-          {/* Step 1 — Identity: name + description + version */}
           {step === 1 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Identity</h2>
@@ -439,10 +399,13 @@ export default function McpServerRegistrationWizard() {
                   value={draft.description}
                   onChange={(e) => set('description', e.target.value)}
                   rows={4}
+                  maxLength={100}
                   placeholder="What does this MCP server expose? (optional)"
                   aria-label="MCP server description"
                   className={INPUT}
                 />
+                {/* The registry's server.json schema caps the description at 100 characters. */}
+                <p className="mt-1 text-right text-xs text-slate-500">{draft.description.length}/100</p>
               </div>
               <div>
                 <label htmlFor="mcp-version" className={LABEL}>
@@ -460,7 +423,6 @@ export default function McpServerRegistrationWizard() {
             </div>
           )}
 
-          {/* Step 2 — Kind + endpoint */}
           {step === 2 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Kind</h2>
@@ -472,7 +434,7 @@ export default function McpServerRegistrationWizard() {
                   id="mcp-kind"
                   value={draft.kind}
                   onChange={(e) => {
-                    set('kind', e.target.value as McpServerKind);
+                    set('kind', e.target.value as Kind);
                     if (arnError) setArnError(null);
                   }}
                   aria-label="MCP server kind"
@@ -488,6 +450,14 @@ export default function McpServerRegistrationWizard() {
                   Gateway servers are AgentCore-managed and carry a Cedar policy tab; standard
                   servers point at an external endpoint.
                 </p>
+                {draft.kind === 'gateway' && (
+                  <p className="mt-2 text-xs text-blue-700 bg-blue-50/70 border border-blue-100 rounded-lg px-2.5 py-1.5">
+                    {WIZARD_GATEWAY_HINT}{' '}
+                    <Link to="/ops/mcp-servers" className="font-medium underline underline-offset-2 hover:text-blue-900">
+                      Open MCP servers
+                    </Link>
+                  </p>
+                )}
               </div>
               <div>
                 <label htmlFor="mcp-endpoint" className={LABEL}>
@@ -578,7 +548,6 @@ export default function McpServerRegistrationWizard() {
             </div>
           )}
 
-          {/* Step 3 — Owner */}
           {step === 3 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Owner</h2>
@@ -615,7 +584,6 @@ export default function McpServerRegistrationWizard() {
             </div>
           )}
 
-          {/* Step 4 — Classification: business unit + region + data classification */}
           {step === 4 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Classification</h2>
@@ -697,7 +665,6 @@ export default function McpServerRegistrationWizard() {
             </div>
           )}
 
-          {/* Step 5 — Tools: add-row editor */}
           {step === 5 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Tools</h2>
@@ -790,7 +757,6 @@ export default function McpServerRegistrationWizard() {
             </div>
           )}
 
-          {/* Step 6 — Confirm */}
           {step === 6 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Confirm</h2>
@@ -874,7 +840,6 @@ export default function McpServerRegistrationWizard() {
           )}
         </div>
 
-        {/* Nav buttons */}
         <div className="mt-6 flex items-center justify-between">
           <button
             onClick={back}
@@ -905,10 +870,6 @@ export default function McpServerRegistrationWizard() {
     </div>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Confirm-step summary field
-// ---------------------------------------------------------------------------
 
 function Summary({
   label,

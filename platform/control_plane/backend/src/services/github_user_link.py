@@ -1,96 +1,40 @@
-"""Per-user GitHub account links (E27B/T7) — the epic's core service.
+"""Per-user GitHub account links: an Entra human authorizes AGP to act on GitHub as them.
 
-Composes the pure OAuth transport in :mod:`services.github_user_oauth` with storage so an
-Entra human can authorize AGP to act on GitHub **as them**: AGP holds the Entra ``oid`` on
-one side and GitHub's numeric user id on the other, and owns the resulting token's whole
-lifecycle (mint → refresh → verify → revoke). Every seam is injected, so this module holds
-no ``httpx`` response parsing, no FastAPI, and no wall-clock read.
+Composes the OAuth transport in :mod:`services.github_user_oauth` with storage and owns the token's
+whole lifecycle (mint, refresh, verify, revoke). Every seam is injected, so this module holds no
+``httpx`` response parsing, no FastAPI and no wall-clock read. :meth:`get_user_bearer_token` is a
+separate ``(principal_oid, connection_id)`` seam rather than a third ``ConnectionAuthType`` on the
+connection service, which resolves per-org records and never sees a principal.
 
-A NEW SEAM, NOT A THIRD ``AuthType`` (D2). E27A's design pre-committed to hiding user
-tokens behind ``ConnectionService.get_bearer_token`` "so no call site changes". That is not
-achievable: ``get_bearer_token(connection_id)`` resolves a per-ORG record and
-``ConnectionService`` never sees a principal, so overloading it would either grow the
-signature (touching all six production callers) or smuggle request state into a service.
-Hence :meth:`GitHubUserLinkService.get_user_bearer_token` — a separate
-``(principal_oid, connection_id)`` seam. The E27A invariant that still holds is the one that
-matters: no code mints or reads a provider credential outside a service seam.
+Storage: one :class:`core.state_store.StateStore` over the connections table; link metadata is a
+partition (``pk="github_user_link"``, ``sk="<principal_oid>#<connection_id>"``) and the short-lived
+CSRF/PKCE state is a second partition, written once and consumed by one conditional delete, expired
+by the application. The ``ghu_``/``ghr_`` pair lives only in Secrets Manager under
+``<secret_prefix><link_id>`` with body ``{"access_token", "refresh_token"}``; the row and every read
+model carry ``secret_arn``, a pointer. No token, ``client_secret``, authorization ``code`` or provider
+body ever reaches a log line, a :class:`GitHubLinkError` message or an HTTP body, and every store
+fault (``core.state_store.STORE_FAULTS``) is translated at its call site into this service's own
+retryable kind.
 
-STORAGE (D1). Link METADATA is a new **partition** in the existing connections table
-(``pk="github_user_link"``, composite ``sk="<principal_oid>#<connection_id>"``) — a new
-partition needs zero terraform, where a new table would need an ARN added to the ECS task's
-explicit DDB allowlist. Short-lived CSRF/PKCE state is a second partition
-(``pk="github_link_state"``), expired by the APPLICATION (``_STATE_TTL_SECONDS``) because
-this table has no DDB TTL. Persistence is the DDB-or-local shape cloned from
-``connection_service`` / ``project_role_service``: the ``_has_ddb`` guard, two local dicts
-under ONE lock, ``_to_item``/``_from_item`` stripping ``pk``/``sk``. Nothing is written to
-Entra — AGP reads identity from the directory and never writes to it.
+Refresh is claim-then-rotate. GitHub's refresh is destructive and single-use, and AGP runs two ECS
+tasks, so a rotation is claimed with the store's ``put_if_version`` on ``token_version`` before
+GitHub is ever called, which exactly one caller wins. ``token_version`` is the row's
+optimistic-concurrency token: a re-link is conditional on the version it read and writes the next
+one, and every other whole-row writer goes through :meth:`GitHubUserLinkService._save_guarded`,
+which refuses a row that moved or is gone (a link deleted mid-rotation is never recreated by a late
+release). A first link is ``put_new``, conditional on the row's absence, and ``verify_link`` writes
+its label with the store's ``update_existing``, which never mentions ``status`` or
+``token_version``. A loser re-reads once and trusts the published expiry, not the version bump. A
+claim left ``REFRESHING`` past ``_CLAIM_TIMEOUT_SECONDS`` is abandoned only after a ``GET /user``
+read proves the stored pair dead. Rotations are never retried.
 
-SECRET SEAM. The ``ghu_``/``ghr_`` pair lives ONLY in Secrets Manager, under
-``<secret_prefix><link_id>``, body exactly ``{"access_token", "refresh_token"}``. The DDB row
-and every read model carry only ``secret_arn`` — a POINTER — plus non-secret metadata, exactly
-as ``Connection`` exposes ``secret_arn``/``has_secret`` and never the credential. No token, no
-``client_secret``, no authorization ``code``, and no provider response body ever reaches a log
-line, a :class:`GitHubLinkError` message, or (therefore) an HTTP body: errors carry a fixed
-safe string plus a ``.kind``, and every transport failure is re-raised ``from None`` because a
-chained exception's args can carry URLs with auth material.
-
-CONCURRENCY — claim-then-rotate (D6, the epic's top outage risk). GitHub's refresh is
-DESTRUCTIVE and SINGLE-USE: spending a ``ghr_`` token invalidates both the old refresh token
-AND the old access token. AGP runs **two ECS tasks**, so two concurrent refreshes of one link
-would mutually invalidate — the loser's write would land last and store a pair GitHub has
-already killed, locking the human out of their own link with no recovery but a full re-link.
-So the rotation is CLAIMED before GitHub is ever called: a conditional write of
-``status=REFRESHING, token_version=n+1`` guarded by ``Attr("token_version").eq(n)``, which
-exactly one caller can win (the local-fallback branch performs the same compare-and-set under
-its lock, so dev behaves like production). The order is load-strict as well as claim-first:
-claim → refresh → write secret → publish. Rotations are NEVER retried.
-
-``token_version`` IS THE ROW'S OPTIMISTIC-CONCURRENCY TOKEN, not a refresh counter, so EVERY
-whole-row writer goes through :meth:`~GitHubUserLinkService._save_guarded` and names the
-version it read. A version-blind ``put_item`` after any network round-trip can erase a
-concurrent claim — after which the loser's CAS on the OLD version passes and the same ``ghr_``
-token is spent a SECOND time, which is precisely the outage this design exists to prevent. That
-is why ``verify_link`` writes its three label fields with a TARGETED ``update_item`` that never
-mentions ``status``/``token_version`` (:meth:`~GitHubUserLinkService._save_label`) rather than
-putting back the row it read before its probe.
-
-A caller that LOSES the claim re-reads exactly once. ``LINKED`` at a higher version is NOT by
-itself proof of a completed rotation — a released claim keeps the bump while the secret still
-holds the old pair — so the published EXPIRY is what decides: still-expiring means "retry"
-(``refresh_in_progress``), never a token that is already dead.
-
-A claim left ``REFRESHING`` past ``_CLAIM_TIMEOUT_SECONDS`` is ABANDONED, but the link is not
-destroyed before the stored pair is PROVEN dead: a ``GET /user`` read (no refresh token spent)
-distinguishes "the rotation completed and only the row write failed" — republish ``LINKED``,
-keep the working credential — from a genuine 401, which is the case ``UNLINKED`` + "re-link"
-was written for. A transient probe failure destroys nothing. Never discard a live credential
-because a metadata write failed.
-
-LIVENESS. AGP does not consume the ``github_app_authorization`` webhook, so revocation is
-discovered on use: a ``401`` from GitHub on a user-token call raises ``kind="revoked"`` in the
-transport, and this service persists ``status=UNLINKED`` so the console can prompt a re-link
-instead of retrying forever. :meth:`unlink` calls
-``DELETE /applications/{client_id}/grant`` BEFORE deleting anything locally — deleting only
-AGP's row would leave a live ``ghu_``/``ghr_`` pair at GitHub after the human believes they
-unlinked — and it does NOT report success when that revoke failed: a failed unlink the human
-can retry beats telling them their authorization is gone while it is live. NO PATH LEAVES A
-LIVE CREDENTIAL AGP CANNOT FIND: ``complete_link`` creates the secret before the row, so a
-failed row write revokes at GitHub and deletes the secret rather than orphaning a pair no row
-points at.
-
-DETERMINISM. The clock (``now``), the id source (``new_id``, used for both the state token and
-the link id) and the PKCE verifier source (``new_verifier``) are all injected; tests pass a
-fixed clock and deterministic generators. There is no inline ``datetime.now()`` in logic — the
-repo-wide rule.
-
-CONNECTION-UNAWARE BY DESIGN. This service never loads a ``Connection``: it takes a
-``client_credentials_loader(connection_id) -> (client_id, client_secret)`` callable (the route
-injects ``ConnectionService.get_oauth_client_credentials``). That is also where the GHE refusal
-lives — the OAuth legs are ``github.com``-only and a web base cannot be derived from an API
-base, so the loader raises for a connection with a ``base_url``. A DETERMINISTIC loader failure
-surfaces here as ``kind="oauth_client_missing"``; a transient one surfaces as the retryable
-``kind="secret_error"``, because ``oauth_client_missing`` is the one thing :meth:`unlink` treats
-as licence to purge a token without revoking it.
+Revocation is discovered on use (a 401 persists ``UNLINKED``), and :meth:`unlink` revokes at GitHub
+before purging anything locally, raising rather than reporting success when the revoke failed. The
+service never loads a ``Connection``: it takes two callables. ``client_credentials_loader``'s
+deterministic failures (``bad_request``, ``not_found``) are ``oauth_client_missing`` and its
+transient ones the retryable ``secret_error``, because ``oauth_client_missing`` is the one thing
+``unlink`` treats as licence to purge without revoking. ``connection_org_loader`` answers the org a
+link is on; a connection that is gone is ``connection_missing``, which renders as the link not found.
 """
 
 from __future__ import annotations
@@ -98,17 +42,17 @@ from __future__ import annotations
 import json
 import logging
 import secrets
-import threading
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, ClassVar, List, Optional
 from urllib.parse import urlparse
 from uuid import uuid4
 
-import boto3
 import httpx
-from boto3.dynamodb.conditions import Attr, Key
-from botocore.exceptions import BotoCoreError, ClientError
 
+from core import aws_clients
+from core.errors import AppError, Outcome
+from core.state_store import STORE_FAULTS, StateStore, VersionMismatch
 from models.github_link import GitHubUserLink, LinkStatus
 from services.github_user_oauth import (
     GitHubOAuthError,
@@ -122,67 +66,66 @@ from services.github_user_oauth import revoke_grant as _revoke_grant
 
 logger = logging.getLogger(__name__)
 
-# The ONE literal four tasks depend on byte-for-byte: T5 builds it client-side, T7 (here)
-# validates the supplied redirect_uri's path against it, T9 derives the App manifest's
-# callback_urls entry from it, T10 registers the SPA route at it. A mismatch anywhere makes
-# GitHub reject the redirect_uri outright, so it is declared ONCE and imported.
 LINK_CALLBACK_PATH = "/ops/github-link/callback"
 
-_PARTITION_KEY = "github_user_link"  # a new partition in the EXISTING connections table
-_STATE_PARTITION_KEY = "github_link_state"  # CSRF + PKCE state, a SEPARATE partition
+_PARTITION_KEY = "github_user_link"
+_STATE_PARTITION_KEY = "github_link_state"
 _SK_SEPARATOR = "#"
 
-_STATE_TTL_SECONDS = 900  # application-enforced (this table has no DDB TTL)
-_REFRESH_SKEW_SECONDS = 300  # refresh when the access token expires within this
-_CLAIM_TIMEOUT_SECONDS = 60  # a REFRESHING row older than this is ABANDONED → unlinked
+_STATE_TTL_SECONDS = 900
+_REFRESH_SKEW_SECONDS = 300
+_CLAIM_TIMEOUT_SECONDS = 60
 
-# SM secret tags. Deliberately NO principal_oid: tags are readable metadata, and which human a
-# secret belongs to belongs in the row, not in a listable tag.
 _SECRET_TAGS = [
     {"Key": "managed_by", "Value": "agp"},
     {"Key": "purpose", "Value": "github-user-link"},
 ]
 
-# GitHubOAuthError.kind → GitHubLinkError.kind. Anything unmapped is a provider fault.
 _OAUTH_KIND_MAP = {"bad_grant": "bad_request", "revoked": "link_revoked"}
-
-# The loader failures that genuinely mean "this org has no usable OAuth client", as opposed to
-# "the store could not answer right now". The injected loader
-# (``ConnectionService.get_oauth_client_credentials``) carries a ``.kind`` and uses exactly these
-# two for its DETERMINISTIC answers: ``bad_request`` for an absent client_id/client_secret pair
-# and for the GitHub Enterprise refusal, ``not_found`` for an unknown connection. Everything
-# else — a raw ``ClientError``, a ``secret_error`` from Secrets Manager, an unexpected fault — is
-# TRANSIENT-OR-UNKNOWN and must stay retryable. Duck-typed on the attribute rather than the
-# class because this module must not depend on ``ConnectionService`` (module docstring).
 _PERMANENT_LOADER_KINDS = frozenset({"bad_request", "not_found"})
 
-# EVERY boto3 fault this module translates, at EVERY store call site. ``ClientError`` is the
-# service-answered half (a throttle, an IAM denial, a validation refusal); ``BotoCoreError`` is the
-# half that never reached the service at all (``EndpointConnectionError``,
-# ``ConnectTimeoutError``, ``ReadTimeoutError``, a credential-resolution failure) and is NOT a
-# subclass of ``ClientError``. Both are equally ordinary against DynamoDB and Secrets Manager from
-# ECS, and either one escaping raw is an HTTP 500 — outside the {400,404,409,502} set this epic
-# pins, and unactionable where a retryable 502 was intended. Named once so no site can guard only
-# half of it.
-_STORE_FAULTS = (ClientError, BotoCoreError)
 
+class GitHubLinkError(AppError):
+    """A GitHub user-link operation failed. The message is fixed text (never a token, the
+    ``client_secret``, the authorization ``code``, the PKCE verifier or a provider body) and the
+    client sees the fixed detail of the kind. No kind is a 401: the SPA's interceptor turns a 401
+    into a sign-out. ``refresh_in_progress`` (ordinary two-task contention on the claim) and
+    ``secret_error`` (a transient store fault) are retryable, not terminal. ``connection_missing``
+    (the link's connection is gone) shares ``not_found``'s wire: a link cannot exist on a connection
+    that does not, and the console keys on that detail. ``not_linked`` is the pull-request routes'
+    refusal of a caller with no live link on the repository's connection, a remedy the UI offers;
+    this service answers ``not_found`` for the same absence. ``changed`` is a link write whose row
+    moved or was deleted after its read."""
 
-class GitHubLinkError(Exception):
-    """A GitHub user-link operation failed. Carries a SAFE message — never a token, the
-    ``client_secret``, the authorization ``code``, the PKCE verifier, or a provider body — plus
-    a ``.kind`` the route maps to a FIXED status and a FIXED detail literal (never
-    ``str(exc)``): ``{"not_found","bad_request","conflict","oauth_client_missing",
-    "refresh_in_progress","link_revoked","provider_error","secret_error"}``."""
+    domain: ClassVar[str] = "github_link"
+    kinds: ClassVar[Mapping[str, Outcome]] = {
+        "not_found": Outcome(404, "GitHub link not found"),
+        "connection_missing": Outcome(404, "GitHub link not found"),
+        "not_linked": Outcome(409, "connect your GitHub account to act on pull requests"),
+        "bad_request": Outcome(400, "Invalid request"),
+        "conflict": Outcome(409, "That GitHub account is already linked to another user"),
+        "oauth_client_missing": Outcome(
+            409, "This org connection has no GitHub OAuth client — ask an admin to add one"
+        ),
+        "refresh_in_progress": Outcome(409, "GitHub token refresh in progress — retry"),
+        "link_revoked": Outcome(409, "Your GitHub authorization was revoked — reconnect your account"),
+        "provider_error": Outcome(502, "GitHub request failed"),
+        "secret_error": Outcome(502, "Secret store operation failed"),
+        "changed": Outcome(409, "GitHub link changed while this request ran; reload and retry"),
+    }
 
     def __init__(self, message: str, kind: str) -> None:
-        super().__init__(message)
-        self.message = message
-        self.kind = kind
+        super().__init__(message, kind)
 
 
 class _ClaimLost(Exception):
-    """Internal: another task won the refresh claim (the conditional write's condition
-    failed). Never escapes :meth:`GitHubUserLinkService.get_user_bearer_token`."""
+    """Internal: another task won the refresh claim, or the row is gone (the store's version guard
+    refused the write). Never escapes :meth:`GitHubUserLinkService.get_user_bearer_token`."""
+
+
+class _LinkLost(Exception):
+    """Internal: a link write found its row taken, moved or gone (the store's guard refused the
+    write). Never escapes :meth:`GitHubUserLinkService.complete_link`."""
 
 
 class GitHubUserLinkService:
@@ -191,13 +134,10 @@ class GitHubUserLinkService:
         *,
         table_name: str = "",
         secret_prefix: str = "",
-        region: str = "us-east-1",
-        # The origins a redirect_uri may name (T8 passes ``tuple(settings.CORS_ORIGINS)``, the
-        # same list the API already accepts a browser from). Injected like every other seam, and
-        # optional so an empty value degrades to the https/localhost floor rather than breaking
-        # every link on a wiring miss.
-        allowed_origins: "tuple[str, ...]" = (),
-        client_credentials_loader: Callable[[str], "tuple[str, str]"],
+        region: str | None = None,
+        allowed_origins: tuple[str, ...] = (),
+        client_credentials_loader: Callable[[str], tuple[str, str]],
+        connection_org_loader: Callable[[str], str],
         secrets_client=None,
         new_id=lambda: str(uuid4()),
         new_verifier=lambda: secrets.token_urlsafe(32),
@@ -212,21 +152,13 @@ class GitHubUserLinkService:
         self.region = region
         self._allowed_origins = tuple(o.lower().rstrip("/") for o in allowed_origins)
         if not self._allowed_origins:
-            # The empty default fails OPEN — ``_validate_redirect_uri`` then checks only the path
-            # and scheme, never the host. That is deliberate (a T8 wiring miss must not break
-            # every link) but it must not be SILENT: with no list, the only thing between a
-            # user-supplied host and the authorization code is GitHub's own registered-callback
-            # match, a backstop AGP does not own. Logged once at construction rather than per
-            # request, since the service is a lazy singleton.
             logger.warning(
                 "[github-link] constructed with NO allowed_origins: a redirect_uri's ORIGIN will "
-                "not be checked, only its path and scheme. Wire allowed_origins (T8 passes "
+                "not be checked, only its path and scheme. Wire allowed_origins (the route passes "
                 "CORS_ORIGINS)"
             )
-        # (client_id, client_secret) for a connection's OAuth client. Injected rather than
-        # imported so this module never depends on ConnectionService — and so the GHE refusal
-        # can live on the loader side (see the module docstring).
         self._client_credentials_loader = client_credentials_loader
+        self._connection_org_loader = connection_org_loader
         self._new_id = new_id
         self._new_verifier = new_verifier
         self._now = now
@@ -235,42 +167,15 @@ class GitHubUserLinkService:
         self._fetch_user_identity = fetch_user_identity
         self._revoke_grant = revoke_grant
 
-        self._sm = secrets_client or boto3.client("secretsmanager", region_name=region)
+        self._sm = secrets_client or aws_clients.client("secretsmanager", region=region)
+        self._store = StateStore(table_name, region=region)
 
-        self._ddb = None
-        self._table = None
-        if table_name:
-            try:
-                self._ddb = boto3.resource("dynamodb", region_name=region)
-                self._table = self._ddb.Table(table_name)
-            except Exception:  # pragma: no cover — degrade to local fallback.
-                self._table = None
+    def begin_link(self, principal_oid: str, connection_id: str, redirect_uri: str) -> tuple[str, str]:
+        """Start the web flow: mint PKCE and CSRF state and return ``(authorize_url, state)``.
 
-        # Local fallback caches, keyed by the composite sk / the state token. Two dicts under
-        # ONE lock, exactly as connection_service holds _local + _state.
-        self._local: Dict[str, GitHubUserLink] = {}
-        self._state: Dict[str, dict] = {}
-        self._local_lock = threading.Lock()
-
-    # -- mode helper --------------------------------------------------------
-
-    @property
-    def _has_ddb(self) -> bool:
-        return bool(self.table_name) and self._table is not None
-
-    # ===================================================================== #
-    # Public API
-    # ===================================================================== #
-
-    def begin_link(
-        self, principal_oid: str, connection_id: str, redirect_uri: str
-    ) -> "tuple[str, str]":
-        """Start the web flow: mint PKCE + CSRF state and return ``(authorize_url, state)``.
-
-        Refuses a falsy ``principal_oid`` — the dev-auth path has no ``oid``, and a link with
-        no Entra subject is unattributable, which is the one thing this feature exists to
-        provide (design §1). The connection's OAuth client is resolved FIRST so an org that
-        still needs the one-time admin paste fails before any state is persisted."""
+        A falsy ``principal_oid`` is refused: a link with no Entra subject is unattributable. The
+        connection's OAuth client is resolved first, so an org that still needs the one-time admin
+        paste fails before any state is persisted."""
         self._validate_ids(principal_oid, connection_id)
         client_id, _client_secret = self._load_credentials(connection_id)
         self._validate_redirect_uri(redirect_uri)
@@ -296,24 +201,22 @@ class GitHubUserLinkService:
         return url, state
 
     def complete_link(self, principal_oid: str, code: str, state: str) -> GitHubUserLink:
-        """Finish the web flow: consume the state, exchange the code, prove the identity, and
+        """Finish the web flow: consume the state, exchange the code, prove the identity and
         persist the link.
 
-        The state is deleted UNCONDITIONALLY before it is validated — single-use regardless of
-        validity, the rule ``consume_manifest_state`` already follows, so a replayed or expired
-        state can never be spent twice. The exchange uses the STATE's ``redirect_uri`` and
-        ``code_verifier``, never anything from this request: those two are what bind the
-        callback to the authorize call, and taking them from the caller would make the PKCE
-        pairing decorative."""
-        record = self._get_state(state)
-        self._delete_state(state)  # single-use regardless of validity
+        The state is consumed in one conditional delete before it is validated, so a replayed or
+        expired state is never spent twice, and the session that finishes must be the session that
+        started. The exchange uses the state's ``redirect_uri`` and ``code_verifier``, never
+        anything from this request. The secret is created before the row; a row write that faulted
+        revokes at GitHub and deletes the secret rather than orphaning a live pair no row points
+        at; a lost write deletes the secret and is ``changed``. A re-link writes one
+        ``token_version`` past the row it read, so a guarded write still expecting the replaced
+        row's version cannot land on the new one."""
+        record = self._delete_state(state)
 
         if record is None or int(record.get("exp") or 0) < int(self._now().timestamp()):
             raise GitHubLinkError("The link request expired or is unknown", kind="bad_request")
         if not principal_oid or record.get("principal_oid") != principal_oid:
-            # The binding is only trustworthy if the session that FINISHES is the session that
-            # started: otherwise one human could complete a flow another human began and end up
-            # bound to that person's GitHub account.
             raise GitHubLinkError("The link request does not belong to this user", kind="bad_request")
 
         connection_id = str(record.get("connection_id") or "")
@@ -353,7 +256,7 @@ class GitHubUserLinkService:
             github_login=identity["github_login"],
             status=LinkStatus.LINKED,
             secret_arn=secret_arn,
-            token_version=0,
+            token_version=0 if existing is None else existing.token_version + 1,
             access_token_expires_at=self._deadline(ts, tokens.get("expires_in")),
             refresh_token_expires_at=self._deadline(ts, tokens.get("refresh_token_expires_in")),
             refresh_claimed_at=None,
@@ -362,57 +265,34 @@ class GitHubUserLinkService:
             updated_at=ts.isoformat(),
         )
         try:
-            # The secret already holds a LIVE ghu_/ghr_ pair for a real human. An unguarded
-            # write here would, on a store fault, leave that pair in Secrets Manager with NO row
-            # pointing at it: unfindable (no row → no link_id) and unrevocable (unlink needs the
-            # row) for the whole 6-month refresh window. So roll the credential back — at GitHub
-            # first, because forgetting a live grant is worse than failing the link — then speak
-            # this service's own vocabulary rather than letting a raw boto3 error 500. Mirrors
-            # ``connection_service.create_connection``'s documented rollback.
-            #
-            # CATCHES ALL THREE SHAPES, DELIBERATELY. ``_save`` now translates store faults into
-            # ``GitHubLinkError`` itself, so that is the live production shape and it MUST be
-            # caught — a handler still naming only ``ClientError`` would have silently stopped
-            # this rollback firing the moment that translation landed, which is exactly the
-            # orphaned-live-pair outcome the block exists to prevent. The two raw classes are kept
-            # as belt-and-braces for the same reason the rollback exists at all: this is the one
-            # window where a LIVE ``ghu_``/``ghr_`` pair has no row pointing at it, so a store
-            # fault reaching it by ANY shape — including a ``BotoCoreError``, which is not a
-            # ``ClientError`` and used to escape this handler entirely — must roll back rather
-            # than orphan. Cheap, and the failure mode it guards is unrecoverable.
-            self._save(record_out)
-        except (GitHubLinkError, *_STORE_FAULTS):
-            logger.exception(
-                "[github-link] persist failed for link %s; rolling back the credential", link_id
-            )
+            self._save(record_out, existing=existing)
+        except _LinkLost:
+            logger.warning("[github-link] link %s lost to a concurrent write; deleting its secret", link_id)
+            self._delete_secret_best_effort(link_id)
+            raise GitHubLinkError("GitHub link changed", kind="changed") from None
+        except (GitHubLinkError, *STORE_FAULTS):
+            logger.exception("[github-link] persist failed for link %s; rolling back the credential", link_id)
             self._revoke_best_effort(client_id, client_secret, tokens["access_token"], link_id)
             self._delete_secret_best_effort(link_id)
             raise GitHubLinkError("Failed to store the GitHub link", kind="secret_error") from None
         if existing is not None and existing.id != link_id:
-            # A re-link reuses the composite sk but mints a NEW link id + secret, so the
-            # superseded secret would otherwise be orphaned (and still hold a live pair).
             self._delete_secret_best_effort(existing.id)
         return record_out
 
     def list_for_principal(self, principal_oid: str) -> List[GitHubUserLink]:
-        """Every link this human holds — a ``begins_with`` range read, not a whole scan.
-
-        Fails CLOSED on a store fault rather than degrading to ``[]``: the console turns an
-        empty list into "not linked" and offers a Connect button, so a swallowed blip would
-        push a linked human back through the whole web flow."""
+        """Every link this human holds: a ``begins_with`` range read that fails closed on a store
+        fault, since the console turns an empty list into "not linked"."""
         self._validate_ids(principal_oid)
         try:
             return self._load_for_principal_strict(principal_oid)
-        except _STORE_FAULTS:
+        except STORE_FAULTS:
             logger.exception("[github-link] could not list links for a principal")
             raise GitHubLinkError("Failed to read the GitHub links", kind="secret_error") from None
 
     def get_user_bearer_token(self, principal_oid: str, connection_id: str) -> str:
-        """THE new seam (design §2): a live user access token for this human on this org.
-
-        Refresh-if-expiring behind the claim-then-rotate guard described in the module
-        docstring. Returns the stored token untouched when it is fresh, or when the grant does
-        not expire at all."""
+        """A live user access token for this human on this org: refresh-if-expiring behind the
+        claim-then-rotate guard. The stored token is returned untouched when it is fresh or when
+        the grant does not expire at all."""
         row = self._require_row(principal_oid, connection_id)
 
         if row.status == LinkStatus.UNLINKED:
@@ -421,7 +301,7 @@ class GitHubUserLinkService:
             return self._handle_inflight_claim(row)
 
         if row.access_token_expires_at is None:
-            return self._stored_access_token(row)  # a non-expiring grant: nothing to rotate
+            return self._stored_access_token(row)
         remaining = self._seconds_until(row.access_token_expires_at)
         if remaining > _REFRESH_SKEW_SECONDS:
             return self._stored_access_token(row)
@@ -429,17 +309,9 @@ class GitHubUserLinkService:
         return self._rotate(row)
 
     def verify_link(self, principal_oid: str, connection_id: str) -> GitHubUserLink:
-        """Probe ``GET /user`` and refresh the denormalized login.
-
-        The identity probe is also the liveness probe: a ``401`` means the human revoked the
-        authorization, so the link is persisted ``UNLINKED`` and the caller is told to
-        re-link. A rename updates the LABEL only — ``github_id`` is the join key and this
-        row's binding, so it is never rewritten from a probe.
-
-        The label write is a TARGETED update of three fields, never a put of the row read
-        before the probe: ``get_user_bearer_token`` on another task may have claimed a refresh
-        in the meantime, and writing back a stale ``token_version`` would erase that claim and
-        let one refresh token be spent twice (see :meth:`_save_label`)."""
+        """Probe ``GET /user`` and refresh the denormalized login; a 401 persists ``UNLINKED``.
+        Only the label moves: ``github_id`` is the join key and is never rewritten from a probe,
+        and the write is :meth:`_save_label`'s targeted update."""
         token = self.get_user_bearer_token(principal_oid, connection_id)
         row = self._require_row(principal_oid, connection_id)
 
@@ -455,71 +327,57 @@ class GitHubUserLinkService:
                 raise self._from_oauth_error(exc, "Could not read the GitHub identity") from None
 
         ts = self._now()
-        return self._save_label(
-            row, github_login=identity["github_login"], ts=ts.isoformat()
-        )
+        return self._save_label(row, github_login=identity["github_login"], ts=ts.isoformat())
 
     def unlink(self, principal_oid: str, connection_id: str) -> None:
-        """Revoke at GitHub FIRST, and only purge locally once the grant is known to be gone.
+        """Revoke at GitHub first, then purge locally once the grant is known to be gone.
 
-        ORDERING, decided deliberately. Revoke-before-delete is not negotiable: AGP's stored
-        access token is the only thing ``DELETE /applications/{client_id}/grant`` accepts, so
-        deleting first would leave a live ``ghu_``/``ghr_`` pair authorized at GitHub with
-        nothing left to revoke it with.
-
-        WHEN THE REVOKE FAILS, THIS RAISES rather than reporting success. Purging anyway would
-        (a) tell the human their GitHub authorization is gone while it is LIVE for up to the
-        6-month refresh window, and (b) destroy the one credential that could still revoke it —
-        making the revoke permanently unretryable and leaving one un-alerted log line as the
-        only trace. A failed unlink the human can RETRY is strictly better than a silent live
-        grant, so the token and the row are both KEPT and the caller gets a retryable
-        ``provider_error``. The link is marked ``UNLINKED`` first, so the console shows it as
-        disconnected (and no token is handed out) while the retry is still possible.
-
-        The one case that still purges without a successful revoke is an unresolvable OAuth
-        client (``oauth_client_missing`` — the admin rotated or removed it): AGP then has no way
-        to ever call the revoke endpoint, so blocking would leave a row the human can never
-        delete. That grant is recorded as outstanding and only the human's own GitHub settings
-        can clear it."""
+        A failed revoke raises ``provider_error`` with the token and the row kept (the token is
+        the only means of revoking and the row the only way to find it again) and the link marked
+        ``UNLINKED``, so the human can retry. The one case that purges without a revoke is an
+        unresolvable OAuth client, when AGP could never call the revoke endpoint again."""
         row = self._require_row(principal_oid, connection_id)
 
         client_id, client_secret = self._load_credentials_for_unlink(row)
         if client_id is not None:
             access_token = self._get_secret_body(row.id).get("access_token")
-            if access_token and not self._revoke_best_effort(
-                client_id, client_secret, access_token, row.id
-            ):
-                # Keep the secret AND the row: the token is the only means of revoking, and a
-                # row is the only thing that can find it again.
+            if access_token and not self._revoke_best_effort(client_id, client_secret, access_token, row.id):
                 self._publish_unlinked(row)
                 raise GitHubLinkError(
-                    "Could not revoke the GitHub authorization — retry, or remove it in your "
-                    "GitHub settings",
+                    "Could not revoke the GitHub authorization — retry, or remove it in your GitHub settings",
                     kind="provider_error",
                 )
 
         self._delete_secret_best_effort(row.id)
         self._delete(principal_oid, connection_id)
 
-    def _load_credentials_for_unlink(
-        self, row: GitHubUserLink
-    ) -> "tuple[Optional[str], str]":
-        """``(client_id, client_secret)``, or ``(None, "")`` when the org's OAuth client is
-        GENUINELY GONE — the one condition under which :meth:`unlink` purges without revoking.
+    def connection_org(self, connection_id: str) -> str:
+        """The org of the connection a link is on, through the injected loader; the one connection
+        fact a link view carries.
 
-        THE CARVE-OUT IS DELIBERATE, AND IT IS DELIBERATELY NARROW. ``oauth_client_missing`` means
-        the pair AGP would authenticate the revoke with no longer exists (an admin rotated or
-        removed it), so ``DELETE /applications/{client_id}/grant`` is not a call AGP can ever make
-        again — for that link or any retry of it. Refusing to purge would then leave a row the
-        human can never delete, in exchange for a revoke that will never happen, so purging is the
-        better of two bad outcomes. The grant is recorded as outstanding and only the human's own
-        GitHub settings can clear it.
+        A connection that is gone is ``connection_missing`` (404 "GitHub link not found": a link
+        cannot exist on a connection that does not), a store fault is the retryable
+        ``secret_error``, and anything else is ``provider_error``. Duck-typed on ``.kind`` because
+        this module does not import the connection service; the loader's message is discarded."""
+        try:
+            return self._connection_org_loader(connection_id)
+        except Exception as exc:
+            kind = getattr(exc, "kind", None)
+            if kind == "not_found":
+                raise GitHubLinkError(
+                    "The link's connection no longer exists", kind="connection_missing"
+                ) from None
+            if kind == "secret_error":
+                logger.exception("[github-link] could not read the connection %s for its org", connection_id)
+                raise GitHubLinkError("Could not read the link's connection", kind="secret_error") from None
+            logger.exception("[github-link] could not resolve the connection %s for its org", connection_id)
+            raise GitHubLinkError("Could not resolve the link's connection", kind="provider_error") from None
 
-        EVERY OTHER FAILURE IS RE-RAISED. A transient store fault must not reach this branch: it
-        would purge the only token that can revoke a grant still LIVE at GitHub, which is exactly
-        the defect the raising :meth:`unlink` closed — reached through a different door. So
-        ``_load_credentials`` classifies at the loader boundary (only a deterministic loader
-        failure becomes ``oauth_client_missing``) and this method trusts nothing but that kind."""
+    def _load_credentials_for_unlink(self, row: GitHubUserLink) -> tuple[Optional[str], str]:
+        """``(client_id, client_secret)``, or ``(None, "")`` when the org's OAuth client is gone:
+        the one condition under which :meth:`unlink` purges without revoking. Every other failure
+        is re-raised, so a transient store fault cannot purge the only token that can revoke a
+        grant still live at GitHub."""
         try:
             return self._load_credentials(row.connection_id)
         except GitHubLinkError as exc:
@@ -535,13 +393,8 @@ class GitHubUserLinkService:
     def _revoke_best_effort(
         self, client_id: str, client_secret: str, access_token: str, link_id: str
     ) -> bool:
-        """``DELETE /applications/{client_id}/grant`` — kill the ghu_/ghr_ pair at GitHub.
-        Returns whether the grant is known to be gone.
-
-        ``False`` means the grant may still be LIVE at GitHub, which is an operational event,
-        not a swallowed nothing: the caller decides whether that is survivable. Only the
-        traceback is logged — both error classes guarantee safe messages, but neither is
-        allowed to reach a caller from here."""
+        """``DELETE /applications/{client_id}/grant``; returns whether the grant is known to be
+        gone. Only the traceback is logged."""
         try:
             with _http_client() as client:
                 self._revoke_grant(
@@ -558,25 +411,10 @@ class GitHubUserLinkService:
             )
             return False
 
-    # ===================================================================== #
-    # Refresh — claim-then-rotate (D6)
-    # ===================================================================== #
-
     def _handle_inflight_claim(self, row: GitHubUserLink) -> str:
-        """A row found ``REFRESHING``: retry, or declare the claim abandoned.
-
-        Within the timeout another task holds the rotation, so the honest answer is "retry" —
-        never a second rotation, which would destroy the pair the winner is about to store.
-        Past the timeout the claimer is gone (its task died between calling GitHub and writing
-        the secret), so the stored pair may already be dead at GitHub: the link is marked
-        ``UNLINKED`` and the human re-links. Retrying with a possibly-spent refresh token
-        would instead hard-kill a link that might still have been recoverable.
-
-        ONE case is NOT abandoned: the rotation succeeded and only the PUBLISH write failed, so
-        the secret already holds a good pair. That is visible without asking GitHub — the stored
-        access token is still comfortably live, which a pair killed by a completed rotation
-        never is. Recovering it means re-publishing ``LINKED``; unlinking instead would force a
-        full re-link and throw away a working credential over a metadata write."""
+        """A row found ``REFRESHING``: within the timeout another task holds the rotation, so the
+        answer is "retry"; past it the claimer is gone, and the link is recovered when the stored
+        pair still works or marked ``UNLINKED`` when it does not."""
         claimed_at = row.refresh_claimed_at
         stale = claimed_at is None or self._seconds_since(claimed_at) > _CLAIM_TIMEOUT_SECONDS
         if stale:
@@ -592,40 +430,21 @@ class GitHubUserLinkService:
         raise GitHubLinkError("A GitHub token refresh is already in progress", kind="refresh_in_progress")
 
     def _recover_unpublished_rotation(self, row: GitHubUserLink) -> Optional[str]:
-        """A stale claim whose stored pair turns out to be ALIVE: re-publish ``LINKED`` and
-        return that token. ``None`` when there is nothing to recover, so the caller abandons.
-
-        The row cannot tell these two apart — a claim leaves ``access_token_expires_at`` at its
-        pre-rotation value either way — so the only honest discriminator is whether the STORED
-        pair still works, which is a question only GitHub can answer. ``GET /user`` answers it
-        with a read: it is the same non-destructive probe :meth:`verify_link` uses, it spends no
-        refresh token, and it is NOT a retry of the rotation.
-
-        - probe succeeds ⇒ the pair is live. Either the rotation completed and only the row
-          write failed (C3), or the claimer died before ever calling GitHub. Both are
-          recoverable, and unlinking either would force a full re-link and destroy a working
-          credential over a metadata write. Republish ``LINKED``; the token is returned as-is,
-          and if it is still inside the skew the next call simply rotates it.
-        - probe says ``revoked`` (401) ⇒ the pair really is dead, which is the case the
-          abandon-and-unlink rule was written for. Return ``None``.
-        - probe fails transiently ⇒ nothing is PROVEN dead, so nothing may be destroyed. Raise
-          the provider fault (retryable) rather than unlinking on a blip.
-
-        Reached only on the rare stale-claim path, so it costs one extra read there and nothing
-        on the hot path."""
+        """A stale claim whose stored pair turns out to be alive: re-publish ``LINKED`` and return
+        that token; ``None`` when there is nothing to recover. The row cannot tell the two apart,
+        so ``GET /user`` (a read, never a rotation) decides: a success recovers, a 401 abandons,
+        and a transient failure raises rather than destroy anything on a blip."""
         try:
             token = self._stored_access_token(row)
         except GitHubLinkError:
-            return None  # no usable stored pair ⇒ genuinely nothing to recover
+            return None
         with _http_client() as client:
             try:
                 self._fetch_user_identity(token, client=client)
             except GitHubOAuthError as exc:
                 if exc.kind == "revoked":
                     return None
-                raise self._from_oauth_error(
-                    exc, "Could not check the GitHub authorization"
-                ) from None
+                raise self._from_oauth_error(exc, "Could not check the GitHub authorization") from None
 
         ts = self._now()
         logger.warning(
@@ -646,11 +465,16 @@ class GitHubUserLinkService:
         return token
 
     def _rotate(self, row: GitHubUserLink) -> str:
-        """Claim the rotation, spend the refresh token exactly once, then publish the result."""
+        """Claim the rotation, spend the refresh token exactly once, then publish the result.
+
+        A transient provider failure releases the claim (keeping the version bump, so a caller
+        that already lost it still loses it) and is never retried; a spent or revoked grant
+        publishes ``UNLINKED``; a lost secret write after rotation also publishes ``UNLINKED``,
+        because the old pair is already dead; a store fault on the publish is ``secret_error``
+        with the good pair still in the secret."""
         body = self._get_secret_body(row.id)
         refresh_token = body.get("refresh_token")
         if not refresh_token:
-            # The access token is expiring and there is nothing to rotate with.
             self._publish_unlinked(row)
             raise GitHubLinkError("The GitHub authorization is no longer valid", kind="link_revoked")
 
@@ -679,16 +503,10 @@ class GitHubUserLinkService:
                 )
             except GitHubOAuthError as exc:
                 if exc.kind in ("bad_grant", "revoked"):
-                    # The refresh token is spent or the human revoked: nothing to recover.
                     self._publish_unlinked(claimed)
                     raise GitHubLinkError(
                         "The GitHub authorization is no longer valid", kind="link_revoked"
                     ) from None
-                # Transient (network/5xx): GitHub never saw a usable request, so the OLD pair
-                # is still live. Release the claim so the next request is not wedged for the
-                # full claim timeout — but KEEP the version bump, so a caller that already
-                # lost this claim still loses it. NEVER retried here: a retry is exactly how
-                # one logical refresh becomes two destructive rotations.
                 self._release_claim(claimed)
                 raise self._from_oauth_error(exc, "Could not refresh the GitHub user token") from None
 
@@ -699,9 +517,6 @@ class GitHubUserLinkService:
         try:
             self._put_secret_body(row.id, new_body)
         except GitHubLinkError:
-            # The rotated pair is lost AND the old pair is already dead at GitHub (rotation is
-            # destructive), so the link really is broken. Saying so beats leaving a row that
-            # looks linked and fails on every use.
             logger.exception(
                 "[github-link] lost the rotated token pair for link %s; marking it unlinked", row.id
             )
@@ -716,21 +531,13 @@ class GitHubUserLinkService:
                 "status": LinkStatus.LINKED,
                 "refresh_claimed_at": None,
                 "access_token_expires_at": self._deadline(ts, rotated.get("expires_in")),
-                "refresh_token_expires_at": self._deadline(
-                    ts, rotated.get("refresh_token_expires_in")
-                ),
+                "refresh_token_expires_at": self._deadline(ts, rotated.get("refresh_token_expires_in")),
                 "updated_at": ts.isoformat(),
             }
         )
         try:
-            # GUARDED, and inside the contract. A bare put here could erase a concurrent claim,
-            # and a raw ClientError would escape the .kind vocabulary as a 500. On a store fault
-            # the row stays REFRESHING at the claimed version while the secret holds the GOOD
-            # new pair — recoverable, so `secret_error` (502, retryable), NEVER an unlink.
             self._save_guarded(published, expected_version=claimed.token_version)
         except _ClaimLost:
-            # Someone moved the row out from under a rotation we already completed. The pair we
-            # just stored is live, so hand it back rather than discard a working credential.
             logger.warning(
                 "[github-link] link %s moved during a rotation publish; returning the live token",
                 row.id,
@@ -738,40 +545,24 @@ class GitHubUserLinkService:
         return rotated["access_token"]
 
     def _read_after_lost_claim(self, row: GitHubUserLink) -> str:
-        """Re-read ONCE after losing the claim. The winner either published (return its fresh
-        token) or is still rotating (retry). Exactly one re-read: looping here would turn a
-        contended link into a spin, and re-claiming would double-rotate.
-
-        FRESHNESS COMES FROM THE EXPIRY, NOT THE VERSION. A bumped ``token_version`` on a
-        ``LINKED`` row is NOT proof that a rotation happened: :meth:`_release_claim` produces
-        exactly that shape after a transient provider failure, keeping the bump while the
-        secret still holds the OLD pair. Trusting the bump there would hand this caller a token
-        that already expired, which its consumer would 401 on with nothing marking the link
-        dead — a silent, self-sustaining failure with a link that reads healthy. So the
-        published expiry is re-applied: still-expiring means the rotation did not actually
-        happen, which is a retry, not a fresh token."""
+        """Re-read once after losing the claim: the winner either published (return its fresh
+        token) or is still rotating (retry). Freshness comes from the published expiry, not the
+        version bump, which :meth:`_release_claim` leaves behind with the old pair still stored."""
         current = self._require_row(row.principal_oid, row.connection_id)
         if current.status == LinkStatus.LINKED and current.token_version > row.token_version:
             if current.access_token_expires_at is None or (
                 self._seconds_until(current.access_token_expires_at) > _REFRESH_SKEW_SECONDS
             ):
                 return self._stored_access_token(current)
-            raise GitHubLinkError(
-                "A GitHub token refresh is already in progress", kind="refresh_in_progress"
-            )
+            raise GitHubLinkError("A GitHub token refresh is already in progress", kind="refresh_in_progress")
         if current.status == LinkStatus.UNLINKED:
             raise GitHubLinkError("The GitHub authorization is no longer valid", kind="link_revoked")
         raise GitHubLinkError("A GitHub token refresh is already in progress", kind="refresh_in_progress")
 
     def _publish_unlinked(self, row: GitHubUserLink) -> None:
-        """Persist ``status=UNLINKED`` so the console can prompt a re-link. The row and secret
-        are KEPT (unlike :meth:`unlink`) — the human may re-link over the same sk, and the row
-        is what tells the UI which connection needs attention.
-
-        GUARDED on the version ``row`` was read at: if another task has since claimed a
-        refresh, this write must NOT land, because clobbering a live claim is how one refresh
-        token gets spent twice. Losing the guard is benign — the caller still raises
-        ``link_revoked``, and whatever moved the row is itself resolving the link's state."""
+        """Persist ``status=UNLINKED`` so the console can prompt a re-link; the row and secret are
+        kept. Guarded on the version ``row`` was read at, so a concurrent claim is never
+        clobbered; losing the guard is benign because the caller raises regardless."""
         ts = self._now()
         self._save_lossy(
             row.model_copy(
@@ -785,13 +576,8 @@ class GitHubUserLinkService:
         )
 
     def _release_claim(self, row: GitHubUserLink) -> None:
-        """Undo a claim whose rotation never reached GitHub, keeping the version bump.
-
-        Guarded on the claim's own version, so a release cannot overwrite a state some other
-        writer has since published. The version bump is deliberately KEPT: dropping it would
-        wedge a caller that already lost this claim. That the version moved without the token
-        rotating is exactly why :meth:`_read_after_lost_claim` re-checks the EXPIRY rather than
-        trusting the bump."""
+        """Undo a claim whose rotation never reached GitHub, keeping the version bump so a caller
+        that already lost this claim still loses it."""
         ts = self._now()
         self._save_lossy(
             row.model_copy(
@@ -805,9 +591,8 @@ class GitHubUserLinkService:
         )
 
     def _save_lossy(self, record: GitHubUserLink, *, expected_version: int) -> None:
-        """A guarded write whose LOSS is an acceptable outcome — used by the state-publishing
-        paths whose caller raises regardless. Never clobbers a concurrent claim; a store fault
-        still surfaces as this service's own ``secret_error``."""
+        """A guarded write whose loss is an acceptable outcome, for the state-publishing paths
+        whose caller raises regardless."""
         try:
             self._save_guarded(record, expected_version=expected_version)
         except _ClaimLost:
@@ -817,115 +602,40 @@ class GitHubUserLinkService:
             )
 
     def _save_guarded(self, record: GitHubUserLink, *, expected_version: int) -> None:
-        """Write a whole row ONLY while it still sits at the ``token_version`` the caller read.
-        Raises :class:`_ClaimLost` when it moved under us.
-
-        ``token_version`` is the row's OPTIMISTIC-CONCURRENCY token, not a refresh-path
-        counter, so EVERY whole-row writer goes through here — the claim, its release, an
-        unlink publish, and the rotated publish. A version-blind ``put_item`` after any network
-        round-trip can erase a concurrent claim, and an erased claim means the same ``ghr_``
-        token gets spent twice, which is the one outage D6 exists to prevent.
-
-        DDB mode uses a real ``ConditionExpression`` — the only construct that arbitrates
-        across the two ECS tasks. The local fallback performs the SAME compare-and-set under
-        its lock so a dev process cannot double-rotate against live GitHub either. Deliberately
-        NOT wrapped in the local lock in DDB mode: the condition is the arbiter, and a
-        process-local lock there would give a false sense of mutual exclusion."""
-        if self._has_ddb:
-            try:
-                self._table.put_item(
-                    Item=self._to_item(record),
-                    ConditionExpression=Attr("token_version").eq(expected_version),
-                )
-            except ClientError as exc:
-                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                    raise _ClaimLost() from None
-                logger.exception("[github-link] could not write link %s", record.id)
-                raise GitHubLinkError("Failed to update the GitHub link", kind="secret_error") from None
-            except BotoCoreError:
-                # A SEPARATE clause, not folded into ``_STORE_FAULTS`` above: that block reads
-                # ``exc.response`` to tell a lost claim from a real fault, an attribute only
-                # ``ClientError`` has. A BotoCoreError never reached DynamoDB, so it is never a
-                # lost claim — always the retryable store fault.
-                logger.exception("[github-link] could not write link %s", record.id)
-                raise GitHubLinkError("Failed to update the GitHub link", kind="secret_error") from None
-            return
-        sk = _sort_key(record.principal_oid, record.connection_id)
-        with self._local_lock:
-            current = self._local.get(sk)
-            if current is None or current.token_version != expected_version:
-                raise _ClaimLost()
-            self._local[sk] = record.model_copy(deep=True)
+        """Write a whole row only while it still sits at the ``token_version`` the caller read;
+        raises :class:`_ClaimLost` when it moved or is gone, so a late release never recreates a
+        link that was unlinked meanwhile. A store fault never reached the condition, so it is
+        never a lost claim and always the retryable fault."""
+        try:
+            self._store.put_if_version(self._to_item(record), "token_version", expected_version)
+        except VersionMismatch:
+            raise _ClaimLost() from None
+        except STORE_FAULTS:
+            logger.exception("[github-link] could not write link %s", record.id)
+            raise GitHubLinkError("Failed to update the GitHub link", kind="secret_error") from None
 
     def _save_label(self, row: GitHubUserLink, *, github_login: str, ts: str) -> GitHubUserLink:
-        """Write ONLY the three label fields :meth:`verify_link` owns, and return the row as it
-        now stands.
-
-        A TARGETED update, not a whole-row put: ``verify_link`` reads its row, spends up to 15s
-        on ``GET /user``, and by then any ``token_version``/``status`` it holds may be stale.
-        Putting that row back would erase a concurrent refresh claim and let one ``ghr_`` token
-        be spent twice. This shape structurally cannot: it never mentions ``status`` or
-        ``token_version``, so there is no lost-update window to guard and nothing to retry.
-
-        GUARDED ON EXISTENCE, because ``UpdateItem`` is an UPSERT. The same probe window that
-        makes a whole-row put unsafe also lets ``unlink`` DELETE the row, and an unguarded
-        ``update_item`` would then CREATE a five-field orphan (the key plus the three label
-        fields). That row fails ``GitHubUserLink.model_validate``, and ``_from_item`` is applied
-        to EVERY row of the partition by :meth:`_load_all_strict` — which ``complete_link`` calls
-        through :meth:`_refuse_foreign_binding` — so one racing verify would stop every human on
-        every connection from linking at all, with a raw ``ValidationError`` outside the ``.kind``
-        contract and no service path able to delete the orphan again. ``attribute_exists(pk)``
-        makes the write land only on a row that already exists, and a refusal is ``not_found`` —
-        the same answer the local branch below gives, so the two branches agree exactly."""
-        sk = _sort_key(row.principal_oid, row.connection_id)
-        if self._has_ddb:
-            try:
-                resp = self._table.update_item(
-                    Key={"pk": _PARTITION_KEY, "sk": sk},
-                    UpdateExpression=(
-                        "SET github_login = :login, last_verified_at = :ts, updated_at = :ts"
-                    ),
-                    ExpressionAttributeValues={":login": github_login, ":ts": ts},
-                    ConditionExpression=Attr("pk").exists(),
-                    ReturnValues="ALL_NEW",
-                )
-            except ClientError as exc:
-                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                    raise GitHubLinkError("Unknown GitHub link", kind="not_found") from None
-                logger.exception("[github-link] could not update the label for link %s", row.id)
-                raise GitHubLinkError("Failed to update the GitHub link", kind="secret_error") from None
-            except BotoCoreError:
-                # Separate for the same reason as ``_save_guarded``: the clause above reads
-                # ``exc.response`` to recognize the existence guard's refusal, which only a
-                # ``ClientError`` carries. A BotoCoreError never reached DynamoDB, so it proves
-                # nothing about whether the row exists — it must NOT read as ``not_found``, which
-                # the console would show as a vanished link.
-                logger.exception("[github-link] could not update the label for link %s", row.id)
-                raise GitHubLinkError("Failed to update the GitHub link", kind="secret_error") from None
-            return self._from_item(resp["Attributes"])
-        with self._local_lock:
-            current = self._local.get(sk)
-            if current is None:
-                raise GitHubLinkError("Unknown GitHub link", kind="not_found")
-            merged = current.model_copy(
-                update={"github_login": github_login, "last_verified_at": ts, "updated_at": ts}
+        """Write only the three label fields :meth:`verify_link` owns and return the row as it
+        now stands. A targeted update, never a whole-row put, so a stale ``token_version`` cannot
+        erase a concurrent claim; the store's ``update_existing`` refuses an absent row, so a link
+        deleted during the probe is ``not_found`` rather than an unparseable partial row. A store
+        fault proves nothing about existence and is the retryable fault, never ``not_found``."""
+        key = (_PARTITION_KEY, _sort_key(row.principal_oid, row.connection_id))
+        try:
+            merged = self._store.update_existing(
+                key, {"github_login": github_login, "last_verified_at": ts, "updated_at": ts}
             )
-            self._local[sk] = merged
-            return merged.model_copy(deep=True)
-
-    # ===================================================================== #
-    # Validation
-    # ===================================================================== #
+        except STORE_FAULTS:
+            logger.exception("[github-link] could not update the label for link %s", row.id)
+            raise GitHubLinkError("Failed to update the GitHub link", kind="secret_error") from None
+        if merged is None:
+            raise GitHubLinkError("Unknown GitHub link", kind="not_found")
+        return self._from_item(merged)
 
     @staticmethod
     def _validate_ids(principal_oid: str, connection_id: Optional[str] = None) -> None:
-        """Refuse a falsy or separator-bearing key half.
-
-        A falsy ``principal_oid`` is the dev-auth path (design §1): a link with no Entra
-        subject is unattributable. The ``#`` refusal keeps the composite sk injective —
-        ``("a", "b#c")`` and ``("a#b", "c")`` both encode to ``"a#b#c"``, so without it one
-        link would silently OVERWRITE another and the survivor would read back the wrong
-        connection."""
+        """Refuse a falsy or separator-bearing key half: a falsy ``principal_oid`` is the dev-auth
+        path, and a ``#`` would make the composite sk non-injective."""
         if not principal_oid:
             raise GitHubLinkError("A signed-in Entra user is required", kind="bad_request")
         if _SK_SEPARATOR in principal_oid:
@@ -937,30 +647,13 @@ class GitHubUserLinkService:
                 raise GitHubLinkError("Invalid connection identifier", kind="bad_request")
 
     def _validate_redirect_uri(self, redirect_uri: str) -> None:
-        """The ``redirect_uri`` must be OUR callback, on OUR origin, with no extras.
+        """The ``redirect_uri`` must be our callback, on our origin, with no extras.
 
-        The path is compared to :data:`LINK_CALLBACK_PATH` exactly, so a caller cannot aim the
-        authorization code at another route (GitHub also requires a byte-for-byte match against
-        a registered Callback URL and forbids extra parameters, which is why a query or
-        fragment is refused outright). ``https`` is required except on ``localhost``, where the
-        dev server has no certificate — an authorization code over plain http on a real network
-        is interceptable.
-
-        THE ORIGIN IS CHECKED SERVER-SIDE, not just the path. A path-only check accepts
-        ``https://evil.example.com<path>`` and lets an authenticated user have AGP mint state and
-        vouch for an authorize URL aimed at an arbitrary host. GitHub's byte-for-byte match
-        against its one registered callback is the only thing that would then stop the code
-        reaching that host — a backstop AGP does not own, and one that evaporates the moment a
-        customer registers a second callback URL. So the whole ORIGIN (scheme + host + port) is
-        compared against ``allowed_origins`` by exact match: a substring or suffix test would
-        accept ``console.example.com.evil.io``. Userinfo is refused outright — the authority in
-        ``https://console.example.com@evil.example.com/…`` reads as ours at a glance and is not.
-
-        ``allowed_origins`` empty (a service constructed without it) keeps the https/localhost
-        rule as the floor rather than failing every link, since it is a T8 wiring concern — but it
-        fails OPEN, so the miss is LOGGED rather than silent: with no list, the only thing between
-        a user-supplied host and the authorization code is GitHub's own registered-callback match,
-        the backstop this docstring says AGP does not own."""
+        The path is compared to :data:`LINK_CALLBACK_PATH` exactly; a query, fragment or userinfo
+        is refused; ``https`` is required except on ``localhost``. The whole origin (scheme, host,
+        port) is compared against ``allowed_origins`` by exact match, since a substring or suffix
+        test would accept ``console.example.com.evil.io``. An empty ``allowed_origins`` keeps the
+        https/localhost floor and is warned about once at construction."""
         parsed = urlparse(redirect_uri or "")
         host = (parsed.hostname or "").lower()
         if not parsed.scheme or not host:
@@ -975,7 +668,7 @@ class GitHubUserLinkService:
         if parsed.scheme != "https" and not local:
             raise GitHubLinkError("Invalid redirect_uri", kind="bad_request")
         if not self._allowed_origins:
-            return  # fails open to the floor above; warned about once at construction
+            return
         origin = f"{parsed.scheme}://{parsed.netloc}".lower()
         if origin not in self._allowed_origins:
             raise GitHubLinkError("Invalid redirect_uri", kind="bad_request")
@@ -983,69 +676,40 @@ class GitHubUserLinkService:
     def _refuse_foreign_binding(
         self, principal_oid: str, connection_id: str, github_id: int
     ) -> Optional[GitHubUserLink]:
-        """Refuse a GitHub account already bound to a DIFFERENT Entra human, and return this
-        principal's existing row for this connection (if any) so its secret can be purged.
-
-        One GitHub account is one human, so two Entra oids claiming it would let either of them
-        act as the other — the whole attribution claim collapses. The same human linking the
-        same GitHub account on SEVERAL org connections is legitimate and passes.
-
-        ONE whole-partition read answers both questions, so they cannot disagree. It is the
-        STRICT read and it fails CLOSED — an unreadable partition must never be mistaken for
-        "no conflict" (the ``ownership_unverified`` discipline from ``project_role_service``),
-        because that is precisely how the binding this guard protects would be handed to the
-        wrong person."""
+        """Refuse a GitHub account already bound to a different Entra human, and return this
+        principal's existing row for this connection (if any) so its secret can be purged. One
+        strict whole-partition read answers both and fails closed: an unreadable partition is a
+        ``conflict``, never "no conflict"."""
         try:
-            rows = self._load_all_strict()
-        except _STORE_FAULTS:
+            rows = self._load_all_strict(consistent=True)
+        except STORE_FAULTS:
             logger.exception(
                 "[github-link] could not read the link partition, so a foreign GitHub binding "
                 "cannot be ruled out"
             )
-            raise GitHubLinkError(
-                "Could not verify the GitHub account binding", kind="conflict"
-            ) from None
+            raise GitHubLinkError("Could not verify the GitHub account binding", kind="conflict") from None
         for row in rows:
             if row.github_id == github_id and row.principal_oid != principal_oid:
-                raise GitHubLinkError(
-                    "That GitHub account is linked to another user", kind="conflict"
-                )
+                raise GitHubLinkError("That GitHub account is linked to another user", kind="conflict")
         return next(
-            (
-                r
-                for r in rows
-                if r.principal_oid == principal_oid and r.connection_id == connection_id
-            ),
+            (r for r in rows if r.principal_oid == principal_oid and r.connection_id == connection_id),
             None,
         )
 
-    def _load_credentials(self, connection_id: str) -> "tuple[str, str]":
-        """Resolve ``(client_id, client_secret)`` via the injected loader.
+    def _load_credentials(self, connection_id: str) -> tuple[str, str]:
+        """Resolve ``(client_id, client_secret)`` through the injected loader.
 
-        ``oauth_client_missing`` IS A CLAIM ABOUT CONFIGURATION, NOT A CATCH-ALL. A
-        DETERMINISTIC loader failure — "the org never pasted an OAuth client", "the connection is
-        gone", "this is a GitHub Enterprise Server connection, which the github.com-only OAuth
-        legs cannot serve" — is one actionable answer: an admin must fix the connection. Those
-        arrive as a loader exception whose ``.kind`` is in :data:`_PERMANENT_LOADER_KINDS`.
-
-        Everything else is TRANSIENT-OR-UNKNOWN and stays retryable (``secret_error``, this
-        module's existing store-fault kind). The loader reads DynamoDB and Secrets Manager, so a
-        throttle, a timeout or a KMS blip is an ordinary occurrence — and collapsing one into
-        "no client configured" is not merely imprecise: :meth:`unlink` treats an unresolvable
-        client as licence to purge WITHOUT revoking, so a blip would destroy the only token that
-        can revoke a grant that is still live at GitHub. That is the exact defect the raising
-        ``unlink`` was written to close, and it must not be reachable through this door.
-
-        The loader's own message is DISCARDED either way, so a store-internal detail cannot reach
-        an HTTP body."""
+        A deterministic loader failure (no OAuth client pasted, an unknown connection, a GitHub
+        Enterprise connection) carries a kind in :data:`_PERMANENT_LOADER_KINDS` and is
+        ``oauth_client_missing``; everything else is the retryable ``secret_error``, because
+        :meth:`unlink` treats an unresolvable client as licence to purge without revoking. The
+        loader's message is discarded either way. Duck-typed on ``.kind`` because this module does
+        not import the connection service."""
         try:
             client_id, client_secret = self._client_credentials_loader(connection_id)
         except Exception as exc:
-            # Duck-typed on ``.kind`` — this module must not import ConnectionService.
             if getattr(exc, "kind", None) in _PERMANENT_LOADER_KINDS:
-                logger.warning(
-                    "[github-link] no usable OAuth client for connection %s", connection_id
-                )
+                logger.warning("[github-link] no usable OAuth client for connection %s", connection_id)
                 raise GitHubLinkError(
                     "This org connection has no usable GitHub OAuth client",
                     kind="oauth_client_missing",
@@ -1067,78 +731,58 @@ class GitHubUserLinkService:
 
     @staticmethod
     def _from_oauth_error(exc: GitHubOAuthError, message: str) -> GitHubLinkError:
-        """Translate a transport failure into this service's vocabulary.
-
-        The transport's message is DROPPED, not re-wrapped: it is safe by construction but it
-        is also the wrong altitude for a route, and re-using it is how provider text starts
-        leaking into HTTP bodies. Only ``.kind`` crosses the boundary."""
+        """Translate a transport failure into this service's vocabulary; only ``.kind`` crosses,
+        the transport's message is dropped."""
         return GitHubLinkError(message, kind=_OAUTH_KIND_MAP.get(exc.kind, "provider_error"))
-
-    # ===================================================================== #
-    # Time helpers (injected clock only — no inline wall-clock read)
-    # ===================================================================== #
 
     @staticmethod
     def _deadline(ts: datetime, seconds: Optional[int]) -> Optional[str]:
-        """Absolute ISO-8601 expiry from a provider lifetime; ``None`` ⇒ non-expiring."""
+        """Absolute ISO-8601 expiry from a provider lifetime; ``None`` means non-expiring."""
         if not seconds:
             return None
         return (ts + timedelta(seconds=int(seconds))).isoformat()
 
     def _seconds_until(self, iso_ts: str) -> float:
-        """Seconds from the injected clock to ``iso_ts``; an unparseable value reads as
-        already expired (it is AGP's own field, so this is a bug-or-corruption path, and
-        treating it as fresh would hand out a token that fails at GitHub)."""
+        """Seconds from the injected clock to ``iso_ts``; an unparseable value reads as already
+        expired, since treating a corrupt own field as fresh would hand out a dead token."""
         parsed = _parse_ts(iso_ts)
         if parsed is None:
             return -1.0
         return (parsed - self._now()).total_seconds()
 
     def _seconds_since(self, iso_ts: str) -> float:
-        """Seconds from ``iso_ts`` to the injected clock; unparseable ⇒ infinitely old, so a
-        corrupt claim timestamp is treated as ABANDONED rather than blocking forever."""
+        """Seconds from ``iso_ts`` to the injected clock; unparseable reads as infinitely old, so a
+        corrupt claim timestamp is abandoned rather than blocking forever."""
         parsed = _parse_ts(iso_ts)
         if parsed is None:
             return float("inf")
         return (self._now() - parsed).total_seconds()
-
-    # ===================================================================== #
-    # Secrets Manager (mirror connection_service)
-    # ===================================================================== #
 
     def _secret_name(self, link_id: str) -> str:
         return f"{self.secret_prefix}{link_id}"
 
     def _create_secret(self, link_id: str, body: dict) -> str:
         """Create the ``{"access_token","refresh_token"}`` secret, overwriting a name a previous
-        link already took (a re-link over the same sk, or a retry after a half-failed create).
-
-        The ``ResourceExistsException`` fallback is NESTED rather than a sibling ``except``: a
-        handler does not catch what another handler raises, so the ``put_secret_value`` on that
-        path used to be able to throw a raw boto3 error straight past the translation below —
-        exactly the 500 this guard pass exists to close, on the one call that decides whether a
-        live ``ghu_``/``ghr_`` pair becomes findable at all."""
+        link already took. The ``ResourceExistsException`` fallback is nested so its
+        ``put_secret_value`` is translated too."""
         name = self._secret_name(link_id)
         secret_string = json.dumps(body)
         try:
             try:
-                resp = self._sm.create_secret(
-                    Name=name, SecretString=secret_string, Tags=list(_SECRET_TAGS)
-                )
+                resp = self._sm.create_secret(Name=name, SecretString=secret_string, Tags=list(_SECRET_TAGS))
             except self._sm.exceptions.ResourceExistsException:
                 resp = self._sm.put_secret_value(SecretId=name, SecretString=secret_string)
             return resp["ARN"]
-        except _STORE_FAULTS:
+        except STORE_FAULTS:
             logger.exception("[github-link] create_secret failed for link %s", link_id)
             raise GitHubLinkError("Failed to store the GitHub token", kind="secret_error") from None
 
     def _get_secret_body(self, link_id: str) -> dict:
-        """Read + parse ``{"access_token", "refresh_token"}``. The value is NEVER logged —
-        traceback only."""
+        """Read and parse ``{"access_token", "refresh_token"}``; the value is never logged."""
         try:
             resp = self._sm.get_secret_value(SecretId=self._secret_name(link_id))
             body = json.loads(resp["SecretString"])
-        except _STORE_FAULTS:
+        except STORE_FAULTS:
             logger.exception("[github-link] get_secret_value failed for link %s", link_id)
             raise GitHubLinkError("Failed to read the GitHub token", kind="secret_error") from None
         except ValueError:
@@ -1148,22 +792,18 @@ class GitHubUserLinkService:
 
     def _put_secret_body(self, link_id: str, body: dict) -> None:
         try:
-            self._sm.put_secret_value(
-                SecretId=self._secret_name(link_id), SecretString=json.dumps(body)
-            )
-        except _STORE_FAULTS:
+            self._sm.put_secret_value(SecretId=self._secret_name(link_id), SecretString=json.dumps(body))
+        except STORE_FAULTS:
             logger.exception("[github-link] put_secret_value failed for link %s", link_id)
             raise GitHubLinkError("Failed to rotate the GitHub token", kind="secret_error") from None
 
     def _delete_secret_best_effort(self, link_id: str) -> None:
         """Delete the secret; a missing secret is success (unlink must be idempotent)."""
         try:
-            self._sm.delete_secret(
-                SecretId=self._secret_name(link_id), ForceDeleteWithoutRecovery=True
-            )
+            self._sm.delete_secret(SecretId=self._secret_name(link_id), ForceDeleteWithoutRecovery=True)
         except self._sm.exceptions.ResourceNotFoundException:
             pass
-        except _STORE_FAULTS:
+        except STORE_FAULTS:
             logger.exception("[github-link] delete_secret failed for link %s", link_id)
 
     def _stored_access_token(self, row: GitHubUserLink) -> str:
@@ -1173,18 +813,13 @@ class GitHubUserLinkService:
             raise GitHubLinkError("Failed to read the GitHub token", kind="secret_error")
         return token
 
-    # ===================================================================== #
-    # Persistence (DDB-or-local, mirror connection_service / project_role_service)
-    # ===================================================================== #
-
     def _require_row(self, principal_oid: str, connection_id: str) -> GitHubUserLink:
-        """Load one link or raise. A store fault is ``secret_error`` (retryable 502), NEVER
-        ``not_found``: telling a linked human "no link" would send them through the entire web
-        flow again to fix a transient blip."""
+        """Load one link or raise. A store fault is ``secret_error``, never ``not_found``: telling
+        a linked human "no link" would send them through the whole web flow again."""
         self._validate_ids(principal_oid, connection_id)
         try:
             row = self._get(principal_oid, connection_id)
-        except _STORE_FAULTS:
+        except STORE_FAULTS:
             logger.exception("[github-link] could not read a link row")
             raise GitHubLinkError("Failed to read the GitHub link", kind="secret_error") from None
         if row is None:
@@ -1192,142 +827,68 @@ class GitHubUserLinkService:
         return row
 
     def _get(self, principal_oid: str, connection_id: str) -> Optional[GitHubUserLink]:
-        """Strict read: a DDB ``ClientError`` PROPAGATES (see ``_require_row``)."""
-        sk = _sort_key(principal_oid, connection_id)
-        if self._has_ddb:
-            item = self._table.get_item(Key={"pk": _PARTITION_KEY, "sk": sk}).get("Item")
-            return self._from_item(item) if item else None
-        with self._local_lock:
-            record = self._local.get(sk)
-            return record.model_copy(deep=True) if record else None
+        """Strict read: a store fault propagates to :meth:`_require_row`."""
+        item = self._store.get((_PARTITION_KEY, _sort_key(principal_oid, connection_id)))
+        return self._from_item(item) if item else None
 
     def _load_for_principal_strict(self, principal_oid: str) -> List[GitHubUserLink]:
         prefix = f"{principal_oid}{_SK_SEPARATOR}"
-        if self._has_ddb:
-            return [self._from_item(i) for i in self._scan_partition(sk_prefix=prefix)]
-        with self._local_lock:
-            return [
-                r.model_copy(deep=True) for sk, r in self._local.items() if sk.startswith(prefix)
-            ]
+        return [self._from_item(i) for i in self._scan_partition(sk_prefix=prefix)]
 
-    def _load_all_strict(self) -> List[GitHubUserLink]:
-        """The whole link partition — the uniqueness guard's input. There is no GSI on
-        ``github_id``, so "is this GitHub account bound elsewhere?" needs every row."""
-        if self._has_ddb:
-            return [self._from_item(i) for i in self._scan_partition()]
-        with self._local_lock:
-            return [r.model_copy(deep=True) for r in self._local.values()]
+    def _load_all_strict(self, *, consistent: bool = False) -> List[GitHubUserLink]:
+        """The whole link partition, the uniqueness guard's input; there is no GSI on ``github_id``."""
+        return [self._from_item(i) for i in self._scan_partition(consistent=consistent)]
 
-    def _save(self, record: GitHubUserLink) -> None:
-        """The UNGUARDED whole-row write — ``complete_link``'s FIRST write of a link only.
-
-        Version-blind on purpose and safe only here: a brand-new row has no concurrent claim to
-        erase, and a re-link deliberately UPSERTS over the same composite sk. Every LATER writer
-        goes through :meth:`_save_guarded` (module docstring). A store fault becomes this
-        service's own retryable ``secret_error`` rather than a raw boto3 exception, which the
-        route has no mapping for and would answer 500 — and which would ALSO skip
-        ``complete_link``'s credential rollback, orphaning a live ``ghu_``/``ghr_`` pair with no
-        row pointing at it. That caller therefore catches :class:`GitHubLinkError`."""
-        if self._has_ddb:
-            try:
-                self._table.put_item(Item=self._to_item(record))
-            except _STORE_FAULTS:
-                logger.exception("[github-link] could not write link %s", record.id)
-                raise GitHubLinkError(
-                    "Failed to store the GitHub link", kind="secret_error"
-                ) from None
-            return
-        with self._local_lock:
-            self._local[_sort_key(record.principal_oid, record.connection_id)] = record.model_copy(
-                deep=True
-            )
+    def _save(self, record: GitHubUserLink, *, existing: Optional[GitHubUserLink]) -> None:
+        item = self._to_item(record)
+        try:
+            if existing is None:
+                if not self._store.put_new(item):
+                    raise _LinkLost()
+            else:
+                self._store.put_if_version(item, "token_version", existing.token_version)
+        except VersionMismatch:
+            raise _LinkLost() from None
+        except STORE_FAULTS:
+            logger.exception("[github-link] could not write link %s", record.id)
+            raise GitHubLinkError("Failed to store the GitHub link", kind="secret_error") from None
 
     def _delete(self, principal_oid: str, connection_id: str) -> None:
-        """Remove the link row (``unlink``'s last step). A store fault surfaces as the retryable
-        ``secret_error`` rather than a raw boto3 error: by this point the grant IS revoked at
-        GitHub and the secret IS deleted, so the row is a stale husk and the honest answer is
-        "retry", not 500."""
-        sk = _sort_key(principal_oid, connection_id)
-        if self._has_ddb:
-            try:
-                self._table.delete_item(Key={"pk": _PARTITION_KEY, "sk": sk})
-            except _STORE_FAULTS:
-                logger.exception("[github-link] could not delete a link row")
-                raise GitHubLinkError(
-                    "Failed to remove the GitHub link", kind="secret_error"
-                ) from None
-            return
-        with self._local_lock:
-            self._local.pop(sk, None)
-
-    # -- CSRF + PKCE state (SEPARATE partition; never surfaced by a link read) ------
+        """Remove the link row (``unlink``'s last step); by then the grant is revoked and the secret
+        deleted, so a store fault is the retryable ``secret_error``."""
+        try:
+            self._store.delete((_PARTITION_KEY, _sort_key(principal_oid, connection_id)))
+        except STORE_FAULTS:
+            logger.exception("[github-link] could not delete a link row")
+            raise GitHubLinkError("Failed to remove the GitHub link", kind="secret_error") from None
 
     def _save_state(self, state: str, record: dict) -> None:
-        """Persist the CSRF/PKCE state. A store fault ABORTS ``begin_link`` as a retryable
-        ``secret_error``: without a stored state the callback could never be validated, so
-        returning an authorize URL anyway would send the human to GitHub to earn a code this
-        service is guaranteed to refuse. The message is fixed and names no store detail —
-        ``record`` holds the PKCE ``code_verifier``, and nothing from it may reach a log or a
-        body."""
-        if self._has_ddb:
-            try:
-                self._table.put_item(Item={"pk": _STATE_PARTITION_KEY, "sk": state, **record})
-            except _STORE_FAULTS:
-                logger.exception("[github-link] could not store a link state")
-                raise GitHubLinkError(
-                    "Failed to start the GitHub authorization", kind="secret_error"
-                ) from None
-            return
-        with self._local_lock:
-            self._state[state] = dict(record)
+        """Persist the CSRF/PKCE state. A store fault aborts ``begin_link``: without a stored state
+        the callback could never be validated. ``record`` holds the verifier, so nothing from it
+        reaches a log or a body."""
+        try:
+            created = self._store.put_new({"pk": _STATE_PARTITION_KEY, "sk": state, **record})
+        except STORE_FAULTS:
+            logger.exception("[github-link] could not store a link state")
+            raise GitHubLinkError("Failed to start the GitHub authorization", kind="secret_error") from None
+        if not created:
+            raise RuntimeError("a link state with this id was already issued")
 
-    def _get_state(self, state: str) -> Optional[dict]:
-        if self._has_ddb:
-            try:
-                item = self._table.get_item(
-                    Key={"pk": _STATE_PARTITION_KEY, "sk": state}
-                ).get("Item")
-            except _STORE_FAULTS:
-                logger.exception("[github-link] could not read a link state")
-                return None
-            return {k: v for k, v in item.items() if k not in ("pk", "sk")} if item else None
-        with self._local_lock:
-            record = self._state.get(state)
-            return dict(record) if record else None
+    def _delete_state(self, state: str) -> Optional[dict]:
+        """Consume the state: one conditional delete that returns the record, or ``None`` when it
+        was never issued or is already spent. A store fault raises rather than continuing, because
+        this delete is what makes the state single-use and no code has been redeemed yet."""
+        try:
+            item = self._store.delete((_STATE_PARTITION_KEY, state))
+        except STORE_FAULTS:
+            logger.exception("[github-link] could not consume a link state")
+            raise GitHubLinkError(
+                "Failed to complete the GitHub authorization", kind="secret_error"
+            ) from None
+        return {k: v for k, v in item.items() if k not in ("pk", "sk")} if item else None
 
-    def _delete_state(self, state: str) -> None:
-        """Consume the state. A store fault RAISES rather than continuing, because this delete is
-        what makes the state single-use: proceeding on a failed delete would exchange the code
-        against a state row still present in the table, i.e. spend a state that is still
-        replayable. ``complete_link`` calls this BEFORE the exchange, so aborting here costs
-        nothing — no code has been redeemed and the row still expires at ``exp``. Retryable
-        (``secret_error``), since a throttle is not the human's error."""
-        if self._has_ddb:
-            try:
-                self._table.delete_item(Key={"pk": _STATE_PARTITION_KEY, "sk": state})
-            except _STORE_FAULTS:
-                logger.exception("[github-link] could not consume a link state")
-                raise GitHubLinkError(
-                    "Failed to complete the GitHub authorization", kind="secret_error"
-                ) from None
-            return
-        with self._local_lock:
-            self._state.pop(state, None)
-
-    def _scan_partition(self, sk_prefix: str = "") -> List[dict]:
-        condition = Key("pk").eq(_PARTITION_KEY)
-        if sk_prefix:
-            condition = condition & Key("sk").begins_with(sk_prefix)
-        items: List[dict] = []
-        kwargs = {"KeyConditionExpression": condition}
-        while True:
-            resp = self._table.query(**kwargs)
-            items.extend(resp.get("Items", []))
-            lek = resp.get("LastEvaluatedKey")
-            if not lek:
-                break
-            kwargs["ExclusiveStartKey"] = lek
-        return items
+    def _scan_partition(self, sk_prefix: str = "", *, consistent: bool = False) -> List[dict]:
+        return self._store.query(_PARTITION_KEY, sk_prefix=sk_prefix, consistent=consistent)
 
     def _to_item(self, record: GitHubUserLink) -> dict:
         return {
@@ -1342,8 +903,8 @@ class GitHubUserLinkService:
 
 
 def _sort_key(principal_oid: str, connection_id: str) -> str:
-    """The composite sk — ``<principal_oid>#<connection_id>``. Derived, not generated, which
-    is what makes a re-link an UPSERT over the same row."""
+    """The composite sk, ``<principal_oid>#<connection_id>``: derived, not generated, which is what
+    makes a re-link an upsert over the same row."""
     return f"{principal_oid}{_SK_SEPARATOR}{connection_id}"
 
 
@@ -1359,6 +920,6 @@ def _parse_ts(iso_ts: Optional[str]) -> Optional[datetime]:
 
 
 def _http_client() -> httpx.Client:
-    """One short-lived ``httpx.Client`` per operation, used as a context manager so it is
-    always closed. Every GitHub call is injected, so tests never construct one."""
+    """One short-lived ``httpx.Client`` per operation, used as a context manager so it is always
+    closed. Every GitHub call is injected, so tests never construct one."""
     return httpx.Client(timeout=15.0)

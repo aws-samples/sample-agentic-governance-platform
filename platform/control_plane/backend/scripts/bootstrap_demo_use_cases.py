@@ -70,17 +70,11 @@ import logging
 import os
 import sys
 
-# Reuse the sibling scripts VERBATIM (no copy-paste of their bodies). `scripts/` is not a
-# regular package (no __init__.py), but with the backend dir on sys.path Python treats
-# `scripts` as an implicit namespace package, so `import scripts.<mod>` works under
-# `PYTHONPATH=src` (cwd is the backend dir). To stay robust when invoked as
-# `python scripts/bootstrap_demo_use_cases.py` from elsewhere, ensure the backend dir
-# (this file's parent's parent) is on sys.path — the SAME shim as bootstrap_demo_gateway.py.
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from scripts.create_example_gateway import (  # noqa: E402 — after sys.path shim
+from scripts.create_example_gateway import (  # noqa: E402 — `scripts.` resolves only after the sys.path shim above; expires 2027-10-23; added E49A-50A/T17
     _DEFAULT_TENANT_ID,
     _PLACEHOLDER_AUDIENCE,
     _discovery_url,
@@ -88,7 +82,7 @@ from scripts.create_example_gateway import (  # noqa: E402 — after sys.path sh
     build_create_target_kwargs,
     create_example_gateway,
 )
-from scripts.demo_gateway_common import (  # noqa: E402 — after sys.path shim
+from scripts.demo_gateway_common import (  # noqa: E402 — `scripts.` resolves only after the sys.path shim above; expires 2027-10-23; added E49A-50A/T17
     _GATEWAY_TRUST_POLICY,
     _LAMBDA_BASIC_EXEC_POLICY_ARN,
     _LAMBDA_HANDLER,
@@ -100,18 +94,11 @@ from scripts.demo_gateway_common import (  # noqa: E402 — after sys.path shim
     ensure_lambda,
     ensure_role,
 )
-from scripts.demo_use_cases import DEMO_USE_CASES  # noqa: E402 — after sys.path shim
+from scripts.demo_use_cases import DEMO_USE_CASES  # noqa: E402 — `scripts.` resolves only after the sys.path shim above; expires 2027-10-23; added E49A-50A/T17
 
 logger = logging.getLogger("bootstrap_demo_use_cases")
 
-# Inline-policy name for the gateway role's lambda:InvokeFunction grant. Defined locally
-# (NOT imported from demo_gateway_common, whose `agp-demo-invoke-demo-lambda` belongs to
-# the original echo/add bootstrap) so the use-case gateways carry no `demo` in any created
-# resource name.
 _GATEWAY_INVOKE_POLICY_NAME = "agp-invoke-lambda"
-
-# The output file the script owns: written next to the script, overwritten each run with
-# only the domains that succeeded this run. `--output-file` overrides the location.
 _DEFAULT_OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "use_cases_gateways.txt")
 
 
@@ -142,21 +129,12 @@ def _validate_handler_src(domain: dict) -> None:
     handler_src = domain["handler_src"]
     key = domain["key"]
 
-    # (a) The handler must be syntactically valid Python.
     try:
         ast.parse(handler_src)
     except SyntaxError as exc:
-        raise ValueError(
-            f"domain {key!r}: handler_src failed to parse (SyntaxError): {exc}"
-        ) from exc
+        raise ValueError(f"domain {key!r}: handler_src failed to parse (SyntaxError): {exc}") from exc
 
-    # (b) Every advertised tool name must appear as a branch in the handler. The handler
-    # branches with `if name == "<tool>":`, so the quoted tool name must be present.
-    missing = [
-        tool["name"]
-        for tool in domain["tool_schema"]
-        if f'"{tool["name"]}"' not in handler_src
-    ]
+    missing = [tool["name"] for tool in domain["tool_schema"] if f'"{tool["name"]}"' not in handler_src]
     if missing:
         raise ValueError(
             f"domain {key!r}: tool(s) {missing} advertised in tool_schema have no branch "
@@ -172,13 +150,12 @@ def bootstrap_one(region: str, tenant_id: str, domain: dict) -> dict:
     `bootstrap_demo_gateway.py`'s `bootstrap()` but threads the domain's `handler_src`
     (its Lambda code) and `tool_schema` (its inline target schema).
     """
-    import boto3  # imported lazily so a dry-run never constructs a client
+    from core.aws_clients import client
 
     names = _names(domain["prefix"])
-    iam = boto3.client("iam", region_name=region)
-    lam = boto3.client("lambda", region_name=region)
+    iam = client("iam", region=region)
+    lam = client("lambda", region=region)
 
-    # 1) Lambda execution role (+ basic-exec managed policy for CloudWatch logs).
     exec_role_arn, exec_role_created = ensure_role(
         iam,
         names["exec_role"],
@@ -186,10 +163,8 @@ def bootstrap_one(region: str, tenant_id: str, domain: dict) -> dict:
         f"Agentic Governance Platform {domain['display_name']} MCP-tools Lambda execution role (dev helper).",
     )
     if exec_role_created:
-        # Only attach on a fresh create — a found role was already set up by a prior run.
         ensure_attached_policy(iam, names["exec_role"], _LAMBDA_BASIC_EXEC_POLICY_ARN)
 
-    # 2) The domain Lambda (inline handler — only this domain's tools).
     lambda_arn = ensure_lambda(
         lam,
         names["lambda"],
@@ -198,7 +173,6 @@ def bootstrap_one(region: str, tenant_id: str, domain: dict) -> dict:
         description=domain["description"],
     )
 
-    # 3) Gateway service role (+ least-privilege lambda:InvokeFunction on THIS Lambda).
     gateway_role_arn, gateway_role_created = ensure_role(
         iam,
         names["gateway_role"],
@@ -206,7 +180,6 @@ def bootstrap_one(region: str, tenant_id: str, domain: dict) -> dict:
         f"Agentic Governance Platform {domain['display_name']} gateway service role (dev helper).",
     )
     if gateway_role_created:
-        # Only put the inline policy on a fresh create — a found role was already set up.
         ensure_inline_policy(
             iam,
             names["gateway_role"],
@@ -214,9 +187,6 @@ def bootstrap_one(region: str, tenant_id: str, domain: dict) -> dict:
             _gateway_invoke_policy_doc(lambda_arn),
         )
 
-    # 4) The gateway + inline-lambda target — REUSE create_example_gateway with this
-    # domain's tool_schema. It is get-or-create-by-name (idempotent) and waits both to
-    # READY, returning the GetGateway response (gatewayUrl/gatewayArn verbatim).
     gw_ready = create_example_gateway(
         gateway_name=names["gateway"],
         role_arn=gateway_role_arn,
@@ -258,9 +228,7 @@ def _select_domains(only):
     known = {d["key"] for d in DEMO_USE_CASES}
     unknown = [k for k in wanted if k not in known]
     if unknown:
-        raise ValueError(
-            f"--only contains unknown key(s) {unknown}; known keys: {sorted(known)}"
-        )
+        raise ValueError(f"--only contains unknown key(s) {unknown}; known keys: {sorted(known)}")
     return [d for d in DEMO_USE_CASES if d["key"] in wanted]
 
 
@@ -271,14 +239,10 @@ def _print_dry_run_domain(region: str, tenant_id: str, domain: dict) -> None:
     names + the CreateGateway/CreateGatewayTarget call shapes (reusing the same
     build_*_kwargs the live path uses, threading the domain's tool_schema).
     """
-    # Drift guard — raises ValueError (with a clear message) on a syntax error or a tool
-    # advertised in tool_schema with no matching branch in handler_src.
     _validate_handler_src(domain)
 
     names = _names(domain["prefix"])
-    lambda_arn_placeholder = (
-        f"arn:aws:lambda:{region}:<account-id>:function:{names['lambda']}"
-    )
+    lambda_arn_placeholder = f"arn:aws:lambda:{region}:<account-id>:function:{names['lambda']}"
     gw_kwargs = build_create_gateway_kwargs(
         names["gateway"],
         f"arn:aws:iam::<account-id>:role/{names['gateway_role']}",
@@ -293,79 +257,126 @@ def _print_dry_run_domain(region: str, tenant_id: str, domain: dict) -> None:
     tool_names = [t["name"] for t in domain["tool_schema"]]
 
     print(f"\n========== {domain['display_name']}  ({names['gateway']}) ==========")
-    print(f"  handler_src OK (ast.parse passed); {len(tool_names)} tools, every tool has "
-          "a handler branch (drift guard passed).")
+    print(
+        f"  handler_src OK (ast.parse passed); {len(tool_names)} tools, every tool has "
+        "a handler branch (drift guard passed)."
+    )
 
     print(f"\n[1/4] IAM role {names['exec_role']!r} (Lambda execution role)")
     print("  get-or-create via iam.get_role(RoleName=...) -> on NoSuchEntity, iam.create_role(")
-    print(_indent(json.dumps({
-        "RoleName": names["exec_role"],
-        "AssumeRolePolicyDocument": _LAMBDA_TRUST_POLICY,
-    }, indent=2), 4))
+    print(
+        _indent(
+            json.dumps(
+                {
+                    "RoleName": names["exec_role"],
+                    "AssumeRolePolicyDocument": _LAMBDA_TRUST_POLICY,
+                },
+                indent=2,
+            ),
+            4,
+        )
+    )
     print("  )")
-    print(f"  then iam.attach_role_policy(RoleName={names['exec_role']!r}, "
-          f"PolicyArn={_LAMBDA_BASIC_EXEC_POLICY_ARN!r})")
+    print(
+        f"  then iam.attach_role_policy(RoleName={names['exec_role']!r}, "
+        f"PolicyArn={_LAMBDA_BASIC_EXEC_POLICY_ARN!r})"
+    )
 
     print(f"\n[2/4] Lambda {names['lambda']!r} (inline {domain['key']} handler)")
-    print("  get-or-create via lambda.get_function(FunctionName=...) -> on "
-          "ResourceNotFoundException, lambda.create_function(")
-    print(_indent(json.dumps({
-        "FunctionName": names["lambda"],
-        "Runtime": _LAMBDA_RUNTIME,
-        "Role": f"arn:aws:iam::<account-id>:role/{names['exec_role']}",
-        "Handler": _LAMBDA_HANDLER,
-        "Code": {"ZipFile": "<in-memory zip of index.py from this domain's handler_src>"},
-        "Timeout": 15,
-        "MemorySize": 128,
-    }, indent=2), 4))
+    print(
+        "  get-or-create via lambda.get_function(FunctionName=...) -> on "
+        "ResourceNotFoundException, lambda.create_function("
+    )
+    print(
+        _indent(
+            json.dumps(
+                {
+                    "FunctionName": names["lambda"],
+                    "Runtime": _LAMBDA_RUNTIME,
+                    "Role": f"arn:aws:iam::<account-id>:role/{names['exec_role']}",
+                    "Handler": _LAMBDA_HANDLER,
+                    "Code": {"ZipFile": "<in-memory zip of index.py from this domain's handler_src>"},
+                    "Timeout": 15,
+                    "MemorySize": 128,
+                },
+                indent=2,
+            ),
+            4,
+        )
+    )
     print("  )  # bounded retry on InvalidParameterValueException (IAM eventual consistency)")
     print(f"  inline handler implements this domain's tools: {tool_names}")
-    print("  (reads tool name from context.client_context.custom['bedrockAgentCoreToolName'], "
-          "split on '___')")
+    print(
+        "  (reads tool name from context.client_context.custom['bedrockAgentCoreToolName'], split on '___')"
+    )
 
     print(f"\n[3/4] IAM role {names['gateway_role']!r} (gateway service role)")
     print("  get-or-create via iam.get_role(RoleName=...) -> on NoSuchEntity, iam.create_role(")
-    print(_indent(json.dumps({
-        "RoleName": names["gateway_role"],
-        "AssumeRolePolicyDocument": _GATEWAY_TRUST_POLICY,
-    }, indent=2), 4))
+    print(
+        _indent(
+            json.dumps(
+                {
+                    "RoleName": names["gateway_role"],
+                    "AssumeRolePolicyDocument": _GATEWAY_TRUST_POLICY,
+                },
+                indent=2,
+            ),
+            4,
+        )
+    )
     print("  )")
-    print(f"  then iam.put_role_policy(RoleName={names['gateway_role']!r}, "
-          f"PolicyName={_GATEWAY_INVOKE_POLICY_NAME!r}, PolicyDocument=")
+    print(
+        f"  then iam.put_role_policy(RoleName={names['gateway_role']!r}, "
+        f"PolicyName={_GATEWAY_INVOKE_POLICY_NAME!r}, PolicyDocument="
+    )
     print(_indent(json.dumps(_gateway_invoke_policy_doc(lambda_arn_placeholder), indent=2), 4))
     print("  )  # lambda:InvokeFunction scoped to THIS Lambda ARN (least privilege, NOT '*')")
 
-    print(f"\n[4/4] Gateway {names['gateway']!r} + target {names['target']!r} "
-          "(REUSING create_example_gateway builders)")
+    print(
+        f"\n[4/4] Gateway {names['gateway']!r} + target {names['target']!r} "
+        "(REUSING create_example_gateway builders)"
+    )
     print("  bedrock-agentcore-control.CreateGateway(")
     print(_indent(json.dumps(gw_kwargs, indent=2), 4))
     print("  )")
-    print("  # gateway is BORN LOCKED: authorizerType=CUSTOM_JWT + placeholder "
-          f"allowedAudience=[{_PLACEHOLDER_AUDIENCE!r}] + a default discoveryUrl.")
-    print("  # The type is IMMUTABLE post-create; the platform overwrites the "
-          "customJWTAuthorizer (real discoveryUrl + audience) at registration.")
+    print(
+        "  # gateway is BORN LOCKED: authorizerType=CUSTOM_JWT + placeholder "
+        f"allowedAudience=[{_PLACEHOLDER_AUDIENCE!r}] + a default discoveryUrl."
+    )
+    print(
+        "  # The type is IMMUTABLE post-create; the platform overwrites the "
+        "customJWTAuthorizer (real discoveryUrl + audience) at registration."
+    )
     print("  # then poll GetGateway(gatewayIdentifier=<gatewayId>) until status==READY")
     print("  bedrock-agentcore-control.CreateGatewayTarget(")
     print(_indent(json.dumps(tgt_kwargs, indent=2), 4))
     print("  )")
-    print("  # then poll GetGatewayTarget(...) until status==READY, then collect "
-          "gatewayUrl + gatewayArn (verbatim) to register the MCP server")
+    print(
+        "  # then poll GetGatewayTarget(...) until status==READY, then collect "
+        "gatewayUrl + gatewayArn (verbatim) to register the MCP server"
+    )
 
 
 def _print_dry_run(region: str, tenant_id: str, domains: list) -> None:
     """Print every resource ALL selected domains WOULD create — ZERO boto3 calls."""
-    print("DRY RUN — no boto3/IAM/Lambda calls will be made. The script WOULD create, "
-          f"for {len(domains)} domain(s):")
+    print(
+        "DRY RUN — no boto3/IAM/Lambda calls will be made. The script WOULD create, "
+        f"for {len(domains)} domain(s):"
+    )
     for domain in domains:
         _print_dry_run_domain(region, tenant_id, domain)
 
-    print("\nTo clean up afterwards, delete each domain's agp-* resources (this "
-          "script NEVER deletes anything): the exec role (detach "
-          "AWSLambdaBasicExecutionRole first), the Lambda, the gateway role (delete the "
-          f"inline policy {_GATEWAY_INVOKE_POLICY_NAME} first), and the gateway (delete "
-          "its target first).")
-    print("\nDry run OK: handlers parsed, tool/handler drift guard passed, resource shapes "
-          "printed, no AWS calls made.")
+    print(
+        "\nTo clean up afterwards, delete each domain's agp-* resources (this "
+        "script NEVER deletes anything): the exec role (detach "
+        "AWSLambdaBasicExecutionRole first), the Lambda, the gateway role (delete the "
+        f"inline policy {_GATEWAY_INVOKE_POLICY_NAME} first), and the gateway (delete "
+        "its target first)."
+    )
+    print(
+        "\nDry run OK: handlers parsed, tool/handler drift guard passed, resource shapes "
+        "printed, no AWS calls made."
+    )
 
 
 def _indent(text: str, spaces: int) -> str:
@@ -494,6 +505,49 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def _bootstrap_domains(region: str, tenant_id: str, domains: list) -> tuple[list, list]:
+    """Attempt every selected domain independently; return (successes, failures).
+
+    A failure is logged with the hint block and recorded, and the loop continues, so one
+    domain's failure never aborts the run.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    successes: list = []
+    failures: list = []
+    for domain in domains:
+        logger.info("=== Bootstrapping gateway: %s (%s) ===", domain["display_name"], domain["key"])
+        try:
+            summary = bootstrap_one(region, tenant_id, domain)
+            successes.append(summary)
+            logger.info("Domain %s is READY.", domain["key"])
+        except (BotoCoreError, ClientError, TimeoutError, RuntimeError) as exc:
+            logger.error("Failed to bootstrap gateway for domain %s: %s", domain["key"], exc)
+            _print_failure_hint(region)
+            failures.append({"key": domain["key"], "display_name": domain["display_name"], "error": str(exc)})
+    return successes, failures
+
+
+def _print_live_summary(successes: list, failures: list, selected: int, output_file: str) -> None:
+    """Print each succeeded gateway's block, then the OK/FAIL summary."""
+    if successes:
+        print("\nUse-case gateways that are READY (paste into the UI to register):")
+        for summary in successes:
+            print(f"\n## {summary['display_name']}  ({summary['gateway_name']})")
+            print(f"  Lambda exec role : {summary['exec_role_name']}  ({summary['exec_role_arn']})")
+            print(f"  Lambda           : {summary['lambda_name']}  ({summary['lambda_arn']})")
+            print(f"  Gateway role     : {summary['gateway_role_name']}  ({summary['gateway_role_arn']})")
+            print(f"gatewayUrl: {summary['gateway_url']}")
+            print(f"gatewayArn: {summary['gateway_arn']}")
+        print(f"\nWrote the above to {output_file}")
+
+    print(f"\nSummary: {len(successes)} succeeded, {len(failures)} failed (of {selected} selected).")
+    for summary in successes:
+        print(f"  OK   {summary['key']}  ->  {summary['gateway_name']}")
+    for failure in failures:
+        print(f"  FAIL {failure['key']}  ->  {failure['error']}")
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
@@ -508,9 +562,6 @@ def main(argv=None) -> int:
         return 2
 
     if args.dry_run:
-        # ZERO boto3 calls — we never construct a client on this path. The drift guard
-        # (ast.parse + tool-branch check) runs inside _print_dry_run_domain and raises a
-        # clear ValueError on a syntax error or a schema/handler mismatch.
         try:
             _print_dry_run(args.region, args.tenant_id, domains)
         except ValueError as exc:
@@ -518,59 +569,21 @@ def main(argv=None) -> int:
             return 1
         return 0
 
-    # Live path: per-domain continue-on-error. Each domain is attempted independently;
-    # a failure is logged + recorded and the loop continues to the next domain.
-    successes = []
-    failures = []
-    for domain in domains:
-        logger.info("=== Bootstrapping gateway: %s (%s) ===",
-                    domain["display_name"], domain["key"])
-        try:
-            summary = bootstrap_one(args.region, args.tenant_id, domain)
-            successes.append(summary)
-            logger.info("Domain %s is READY.", domain["key"])
-        except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-            # botocore exceptions (ClientError, EndpointConnectionError, NoCredentials,
-            # UnknownServiceError, AccessDenied, etc.) plus the poll TimeoutError/
-            # RuntimeError are caught broadly so one domain's failure never aborts the run.
-            logger.error("Failed to bootstrap gateway for domain %s: %s",
-                         domain["key"], exc)
-            _print_failure_hint(args.region)
-            failures.append({"key": domain["key"], "display_name": domain["display_name"],
-                             "error": str(exc)})
-
-    # Always (over)write the output file with the domains that succeeded this run.
+    successes, failures = _bootstrap_domains(args.region, args.tenant_id, domains)
     _write_output_file(args.output_file, successes)
-
-    # Print each succeeded gateway's block (same style as the existing bootstrap summary).
-    if successes:
-        print("\nUse-case gateways that are READY (paste into the UI to register):")
-        for summary in successes:
-            print(f"\n## {summary['display_name']}  ({summary['gateway_name']})")
-            print(f"  Lambda exec role : {summary['exec_role_name']}  ({summary['exec_role_arn']})")
-            print(f"  Lambda           : {summary['lambda_name']}  ({summary['lambda_arn']})")
-            print(f"  Gateway role     : {summary['gateway_role_name']}  ({summary['gateway_role_arn']})")
-            print(f"gatewayUrl: {summary['gateway_url']}")
-            print(f"gatewayArn: {summary['gateway_arn']}")
-        print(f"\nWrote the above to {args.output_file}")
-
-    # Final summary: successes/failures.
-    print(f"\nSummary: {len(successes)} succeeded, {len(failures)} failed "
-          f"(of {len(domains)} selected).")
-    for summary in successes:
-        print(f"  OK   {summary['key']}  ->  {summary['gateway_name']}")
-    for failure in failures:
-        print(f"  FAIL {failure['key']}  ->  {failure['error']}")
+    _print_live_summary(successes, failures, len(domains), args.output_file)
 
     if failures:
-        print("\nTo clean up later, delete the agp-* resources listed above (this "
-              "script never deletes anything). Re-running is safe (get-or-create); use "
-              "--only <key> to retry a single failed domain.")
-        # Non-zero exit if any domain failed (successes are still printed + written).
+        print(
+            "\nTo clean up later, delete the agp-* resources listed above (this "
+            "script never deletes anything). Re-running is safe (get-or-create); use "
+            "--only <key> to retry a single failed domain."
+        )
         return 1
 
-    print("\nTo clean up later, delete the agp-* resources listed above (this script "
-          "never deletes anything).")
+    print(
+        "\nTo clean up later, delete the agp-* resources listed above (this script never deletes anything)."
+    )
     return 0
 
 

@@ -1,13 +1,11 @@
-"""
-S3 service for uploading and managing project archives
-"""
+"""S3 service for uploading and managing project archives."""
 
-import boto3
-from botocore.exceptions import ClientError
-from datetime import datetime, timedelta
 import logging
-from typing import Optional
+from datetime import datetime, timedelta
 
+from botocore.exceptions import ClientError
+
+from core import aws_clients
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -18,7 +16,7 @@ class S3Service:
 
     def __init__(self):
         """Initialize S3 service"""
-        self.s3_client = boto3.client("s3", region_name=settings.AWS_REGION)
+        self.s3_client = aws_clients.client("s3", region=settings.AWS_REGION)
         self.bucket_name = settings.S3_BUCKET_NAME or settings.PROJECT_ARCHIVES_BUCKET
 
     def upload_project(self, zip_data: bytes, project_name: str) -> tuple[str, str]:
@@ -35,42 +33,32 @@ class S3Service:
         Raises:
             Exception: If upload fails
         """
-        # Generate S3 key
         timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
         s3_key = f"projects/{project_name}/{timestamp}/{project_name}.zip"
 
         logger.info(f"Uploading project to S3: {s3_key}")
 
         try:
-            # Upload to S3
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
                 Key=s3_key,
                 Body=zip_data,
                 ContentType="application/zip",
                 ServerSideEncryption="AES256",
-                Metadata={
-                    "project-name": project_name,
-                    "created-at": datetime.utcnow().isoformat()
-                }
+                Metadata={"project-name": project_name, "created-at": datetime.utcnow().isoformat()},
             )
 
             logger.info(f"Successfully uploaded to S3: {s3_key}")
 
-            # Generate presigned URL
             presigned_url = self.generate_presigned_url(s3_key)
 
             return s3_key, presigned_url
 
         except ClientError as e:
             logger.error(f"Failed to upload to S3: {e}")
-            raise Exception(f"S3 upload failed: {str(e)}")
+            raise Exception(f"S3 upload failed: {e!s}") from e
 
-    def generate_presigned_url(
-        self,
-        s3_key: str,
-        expiration: int = 604800  # 7 days in seconds
-    ) -> str:
+    def generate_presigned_url(self, s3_key: str, expiration: int = 604800) -> str:
         """
         Generate presigned URL for S3 object
 
@@ -86,12 +74,7 @@ class S3Service:
         """
         try:
             presigned_url = self.s3_client.generate_presigned_url(
-                "get_object",
-                Params={
-                    "Bucket": self.bucket_name,
-                    "Key": s3_key
-                },
-                ExpiresIn=expiration
+                "get_object", Params={"Bucket": self.bucket_name, "Key": s3_key}, ExpiresIn=expiration
             )
 
             logger.info(f"Generated presigned URL for {s3_key}")
@@ -100,7 +83,7 @@ class S3Service:
 
         except ClientError as e:
             logger.error(f"Failed to generate presigned URL: {e}")
-            raise Exception(f"Presigned URL generation failed: {str(e)}")
+            raise Exception(f"Presigned URL generation failed: {e!s}") from e
 
     def delete_project(self, s3_key: str) -> bool:
         """
@@ -116,18 +99,15 @@ class S3Service:
             Exception: If deletion fails
         """
         try:
-            self.s3_client.delete_object(
-                Bucket=self.bucket_name,
-                Key=s3_key
-            )
+            self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
 
             logger.info(f"Deleted S3 object: {s3_key}")
 
             return True
 
         except ClientError as e:
-            logger.error(f"Failed to delete from S3: {e}")
-            raise Exception(f"S3 deletion failed: {str(e)}")
+            logger.error(f"S3 delete_object failed: {e}")
+            raise Exception(f"S3 deletion failed: {e!s}") from e
 
     def check_bucket_accessible(self) -> bool:
         """

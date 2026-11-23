@@ -1,9 +1,7 @@
-import { useState, useEffect } from 'react';
+// Decision: docs/adr/frontend-loading-state.md
+// Rationale: frontend/README.md "The honesty copy is pinned and frozen" (interpolated honesty copy)
+import { useState } from 'react';
 import { useParams } from 'react-router-dom';
-// The honesty vocabulary is INTERPOLATED, not retyped: the `roadmap` section below quotes the
-// exact strings the ten bannered pages render, and `comingSoonCopy.test.ts` freezes them. Importing
-// them is what makes it impossible for this page to describe the banner in words the banner does
-// not use — the tenth phrasing the copy contract exists to prevent.
 import {
   COMING_SOON_BODY,
   COMING_SOON_TITLE,
@@ -18,23 +16,6 @@ interface DocSection {
   content?: string;
 }
 
-/**
- * In-app documentation for AGP itself.
- *
- * EVERY CLAIM ON THIS PAGE IS VERIFIABLE FROM THE CODE IN THIS REPOSITORY. It ships publicly, so
- * it is bound by the same honesty rule as the README: document what exists, and mark what does
- * not as roadmap (the `roadmap` section below, in the pinned `shared/comingSoonCopy.ts`
- * vocabulary). If you change a behaviour, change the section that describes it in the same commit
- * — a docs page that drifts is worse than no docs page.
- *
- * Deliberately NOT here: a hand-maintained endpoint list. The backend serves live OpenAPI at
- * `/docs`, `/openapi.json` and `/redoc`, which cannot drift; the `api` section links to it.
- *
- * The nav renders group → child, and a child carrying its own `children` renders as an expander
- * (see the sidebar below). The AGP tree is two levels deep today, so that branch is unexercised —
- * it is kept because it is the layout's contract, and adding a sub-page to any section below is
- * meant to be a data-only change.
- */
 const docs: DocSection[] = [
   {
     id: 'start-here',
@@ -468,7 +449,7 @@ This page exists so the rest of the documentation can be trusted. Everything des
 
 ## Pages that are design, not function
 
-Ten pages ship as **${COMING_SOON_TITLE.toLowerCase()}** designs. Each one carries a banner reading **"${COMING_SOON_BODY}"**, and its nav entry is tagged \`${SOON_TAG_LABEL}\`. Where a live page shows one illustrative widget, that widget is labelled **"${SAMPLE_BADGE_LABEL}"**:
+Nine pages ship as **${COMING_SOON_TITLE.toLowerCase()}** designs. Each one carries a banner reading **"${COMING_SOON_BODY}"**, and its nav entry is tagged \`${SOON_TAG_LABEL}\`. Where a live page shows one illustrative widget, that widget is labelled **"${SAMPLE_BADGE_LABEL}"**:
 
 | Page | Where |
 |---|---|
@@ -481,7 +462,6 @@ Ten pages ship as **${COMING_SOON_TITLE.toLowerCase()}** designs. Each one carri
 | Experiments | Operations |
 | Model Catalog | Operations |
 | Playground | Operations |
-| Studio | Operations |
 
 They are kept in the tree because the shape of the eventual feature is part of the design, and deleting them would hide the intent. The banner is the contract: if you see it, nothing on that page is wired to anything.
 
@@ -500,14 +480,12 @@ They are kept in the tree because the shape of the eventual feature is part of t
   },
 ];
 
-/** Inline markdown: `**bold**` and `` `code` ``. */
 function inline(text: string): string {
   return text
     .replace(/\*\*(.*?)\*\*/g, '<strong class="text-slate-800">$1</strong>')
     .replace(/`(.*?)`/g, '<code class="bg-slate-100 px-1.5 py-0.5 rounded text-xs text-blue-700 font-mono">$1</code>');
 }
 
-/** Render collected pipe-table rows (header first) as one `<table>`. */
 function renderTable(tableRows: string[]): string {
   const headerCells = tableRows[0].split('|').filter(c => c.trim());
   const bodyRows = tableRows.slice(1);
@@ -520,7 +498,6 @@ function renderTable(tableRows: string[]): string {
   return table + '</tbody></table></div>';
 }
 
-// Simple markdown renderer
 function renderMarkdown(md: string) {
   const lines = md.split('\n');
   const html: string[] = [];
@@ -565,46 +542,46 @@ function renderMarkdown(md: string) {
   return html.join('\n');
 }
 
+function parentsOf(sections: DocSection[], targetId: string, parents: string[] = []): string[] | null {
+  for (const s of sections) {
+    if (s.id === targetId) return parents;
+    if (s.children) {
+      const found = parentsOf(s.children, targetId, [...parents, s.id]);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 export default function Documentation() {
   const { section } = useParams<{ section?: string }>();
-  const [activeId, setActiveId] = useState(section || 'overview');
+  const [manual, setManual] = useState<string | null>(null);
+  const [seenSection, setSeenSection] = useState(section);
+  if (section !== seenSection) {
+    setSeenSection(section);
+    setManual(null);
+  }
+  const activeId = manual ?? section ?? 'overview';
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showFloatingButton, setShowFloatingButton] = useState(false);
-  const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set());
+  const [userOpened, setUserOpened] = useState<ReadonlySet<string>>(new Set());
+  const [userClosed, setUserClosed] = useState<ReadonlySet<string>>(new Set());
 
-  // Deep link: when URL param changes, navigate to that section and expand parents
-  useEffect(() => {
-    if (!section) return;
-    setActiveId(section);
-    // Auto-expand parent sections so the nav item is visible
-    const expandParents = (sections: DocSection[], targetId: string, parents: string[] = []): string[] | null => {
-      for (const s of sections) {
-        if (s.id === targetId) return parents;
-        if (s.children) {
-          const found = expandParents(s.children, targetId, [...parents, s.id]);
-          if (found) return found;
-        }
-      }
-      return null;
-    };
-    const parents = expandParents(docs, section);
-    if (parents) {
-      setExpandedSections(prev => {
-        const next = new Set(prev);
-        parents.forEach(p => next.add(p));
-        return next;
-      });
-    }
-  }, [section]);
+  const deepLinkParents = section ? (parentsOf(docs, section) ?? []) : [];
+  const expandedSections = new Set([...deepLinkParents, ...userOpened].filter((id) => !userClosed.has(id)));
 
   const toggleSection = (sectionId: string) => {
-    setExpandedSections(prev => {
+    const opening = !expandedSections.has(sectionId);
+    setUserOpened((prev) => {
       const next = new Set(prev);
-      if (next.has(sectionId)) {
-        next.delete(sectionId);
-      } else {
-        next.add(sectionId);
-      }
+      if (opening) next.add(sectionId);
+      else next.delete(sectionId);
+      return next;
+    });
+    setUserClosed((prev) => {
+      const next = new Set(prev);
+      if (opening) next.delete(sectionId);
+      else next.add(sectionId);
       return next;
     });
   };
@@ -621,7 +598,6 @@ export default function Documentation() {
 
   const content = findContent(docs, activeId) || '';
 
-  // Show floating button when scrolled down
   const handleScroll = (e: React.UIEvent<HTMLElement>) => {
     const scrollTop = (e.target as HTMLElement).scrollTop;
     setShowFloatingButton(scrollTop > 100);
@@ -629,7 +605,6 @@ export default function Documentation() {
 
   return (
     <div className="h-[calc(100vh-4rem)] bg-white flex relative overflow-hidden">
-      {/* Overlay for mobile */}
       {sidebarOpen && (
         <div
           className="lg:hidden fixed inset-0 bg-black/50 z-30"
@@ -637,7 +612,6 @@ export default function Documentation() {
         />
       )}
 
-      {/* Sidebar - fixed height with independent scroll */}
       <aside className={`
         w-64 flex-shrink-0 border-r border-slate-200 bg-white overflow-y-auto
         fixed lg:relative inset-y-0 left-0 z-40 lg:z-auto transform transition-transform duration-300 shadow-xl lg:shadow-none
@@ -654,7 +628,6 @@ export default function Documentation() {
                 </div>
                 {section.children?.map((child) => (
                   <div key={child.id}>
-                    {/* If child has sub-children, show expandable button */}
                     {child.children && child.children.length > 0 ? (
                       <>
                         <button
@@ -672,14 +645,13 @@ export default function Documentation() {
                             <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
                           </svg>
                         </button>
-                        {/* Show nested children when expanded */}
                         {expandedSections.has(child.id) && (
                           <div className="ml-3 mt-1 space-y-1 border-l-2 border-slate-200 pl-2">
                             {child.children.map((subChild) => (
                               <button
                                 key={subChild.id}
                                 onClick={() => {
-                                  setActiveId(subChild.id);
+                                  setManual(subChild.id);
                                   setSidebarOpen(false);
                                 }}
                                 className={`w-full text-left px-2 py-1.5 rounded-lg text-sm transition-all duration-150 ${
@@ -695,10 +667,9 @@ export default function Documentation() {
                         )}
                       </>
                     ) : (
-                      /* Regular page without children - clickable directly */
                       <button
                         onClick={() => {
-                          setActiveId(child.id);
+                          setManual(child.id);
                           setSidebarOpen(false);
                         }}
                         className={`w-full text-left px-3 py-2 rounded-xl text-sm transition-all duration-150 ${
@@ -718,9 +689,7 @@ export default function Documentation() {
         </div>
       </aside>
 
-      {/* Content - independent scroll */}
       <main className="flex-1 overflow-y-auto" onScroll={handleScroll}>
-        {/* Mobile menu button at top */}
         <div className="lg:hidden sticky top-0 z-20 bg-white border-b border-slate-200 px-6 py-4">
           <button
             onClick={() => setSidebarOpen(!sidebarOpen)}
@@ -734,23 +703,10 @@ export default function Documentation() {
         </div>
 
         <div className="max-w-4xl mx-auto px-6 lg:px-10 py-12">
-          {/*
-            SAFETY INVARIANT for the raw-HTML render immediately below — the ONLY such call in
-            this file, and the reason the whole page is authored as constants.
-            Every string `renderMarkdown` is ever given is a COMPILE-TIME CONSTANT defined in the
-            `docs` tree above (plus the four imported honesty-copy constants, themselves literals).
-            No user input, no API response, no route parameter and no `localStorage` value may EVER
-            reach it: `activeId` is used only to LOOK UP a section by id, never as content, so a
-            hostile `/docs/:section` value can at worst select nothing and render an empty page.
-            `renderMarkdown` is intentionally not an HTML sanitizer and must not be treated as one
-            — it emits raw tags. If a future change makes any part of this content dynamic, this
-            call must be replaced (or the input sanitized) in the SAME commit.
-          */}
           <div dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} />
         </div>
       </main>
 
-      {/* Floating button - outside scroll container, mobile only */}
       {showFloatingButton && (
         <button
           onClick={() => setSidebarOpen(true)}

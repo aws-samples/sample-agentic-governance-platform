@@ -30,6 +30,17 @@ resource "aws_cloudwatch_log_group" "ecs" {
   })
 }
 
+# E42: eval score events (one EMF event per score → AGP/Evals Score + Pass metrics).
+# Prefix from the design; the name_prefix suffix keeps two envs in one account apart.
+resource "aws_cloudwatch_log_group" "evals" {
+  name              = "/agp/evals/results/${var.name_prefix}"
+  retention_in_days = 365
+
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-evals-logs"
+  })
+}
+
 # ============================================================================
 # IAM Roles
 # ============================================================================
@@ -139,11 +150,55 @@ resource "aws_iam_role_policy" "ecs_task_dynamodb" {
           var.projects_table_arn,
           "${var.projects_table_arn}/index/*",
           var.tenants_table_arn,
-          "${var.tenants_table_arn}/index/*"
+          "${var.tenants_table_arn}/index/*",
+          var.evals_table_arn,
+          "${var.evals_table_arn}/index/*",
+          var.containment_table_arn,
+          "${var.containment_table_arn}/index/*"
         ]
       }
     ]
   })
+}
+
+# Append-only audit table (E41): the task may write and read rows, never update or
+# delete one; the explicit Deny wins over any later Allow/wildcard. Overwrite protection
+# (PutItem on an existing key) is AuditStore's attribute_not_exists(sk) condition, not IAM.
+# The table's resource policy (dynamodb module) repeats the Deny for every principal.
+# Managed (not inline): the task role's inline policies hit the 10,240-byte aggregate cap.
+resource "aws_iam_policy" "ecs_task_audit" {
+  name = "${var.name_prefix}-dynamodb-audit-append-only"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:GetItem",
+          "dynamodb:Query"
+        ]
+        Resource = [var.audit_table_arn]
+      },
+      {
+        Effect = "Deny"
+        Action = [
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:BatchWriteItem",
+          "dynamodb:PartiQLUpdate",
+          "dynamodb:PartiQLDelete"
+        ]
+        Resource = [var.audit_table_arn]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_audit" {
+  role       = aws_iam_role.ecs_task.name
+  policy_arn = aws_iam_policy.ecs_task_audit.arn
 }
 
 # Policy for S3 access
@@ -167,6 +222,19 @@ resource "aws_iam_role_policy" "ecs_task_s3" {
           "${var.project_archives_bucket_arn}/*",
           var.frontend_bucket_arn,
           "${var.frontend_bucket_arn}/*"
+        ]
+      },
+      {
+        # E42: eval run records (run.json / results.jsonl / dataset.jsonl).
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          var.evals_bucket_arn,
+          "${var.evals_bucket_arn}/*"
         ]
       }
     ]
@@ -210,10 +278,22 @@ resource "aws_iam_role_policy" "ecs_task_step_functions" {
 # has no count/toggle and applies every time — it is what runs the runtime Terraform when
 # an agent is pushed), and the root has always passed a real ARN. `var.codebuild_project_arn`
 # is now a REQUIRED input, so there is no empty case left to guard.
+# LIVEFIX (E30 dev deploy): the project's build ARNs use "build/" where the project ARN uses
+# "project/" — BatchGetBuilds needs the former, scoped to this project's builds only.
+locals {
+  codebuild_build_arns = "${replace(var.codebuild_project_arn, ":project/", ":build/")}:*"
+}
+
 resource "aws_iam_role_policy" "ecs_task_codebuild_startbuild" {
   name = "codebuild-startbuild"
   role = aws_iam_role.ecs_task.id
 
+  # LIVEFIX (E30 dev deploy): the in-flight build check in runtime_build_service.py
+  # (_has_in_flight_build) calls ListBuildsForProject + BatchGetBuilds against this SAME
+  # project before every StartBuild. Without them the calls AccessDenied and the check
+  # fails open (logged, but every build still races). ListBuildsForProject is scoped to
+  # the project ARN; BatchGetBuilds is scoped to that project's build ARNs
+  # (arn:...:build/<project-name>:*) — a build id is not a project id.
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -221,6 +301,17 @@ resource "aws_iam_role_policy" "ecs_task_codebuild_startbuild" {
         Effect   = "Allow"
         Action   = "codebuild:StartBuild"
         Resource = var.codebuild_project_arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "codebuild:ListBuildsForProject",
+          "codebuild:BatchGetBuilds"
+        ]
+        Resource = [
+          var.codebuild_project_arn,
+          local.codebuild_build_arns
+        ]
       }
     ]
   })
@@ -479,6 +570,54 @@ resource "aws_iam_role_policy" "ecs_task_logs" {
           "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/vendedlogs/bedrock-agentcore/*",
           "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/vendedlogs/bedrock-agentcore/*:log-stream:*",
         ]
+      },
+      {
+        # E42: write eval score events (EMF) to the evals log group.
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ]
+        Resource = [
+          aws_cloudwatch_log_group.evals.arn,
+          "${aws_cloudwatch_log_group.evals.arn}:log-stream:*",
+        ]
+      },
+      {
+        # E41: the containment monitor reads new spans with FilterLogEvents.
+        Effect = "Allow"
+        Action = ["logs:FilterLogEvents"]
+        Resource = [
+          "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:aws/spans",
+          "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:aws/spans:*",
+        ]
+      },
+      {
+        # E42: Logs Insights over the span + AgentCore runtime groups (judges, traces → dataset).
+        Effect = "Allow"
+        Action = ["logs:StartQuery"]
+        Resource = [
+          "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:aws/spans",
+          "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:aws/spans:*",
+          "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/bedrock-agentcore/*",
+          "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/vendedlogs/bedrock-agentcore/*",
+          aws_cloudwatch_log_group.evals.arn,
+          "${aws_cloudwatch_log_group.evals.arn}:*",
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["logs:DescribeLogGroups"]
+        Resource = "*"
+      },
+      {
+        # GetQueryResults/StopQuery support no resource-level scoping (keyed by query id).
+        Effect = "Allow"
+        Action = [
+          "logs:GetQueryResults",
+          "logs:StopQuery",
+        ]
+        Resource = "*"
       }
     ]
   })
@@ -513,6 +652,59 @@ resource "aws_iam_role_policy" "ecs_task_bedrock_guardrails" {
       }
     ]
   })
+}
+
+# E45 Studio "Compose with AI": the backend calls Bedrock Converse (authorized as
+# bedrock:InvokeModel) on a cross-region inference profile. IAM checks both the profile
+# (this account + region) and the foundation model in whichever region the profile
+# routes to, hence the region wildcard on the foundation-model ARN. The geo prefix (us.,
+# eu., apac., global., ...) is stripped only when a vendor segment follows, so a bare
+# foundation-model id (anthropic.claude-...) passes through unchanged.
+resource "aws_iam_role_policy" "ecs_task_bedrock_studio" {
+  name = "bedrock-studio-invoke"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["bedrock:InvokeModel"]
+        Resource = [
+          "arn:aws:bedrock:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:inference-profile/${var.studio_model_id}",
+          "arn:aws:bedrock:*::foundation-model/${replace(var.studio_model_id, "/^[a-z-]+\\.([a-z0-9-]+\\.)/", "$1")}"
+        ]
+      }
+    ]
+  })
+}
+
+# E41: the custom llmAsAJudge misuse evaluator invokes Haiku 4.5 under the caller's credentials.
+# Managed (not inline): the task role's inline policies hit the 10,240-byte aggregate cap.
+resource "aws_iam_policy" "ecs_task_bedrock_contain_judge" {
+  name = "${var.name_prefix}-bedrock-contain-judge"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+        ]
+        Resource = [
+          "arn:aws:bedrock:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_bedrock_contain_judge" {
+  role       = aws_iam_role.ecs_task.name
+  policy_arn = aws_iam_policy.ecs_task_bedrock_contain_judge.arn
 }
 
 # ============================================================================
@@ -673,10 +865,6 @@ resource "aws_ecs_task_definition" "main" {
 
       environment = [
         {
-          name  = "ENVIRONMENT"
-          value = var.environment
-        },
-        {
           name  = "ROOT_PATH"
           value = "/${var.environment}"
         },
@@ -708,18 +896,6 @@ resource "aws_ecs_task_definition" "main" {
           value = var.entra_backend_client_id
         },
         {
-          name  = "REFERENCE_IMPLEMENTATIONS_DIR"
-          value = "/app/reference_implementations"
-        },
-        {
-          name  = "APPLICATION_CATALOG_TABLE"
-          value = var.application_catalog_table_name
-        },
-        {
-          name  = "DEPLOYMENT_METADATA_TABLE"
-          value = var.deployment_metadata_table_name
-        },
-        {
           name  = "PROJECT_ARCHIVES_BUCKET"
           value = var.project_archives_bucket_name
         },
@@ -733,7 +909,10 @@ resource "aws_ecs_task_definition" "main" {
         },
         # E22 bugfix: written as the AGP_API_URL repo var on materialized agent repos so the
         # scaffold build.yml trigger job can POST to ${AGP_API_URL}/builds/runtime. Empty ⇒
-        # the backend omits the repo var (set_repo_variables skips empty values).
+        # materializing an agent repo FAILS at "Set repository CI variables" naming the root
+        # tfvar agp_api_url (before 2026-10-14 the repo var was silently omitted instead and
+        # GitHub could never notify the platform). The value is <api_endpoint>/api/v1, set on
+        # the second apply — see variables.tf and scripts/deploy-full.sh.
         {
           name  = "AGP_API_URL"
           value = var.agp_api_url
@@ -753,10 +932,6 @@ resource "aws_ecs_task_definition" "main" {
           value = var.agent_images_ecr_arn
         },
         {
-          name  = "FRONTEND_BUCKET"
-          value = var.frontend_bucket_name
-        },
-        {
           name  = "GUARDRAILS_TABLE_NAME"
           value = var.guardrails_table_name
         },
@@ -765,12 +940,12 @@ resource "aws_ecs_task_definition" "main" {
           value = data.aws_region.current.region
         },
         {
-          name  = "CONTROL_PLANE_VPC_ID"
-          value = var.vpc_id
+          name  = "STUDIO_MODEL_ID"
+          value = var.studio_model_id
         },
         {
-          name  = "APP_FACTORY_TABLE_NAME"
-          value = var.app_factory_table_name
+          name  = "CONTROL_PLANE_VPC_ID"
+          value = var.vpc_id
         },
         {
           name  = "CORS_ORIGINS"
@@ -809,6 +984,28 @@ resource "aws_ecs_task_definition" "main" {
           name  = "TENANTS_TABLE_NAME"
           value = var.tenants_table_name
         },
+        # === Evaluations (E42) ===
+        {
+          name  = "EVALS_BUCKET_NAME"
+          value = var.evals_bucket_name
+        },
+        {
+          name  = "EVALS_TABLE_NAME"
+          value = var.evals_table_name
+        },
+        {
+          name  = "EVALS_LOG_GROUP"
+          value = aws_cloudwatch_log_group.evals.name
+        },
+        # === Containment / kill switch (E41) ===
+        {
+          name  = "CONTAINMENT_TABLE_NAME"
+          value = var.containment_table_name
+        },
+        {
+          name  = "AUDIT_TABLE_NAME"
+          value = var.audit_table_name
+        },
         # === Databricks tenant credentials (E29/T3) ===
         # Environment-scoped so a prod deploy namespaces its Databricks secrets under
         # agp-prod/… instead of silently inheriting the backend default's literal "agp-dev/…".
@@ -816,6 +1013,18 @@ resource "aws_ecs_task_definition" "main" {
         {
           name  = "DATABRICKS_TENANT_SECRET_PREFIX"
           value = "agp-${var.environment}/databricks-tenants/"
+        },
+        {
+          name  = "CONNECTIONS_SECRET_PREFIX"
+          value = "agp-${var.environment}/git-connections/"
+        },
+        {
+          name  = "RUNTIME_BUILD_TOKEN_PREFIX"
+          value = "agp-${var.environment}/runtime-build-token/"
+        },
+        {
+          name  = "GITHUB_USER_LINK_SECRET_PREFIX"
+          value = "agp-${var.environment}/github-user-link/"
         },
         # === Agent Registry (E4 — AWS Agent Registry, `agent-registry` namespace) ===
         # NAME + REGION ONLY — there is deliberately no AGENT_REGISTRY_ID here. AWS mints the
@@ -933,6 +1142,12 @@ resource "aws_ecs_service" "main" {
   tags = merge(var.tags, {
     Name = "${var.name_prefix}-service"
   })
+
+  # E43: autoscaling (aws_appautoscaling_target.ecs) owns the running count after
+  # creation; without this every apply reset it to var.desired_count (seen as 2 -> 1).
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
 
   depends_on = [aws_lb_listener.main]
 }
@@ -1167,10 +1382,13 @@ resource "aws_iam_role_policy" "ecs_task_bedrock_agentcore" {
         # same full-replace shape — the backend replays the gateway's service roleArn when
         # it flips the inbound authorizer to CUSTOM_JWT — and the demo-gateway bootstrap
         # scripts (scripts/bootstrap_demo_*.py) name those roles `agp-*-gateway-role`.
+        # The FOURTH is the pipeline's runtime module (modules/agentcore_runtime):
+        # `{agent_name}-{stage}-agentcore-exec`, replayed by MCP env wiring on grant/reconcile.
         Resource = [
           "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/service-role/AmazonBedrockAgentCoreRuntime*",
           "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/AmazonBedrockAgentCoreSDKRuntime*",
           "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/agp-*-gateway-role",
+          "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/*-agentcore-exec",
         ]
         Condition = {
           StringEquals = {
@@ -1225,28 +1443,26 @@ resource "aws_iam_role_policy" "ecs_task_secrets_manager" {
         #      langfuse-agent-<id>-keys (services/langfuse_provisioning.py)
         #   3. Terraform-created platform secrets -> agp-${environment}/* — this one IS
         #      environment-templated (modules/secrets_manager gets name_prefix =
-        #      "agp-${var.environment}", e.g. agp-dev/graph-client-secret).
-        #   4. THE CODE'S OWN PREFIXES ARE HARDCODED "agp-dev/" AND ARE **NOT**
-        #      ENVIRONMENT-TEMPLATED. core/config.py pins three literal defaults —
-        #      CONNECTIONS_SECRET_PREFIX = "agp-dev/git-connections/",
-        #      RUNTIME_BUILD_TOKEN_PREFIX = "agp-dev/runtime-build-token/",
-        #      GITHUB_USER_LINK_SECRET_PREFIX = "agp-dev/github-user-link/" — and NOTHING
-        #      injects them into this task definition, so the backend reads "agp-dev/..."
-        #      whatever var.environment says. The literal agp-dev/* entry below is therefore
-        #      load-bearing: without it a deploy with environment = "prod" would grant
-        #      agp-prod/* while the code still reads agp-dev/*, and EVERY git-connection
-        #      token and GitHub user-link token read would fail with AccessDenied — an authz
-        #      error that looks like a broken credential.
-        #      The real fix is to parameterize those three settings and inject them here;
-        #      that is a deferred E28D row (owner: Jannis). Until then keep BOTH entries.
-        #   5. the Entra backend client secret, whose ARN is passed in explicitly.
+        #      "agp-${var.environment}").
+        #   4. the Entra backend client secret, whose ARN is passed in explicitly.
         Resource = compact([
           "arn:aws:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}-*",
           "arn:aws:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:langfuse-*-keys*",
           "arn:aws:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:agp-${var.environment}/*",
-          "arn:aws:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:agp-dev/*",
           var.entra_backend_client_secret_arn,
         ])
+      },
+      {
+        Sid    = "GrantRuntimeReadOnLangfuseKeys"
+        Effect = "Allow"
+        # wire_agent_runtime (E36/T13 leg 4, services/langfuse_provisioning.py) grants a
+        # registered agent's runtime exec role GetSecretValue on ITS OWN per-agent key
+        # secret via a RESOURCE policy (put_resource_policy). The leg is best-effort and
+        # degrades to a logged no-op, so without this grant the failure is silent and the
+        # runtime's Langfuse telemetry stays disabled (AccessDenied at agent cold start).
+        # Scoped to the per-agent key namespace only — never the platform's own secrets.
+        Action   = "secretsmanager:PutResourcePolicy"
+        Resource = "arn:aws:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:langfuse-*-keys*"
       },
       {
         Sid    = "ManageDynamicSecrets"

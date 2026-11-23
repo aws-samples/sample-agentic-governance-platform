@@ -6,9 +6,10 @@
 # The `.env` step is not decoration. The image deliberately does NOT COPY `.env` (that would bake
 # secrets into a layer), so without the `env_file` below `Settings` runs on defaults: real Entra
 # JWT validation against an EMPTY tenant, so every `/api/v1/*` route rejects you, and an empty
-# bucket name, so `/health` is permanently `degraded`. For local API work set `USE_DEV_AUTH=true`
-# in `.env`. Do NOT set `DEBUG=true` — it flips `global_exception_handler` back to echoing
-# `str(exc)` to the caller, which is exactly the disclosure class E34/T9 closed.
+# bucket name, so `/health` is permanently `degraded`. For local API work without a token use the
+# local launcher (`agp up`, see README.md): it runs the backend in the only shape the dev-auth bypass
+# is honoured in, no store configured; `USE_DEV_AUTH=true` in `.env` beside a configured store is
+# refused and says so at startup. `DEBUG=true` raises the log level to DEBUG and nothing else.
 #
 # `context` is the REPO ROOT (four levels up), not this directory: the Dockerfile COPYs
 # `platform/control_plane/backend/src/` and `platform/control_plane/agent-templates/` as paths

@@ -1,20 +1,20 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import App from './App.tsx'
+import { bootAuth } from './auth/authBoot'
 import { getUiFlavor } from './ui/uiPreference'
 
-// UI-flavor seam (Epic 31E): consult the persisted preference before the first render so a
-// future epic can bring a second UI back without reshaping this entry point.
+// Rationale: frontend/README.md "The UI is Classic, and that is deliberate" (parked Cloudscape arm)
 if (getUiFlavor() === 'cloudscape') {
-  // FUTURE EPIC: replace this arm with a React.lazy import of the Cloudscape root
-  // (`const CloudscapeApp = lazy(() => import('./CloudscapeApp'))`) and render it here
-  // instead of <App />. Until then the preference is accepted but Classic still renders.
   console.info('Cloudscape UI is parked; rendering Classic. Code preserved at tags e31c-complete / e31d-parked.')
 }
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+void bootAuth().then(async (step) => {
+  if (step !== 'mount') return
+  const { default: App } = await import('./App')
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  )
+})

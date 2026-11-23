@@ -1,32 +1,7 @@
-// cedarPosture.test.ts — the ENFORCE posture warning (E36/T10, research item 15 tier 1).
-//
-// WHY THIS FILE IS THE CONTRACT. The deliverable of item 15 tier 1 is not a mechanism, it
-// is COPY: an enforcing gateway denies every uncovered call, in AWS, silently, and the tab
-// used to state the posture without stating that consequence. Copy has no compiler, so the
-// things a reviewer would otherwise have to remember are pinned here instead:
-//
-//   • it fires for `enforce` and for NOTHING else — an amber panel over `none` or
-//     `log_only` (postures that block nobody) would train operators to ignore the one
-//     posture that does block;
-//   • it does not contradict the ENFORCE-flip confirmation dialog in the same component.
-//     The research is explicit that these are ONE copy decision and that "written
-//     separately, the two surfaces will contradict each other", so the shared vocabulary is
-//     asserted, not trusted;
-//   • it survives a loudly-spelled wire value. `enforcement_mode` is a bare `str` on the
-//     backend model and can be adopted from the live AWS engine, whose own spelling is
-//     `ENFORCE`. A strict `=== 'enforce'` would silently withhold the warning from the one
-//     gateway that most needs it — so the asymmetry is a test, not a comment.
-//
-// The mode list below is iterated from the exported table's own keys where it can be, so a
-// new enforcement mode lands in scope of these tests the moment it is added.
-
 import { describe, expect, it } from 'vitest';
 
-import { ENFORCE_POSTURE_WARNING, postureWarning } from './cedarPosture';
+import { ENFORCEMENT_COPY, ENFORCE_FLIP_WARNING, ENFORCE_POSTURE_WARNING, postureWarning } from './cedarPosture';
 
-// The three modes the wire can carry (`CedarEnforcementMode`, `api/client.ts`). Backed by
-// the backend's own lowercase constants: `_MODE_NONE` / `_MODE_LOG_ONLY` / `_MODE_ENFORCE`
-// in `services/mcp_cedar_service.py`.
 const NON_BLOCKING_MODES = ['none', 'log_only'] as const;
 
 describe('postureWarning — which postures warn', () => {
@@ -34,13 +9,14 @@ describe('postureWarning — which postures warn', () => {
     expect(postureWarning('enforce')).toBe(ENFORCE_POSTURE_WARNING);
   });
 
-  it.each(NON_BLOCKING_MODES)('does not warn on %s (it blocks nobody)', (mode) => {
-    expect(postureWarning(mode)).toBeNull();
-  });
+  it.each(NON_BLOCKING_MODES)(
+    'does not warn on %s: an amber panel over a posture that blocks nobody would train operators to ignore the one that does',
+    (mode) => {
+      expect(postureWarning(mode)).toBeNull();
+    },
+  );
 
-  it('returns null for an absent mode rather than guessing', () => {
-    // A request that failed, or one never made. `undefined` is "no answer", and claiming a
-    // gateway is enforcing on no evidence is as wrong as missing one that is.
+  it('returns null for an absent mode (a request that failed or was never made) rather than claiming a posture on no evidence', () => {
     expect(postureWarning(undefined)).toBeNull();
   });
 
@@ -51,15 +27,7 @@ describe('postureWarning — which postures warn', () => {
     expect(postureWarning('ENFORCE_ALL')).toBeNull();
   });
 
-  it('is not fooled by a prototype key', () => {
-    // A mode naming an Object.prototype member resolves to an inherited FUNCTION when the
-    // lookup indexes an object literal — which `?? null` does not catch, since a function is
-    // neither null nor undefined. `constructor` is the reachable one: the lower-casing hides
-    // `toString`/`hasOwnProperty` by mangling them into clean misses, but leaves `constructor`
-    // untouched. This assertion FAILED on `constructor` while the lookup was an object literal;
-    // it holds now because the lookup goes through a `Map`, whose keys are its own entries only
-    // (the `githubLink.ts` idiom). Keep all five: they are the regression net for anyone who
-    // "simplifies" the Map back into a plain-object index.
+  it('returns null for every Object.prototype member name instead of the inherited function an object-literal index would hand React', () => {
     expect(postureWarning('toString')).toBeNull();
     expect(postureWarning('constructor')).toBeNull();
     expect(postureWarning('hasOwnProperty')).toBeNull();
@@ -68,12 +36,9 @@ describe('postureWarning — which postures warn', () => {
   });
 });
 
-describe('postureWarning — tolerant narrowing of a bare-string wire value', () => {
-  // `mcp_server.cedar_enforcement_mode` is a plain `str` (tolerant by design, E36 item 16),
-  // and `_MODE_FROM_AWS` adopts the mode off a live engine whose spelling is `ENFORCE`. The
-  // FE union is an assertion about the wire, not a guarantee from it.
+describe('postureWarning — enforcement_mode is a bare str on the wire that the live engine spells ENFORCE, so narrowing trims and lower-cases', () => {
   it.each(['ENFORCE', 'Enforce', ' enforce', 'enforce\n', '  ENFORCE  '])(
-    'still warns for %o',
+    'still warns for %o: a strict === "enforce" would withhold the warning from the one gateway that most needs it',
     (raw) => {
       expect(postureWarning(raw)).toBe(ENFORCE_POSTURE_WARNING);
     },
@@ -84,58 +49,64 @@ describe('postureWarning — tolerant narrowing of a bare-string wire value', ()
   });
 });
 
-describe('ENFORCE_POSTURE_WARNING — the copy itself', () => {
-  // Pinned literally: this string is a product decision shared with the confirmation
-  // dialog, and an unreviewed edit to it is exactly the drift this task exists to close.
+describe('ENFORCE_POSTURE_WARNING — the copy itself, pinned because copy has no compiler', () => {
   it('is the reviewed copy, verbatim', () => {
     expect(ENFORCE_POSTURE_WARNING).toBe(
       'Every tool call not covered by a policy below is blocked — for every agent connected ' +
         'to this gateway. A blocked call is not recorded here: it reaches the agent as ' +
-        'a tool error with no reason and no policy id. Removing the last policy does not lift ' +
+        'a tool error ("Tool Execution Denied") naming the policy id. Removing the last policy does not lift ' +
         'enforcement — only changing the mode does.',
     );
   });
 
-  it('shares the vocabulary of the other two enforce surfaces in the card', () => {
-    // Transcribed from `CedarPoliciesTab.tsx` — the ENFORCE-flip gate body and the enforce
-    // banner body. They are JSX, and `vitest.config.ts` collects `src/**/*.test.ts` only, so a
-    // transcript is as close to the rendered copy as a `.ts` test reaches; single-sourcing the
-    // pair is a follow-up (review M3). What this test CAN guarantee is that the terms claimed
-    // as shared really are: each is asserted against every surface, so a term only one surface
-    // uses (as "denied" was) cannot be smuggled in as alignment.
-    const OTHER_SURFACES = [
-      'Applying a policy engine switches this gateway to default-deny — only users named in ' +
-        'policies will be able to call its tools. Agents and users not covered by a policy ' +
-        'will be blocked.',
-      'Only users named in a policy can call tools. Assigned users not covered by a policy ' +
-        'are blocked.',
-    ];
+  it('shares "blocked" and "not covered by a policy" with the ENFORCE-flip dialog and the enforce banner, each term asserted against every surface', () => {
+    const OTHER_SURFACES = [ENFORCE_FLIP_WARNING, ENFORCEMENT_COPY.enforce.body];
     for (const term of ['not covered by a policy', 'blocked']) {
       expect(ENFORCE_POSTURE_WARNING).toContain(term);
       for (const surface of OTHER_SURFACES) expect(surface).toContain(term);
     }
   });
 
-  it('states the three facts no other surface on the tab states', () => {
-    // 1. blast radius — every agent on the gateway, not just this operator's.
+  it('states the three facts no other surface on the tab states: the blast radius is every agent on the gateway, the deny is not recorded here, removing the last policy does not lift enforcement', () => {
     expect(ENFORCE_POSTURE_WARNING).toContain('every agent connected to this gateway');
-    // 2. the deny is invisible here — the item-15 gap itself.
     expect(ENFORCE_POSTURE_WARNING).toContain('not recorded here');
     expect(ENFORCE_POSTURE_WARNING).toContain('tool error');
-    // 3. delete is not disable — a gateway that lost its last policy denies everything.
     expect(ENFORCE_POSTURE_WARNING).toContain('Removing the last policy does not lift enforcement');
   });
 
-  it('does not point a viewer at the manage-only mode control', () => {
-    // The segmented Enforce / Log only / Disable group renders only for `canManage`, so the
-    // copy must not name its buttons.
+  it('never names the Log only / Disable buttons, which render only for a manager', () => {
     expect(ENFORCE_POSTURE_WARNING).not.toContain('Log only');
     expect(ENFORCE_POSTURE_WARNING).not.toContain('Disable');
   });
 
-  it('does not contradict the dialog by promising a deny reason or a blocked screen', () => {
-    // The guide is blunt that neither exists ("no reason string, no policy id, no blocked
-    // screen"). Any future edit that starts promising one should fail here.
-    expect(ENFORCE_POSTURE_WARNING).toContain('no reason and no policy id');
+  it('names "Tool Execution Denied" and the policy id as what the agent sees, and promises no blocked screen', () => {
+    expect(ENFORCE_POSTURE_WARNING).toContain('Tool Execution Denied');
+    expect(ENFORCE_POSTURE_WARNING).toContain('naming the policy id');
+    expect(ENFORCE_POSTURE_WARNING).not.toContain('no policy id');
+    expect(ENFORCE_POSTURE_WARNING).not.toContain('blocked screen');
+  });
+});
+
+describe('ENFORCEMENT_COPY and ENFORCE_FLIP_WARNING — the banner and dialog copy, owned once for the Policies tab and the graph drawer', () => {
+  it('is the reviewed copy, verbatim', () => {
+    expect(ENFORCEMENT_COPY).toEqual({
+      none: {
+        heading: 'No policy engine attached',
+        body: 'Every assigned user can call any tool on this gateway. Add a policy to switch to default-deny.',
+      },
+      log_only: {
+        heading: 'Logging only',
+        body: 'Policies are evaluated and logged to CloudWatch, but not enforced — every assigned user can still call any tool.',
+      },
+      enforce: {
+        heading: 'Enforcing — default-deny',
+        body: 'Only users named in a policy can call tools. Assigned users not covered by a policy are blocked.',
+      },
+    });
+    expect(ENFORCE_FLIP_WARNING).toBe(
+      'Applying a policy engine switches this gateway to default-deny — only users named in ' +
+        'policies will be able to call its tools. Agents and users not covered by a policy ' +
+        'will be blocked.',
+    );
   });
 });

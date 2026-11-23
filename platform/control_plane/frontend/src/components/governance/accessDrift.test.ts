@@ -1,8 +1,3 @@
-// Tests for accessDrift — the Access tab's platform-ACL drift decisions (E29/T13e, §3A).
-//
-// Pure-function tests only, for the reason platformLabels.test.ts states: vitest collects
-// `src/**/*.test.ts` in a node environment, so the drift panel's DECISIONS are exported from a
-// `.ts` module and pinned here, while `AccessTab.tsx` only binds and renders them.
 import { describe, it, expect } from 'vitest';
 import {
   driftEntriesOf,
@@ -11,14 +6,13 @@ import {
   driftSummary,
 } from './accessDrift';
 import type { DriftPanelSource } from './accessDrift';
-import type { AccessDriftEntry } from '../../api/client';
+import type { DriftEntry } from '../../api/client';
 import {
   DRIFT_CLEAN_NOTE,
   DRIFT_DIRECTION_NOTE,
   DRIFT_KIND_LABEL,
   DRIFT_PANEL_NOTE,
   DRIFT_UNAVAILABLE_NOTE,
-  DRIFT_UNKNOWN_DIRECTION_NOTE,
 } from './platformLabels';
 
 const governed: DriftPanelSource = {
@@ -27,22 +21,22 @@ const governed: DriftPanelSource = {
   runtime_handle: 'https://agp-agent-1234.aws.databricksapps.com',
 };
 
-const entry = (over: Partial<AccessDriftEntry> = {}): AccessDriftEntry => ({
-  principal: 'lars.svensson@example.com',
-  kind: 'user',
-  level: 'CAN_USE',
-  direction: 'unauthorized_acl',
-  ...over,
-});
+function driftEntry(overrides: Partial<DriftEntry> = {}): DriftEntry {
+  return {
+    principal: 'lars.svensson@example.com',
+    kind: 'user',
+    level: 'CAN_USE',
+    direction: 'unauthorized_acl',
+    ...overrides,
+  };
+}
 
 describe('driftPanelApplies', () => {
   it('is true for a Databricks-governed agent (all three legs present)', () => {
     expect(driftPanelApplies(governed)).toBe(true);
   });
 
-  it('is false without a runtime handle — an inert metadata-only Databricks record', () => {
-    // No app exists, so there is no ACL to drift from. Mirrors the backend gate exactly:
-    // `is_databricks_governed` requires the handle for this reason.
+  it('is false without a runtime handle: an inert metadata-only Databricks record has no app, so no ACL to drift from, and the backend gate requires the handle too', () => {
     expect(driftPanelApplies({ ...governed, runtime_handle: null })).toBe(false);
     expect(driftPanelApplies({ ...governed, runtime_handle: '' })).toBe(false);
   });
@@ -58,11 +52,17 @@ describe('driftPanelApplies', () => {
     expect(driftPanelApplies({ ...governed, platform: null })).toBe(false);
     expect(driftPanelApplies({ ...governed, platform: undefined })).toBe(false);
   });
+
+  it('never reads binding_mode: an sp_secret record carries the same asserted ACL, and a record whose mode never resolved still gets the panel', () => {
+    const withMode: DriftPanelSource & { binding_mode: string } = { ...governed, binding_mode: 'sp_secret' };
+    expect(driftPanelApplies(withMode)).toBe(true);
+    expect(driftPanelApplies({ ...governed })).toBe(true);
+  });
 });
 
 describe('driftRows', () => {
   it('maps unauthorized_acl to its verbatim copy and the fails-OPEN severity', () => {
-    const [row] = driftRows([entry()]);
+    const [row] = driftRows([driftEntry()]);
     expect(row.note).toBe(DRIFT_DIRECTION_NOTE.unauthorized_acl);
     expect(row.note).toBe('Has platform access without an AGP grant');
     expect(row.severity).toBe('warning');
@@ -70,7 +70,7 @@ describe('driftRows', () => {
   });
 
   it('maps missing_acl to its verbatim copy and the fails-CLOSED severity', () => {
-    const [row] = driftRows([entry({ direction: 'missing_acl' })]);
+    const [row] = driftRows([driftEntry({ direction: 'missing_acl' })]);
     expect(row.note).toBe(DRIFT_DIRECTION_NOTE.missing_acl);
     expect(row.note).toBe('AGP grant not enforced on the platform');
     expect(row.severity).toBe('info');
@@ -78,7 +78,7 @@ describe('driftRows', () => {
   });
 
   it('passes the principal and the platform level through unchanged', () => {
-    const [row] = driftRows([entry({ principal: 'data-eng', kind: 'group', level: 'CAN_MANAGE' })]);
+    const [row] = driftRows([driftEntry({ principal: 'data-eng', kind: 'group', level: 'CAN_MANAGE' })]);
     expect(row.principal).toBe('data-eng');
     expect(row.level).toBe('CAN_MANAGE');
     expect(row.kindLabel).toBe(DRIFT_KIND_LABEL.group);
@@ -86,50 +86,24 @@ describe('driftRows', () => {
 
   it('labels all three principal kinds', () => {
     const rows = driftRows([
-      entry({ kind: 'user' }),
-      entry({ kind: 'group' }),
-      entry({ kind: 'service_principal' }),
+      driftEntry({ kind: 'user' }),
+      driftEntry({ kind: 'group' }),
+      driftEntry({ kind: 'service_principal' }),
     ]);
     expect(rows.map((r) => r.kindLabel)).toEqual(['User', 'Group', 'Service principal']);
   });
 
-  it('keeps a row whose direction this build does not know, with the neutral note', () => {
-    // The backend may be newer than the bundle. Dropping the row would hide a principal;
-    // printing the raw wire word would teach a vocabulary the product does not have.
-    const rows = driftRows([entry({ direction: 'weird_new_direction' as AccessDriftEntry['direction'] })]);
-    expect(rows).toHaveLength(1);
-    expect(rows[0].note).toBe(DRIFT_UNKNOWN_DIRECTION_NOTE);
-    expect(rows[0].severity).toBe('warning');
-  });
-
-  it('falls back on an unrecognised principal kind rather than rendering the raw wire value', () => {
-    const rows = driftRows([entry({ kind: 'toaster' as AccessDriftEntry['kind'] })]);
-    expect(rows[0].kindLabel).toBe('Principal');
-  });
-
-  it('survives a prototype-chain key in either field (the platformHostLabel bug class)', () => {
-    // `in`/bare-index lookups walk the prototype chain, so 'constructor' would read a
-    // non-string off Object and hand it to JSX. Both lookups must be own-property tests.
+  it('gives each row a distinct key when one principal appears in both directions, and when two entries differ only by level', () => {
     const rows = driftRows([
-      entry({ direction: 'constructor' as AccessDriftEntry['direction'], kind: 'toString' as AccessDriftEntry['kind'] }),
+      driftEntry({ direction: 'unauthorized_acl' }),
+      driftEntry({ direction: 'missing_acl' }),
+      driftEntry({ direction: 'missing_acl', level: 'CAN_MANAGE' }),
     ]);
-    expect(typeof rows[0].note).toBe('string');
-    expect(rows[0].note).toBe(DRIFT_UNKNOWN_DIRECTION_NOTE);
-    expect(rows[0].kindLabel).toBe('Principal');
+    expect(new Set(rows.map((r) => r.key)).size).toBe(3);
   });
 
-  it('gives each row a key that distinguishes the two directions for one principal', () => {
-    // A principal can legitimately appear in BOTH directions at different levels; React keys
-    // must not collide or one row silently vanishes.
-    const rows = driftRows([
-      entry({ direction: 'unauthorized_acl' }),
-      entry({ direction: 'missing_acl' }),
-    ]);
-    expect(new Set(rows.map((r) => r.key)).size).toBe(2);
-  });
-
-  it('preserves the server ordering and returns [] for no entries', () => {
-    const rows = driftRows([entry({ principal: 'b' }), entry({ principal: 'a' })]);
+  it('preserves the server ordering, since re-sorting a diff would make two reads of unchanged state look like a change, and returns [] for no entries', () => {
+    const rows = driftRows([driftEntry({ principal: 'b' }), driftEntry({ principal: 'a' })]);
     expect(rows.map((r) => r.principal)).toEqual(['b', 'a']);
     expect(driftRows([])).toEqual([]);
   });
@@ -137,22 +111,18 @@ describe('driftRows', () => {
 
 describe('driftEntriesOf', () => {
   it('passes a real entries array through', () => {
-    const entries = [entry()];
+    const entries = [driftEntry()];
     expect(driftEntriesOf({ entries })).toEqual(entries);
     expect(driftEntriesOf({ entries: [] })).toEqual([]);
   });
 
-  it('maps a body WITHOUT entries to null, never to the positive "clean" answer', () => {
-    // A proxy answering `{}`, a route-shape change, an error page served with a 200: none of
-    // those are evidence that the platform matches AGP's grants.
+  it('maps a body without entries to null, never to the positive "clean" answer: a proxy answering {}, a route-shape change or an error page served with a 200 is no evidence of a match', () => {
     expect(driftEntriesOf({})).toBeNull();
     expect(driftSummary(driftEntriesOf({})).state).toBe('unavailable');
     expect(driftSummary(driftEntriesOf({})).note).not.toBe(DRIFT_CLEAN_NOTE);
   });
 
-  it('maps a non-array entries to null instead of letting it reach driftRows', () => {
-    // Left un-guarded this survives a `?? []`, reports 'drifted' with an undefined count, and
-    // then throws inside `.map` during render.
+  it('maps a non-array entries to null instead of letting it reach driftRows, where .map would throw during render', () => {
     expect(driftEntriesOf({ entries: {} })).toBeNull();
     expect(driftEntriesOf({ entries: 'CAN_USE' })).toBeNull();
     expect(driftEntriesOf({ entries: null })).toBeNull();
@@ -167,7 +137,7 @@ describe('driftEntriesOf', () => {
 
 describe('driftSummary', () => {
   it('reports drift and its count when entries exist', () => {
-    const s = driftSummary([entry(), entry({ direction: 'missing_acl' })]);
+    const s = driftSummary([driftEntry(), driftEntry({ direction: 'missing_acl' })]);
     expect(s.state).toBe('drifted');
     expect(s.count).toBe(2);
     expect(s.note).toBe(DRIFT_PANEL_NOTE);

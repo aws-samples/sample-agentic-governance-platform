@@ -1,47 +1,21 @@
-// ObservabilityTab — the project's Langfuse-backed metrics, honestly scoped (E28/T12, design D13).
-//
-// ---------------------------------------------------------------------------
-// WHAT IT READS, AND WHY IT OWNS ITS OWN RENDERING
-//
-// `observabilityApi.getMetrics('project', …)` directly. The client signature already accepts the
-// project scope and the backend already implements it (it resolves the project's agents through its
-// repositories and tenant-filters them), so nothing anywhere needs widening for this tab to exist.
-//
-// It imports NOTHING from the governance component tree — that surface belongs to another owner and
-// this epic may not touch or depend on one line of it. The consequence is a deliberately small panel:
-// the figures are rendered as tiles rather than reusing that tree's Recharts composition, because
-// reaching for those components would mean importing from it. A guard asserts no such import path
-// appears in this file, and it reads raw source without skipping comments — which is why this one
-// describes the tree instead of writing its path.
-//
-// ---------------------------------------------------------------------------
-// THE SCOPE MISMATCH IS STATED, NOT PAPERED OVER
-//
-// There is no repo-scoped metrics route and this task does not build one. `scope=project` aggregates
-// EVERY agent in the project, so labelling those totals as this repository's would be a false
-// attribution — and a costly one here, where an operator may be reading the number to decide whether
-// THIS agent is expensive. So the project totals are labelled as the project's (`PROJECT_SCOPE_NOTE`)
-// and this repository's own agent is broken out separately from `by_agent[]`, which is genuinely
-// per-agent and is the only figure on the panel that may carry this repository's name.
-//
-// ---------------------------------------------------------------------------
-// D13: NOT INSTRUMENTED IS A THIRD STATE, NEVER A ZERO
-//
-// The metrics service degrades every unhappy path to a ZEROED payload and that behaviour is
-// deliberately left alone, so a rendered `0` is ambiguous by construction — and ambiguous in the
-// reassuring direction, because "this agent cost nothing" reads calm while the truth may be that the
-// platform cannot measure it at all. `metricsState` splits the four cases (loading / not-instrumented
-// / unread / data) in the `.ts` where tests reach them, and an agent MISSING from the breakdown is
-// reported absent rather than as zero. This file only renders whichever state it is handed.
-//
-// House style: emerald-on-glass Ops tokens, Tailwind v4 utility strings, 2-space indent.
+import { useCallback, useEffect, useMemo, useState, type JSX } from 'react';
 
-import { useEffect, useMemo, useState, type JSX } from 'react';
-
-import { observabilityApi, type Repository } from '../../../api/client';
-import type { ScopeMetrics } from '../../../types';
+import { evalsApi, observabilityApi, type Repository, type ScopeMetrics, type TraceList } from '../../../api/client';
+import { useLoad } from '../../../api/useLoad';
 import { NO_VALUE } from '../opsLabels';
-import { OPS_CARD } from '../opsUi';
+import { OPS_BADGE, OPS_CARD, OPS_PRIMARY_BTN, OPS_TABLE_DIVIDE, OPS_TABLE_HEAD } from '../opsUi';
+import AddToDatasetModal from './AddToDatasetModal';
+import { evalsTabVisible } from './evaluationsLogic';
+import {
+  DEFAULT_TRACE_STAGE,
+  TRACES_COPY,
+  TRACE_LIMIT,
+  TRACE_STAGES,
+  committedFlash,
+  selectable,
+  traceRowView,
+  type TraceStage,
+} from './tracesToDataset';
 import {
   AGENT_ZERO_NOTE,
   METRICS_STATE_COPY,
@@ -49,90 +23,74 @@ import {
   agentSlice,
   metricsState,
   metricsWindow,
-} from './observabilityTab';
+} from './observabilityTabModel';
 
 const FIELD_LABEL = 'block text-[11px] uppercase tracking-wide text-slate-400 font-medium mb-1';
 
 const fmtInt = (n: number): string => n.toLocaleString();
 const fmtUsd = (n: number): string => `$${n.toFixed(2)}`;
 
-export default function ObservabilityTab({ repo }: { repo: Repository }): JSX.Element {
+export default function ObservabilityTab({
+  repo,
+  mayWrite,
+}: {
+  repo: Repository;
+  mayWrite: boolean;
+}): JSX.Element {
   const range = useMemo(() => metricsWindow(), []);
-  const [metrics, setMetrics] = useState<ScopeMetrics | null>(null);
-  // `null` until the settings probe SUCCEEDS. A failed probe stays null, which `metricsState` reads
-  // as unread rather than as "not instrumented" — the platform Observability page degrades its own
-  // failed read to `configured: false`, asserting an absence it never established, and this panel
-  // deliberately does not inherit that.
-  const [configured, setConfigured] = useState<boolean | null>(null);
-  const [error, setError] = useState(false);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(false);
-    (async () => {
-      let isConfigured: boolean | null = null;
+  const metricsLoad = useLoad(
+    async (): Promise<{ configured: boolean | null; metrics: ScopeMetrics | null; error: boolean }> => {
+      let configured: boolean | null = null;
       try {
-        const settings = await observabilityApi.getSettings();
-        isConfigured = settings.configured;
+        configured = (await observabilityApi.getSettings()).configured;
       } catch {
-        isConfigured = null;
+        configured = null;
       }
-      if (cancelled) return;
-      setConfigured(isConfigured);
-      // Not instrumented ⇒ no metrics read at all. Asking for figures the platform cannot produce
-      // would only turn a clean third state into a degraded row of zeroes.
-      if (isConfigured !== true) {
-        setMetrics(null);
-        setLoading(false);
-        return;
-      }
+      if (configured !== true) return { configured, metrics: null, error: false };
       try {
-        const m = await observabilityApi.getMetrics('project', {
+        const metrics = await observabilityApi.getMetrics('project', {
           projectId: repo.project_id,
           dateFrom: range.dateFrom,
           dateTo: range.dateTo,
         });
-        if (!cancelled) setMetrics(m);
+        return { configured, metrics, error: false };
       } catch {
-        if (!cancelled) {
-          setMetrics(null);
-          setError(true);
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
+        return { configured, metrics: null, error: true };
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [repo.project_id, range.dateFrom, range.dateTo]);
+    },
+    [repo.project_id, range.dateFrom, range.dateTo],
+  );
+  const read = metricsLoad.state.kind === 'ready' ? metricsLoad.state.data : null;
+  const metrics = read?.metrics ?? null;
 
-  const state = metricsState({ loading, configured, error, metrics });
+  const state = metricsState({
+    loading: metricsLoad.state.kind === 'loading',
+    configured: read?.configured,
+    error: read?.error ?? false,
+    metrics,
+  });
   const copy = METRICS_STATE_COPY[state];
-  const slice = agentSlice(metrics, repo.agent_id);
+  const slice = agentSlice(metrics, repo.agent_id ?? '');
 
-  // Loading / not-instrumented / unread each STATE their case and draw no figures. A row of zeroes
-  // under any of them IS the D13 conflation.
+  const traces = evalsTabVisible(repo) ? <TracesPanel repo={repo} mayWrite={mayWrite} /> : null;
+
   if (copy !== null) {
     return (
-      <div className={`${OPS_CARD} p-6`}>
-        <h3 className="text-sm font-semibold text-slate-800">{copy.headline}</h3>
-        <p className="text-sm text-slate-500 mt-1 max-w-2xl">{copy.detail}</p>
-        <p className="text-[11px] text-slate-400 mt-3">
-          Window {range.dateFrom} to {range.dateTo}
-        </p>
+      <div className="space-y-6">
+        <div className={`${OPS_CARD} p-6`}>
+          <h3 className="text-sm font-semibold text-slate-800">{copy.headline}</h3>
+          <p className="text-sm text-slate-500 mt-1 max-w-2xl">{copy.detail}</p>
+          <p className="text-[11px] text-slate-400 mt-3">
+            Window {range.dateFrom} to {range.dateTo}
+          </p>
+        </div>
+        {traces}
       </div>
     );
   }
 
   return (
     <div className="space-y-6">
-      {/* THIS REPOSITORY'S AGENT — the only per-agent figures available, and the only ones that may
-          carry this repository's name. An agent the project payload did not enumerate is reported
-          ABSENT, never as zero: a read that never mentioned it has not established that it recorded
-          nothing. */}
       <div className={`${OPS_CARD} p-5`}>
         <div className="flex flex-wrap items-baseline justify-between gap-2 mb-4">
           <h3 className="text-sm font-semibold text-slate-800">This repository’s agent</h3>
@@ -147,13 +105,6 @@ export default function ObservabilityTab({ repo }: { repo: Repository }): JSX.El
               <Tile label="Cost" value={fmtUsd(slice.totals.cost_usd)} />
               <Tile label="Tokens" value={fmtInt(slice.totals.tokens)} />
             </dl>
-            {/* The tiles are qualified WHERE THEY ARE READ. `configured` above is a platform-wide
-                fact, while instrumentation is per-agent — and the metrics service returns a zeroed
-                row with no upstream call at all for an agent whose own observability project was
-                never provisioned, while the scope route still enumerates it. So a zero on this card
-                has two possible causes and the figure alone cannot separate them. Stating that is
-                the D13 rule applied one level down; the alternative would be tiles that read
-                reassuringly and may be measuring nothing. */}
             <p className="text-[11px] text-slate-400 mt-3 max-w-2xl">{AGENT_ZERO_NOTE}</p>
           </>
         ) : (
@@ -165,20 +116,11 @@ export default function ObservabilityTab({ repo }: { repo: Repository }): JSX.El
         )}
       </div>
 
-      {/* THE PROJECT'S totals, labelled as the project's. Never presented as this repository's. */}
+      {traces}
+
       <div className={`${OPS_CARD} p-5`}>
         <h3 className="text-sm font-semibold text-slate-800">Project totals</h3>
         <p className="text-sm text-slate-500 mt-1 max-w-2xl">{PROJECT_SCOPE_NOTE}</p>
-        {/* `null` rather than a zero fallback (E28 final review). These tiles are only reached in
-            the `data` state, where the payload is non-null — so the nullish-coalescing-to-zero that
-            stood here was unreachable, and an unreachable zero-for-absent-data fallback is still the
-            wrong thing to have written in the one file whose whole thesis is that a zero must come
-            from a read that returned zero. `Tile` already renders `null` as the em dash, so if the
-            state machine ever changed, this degrades honestly instead of reassuringly.
-
-            A guard asserts that operator-plus-zero form appears NOWHERE in this file, and it reads
-            raw source without skipping comments — which is why this comment names the shape in prose
-            rather than writing it out. */}
         <dl className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-4">
           <Tile
             label="Traces"
@@ -195,9 +137,6 @@ export default function ObservabilityTab({ repo }: { repo: Repository }): JSX.El
         </dl>
       </div>
 
-      {/* The per-agent breakdown, so the project total above is decomposable rather than a number an
-          operator has to take on trust. Read-only: no drill-down into the governance surface, which
-          this epic does not link into from here. */}
       <div className={`${OPS_CARD} p-5`}>
         <h3 className="text-sm font-semibold text-slate-800 mb-4">Agents in this project</h3>
         {(metrics?.by_agent ?? []).length === 0 ? (
@@ -233,6 +172,262 @@ function Tile({ label, value }: { label: string; value: string | null }): JSX.El
     <div className="rounded-lg border border-emerald-100/70 px-4 py-3">
       <dt className={FIELD_LABEL}>{label}</dt>
       <dd className="text-2xl font-semibold text-slate-900 tabular-nums">{value ?? NO_VALUE}</dd>
+    </div>
+  );
+}
+
+const PILL = 'inline-flex items-center gap-1.5 text-[11px] font-semibold px-2 py-0.5 rounded-full';
+const SECONDARY_BTN =
+  'px-3 py-1.5 rounded-lg border border-slate-300 bg-white text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
+
+function TracesPanel({ repo, mayWrite }: { repo: Repository; mayWrite: boolean }): JSX.Element {
+  const [stage, setStage] = useState<TraceStage>(DEFAULT_TRACE_STAGE);
+  const [read, setRead] = useState<TraceList | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [tick, setTick] = useState(0);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [adding, setAdding] = useState(false);
+  const [flash, setFlash] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    let cancelled = false;
+    evalsApi
+      .traces(repo.project_id, repo.id, { stage, limit: TRACE_LIMIT })
+      .then((r) => {
+        if (cancelled) return;
+        setRead(r);
+        setNow(Date.now());
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setRead(null);
+        setError(e instanceof Error ? e.message : 'Something went wrong');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [repo.project_id, repo.id, stage, tick]);
+
+  const rows = useMemo(() => read?.traces ?? [], [read]);
+  const pickable = useMemo(() => rows.filter(selectable), [rows]);
+  const picked = useMemo(() => rows.filter((t) => selected.has(t.session_id)), [rows, selected]);
+  const allPicked = pickable.length > 0 && picked.length === pickable.length;
+
+  const restart = () => {
+    setLoading(true);
+    setError(null);
+    setSelected(new Set());
+  };
+
+  const toggle = useCallback((id: string) => {
+    setSelected((s) => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  const toggleAll = () =>
+    setSelected(allPicked ? new Set() : new Set(pickable.map((t) => t.session_id)));
+
+  const empty = read !== null && (read.source === 'none' || rows.length === 0);
+  const emptyCopy = read?.source === 'none' ? TRACES_COPY.emptyNone : TRACES_COPY.emptyList;
+
+  return (
+    <div className={`${OPS_CARD} p-5`}>
+      <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold text-slate-800">{TRACES_COPY.title}</h3>
+          <p className="text-sm text-slate-500 mt-1 max-w-2xl">{TRACES_COPY.subtitle}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <div role="group" aria-label="Stage" className="inline-flex rounded-lg border border-slate-300 bg-white p-0.5">
+            {TRACE_STAGES.map((s) => (
+              <button
+                key={s.value}
+                type="button"
+                aria-pressed={stage === s.value}
+                onClick={() => {
+                  if (s.value === stage) return;
+                  restart();
+                  setRead(null);
+                  setStage(s.value);
+                }}
+                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+                  stage === s.value ? 'bg-emerald-600 text-white' : 'text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            className={SECONDARY_BTN}
+            onClick={() => {
+              restart();
+              setTick((n) => n + 1);
+            }}
+            disabled={loading}
+          >
+            {loading ? 'Reading…' : 'Refresh'}
+          </button>
+        </div>
+      </div>
+
+      {flash && (
+        <div role="status" className="mb-4 flex items-start justify-between gap-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+          <span>{flash}</span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            className="shrink-0 text-emerald-700 hover:text-emerald-900"
+            onClick={() => setFlash(null)}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+      )}
+
+      {error ? (
+        <p role="alert" className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
+          Could not read traces: {error}
+        </p>
+      ) : read === null ? (
+        <p className="text-sm text-slate-500" role="status">Reading traces…</p>
+      ) : empty ? (
+        <div className="rounded-lg border border-dashed border-emerald-200 px-4 py-5">
+          <p className="text-sm font-medium text-slate-700">{emptyCopy.headline}</p>
+          <p className="text-sm text-slate-500 mt-1 max-w-2xl">{emptyCopy.detail}</p>
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <span className="text-xs text-slate-500" aria-live="polite">
+              {picked.length > 0 ? `${picked.length} selected` : `${rows.length} recent trace${rows.length === 1 ? '' : 's'}`}
+              {picked.length > 0 && (
+                <button
+                  type="button"
+                  className="ml-2 font-medium text-emerald-700 hover:text-emerald-800"
+                  onClick={() => setSelected(new Set())}
+                >
+                  Clear
+                </button>
+              )}
+            </span>
+            {mayWrite ? (
+              <button
+                type="button"
+                className={`${OPS_PRIMARY_BTN} disabled:opacity-50 disabled:cursor-not-allowed`}
+                disabled={picked.length === 0}
+                onClick={() => {
+                  setFlash(null);
+                  setAdding(true);
+                }}
+              >
+                Add to dataset{picked.length > 0 ? ` (${picked.length})` : ''}
+              </button>
+            ) : (
+              <span className="text-xs text-slate-400">Adding traces to the dataset needs the Maintainer role on this project.</span>
+            )}
+          </div>
+          <div className="overflow-x-auto -mx-5">
+            <table className="w-full text-sm">
+              <thead className={OPS_TABLE_HEAD}>
+                <tr>
+                  <th className="w-10 pl-5 py-2 text-left">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all traces"
+                      className="accent-emerald-600"
+                      checked={allPicked}
+                      ref={(el) => {
+                        if (el) el.indeterminate = picked.length > 0 && !allPicked;
+                      }}
+                      disabled={!mayWrite || pickable.length === 0}
+                      onChange={toggleAll}
+                    />
+                  </th>
+                  <th className="py-2 text-left font-medium whitespace-nowrap">When</th>
+                  <th className="py-2 pl-4 text-left font-medium">Input</th>
+                  <th className="py-2 pl-4 text-left font-medium">Tools</th>
+                  <th className="py-2 pl-4 pr-5 text-right font-medium">Latency</th>
+                </tr>
+              </thead>
+              <tbody className={OPS_TABLE_DIVIDE}>
+                {rows.map((t) => {
+                  const v = traceRowView(t, now);
+                  const can = selectable(t);
+                  const on = selected.has(t.session_id);
+                  return (
+                    <tr key={t.session_id} className={on ? 'bg-emerald-50/50' : 'hover:bg-slate-50/60'}>
+                      <td className="pl-5 py-2.5 align-top">
+                        <input
+                          type="checkbox"
+                          className="accent-emerald-600 mt-0.5"
+                          aria-label={`Select the trace from ${v.when ?? 'an unknown time'}`}
+                          title={can ? undefined : TRACES_COPY.noInput}
+                          checked={on}
+                          disabled={!mayWrite || !can}
+                          onChange={() => toggle(t.session_id)}
+                        />
+                      </td>
+                      <td className="py-2.5 align-top text-slate-700 tabular-nums whitespace-nowrap" title={v.title}>
+                        {v.when ?? NO_VALUE}
+                      </td>
+                      <td className="py-2.5 pl-4 align-top max-w-[28rem]">
+                        {v.input ? (
+                          <span className="block text-slate-700 truncate" title={t.input ?? undefined}>
+                            {v.input}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400 italic">No input recorded</span>
+                        )}
+                      </td>
+                      <td className="py-2.5 pl-4 align-top">
+                        {v.tools === null ? (
+                          <span className="text-xs text-slate-400 italic">{TRACES_COPY.noToolData}</span>
+                        ) : v.tools.length === 0 ? (
+                          <span className="text-xs text-slate-400">{TRACES_COPY.noTools}</span>
+                        ) : (
+                          <ol className="flex flex-wrap items-center gap-1" aria-label="Tool calls in order">
+                            {v.tools.map((name, i) => (
+                              <li key={i} className={`${PILL} ${OPS_BADGE.unknown} font-mono font-medium`}>
+                                {name}
+                              </li>
+                            ))}
+                          </ol>
+                        )}
+                      </td>
+                      <td className="py-2.5 pl-4 pr-5 align-top text-right text-slate-500 tabular-nums whitespace-nowrap">
+                        {v.latency ?? NO_VALUE}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {adding && mayWrite && (
+        <AddToDatasetModal
+          repo={repo}
+          traces={picked}
+          onClose={() => setAdding(false)}
+          onDone={(n) => {
+            setAdding(false);
+            setSelected(new Set());
+            setFlash(committedFlash(n));
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -1,4 +1,4 @@
-"""Tests for ``services.mcp_cedar_service`` — the E8 Cedar Policy Engine orchestrator.
+"""Tests for ``services.mcp_cedar_service``, the Cedar Policy Engine orchestrator.
 
 A CLONE of ``test_mcp_identity_service`` in idiom: an injected ``MagicMock``
 ``bedrock-agentcore-control`` client (NO live AWS), a ``persist_identity``-recording
@@ -8,8 +8,8 @@ pytest-asyncio ``auto`` mode → every async test is decorated ``@pytest.mark.as
 
 The load-bearing security property under test is the **authorizer replay** on BOTH
 attach (``update_gateway`` with ``policyEngineConfiguration``) and detach (``update_gateway``
-WITHOUT it): the E7 inbound Entra ``CUSTOM_JWT`` gate must never be stripped (research
-§3.1). The engine/policy waiters are exercised via the injected client's
+WITHOUT it): the inbound Entra ``CUSTOM_JWT`` gate must never be stripped. The
+engine/policy waiters are exercised via the injected client's
 ``get_waiter(...).wait(...)`` no-op MagicMock (assert called, don't poll). ``get_policy``
 statements are generated with the REAL ``build_cedar_policy`` so ``parse_cedar_policy``
 round-trips back to the friendly row.
@@ -24,30 +24,20 @@ from unittest.mock import MagicMock
 import pytest
 from botocore.exceptions import ClientError
 
-from models.mcp_server import Kind, LifecycleState, McpServer, McpTool
+from models.mcp_server import CedarEnforcementMode, Kind, LifecycleState, McpServer, McpTool
 from services.cedar_policy_text import build_cedar_policy
 from services.mcp_cedar_service import McpCedarError, McpCedarService
 
-# ---------------------------------------------------------------------------
-# Fixtures / builders
-# ---------------------------------------------------------------------------
 REGION = "us-east-1"
 
 GATEWAY_ID = "demo-claims-gw-aBcDeFgHiJ"
-GATEWAY_ARN = (
-    f"arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{GATEWAY_ID}"
-)
+GATEWAY_ARN = f"arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{GATEWAY_ID}"
 ENGINE_ID = "pe-1"
-ENGINE_ARN = (
-    "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/agpcedar_mcp_1_aaaaaaaaaa"
-)
+ENGINE_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/agpcedar_mcp_1_aaaaaaaaaa"
 
-# A realistic E7 inbound authorizer config — the thing we must NEVER strip.
 AUTHORIZER_CONFIG = {
     "customJWTAuthorizer": {
-        "discoveryUrl": (
-            "https://login.microsoftonline.com/tenant-x/v2.0/.well-known/openid-configuration"
-        ),
+        "discoveryUrl": ("https://login.microsoftonline.com/tenant-x/v2.0/.well-known/openid-configuration"),
         "allowedAudience": ["api://agp-mcp-mcp-rec-123", "app-client-guid"],
     }
 }
@@ -62,7 +52,7 @@ def _make_mcp(
     gateway_id: str | None = GATEWAY_ID,
     cedar_policy_engine_id: str | None = None,
     cedar_policy_engine_arn: str | None = None,
-    cedar_enforcement_mode: str = "none",
+    cedar_enforcement_mode: CedarEnforcementMode = "none",
 ) -> McpServer:
     now = datetime.now(timezone.utc)
     return McpServer(
@@ -84,7 +74,7 @@ def _make_mcp_with_tools(
     *,
     cedar_policy_engine_id: str | None = ENGINE_ID,
     cedar_policy_engine_arn: str | None = ENGINE_ARN,
-    cedar_enforcement_mode: str = "enforce",
+    cedar_enforcement_mode: CedarEnforcementMode = "enforce",
 ) -> McpServer:
     """An mcp whose ``available_tools`` carry typed input schemas — a ``transfer`` tool
     with a numeric ``amount`` param and a ``get_client`` tool with a string ``client_id``
@@ -138,12 +128,9 @@ def _cedar_control_client(
     if gateway_statuses is None:
         control.get_gateway.return_value = {**base, "status": "READY"}
     else:
-        control.get_gateway.side_effect = [
-            {**base, "status": s} for s in gateway_statuses
-        ]
+        control.get_gateway.side_effect = [{**base, "status": s} for s in gateway_statuses]
     control.update_gateway.return_value = {"status": "UPDATING"}
 
-    # Policy Engine surface.
     control.create_policy_engine.return_value = {
         "policyEngineId": ENGINE_ID,
         "policyEngineArn": ENGINE_ARN,
@@ -176,7 +163,6 @@ def _cedar_control_client(
     }
     control.delete_policy.return_value = {}
 
-    # Waiters: get_waiter(name).wait(...) is a no-op MagicMock by default.
     control.get_waiter.return_value = MagicMock(name="waiter")
     return control
 
@@ -200,9 +186,6 @@ def _instant_sleep(monkeypatch):
     monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
 
 
-# ===========================================================================
-# add_policy — first time: create engine → attach ENFORCE → create policy
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_add_policy_first_time_creates_engine_attaches_enforce_then_creates_policy():
     mcp = _make_mcp(cedar_policy_engine_id=None, cedar_enforcement_mode="none")
@@ -225,32 +208,24 @@ async def test_add_policy_first_time_creates_engine_attaches_enforce_then_create
     )
 
     order = [c[0] for c in manager.mock_calls]
-    # create_policy_engine before the engine waiter before the attach.
     assert order.index("create_policy_engine") < order.index("update_gateway")
-    # update_gateway (the attach) before create_policy.
     assert order.index("update_gateway") < order.index("create_policy")
-    # A get_waiter was requested for the engine BEFORE the attach.
     assert order.index("get_waiter") < order.index("update_gateway")
 
-    # The engine waiter was the policy_engine_active waiter on the engine id.
     control.get_waiter.assert_any_call("policy_engine_active")
 
-    # The attach update_gateway carried policyEngineConfiguration ENFORCE + replayed authorizer.
     _, kwargs = control.update_gateway.call_args
     assert kwargs["policyEngineConfiguration"] == {"arn": ENGINE_ARN, "mode": "ENFORCE"}
     assert kwargs["authorizerType"] == "CUSTOM_JWT"
     assert kwargs["authorizerConfiguration"] == AUTHORIZER_CONFIG
 
-    # create_policy got the generated Cedar text for the specific tool.
     _, cp_kwargs = control.create_policy.call_args
     assert cp_kwargs["policyEngineId"] == ENGINE_ID
     statement = cp_kwargs["definition"]["cedar"]["statement"]
     assert 'AgentCore::Action::"ClaimsTarget___get_claim"' in statement
 
-    # The policy_active waiter ran on (engine, policy).
     control.get_waiter.assert_any_call("policy_active")
 
-    # The returned friendly row.
     assert row["policy_id"] == "pol-1"
     assert row["tool"] == "ClaimsTarget___get_claim"
     assert row["user_oid"] == "eb3da"
@@ -271,7 +246,6 @@ async def test_create_policy_engine_client_token_passes_botocore_param_validatio
     registry = _registry_double()
     control = _cedar_control_client()
 
-    # Capture the kwargs the service hands to create_policy_engine.
     captured: dict = {}
 
     def _capture(**kwargs):
@@ -285,7 +259,6 @@ async def test_create_policy_engine_client_token_passes_botocore_param_validatio
     control.create_policy_engine.side_effect = _capture
 
     svc = _make_service(registry=registry, control=control)
-    # Run add_policy on a fresh-engine gateway mcp so _ensure_engine calls create_policy_engine.
     await svc.add_policy(
         mcp,
         principal_oid="eb3da",
@@ -293,12 +266,10 @@ async def test_create_policy_engine_client_token_passes_botocore_param_validatio
         tool_name="ClaimsTarget___get_claim",
     )
 
-    # Resolve the REAL create_policy_engine input shape from the installed model.
     model = botocore.session.get_session().get_service_model("bedrock-agentcore-control")
     shape = model.operation_model("CreatePolicyEngine").input_shape
     errors = ParamValidator().validate(captured, shape)
     assert not errors.has_errors(), errors.generate_report()
-    # And explicitly assert the clientToken length guard (the specific live failure).
     assert len(captured["clientToken"]) >= 33
 
 
@@ -310,17 +281,13 @@ async def test_add_policy_replays_authorizer_on_attach():
     read = control.get_gateway.return_value
 
     svc = _make_service(registry=registry, control=control)
-    await svc.add_policy(
-        mcp, principal_oid="eb3da", principal_label="lars@x", tool_name=None
-    )
+    await svc.add_policy(mcp, principal_oid="eb3da", principal_label="lars@x", tool_name=None)
 
     _, kwargs = control.update_gateway.call_args
     assert kwargs["authorizerType"] == read["authorizerType"]
     assert kwargs["authorizerConfiguration"] == read["authorizerConfiguration"]
-    # Optional fields replayed too (protocolType carries the create-time MCP config).
     assert kwargs["protocolType"] == read["protocolType"]
     assert kwargs["protocolConfiguration"] == read["protocolConfiguration"]
-    # gatewayIdentifier is the short id.
     assert kwargs["gatewayIdentifier"] == GATEWAY_ID
 
 
@@ -358,28 +325,22 @@ async def test_add_policy_all_tools_generates_action_unconstrained_cedar():
     control = _cedar_control_client()
 
     svc = _make_service(registry=registry, control=control)
-    await svc.add_policy(
-        mcp, principal_oid="eb3da", principal_label="lars@x", tool_name=None
-    )
+    await svc.add_policy(mcp, principal_oid="eb3da", principal_label="lars@x", tool_name=None)
 
     _, kwargs = control.create_policy.call_args
     statement = kwargs["definition"]["cedar"]["statement"]
     assert "AgentCore::Action::" not in statement
-    # A bare `action,` clause (all-tools).
     assert re.search(r"^\s*action,\s*$", statement, re.MULTILINE)
 
 
 @pytest.mark.asyncio
 async def test_add_policy_engine_name_sanitized():
-    # mcp.id with a hyphen → the engine name must conform to ^[A-Za-z][A-Za-z0-9_]*$.
     mcp = _make_mcp(mcp_id="mcp-123", cedar_policy_engine_id=None, cedar_enforcement_mode="none")
     registry = _registry_double()
     control = _cedar_control_client()
 
     svc = _make_service(registry=registry, control=control)
-    await svc.add_policy(
-        mcp, principal_oid="eb3da", principal_label="lars@x", tool_name="t1"
-    )
+    await svc.add_policy(mcp, principal_oid="eb3da", principal_label="lars@x", tool_name="t1")
 
     _, kwargs = control.create_policy_engine.call_args
     name = kwargs["name"]
@@ -394,9 +355,7 @@ async def test_add_policy_persists_engine_ids_and_mode():
     control = _cedar_control_client()
 
     svc = _make_service(registry=registry, control=control)
-    await svc.add_policy(
-        mcp, principal_oid="eb3da", principal_label="lars@x", tool_name="t1"
-    )
+    await svc.add_policy(mcp, principal_oid="eb3da", principal_label="lars@x", tool_name="t1")
 
     registry.persist_identity.assert_called()
     assert mcp.cedar_policy_engine_id == ENGINE_ID
@@ -404,9 +363,6 @@ async def test_add_policy_persists_engine_ids_and_mode():
     assert mcp.cedar_enforcement_mode == "enforce"
 
 
-# ===========================================================================
-# list_policies
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_list_policies_engine_unset_returns_empty():
     mcp = _make_mcp(cedar_policy_engine_id=None, cedar_enforcement_mode="none")
@@ -451,7 +407,7 @@ async def test_list_policies_fetches_get_policy_per_summary_and_parses():
 
 @pytest.mark.asyncio
 async def test_list_policies_foreign_policy_row_has_null_user():
-    foreign = 'permit(principal, action, resource);\n'
+    foreign = "permit(principal, action, resource);\n"
     mcp = _make_mcp(
         cedar_policy_engine_id=ENGINE_ID,
         cedar_policy_engine_arn=ENGINE_ARN,
@@ -493,16 +449,12 @@ async def test_list_policies_paginates():
     result = await svc.list_policies(mcp)
 
     assert control.list_policy_summaries.call_count == 2
-    # Second call carried the nextToken.
     _, kwargs = control.list_policy_summaries.call_args_list[1]
     assert kwargs["nextToken"] == "tok"
     assert len(result["policies"]) == 2
     assert {r["policy_id"] for r in result["policies"]} == {"pol-1", "pol-2"}
 
 
-# ===========================================================================
-# delete_policy
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_delete_policy_calls_delete_and_waiter():
     mcp = _make_mcp(
@@ -516,11 +468,8 @@ async def test_delete_policy_calls_delete_and_waiter():
     svc = _make_service(registry=registry, control=control)
     await svc.delete_policy(mcp, "pol-1")
 
-    control.delete_policy.assert_called_once_with(
-        policyEngineId=ENGINE_ID, policyId="pol-1"
-    )
+    control.delete_policy.assert_called_once_with(policyEngineId=ENGINE_ID, policyId="pol-1")
     control.get_waiter.assert_any_call("policy_deleted")
-    # Engine + attachment untouched.
     control.update_gateway.assert_not_called()
     control.delete_policy_engine.assert_not_called()
 
@@ -537,9 +486,6 @@ async def test_delete_policy_engine_unset_raises():
     control.delete_policy.assert_not_called()
 
 
-# ===========================================================================
-# set_enforcement
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_set_enforcement_enforce_attaches():
     mcp = _make_mcp(cedar_policy_engine_id=None, cedar_enforcement_mode="none")
@@ -569,7 +515,6 @@ async def test_set_enforcement_log_only_attaches_log_only():
     svc = _make_service(registry=registry, control=control)
     result = await svc.set_enforcement(mcp, "log_only")
 
-    # Engine already set → no create.
     control.create_policy_engine.assert_not_called()
     _, kwargs = control.update_gateway.call_args
     assert kwargs["policyEngineConfiguration"]["mode"] == "LOG_ONLY"
@@ -592,18 +537,47 @@ async def test_set_enforcement_disabled_detaches():
 
     control.update_gateway.assert_called()
     _, kwargs = control.update_gateway.call_args
-    # Detach: NO policyEngineConfiguration in the kwargs.
     assert "policyEngineConfiguration" not in kwargs
-    # But the authorizer is STILL replayed (the §3.1 hazard guard).
     assert kwargs["authorizerType"] == read["authorizerType"]
     assert kwargs["authorizerConfiguration"] == read["authorizerConfiguration"]
     assert result.cedar_enforcement_mode == "none"
-    # Engine survives (detach != delete).
     control.delete_policy_engine.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_set_enforcement_bad_mode_raises():
+@pytest.mark.parametrize(("mode", "start_mode"), [("enforce", "none"), ("disabled", "enforce")])
+async def test_attach_and_detach_keep_a_terraform_gateways_allowed_scopes(mode, start_mode):
+    """A repo-built gateway is born with ``allowedScopes=["Invoke"]`` (the gate that
+    403s app-only tokens). The full-replace PUT must carry it through on attach AND detach —
+    dropping it silently re-admits app-only tokens for the MCP audience."""
+    mcp = _make_mcp(
+        cedar_policy_engine_id=ENGINE_ID,
+        cedar_policy_engine_arn=ENGINE_ARN,
+        cedar_enforcement_mode=start_mode,
+    )
+    control = _cedar_control_client()
+    scoped = {
+        "customJWTAuthorizer": {
+            **AUTHORIZER_CONFIG["customJWTAuthorizer"],
+            "allowedScopes": ["Invoke"],
+        }
+    }
+    control.get_gateway.return_value = {
+        **control.get_gateway.return_value,
+        "authorizerConfiguration": scoped,
+    }
+
+    svc = _make_service(registry=_registry_double(), control=control)
+    await svc.set_enforcement(mcp, mode)
+
+    _, kwargs = control.update_gateway.call_args
+    assert kwargs["authorizerConfiguration"]["customJWTAuthorizer"]["allowedScopes"] == ["Invoke"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_cedar_error_detail_for_invalid_mode_carries_no_upstream_body():
+    """The only kind whose message is the detail: the service's own sentence, built before any
+    control-plane call, so no AWS text can reach it."""
     mcp = _make_mcp(
         cedar_policy_engine_id=ENGINE_ID,
         cedar_policy_engine_arn=ENGINE_ARN,
@@ -613,13 +587,14 @@ async def test_set_enforcement_bad_mode_raises():
     control = _cedar_control_client()
 
     svc = _make_service(registry=registry, control=control)
-    with pytest.raises(McpCedarError):
+    with pytest.raises(McpCedarError) as exc:
         await svc.set_enforcement(mcp, "bogus")
 
+    assert (exc.value.kind, exc.value.status_code) == ("invalid_mode", 400)
+    assert exc.value.detail == "unknown enforcement mode: bogus"
+    assert control.method_calls == []
 
-# ===========================================================================
-# ConflictException retry on attach
-# ===========================================================================
+
 @pytest.mark.asyncio
 async def test_conflict_exception_on_attach_is_retried():
     mcp = _make_mcp(
@@ -634,20 +609,15 @@ async def test_conflict_exception_on_attach_is_retried():
         {"Error": {"Code": "ConflictException", "Message": "gateway is UPDATING"}},
         "UpdateGateway",
     )
-    # First update_gateway raises ConflictException, then succeeds.
     control.update_gateway.side_effect = [conflict, {"status": "UPDATING"}]
 
     svc = _make_service(registry=registry, control=control)
     await svc.set_enforcement(mcp, "enforce")
 
     assert control.update_gateway.call_count >= 2
-    # Ultimately polled the gateway to READY (get_gateway called for the poll).
     assert control.get_gateway.called
 
 
-# ===========================================================================
-# E10: add_policy — effect + conditions threading + validation (BEFORE any AWS call)
-# ===========================================================================
 def _created_statement(control: MagicMock) -> str:
     """The Cedar statement the service handed to create_policy."""
     _, kwargs = control.create_policy.call_args
@@ -744,7 +714,6 @@ async def test_add_policy_allow_without_user_raises_cedar_error():
             tool_name="transfer",
             effect="allow",
         )
-    # No AWS call happened — validation runs before ensure/attach/create.
     control.create_policy.assert_not_called()
     control.create_policy_engine.assert_not_called()
     control.update_gateway.assert_not_called()
@@ -795,7 +764,6 @@ async def test_add_policy_type_mismatch_raises_cedar_error():
 
     svc = _make_service(registry=registry, control=control)
     with pytest.raises(McpCedarError):
-        # `<` is illegal on the string client_id param.
         await svc.add_policy(
             mcp,
             principal_oid="eb3da",
@@ -808,7 +776,6 @@ async def test_add_policy_type_mismatch_raises_cedar_error():
 
 @pytest.mark.asyncio
 async def test_add_policy_no_conditions_still_works():
-    # The E8 path: effect defaulted, no conditions → unchanged behavior.
     mcp = _make_mcp_with_tools()
     registry = _registry_double()
     control = _cedar_control_client()
@@ -878,24 +845,19 @@ async def test_list_policies_foreign_row_detects_effect():
     assert row["user_oid"] is None
 
 
-# ===========================================================================
-# E32: _ensure_engine adopts a gateway's PRE-ATTACHED policy engine
-# ===========================================================================
-ADOPTED_ARN = (
-    "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/agp_cedar_OLDID-abc"
-)
+ADOPTED_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/agp_cedar_OLDID-abc"
 
 
 def test_ensure_engine_adopts_preattached_engine():
-    """A gateway that already has a policy engine is ADOPTED, never duplicated (E32).
+    """A gateway that already has a policy engine is ADOPTED, never duplicated.
 
-    Regression guard for the E32 re-registration: the new record's envelope has NO
+    Regression guard for re-registration: the new record's envelope has NO
     cedar_policy_engine_id, but the live gateway still has its engine attached (gateways
     and policy engines stayed in the bedrock-agentcore namespace — only Registry moved).
     Creating a second engine here silently orphans the first one and every policy in it.
 
     The adopted engine NAME keeps the OLD record id (``agp_cedar_OLDID-abc``) — accepted
-    drift (spec D8). Renaming would churn live ENFORCE-mode enforcement for cosmetics, so
+    drift. Renaming would churn live ENFORCE-mode enforcement for cosmetics, so
     the id is taken verbatim from the ARN tail.
 
     NOT an ``@pytest.mark.asyncio`` test: ``_ensure_engine`` is one of the private SYNC
@@ -915,8 +877,6 @@ def test_ensure_engine_adopts_preattached_engine():
     control.create_policy_engine.assert_not_called()
     assert mcp.cedar_policy_engine_arn == ADOPTED_ARN
     assert mcp.cedar_policy_engine_id == "agp_cedar_OLDID-abc"
-    # The spread preserved the E7 inbound authorizer on the replayable base dict — the
-    # adoption probe is a pure READ and must never disturb it (research §3.1).
     assert control.get_gateway.return_value["authorizerConfiguration"] == AUTHORIZER_CONFIG
 
 
@@ -924,7 +884,7 @@ def _control_reporting_engine(mode: str) -> MagicMock:
     """A control client whose ``get_gateway`` reports an already-attached engine in ``mode``.
 
     The base dict is SPREAD, not replaced: it carries ``authorizerType`` /
-    ``authorizerConfiguration``, and the adoption probe must never strip the E7 inbound gate
+    ``authorizerConfiguration``, and the adoption probe must never strip the inbound gate
     (guarded by ``test_ensure_engine_adopts_preattached_engine``).
     """
     control = _cedar_control_client()
@@ -965,7 +925,6 @@ def test_ensure_engine_adopting_log_only_gateway_does_not_escalate_to_enforce():
 
     assert mcp.cedar_enforcement_mode == "log_only"
     assert mcp.cedar_enforcement_mode != "enforce"
-    # The E7 inbound authorizer survived the probe (pure READ — research §3.1).
     assert control.get_gateway.return_value["authorizerConfiguration"] == AUTHORIZER_CONFIG
 
 
@@ -1024,7 +983,6 @@ async def test_add_policy_on_reregistered_mcp_persists_the_adopted_engine_id():
     )
 
     assert persisted_engine_ids == [ADOPTED_ARN.rsplit("/", 1)[-1]]
-    # Adoption, not duplication — and the ENFORCE attach never fires (mode was adopted).
     control.create_policy_engine.assert_not_called()
     control.update_gateway.assert_not_called()
 
@@ -1090,17 +1048,6 @@ def test_adopting_unrecognised_mode_keeps_an_ALREADY_RECORDED_mode_untouched():
     control.create_policy_engine.assert_not_called()
 
 
-# ===========================================================================
-# E36/T16 — delete_policy_engine: the teardown twin of _ensure_engine's create.
-#
-# `DELETE /mcp-servers/{id}` used to delete the registry record only, leaving the LIVE
-# gateway attached to an ENFORCE-mode policy engine nothing pointed at any more (research
-# item 5A). These pin the shapes the delete cascade needs: detach-then-delete with the E7
-# authorizer REPLAYED, ONLY ever an engine the RECORD names (fix round 1 — `gateway_arn` is
-# caller-settable, so adopting the live gateway's engine and deleting it was a wrong-target
-# delete), already-gone == success, and "the engine still goes even if the gateway does not
-# answer".
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_delete_policy_engine_detaches_then_deletes():
     mcp = _make_mcp(
@@ -1110,8 +1057,6 @@ async def test_delete_policy_engine_detaches_then_deletes():
     )
     registry = _registry_double()
     control = _cedar_control_client()
-    # The live gateway CARRIES this record's engine — the only shape that earns a detach
-    # (E36/T16 fix round 2); `_replay_kwargs` still omits it, which IS the detach.
     control.get_gateway.return_value = {
         **control.get_gateway.return_value,
         "policyEngineConfiguration": {"arn": ENGINE_ARN, "mode": "ENFORCE"},
@@ -1124,13 +1069,10 @@ async def test_delete_policy_engine_detaches_then_deletes():
     svc = _make_service(registry=registry, control=control)
     await svc.delete_policy_engine(mcp)
 
-    # DETACH first (the full-replace PUT that OMITS policyEngineConfiguration), engine
-    # delete second — an attached engine must never be deleted out from under a gateway.
     assert [c[0] for c in manager.mock_calls] == ["update_gateway", "delete_policy_engine"]
 
     kwargs = control.update_gateway.call_args.kwargs
     assert "policyEngineConfiguration" not in kwargs
-    # The load-bearing security property: the E7 inbound gate is replayed verbatim.
     assert kwargs["authorizerType"] == "CUSTOM_JWT"
     assert kwargs["authorizerConfiguration"] == AUTHORIZER_CONFIG
 
@@ -1161,7 +1103,7 @@ async def test_delete_policy_engine_noop_when_no_engine_anywhere():
 
 @pytest.mark.asyncio
 async def test_delete_policy_engine_never_deletes_an_engine_the_record_does_not_own():
-    """The teardown deletes ONLY an engine id stored ON THE RECORD (E36/T16 fix round 1).
+    """The teardown deletes ONLY an engine id stored ON THE RECORD.
 
     `gateway_id` descends from `gateway_arn`, a CALLER-SETTABLE field, so the engine a LIVE
     gateway reports is not provably this record's — and a policy-engine delete is irreversible,
@@ -1186,33 +1128,27 @@ async def test_delete_policy_engine_never_deletes_an_engine_the_record_does_not_
 
     control.delete_policy_engine.assert_not_called()
     control.update_gateway.assert_not_called()
-    # The skip REASON the route turns into a `skipped` line-item — never a false `deleted`.
     assert note == "engine not owned by this record"
-    # ...and the record was not mutated into looking like the owner either.
     assert not mcp.cedar_policy_engine_id
 
 
 @pytest.mark.asyncio
 async def test_delete_policy_engine_never_detaches_an_engine_the_record_does_not_own():
-    """The DETACH is ownership-guarded too (E36/T16 fix round 2).
+    """The DETACH is ownership-guarded too.
 
-    Round 1 stopped the wrong-target DELETE but still detached whatever gateway `gateway_id`
-    named whenever the record DID carry an engine id — and a detach is a full-replace
-    `update_gateway` that omits `policyEngineConfiguration`, i.e. it strips Cedar (and its
-    default-deny) from that gateway. `gateway_id` descends from the caller-settable
-    `gateway_arn`, so a record legitimately owning engine E but repointed at another team's
-    gateway G2 could still strip G2's engine. So: a live gateway reporting a DIFFERENT engine
-    ⇒ zero `update_gateway`, while the record's OWN engine is still deleted (round 1's
-    only-own-engine semantics are unchanged)."""
+    A detach is a full-replace `update_gateway` that omits `policyEngineConfiguration`, i.e. it
+    strips Cedar (and its default-deny) from whatever gateway `gateway_id` names, and
+    `gateway_id` descends from the caller-settable `gateway_arn`, so a record legitimately
+    owning engine E but repointed at another team's gateway G2 could otherwise strip G2's
+    engine. So: a live gateway reporting a DIFFERENT engine ⇒ zero `update_gateway`, while the
+    record's OWN engine is still deleted."""
     mcp = _make_mcp(
         cedar_policy_engine_id=ENGINE_ID,
         cedar_policy_engine_arn=ENGINE_ARN,
         cedar_enforcement_mode="enforce",
     )
     control = _cedar_control_client()
-    other_engine_arn = (
-        "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/agpcedar_other_team"
-    )
+    other_engine_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/agpcedar_other_team"
     control.get_gateway.return_value = {
         **control.get_gateway.return_value,
         "policyEngineConfiguration": {"arn": other_engine_arn, "mode": "ENFORCE"},
@@ -1221,9 +1157,7 @@ async def test_delete_policy_engine_never_detaches_an_engine_the_record_does_not
     svc = _make_service(registry=_registry_double(), control=control)
     assert await svc.delete_policy_engine(mcp) is None
 
-    # Another team's Cedar gate is left attached...
     control.update_gateway.assert_not_called()
-    # ...and only the engine this record names is deleted.
     control.delete_policy_engine.assert_called_once_with(policyEngineId=ENGINE_ID)
 
 
@@ -1257,7 +1191,6 @@ async def test_delete_policy_engine_idempotent_on_already_gone():
     )
 
     svc = _make_service(registry=_registry_double(), control=control)
-    # Already gone IS the desired end state — no raise.
     await svc.delete_policy_engine(mcp)
 
     control.delete_policy_engine.assert_called_once_with(policyEngineId=ENGINE_ID)

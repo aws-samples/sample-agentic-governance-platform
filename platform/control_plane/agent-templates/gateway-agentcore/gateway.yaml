@@ -1,0 +1,32 @@
+# The MCP server. This file + the OpenAPI spec it names ARE the deploy artifact.
+#
+# There is no code here: the platform's Terraform module reads this file (`yamldecode(file(...))`)
+# and builds an AgentCore Gateway whose tools are the operations of your OpenAPI spec. Push to
+# the trunk and the gateway is created or updated. The KEY NAMES are a contract; extra keys are
+# ignored.
+
+# Shown on the MCP card and the gateway. Max 100 characters.
+description: Claims API as governed MCP tools
+
+# Path to the OpenAPI spec (JSON or YAML), relative to the repo root. Every operation with an
+# operationId becomes one MCP tool. Set the spec's servers[0].url to your real API first — the
+# deploy refuses the template placeholder.
+openapi_spec: openapi.yaml
+
+# How the gateway authenticates to YOUR API: api_key (default when absent) or none (a public
+# API — no credential is sent and the api_key block below is ignored).
+auth: api_key
+
+# The API key (auth: api_key). The key itself never enters this repo or the
+# platform's Terraform state: put it in a Secrets Manager secret (platform account, same region)
+# NAMED agp-mcp/<your MCP server name>/... — the gateway can read only that namespace, and the
+# deploy refuses any other ARN.
+api_key:
+  secret_arn: ""          # REQUIRED: full ARN incl. 6-char suffix, e.g. ...:secret:agp-mcp/<mcp_name>/api-key-AbCdEf
+  json_key: api_key       # the JSON field inside the secret's value
+  location: HEADER        # HEADER | QUERY_PARAMETER
+  parameter_name: x-api-key
+  prefix: ""              # optional, e.g. "Bearer "
+
+# Optional MCP server instructions shown to calling agents.
+instructions: ""

@@ -1,32 +1,28 @@
-"""Governance-graph read-models (Epic 11, Task 3).
+"""Governance-graph read models backing ``GET /governance-graph`` and the lazy
+``GET /governance-graph/principals/{oid}`` Entra lookup.
 
-Plain read-DTOs backing the read-only `GET /governance-graph` aggregation
-endpoint + the lazy `GET /governance-graph/principals/{oid}` Entra lookup. Unlike
-the registry models (`agent.py`, `mcp_server.py`), these carry NO envelope
-(de)serialization — the aggregation service composes them from already-hydrated
-registry + Graph reads. The shapes follow the Epic 11 governance-graph plan's "Backend
-wire contract" + "Pydantic models" blocks.
-
-Mutable-default note: the plain literals `metadata: dict = {}` / `group_names:
-list[str] = []` are safe and idiomatic in Pydantic v2 — it deep-copies defaults
-per instance (verified by tests/test_governance_graph_model.py), so two instances
-never share the same default object. Pinned verbatim from the plan contract.
+Plain read DTOs: unlike the registry models they carry no envelope (de)serialization; the aggregation
+service composes them from already-hydrated registry and Graph reads. The bare ``= {}`` and ``= []``
+defaults are safe in pydantic v2, which deep-copies a default per instance;
+``tests/test_governance_graph_model.py`` pins the isolation.
 """
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import Field
+
+from models.base import WireModel
 
 
-class GraphNode(BaseModel):
+class GraphNode(WireModel):
     type: Literal["user", "group", "agent", "mcp"]
-    id: str            # "<type>:<entity-id>"
+    id: str = Field(description="<type>:<entity-id>")
     label: str
-    ref_id: str        # bare entity id for detail links
-    metadata: dict = {}   # type-specific; see wire contract
+    ref_id: str = Field(description="The bare entity id, for detail links")
+    metadata: dict = Field(default={}, description="Type-specific")
 
 
-class GraphEdge(BaseModel):
+class GraphEdge(WireModel):
     id: str
     source: str
     target: str
@@ -35,16 +31,16 @@ class GraphEdge(BaseModel):
     has_policy: bool = False
 
 
-class GovernanceGraph(BaseModel):
+class GovernanceGraph(WireModel):
     nodes: list[GraphNode]
     edges: list[GraphEdge]
 
 
-class PrincipalDetail(BaseModel):
+class PrincipalDetail(WireModel):
     id: str
     display_name: str
     kind: Literal["user", "group"]
     user_principal_name: Optional[str] = None
     mail: Optional[str] = None
     job_title: Optional[str] = None
-    group_names: list[str] = []
+    group_names: list[str] = Field(default_factory=list)

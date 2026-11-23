@@ -1,20 +1,6 @@
-// Pure helper for the GitHub App Manifest callback landing (Epic 20 / U4).
-// Extracted from ConnectionCallback.tsx so the load-bearing CSRF-echo logic is
-// unit-testable under vitest (node env, no jsdom — the component itself can't be
-// rendered in a collected `*.test.ts`).
-
-/** localStorage key the AddConnectionModal (U3) writes the CSRF state to before opening GitHub
- *  in a new tab. localStorage (not sessionStorage) so the state is visible in the new tab where
- *  this callback lands. */
+/** Written to localStorage by the add-connection modal before GitHub opens in a new tab; sessionStorage is per tab, so the callback could not read it. */
 export const AGP_MANIFEST_STATE_KEY = 'agp_manifest_state';
 
-/**
- * Validate the `?code=&state=` GitHub returns against the CSRF state we stored
- * in localStorage before the manifest handshake. Returns the pair on success,
- * or an `{ error }` describing the first failure (missing code/state, no stored
- * state, or a state mismatch). Never calls the backend — a mismatch means the
- * caller must NOT convert the (single-use) code.
- */
 export function resolveCallbackParams(
   search: URLSearchParams | string,
   sessionState: string | null,

@@ -1,64 +1,43 @@
-"""Agent Registry service — AWS Agent Registry-backed CRUD + lifecycle (Epic 4, Task 2).
+"""AWS Agent Registry-backed CRUD and lifecycle for agents.
 
-Wraps one boto3 client behind a store-agnostic interface (research §6):
-  - ``agent-registry-control`` (``self._ctl``) — CRUD + lifecycle (registry records)
-
-E32: the Registry moved off the ``bedrock-agentcore`` namespace onto its own
-``agent-registry`` one (AWS, 2026-08-06; the old namespace shuts down 2026-09-17 and brand-new
-accounts cannot use it at all). Only the Registry moved — Identity, Gateway, and Policy (the
-``agent_identity_service`` / ``agent_credential_service`` / ``mcp_identity_service`` /
-``mcp_cedar_service`` clients) all stay on ``bedrock-agentcore``. The move also dropped the
-reserved data-plane client this service used to hold but never called: the new namespace's data
-plane is a different API surface (``SearchDiscoverableRegistryRecords``), so it will be wired
-deliberately if/when discovery is actually needed, not carried as dead state.
-
-One AWS Agent Registry holds one **Custom record per agent**. The governance model
-is serialized into the record's ``descriptors.custom.data`` JSON (the
-"envelope", research §4) — built/parsed via ``Agent.to_envelope()`` /
-``Agent.from_record()``. ``lifecycle_state`` is derived from the native ``status``
-(research §5) and never stored in the envelope.
-
-Mirrors ``services.operating_model_service`` structure: module logger,
-``NameTakenError``, config-injected constructor, ``create/get/list/update/delete``
-returning ``Optional[...]``, read-modify-write ``update``. No FastAPI/HTTP concerns
-live here (those are in the T3 routes).
+One registry holds one CUSTOM record per agent; the governance model is serialized into the
+record's ``descriptors.custom.data`` JSON (``Agent.to_envelope()`` / ``Agent.from_record()``),
+and ``lifecycle_state`` derives from the native ``status``. The registry lives on the
+``agent-registry`` namespace; Identity, Gateway and Policy stay on ``bedrock-agentcore``. Every
+registry call goes through ``services.registry_writer.RegistryWriter``. No HTTP vocabulary here:
+the errors are ``core.errors.AppError`` tables.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import ClassVar, List, Optional
 
-import boto3
 from botocore.exceptions import ClientError
 from pydantic import ValidationError
 
-from core.registry_resolver import RegistryNotConfiguredError, resolve_registry_id
+from core.errors import AppError, Outcome
 from models.agent import (
     TRANSITION_TO_STATUS,
     Agent,
     AgentCreate,
     AgentUpdate,
-    IdentityStatus, LifecycleState,
+    IdentityStatus,
+    LifecycleState,
     Platform,
     lifecycle_for_status,
 )
 from models.marketplace import MarketplacePublication
+from services.registry_writer import RecordContent, RegistryWriter, stable_status
 
 logger = logging.getLogger(__name__)
 
-# Registry record constants (single-source so a future bump is one edit).
-_RECORD_TYPE_AGENT = "CUSTOM"  # agents are CUSTOM records (E32: recordType, not descriptorType)
-_RECORD_VERSION = "1.0.0"
+_RECORD_TYPE_AGENT = "CUSTOM"
 
-# Native registry status used as a server-side ListRegistryRecords filter for a
-# given LifecycleState, ONLY where the mapping is 1:1 (PROPOSED also covers the
-# transient CREATING/*_FAILED states, so we omit a server filter for it and
-# filter client-side instead). Everything else stays client-side too — see list().
 _LIFECYCLE_TO_STATUS: dict[LifecycleState, str] = {
     LifecycleState.PENDING_APPROVAL: "PENDING_APPROVAL",
     LifecycleState.APPROVED: "APPROVED",
@@ -68,14 +47,9 @@ _LIFECYCLE_TO_STATUS: dict[LifecycleState, str] = {
 
 
 def apply_creator_sponsor(create: AgentCreate, principal) -> AgentCreate:
-    """The creator sponsors by default: back-fill ``sponsor_*`` from ``principal``.
-
-    Sets ``sponsor_email``/``sponsor_oid`` from ``principal.email``/``principal.oid``
-    ONLY when the create payload leaves them blank; an explicitly-supplied sponsor is
-    left untouched. Pure, no I/O — mutates and returns the same ``AgentCreate`` so both
-    the ``POST /agents`` route and the repo-creation path (``project_service.add_repo``)
-    can share one owner-defaulting rule and avoid "ownerless" agents (research §4).
-    ``principal`` is any object exposing ``.oid`` / ``.email`` (``core.rbac.Principal``).
+    """The creator sponsors by default: fill ``sponsor_email`` / ``sponsor_oid`` from ``principal``
+    when the create payload leaves them blank. Pure; shared by ``POST /agents`` and
+    ``ProjectService.add_repo`` so both flows default the owner identically.
     """
     if not create.sponsor_email:
         create.sponsor_email = principal.email
@@ -84,101 +58,92 @@ def apply_creator_sponsor(create: AgentCreate, principal) -> AgentCreate:
     return create
 
 
-def _wrap_update_description(text: str) -> dict:
-    """Wrap a record ``description`` in the UpdateRegistryRecord PATCH envelope.
+def _record_content(agent: Agent) -> RecordContent:
+    """The record's governed content: ``description`` falls back to the name because the registry
+    requires one character."""
+    return RecordContent(
+        name=agent.name,
+        description=agent.purpose or agent.name,
+        descriptors={"custom": {"data": json.dumps(agent.to_envelope())}},
+    )
 
-    ``UpdateRegistryRecord`` is a PATCH-style API: its mutable fields are wrapped in
-    an ``{"optionalValue": ...}`` envelope, unlike the FLAT ``CreateRegistryRecord``
-    shape. On Create, ``description`` is a plain string; on Update it is
-    ``{"optionalValue": <str>}``. (Confirmed against the agent-registry-control
-    botocore model — see test_registry_update_param_shape.)
+
+class NameTakenError(AppError):
+    """A registry record with the requested name already exists.
+
+    The message names the requested name and nothing else; the registry's response never
+    reaches it. The pre-check is racy (the AWS Agent Registry has no conditional put), so two
+    concurrent creates can both pass it.
     """
-    return {"optionalValue": text}
+
+    domain: ClassVar[str] = "agent"
+    kinds: ClassVar[Mapping[str, Outcome]] = {"name_taken": Outcome(409, None)}
 
 
-def _wrap_update_display_name(text: str) -> dict:
-    """Wrap a record ``displayName`` in the UpdateRegistryRecord PATCH envelope.
+class AgentNotFoundError(AppError):
+    """An agent id resolves to no record, or to one the caller's tenant does not see.
 
-    Must be sent on EVERY update that touches the name, because ``Agent.from_record``
-    PREFERS ``displayName`` over ``name``: patching ``name`` alone leaves the registry
-    holding the old ``displayName``, so a rename returns 200 with the new name and then
-    silently reverts on the very next read, in both the list and detail views.
-
-    Exactly ONE level of wrapping — ``UpdateRegistryRecord.displayName`` is an
-    ``UpdatedDisplayName`` structure whose only member is ``optionalValue``, the same
-    shape as ``description`` and NOT the three levels ``descriptors`` needs. (Confirmed
-    against the agent-registry-control botocore model — see
-    test_registry_update_param_shape.) Note the sibling ``name`` on the same call stays a
-    PLAIN string: it is shape ``RegistryRecordName``, unwrapped.
+    The CRUD methods return ``Optional[Agent]`` and the agents routes raise this for a
+    caller-supplied id, so a missing and a foreign agent answer the same 404.
+    ``persist_marketplace`` raises it too, because its caller is a service holding a decision it
+    is about to persist: a silent ``None`` would let an approve mark a publish request APPROVED
+    while the registry write never landed. The detail is fixed; the message names the id.
     """
-    return {"optionalValue": text}
+
+    domain: ClassVar[str] = "agent"
+    kinds: ClassVar[Mapping[str, Outcome]] = {"not_found": Outcome(404, "Agent not found")}
 
 
-def _wrap_update_descriptors_custom(inline_content: str) -> dict:
-    """Wrap a CUSTOM descriptor's ``data`` blob in the UpdateRegistryRecord envelope.
-
-    On Create the CUSTOM descriptor is the flat ``{"custom": {"data": ...}}``; on Update
-    EVERY level gets its own ``{"optionalValue": ...}`` wrapper — ``descriptors``, then
-    ``custom``, then ``data`` itself — so the blob sits three levels deep.
-
-    E32 note, because this is the easy thing to get wrong: the PATCH-envelope *idea*
-    survived the namespace move, but the depth did NOT. On the old
-    ``bedrock-agentcore-control`` model the leaf was a bare string
-    (``{"custom": {"optionalValue": {"inlineContent": <str>}}}``); on
-    ``agent-registry-control`` the renamed ``data`` leaf is itself an ``UpdatedDescriptorData``
-    STRUCTURE, so it needs one more ``optionalValue``. Sending the old two-level shape fails
-    param validation with "Invalid type for parameter ...custom.optionalValue.data, valid
-    types: dict". (Confirmed against the botocore model — see test_registry_update_param_shape.)
+class AgentRequestError(AppError):
+    """An agent write the agents routes refuse; every kind has a fixed detail.
+    ``platform_tenant_mismatch``: a governable platform label contradicts the tenant's platform.
+    ``not_governed``: a reprovision of an agent with no runtime to bind.
     """
-    return {
-        "optionalValue": {
-            "custom": {"optionalValue": {"data": {"optionalValue": inline_content}}}
-        }
+
+    domain: ClassVar[str] = "agent"
+    kinds: ClassVar[Mapping[str, Outcome]] = {
+        "platform_tenant_mismatch": Outcome(409, "agent platform does not match the tenant's platform"),
+        "not_governed": Outcome(409, "not a governed agent"),
     }
 
 
-class NameTakenError(Exception):
-    """Raised when a registry record with the same name already exists.
+class MalformedAgentRecordError(AppError, ValueError):
+    """A CUSTOM registry record lacks a well-formed governance envelope.
 
-    Note: the underlying check is a *racy* pre-check (research §7) — the AWS Agent
-    Registry has no conditional-put on CreateRegistryRecord. Two concurrent creates
-    could both pass the pre-check. Acceptable for the prototype.
+    The ``descriptors.custom.data`` blob is missing, is not JSON, or holds a structurally
+    invalid sub-model. ``get()`` raises it; ``list()`` skips the record and warns, so one bad
+    record cannot abort the whole fan-out. The one kind has a fixed detail for a route that lets
+    it escape; the message, which quotes the parse error, is for the log. Also a ``ValueError``,
+    because the build-start path maps every ``ValueError`` from its registry read to its own
+    ``build_failed`` outcome.
     """
 
+    domain: ClassVar[str] = "agent"
+    kinds: ClassVar[Mapping[str, Outcome]] = {
+        "malformed_record": Outcome(502, "the agent's registry record could not be read"),
+    }
 
-class AgentNotFoundError(Exception):
-    """Raised when a write targets an agent id that no longer resolves to a record.
 
-    The CRUD methods here return ``Optional[Agent]`` and let the route map a ``None`` to a
-    404, which is right for a caller-supplied id. ``persist_marketplace`` raises instead,
-    because its caller is a SERVICE holding a decision it is about to persist: a silent
-    ``None`` there would let an approve mark a publish request APPROVED while the registry
-    write never landed. An exception forces that path to fail loudly and keep the request
-    retryable.
+class IllegalTransitionError(AppError):
+    """A lifecycle transition was refused.
+
+    ``illegal_transition``: the AWS Agent Registry rejected the status edge (``DRAFT ->
+    APPROVED`` needs a submit first); the message is composed here from the validated action,
+    never from the registry's response, which is logged instead. ``unknown_action``: the action
+    is not one of ``TRANSITION_TO_STATUS``; the message echoes the caller's own action and the
+    valid ones. ``missing_reason``: the registry requires a non-empty ``statusReason``; fixed
+    detail.
     """
 
+    domain: ClassVar[str] = "agent"
+    kinds: ClassVar[Mapping[str, Outcome]] = {
+        "illegal_transition": Outcome(409, None),
+        "unknown_action": Outcome(400, None),
+        "missing_reason": Outcome(400, "A non-empty reason is required for a status transition"),
+    }
 
-class MalformedAgentRecordError(ValueError):
-    """Raised when a CUSTOM registry record lacks a well-formed governance envelope.
-
-    A record could be missing the ``descriptors.custom.data`` blob or carry
-    non-JSON content (e.g. written by another tool, or a partially-synced Preview
-    record). ``get()`` surfaces this loudly; ``list()`` skips-and-warns so one bad
-    record can't abort the whole fan-out / demo list view.
-    """
-
-
-class IllegalTransitionError(ValueError):
-    """Raised when a requested lifecycle transition is an illegal status edge.
-
-    The AWS Agent Registry enforces legal status edges (research §5): e.g.
-    ``DRAFT -> APPROVED`` is rejected with a ``ValidationException`` — a record
-    must first be submitted (``-> PENDING_APPROVAL``) before it can be approved.
-    ``transition()`` maps that AWS error to this domain error so the route layer
-    can return a clean 4xx (409) carrying the AWS message, rather than letting a
-    raw ``ValidationException`` surface as a 500. Subclasses ``ValueError`` so a
-    route that only maps ``ValueError`` still returns a client error.
-    """
+    def __init__(self, message: str, kind: str = "illegal_transition") -> None:
+        super().__init__(message, kind)
 
 
 def _is_not_found(err: ClientError) -> bool:
@@ -191,194 +156,47 @@ class AgentRegistryService:
     def __init__(
         self,
         registry_id: str = "",
-        region: str = "us-east-1",
+        region: str | None = None,
         control_client=None,
         registry_name: str = "",
     ):
-        """Accept the registry NAME, the registry ID, or both.
-
-        ``registry_name`` is the normal production path (E32 follow-up): AWS mints the
-        registryId and it cannot be chosen, so Terraform could only hand it over through a
-        capture file it read during the PLAN walk — before the provisioner that writes it had
-        run — which is what forced a from-zero deploy to `terraform apply` TWICE. The NAME is
-        a static config value everyone knows at plan time, and name -> id is one
-        ``ListRegistries`` call, so the backend resolves it itself. See
-        ``core.registry_resolver`` for the full rationale, including why a duplicate name is
-        a hard error.
-
-        ``registry_id`` stays supported as an explicit OVERRIDE that short-circuits
-        resolution entirely (no AWS call), because six operational scripts pass ids directly
-        and the ``AGENT_REGISTRY_ID`` setting must keep working. It is now OPTIONAL rather
-        than required — passing neither is a configuration error reported on first use, not a
-        silent empty ``registryId`` on every call.
+        """``registry_name`` is the normal path, resolved to the id on first use; ``registry_id`` is an
+        explicit override that skips the lookup. Passing neither is a configuration error reported on
+        first use. ``control_client`` reaches the writer, which obtains one when it is None.
         """
-        # NOT `self.registry_id` — that name is now a lazily-resolving property, so the
-        # supplied value (which may be empty) is held privately and doubles as the resolution
-        # cache. Everything inside this class keeps reading `self.registry_id`.
-        self._registry_id = registry_id or ""
-        self.registry_name = registry_name
-        self.region = region
-        # Injectable for tests (research §10 — MagicMock, not moto).
-        self._ctl = control_client or boto3.client(
-            "agent-registry-control", region_name=region
+        self._writer = RegistryWriter(
+            region=region,
+            registry_id=registry_id,
+            registry_name=registry_name,
+            kind="agent",
+            control_client=control_client,
         )
 
     @property
     def registry_id(self) -> str:
-        """The registryId, resolved from ``registry_name`` on FIRST USE and memoised.
-
-        Lazy and instance-memoised, deliberately:
-
-        * NOT at import time and NOT in ``Settings()`` — importing a module must stay
-          side-effect-free (``tests/test_api_properties.py`` bypasses ``src/__init__.py``
-          specifically to avoid triggering ``Settings()`` validation, and that property is
-          worth preserving). The route-level ``get_service()`` singletons are lazy too, so
-          the first resolution happens on the first request that actually needs the registry.
-        * A FAILURE IS NEVER CACHED. Only a successful lookup writes ``_registry_id``, so a
-          transient AWS error (expired credentials, throttling, a brief control-plane 5xx)
-          does not poison this singleton for the lifetime of the process — the next call
-          retries. Caching the failure would turn a 30-second outage into "restart the ECS
-          task", which is the kind of fix nobody finds from the symptom.
-
-        No lock: resolution is an idempotent read, so two threads racing here converge on the
-        same value and the only cost is one redundant ``ListRegistries`` call.
-        """
-        if self._registry_id:
-            return self._registry_id
-        if not self.registry_name:
-            raise RegistryNotConfiguredError(
-                "AgentRegistryService was constructed with neither a registry id nor a "
-                "registry name, so it cannot address a registry. Set AGENT_REGISTRY_NAME "
-                "(the normal path — the id is then resolved by name) or AGENT_REGISTRY_ID "
-                "(an explicit override)."
-            )
-        self._registry_id = resolve_registry_id(
-            self.registry_name, self.region, ctl=self._ctl
-        )
-        logger.info(
-            "resolved agent registry %r -> %s (region %s)",
-            self.registry_name,
-            self._registry_id,
-            self.region,
-        )
-        return self._registry_id
-
-    # --- helpers -----------------------------------------------------------
-
-    @staticmethod
-    def _record_id_from_arn(record_arn: str) -> str:
-        """Parse the recordId from a recordArn (CreateRegistryRecord output has no
-        recordId — research §6). ARN tail is ``.../record/{recordId}``."""
-        return record_arn.rsplit("/", 1)[-1]
-
-    def _name_exists(self, name: str) -> bool:
-        """Racy name pre-check via the structured ``name`` filter (research §7).
-
-        E32: ListRegistryRecords is now POST-shaped — the discrete ``name`` /
-        ``descriptorType`` / ``status`` query params were replaced by one structured
-        ``filters=[{"name": ..., "values": [...]}]`` list.
-        """
-        resp = self._ctl.list_registry_records(
-            registryId=self.registry_id,
-            filters=[{"name": "name", "values": [name]}],
-        )
-        return bool(resp.get("registryRecords"))
-
-    def _iter_record_summaries(self, *, status: Optional[str] = None):
-        """Paginate ListRegistryRecords (research §6). List items omit descriptors.
-
-        E32: filtering moved from discrete query params to one structured ``filters``
-        list (see ``_name_exists``).
-        """
-        kwargs = {
-            "registryId": self.registry_id,
-            "maxResults": 100,
-            "filters": [{"name": "recordType", "values": [_RECORD_TYPE_AGENT]}],
-        }
-        if status:
-            kwargs["filters"] = kwargs["filters"] + [{"name": "status", "values": [status]}]
-        while True:
-            page = self._ctl.list_registry_records(**kwargs)
-            for summary in page.get("registryRecords", []):
-                yield summary
-            token = page.get("nextToken")
-            if not token:
-                break
-            kwargs["nextToken"] = token
+        return self._writer.registry_id
 
     def _hydrate(self, record_id: str) -> Optional[Agent]:
-        """GetRegistryRecord + parse the envelope into an Agent. None if not found.
-
-        Raises MalformedAgentRecordError if the record exists but its CUSTOM
-        envelope is missing/non-JSON, or holds a structurally invalid sub-model.
+        """``GetRegistryRecord`` parsed into an ``Agent``; None when not found. A missing or non-JSON
+        envelope and a structurally invalid sub-model both raise ``MalformedAgentRecordError``,
+        translated here rather than in ``models.agent`` because that import edge would be a cycle.
         """
-        try:
-            resp = self._ctl.get_registry_record(
-                registryId=self.registry_id, recordId=record_id
-            )
-        except ClientError as err:
-            if _is_not_found(err):
-                return None
-            raise
+        resp = self._writer.get(record_id)
+        if resp is None:
+            return None
         try:
             inline = resp["descriptors"]["custom"]["data"]
             envelope = json.loads(inline)
         except (KeyError, TypeError, json.JSONDecodeError) as err:
             raise MalformedAgentRecordError(
-                f"Registry record {record_id!r} has no well-formed governance "
-                f"envelope: {err}"
+                f"Registry record {record_id!r} has no well-formed governance envelope: {err}"
             ) from err
-        # A well-formed JSON envelope can still hold a structurally invalid SUB-MODEL: since
-        # E33 ``from_record`` parses the ``marketplace`` block via
-        # ``MarketplacePublication.model_validate``, which raises pydantic's
-        # ``ValidationError``. That is the same class of fault as a non-JSON envelope, so it
-        # must reach callers as ``MalformedAgentRecordError`` — otherwise ``list()`` (which
-        # catches only that type) lets it escape and ONE bad record 500s the whole catalog,
-        # defeating the skip-and-warn contract below. Translated HERE, at ``from_record``'s
-        # caller, rather than inside ``models.agent``: ``MalformedAgentRecordError`` is defined
-        # in this module and this module imports ``models.agent``, so raising it from the parse
-        # site would need the reverse import edge — an import cycle.
         try:
             return Agent.from_record(resp, envelope)
         except ValidationError as err:
             raise MalformedAgentRecordError(
-                f"Registry record {record_id!r} has a structurally invalid governance "
-                f"envelope: {err}"
+                f"Registry record {record_id!r} has a structurally invalid governance envelope: {err}"
             ) from err
-
-    def _poll_record_to_draft(
-        self, record_id: str, attempts: int = 10, delay: float = 0.5
-    ) -> str:
-        """Poll GetRegistryRecord until the record reaches DRAFT (mirror MCP §6.2).
-
-        Returns the final observed native status string (``"DRAFT"``) so the caller can
-        derive the lifecycle from the freshly-observed status rather than the stale
-        create response (which is ``"CREATING"`` in the real world).
-
-        A freshly-created record returns ``CREATING`` and is briefly un-modifiable; a
-        ``ConflictException`` while ``CREATING`` is expected — keep polling. Bounded loop;
-        raises ``RuntimeError`` on timeout. In tests the mock returns DRAFT immediately so
-        it exits on the first poll. (Cloned from ``McpServerRegistryService`` which already
-        proves this pattern; an agent CUSTOM record has the same CREATING→DRAFT lag, and
-        skipping the poll is exactly the E6 ConflictException bug this fixes.)
-        """
-        for _ in range(attempts):
-            try:
-                resp = self._ctl.get_registry_record(
-                    registryId=self.registry_id, recordId=record_id
-                )
-                if resp.get("status") == "DRAFT":
-                    return "DRAFT"
-            except ClientError as err:
-                # ConflictException during CREATING is expected — keep polling.
-                if err.response.get("Error", {}).get("Code") != "ConflictException":
-                    raise
-            time.sleep(delay)
-        raise RuntimeError(
-            f"Registry record {record_id!r} did not reach DRAFT after {attempts} polls"
-        )
-
-    # --- CRUD --------------------------------------------------------------
 
     def create(
         self,
@@ -387,20 +205,18 @@ class AgentRegistryService:
         *,
         project_id: Optional[str] = None,
     ) -> Agent:
-        """Register an agent. ``project_id`` (E27/T5) is a SERVER-SIDE stamp — a keyword
-        here rather than a field on ``AgentCreate``, so the owning project can only ever be
-        set by a caller that already resolved and authorized it (``ProjectService.add_repo``),
-        never by a request body. ``POST /agents`` leaves it None → unparented, tenant-gated
-        only."""
-        # Racy name pre-check (research §7) -> NameTakenError -> HTTP 409.
-        if self._name_exists(req.name):
+        """Register an agent. ``project_id`` is a server-side stamp, a keyword rather than a field on
+        ``AgentCreate``, so only a caller that already resolved and authorized the project can set it.
+        An AgentCore agent is stamped ``identity_status='pending'`` into the create envelope; the route
+        schedules ``provision`` after the 201. ``description`` falls back to the name because the API
+        requires one character, and ``clientToken`` is a uuid5 of the name so a retried create is
+        idempotent. The writer polls the record to DRAFT before returning so the following writes do not
+        hit ``ConflictException``, and the lifecycle derives from the observed status.
+        """
+        if next(self._writer.iter_summaries(record_type=_RECORD_TYPE_AGENT, name=req.name), None) is not None:
             raise NameTakenError(f"Agent name '{req.name}' is already in use")
 
         now = datetime.now(timezone.utc)
-        # The authoritative id is the recordId, only known after create. Build the
-        # Agent with a placeholder id so to_envelope() can run, then overwrite id +
-        # lifecycle from the create response. (The envelope's agent_id mirror is for
-        # debug only; the native recordId is authoritative — Decision 3.)
         agent = Agent(
             **req.model_dump(exclude_none=False),
             id="",
@@ -411,44 +227,15 @@ class AgentRegistryService:
             created_by=created_by,
         )
 
-        # Provisioning-on-registration (Epic 6): for an AgentCore agent (arn + entra +
-        # aws_bedrock), stamp identity_status='pending' so it is serialized INTO the
-        # create envelope (to_envelope() includes identity_status). This replaces the
-        # redundant update-right-after-create the route used to do — which 500'd with a
-        # ConflictException because the record was still CREATING. A metadata agent keeps
-        # the default 'none'. The route schedules provision() (background) after the 201.
         if agent.is_agentcore:
             agent.identity_status = IdentityStatus.PENDING
 
-        resp = self._ctl.create_registry_record(
-            registryId=self.registry_id,
-            name=req.name,
-            # E32: displayName is the new human-facing label; `name` stays the unique
-            # identifier. We have exactly one name to offer, so both carry it — a distinct
-            # display label would need a new AgentCreate field and a UI to set it.
-            displayName=req.name,
-            # E32: recordType replaces the removed descriptorType, and is REQUIRED on create.
-            recordType=_RECORD_TYPE_AGENT,
-            # CreateRegistryRecord requires description min length 1 — fall back to the
-            # (always-present) name so a purpose-less create (e.g. the add_repo template
-            # flow) can't send "" and trip a ParamValidationError -> raw 500.
-            description=req.purpose or req.name,
-            descriptors={"custom": {"data": json.dumps(agent.to_envelope())}},
-            recordVersion=_RECORD_VERSION,
-            # Stable idempotency token for retried creates: deterministic uuid5 derived
-            # from the (unique) name -> same name yields the same 36-char token, and the
-            # AWS API requires clientToken min length 33.
-            clientToken=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"agp-agent:{req.name}")),
+        agent.id, status = self._writer.create(
+            _record_content(agent),
+            record_type=_RECORD_TYPE_AGENT,
+            client_token=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"agp-agent:{req.name}")),
         )
-
-        agent.id = self._record_id_from_arn(resp["recordArn"])
-        # A fresh record returns CREATING and is briefly un-modifiable; poll it to DRAFT
-        # before returning so the subsequent background provision() writes (and any later
-        # update/submit) don't hit a ConflictException (mirror the MCP service). Derive
-        # lifecycle from the freshly-observed status, not the stale create response (which
-        # is "CREATING" in the real world).
-        final_status = self._poll_record_to_draft(agent.id)
-        agent.lifecycle_state = lifecycle_for_status(final_status)
+        agent.lifecycle_state = lifecycle_for_status(status)
         return agent
 
     def get(self, agent_id: str) -> Optional[Agent]:
@@ -463,24 +250,18 @@ class AgentRegistryService:
         region: Optional[str] = None,
         platform: Optional[Platform] = None,
     ) -> List[Agent]:
-        # Server-side status filter only where the lifecycle->status mapping is 1:1
-        # (PROPOSED maps from several native states, so we filter it client-side).
         status_filter = _LIFECYCLE_TO_STATUS.get(lifecycle_state) if lifecycle_state else None
 
         agents: List[Agent] = []
-        # N+1 fan-out: list summaries omit descriptors, so GetRegistryRecord per id
-        # to read the governance envelope (research §6; fine at demo density).
-        for summary in self._iter_record_summaries(status=status_filter):
+        for summary in self._writer.iter_summaries(record_type=_RECORD_TYPE_AGENT, status=status_filter):
             try:
                 hydrated = self._hydrate(summary["recordId"])
             except MalformedAgentRecordError as err:
-                # Skip-and-warn: one bad record must not abort the whole list view.
                 logger.warning("Skipping malformed registry record: %s", err)
                 continue
             if hydrated is not None:
                 agents.append(hydrated)
 
-        # Client-side filters: lifecycle (when not server-filtered) + governance.
         def _keep(a: Agent) -> bool:
             if lifecycle_state is not None and a.lifecycle_state != lifecycle_state:
                 return False
@@ -499,179 +280,109 @@ class AgentRegistryService:
         return result
 
     def update(self, agent_id: str, req: AgentUpdate) -> Optional[Agent]:
+        """Read-modify-write through the writer's governed edit; None when the record is gone. A user
+        content edit leaves an APPROVED record DRAFT, so the response reports PROPOSED."""
         existing = self.get(agent_id)
         if existing is None:
             return None
 
-        # Read-modify-write (mirror operating_model_service.update).
         for field, value in req.model_dump(exclude_none=True).items():
             setattr(existing, field, value)
         existing.updated_at = datetime.now(timezone.utc)
 
+        if self._writer.write_content(agent_id, _record_content(existing)) is None:
+            return None
+        if existing.lifecycle_state == LifecycleState.APPROVED:
+            existing.lifecycle_state = LifecycleState.PROPOSED
+        return existing
+
+    def persist_identity(self, agent: Agent) -> Agent:
+        """Envelope-write an in-hand ``Agent``: the fields ``AgentUpdate`` omits (identity, marketplace,
+        the publish flag). The writer's platform write: no call when the record already holds this
+        content, and an APPROVED record is put back to APPROVED afterwards; the returned agent
+        carries the lifecycle of the status the writer saw.
+        """
+        outcome = self._writer.write(agent.id, _record_content(agent))
+        if outcome.written:
+            agent.updated_at = datetime.now(timezone.utc)
+        agent.lifecycle_state = lifecycle_for_status(stable_status(outcome.status))
+        return agent
+
+    def set_published(self, agent_id: str, published: bool) -> Optional[Agent]:
+        """Flip the cross-tenant publish flag as a platform write, through ``persist_identity`` so
+        APPROVED is re-asserted; None when the record is gone.
+        """
+        agent = self.get(agent_id)
+        if agent is None:
+            return None
+        agent.published = published
         try:
-            # UpdateRegistryRecord is a PATCH API: description + descriptors are
-            # wrapped in the optionalValue envelope (unlike the flat create shape).
-            self._ctl.update_registry_record(
-                registryId=self.registry_id,
-                recordId=agent_id,
-                name=existing.name,  # plain string — NOT wrapped
-                # Both name fields, always: reads prefer displayName, so patching
-                # `name` alone makes a rename revert on the next read (E32).
-                displayName=_wrap_update_display_name(existing.name),
-                # ``Description`` is min length 1 on the update shape too, so a
-                # purpose-less agent must fall back to the (always-present) name rather
-                # than patch "" — botocore rejects the zero-length string with a
-                # ParamValidationError, which this method's ClientError-only handler
-                # can't map, so it escapes as a raw 500. Same reason ``create()`` above
-                # already sends ``req.purpose or req.name``. (Confirmed against the
-                # agent-registry-control botocore model — see
-                # test_registry_update_param_shape.)
-                description=_wrap_update_description(existing.purpose or existing.name),
-                descriptors=_wrap_update_descriptors_custom(
-                    json.dumps(existing.to_envelope())
-                ),
-                recordVersion=_RECORD_VERSION,
-            )
+            return self.persist_identity(agent)
         except ClientError as err:
             if _is_not_found(err):
                 return None
             raise
-        return existing
 
-    def persist_identity(self, agent: Agent) -> Agent:
-        """Envelope-write an in-hand ``Agent`` (used to persist E6 identity fields).
-
-        ``AgentUpdate`` deliberately omits the identity fields (``entra_sp_id`` /
-        ``entra_app_audience`` / ``invoker_role_id`` / ``admin_role_id`` /
-        ``identity_status``), so ``update()`` cannot persist them. This thin helper
-        mirrors ``update()``'s envelope-write but for an already-hydrated ``Agent``:
-        it bumps ``updated_at`` and writes ``to_envelope()`` via
-        ``UpdateRegistryRecord``. Used by the T-IDENTITY provisioning orchestrator
-        (and the T-ROUTES create hook). Returns the agent.
-        """
-        agent.updated_at = datetime.now(timezone.utc)
-        # UpdateRegistryRecord is a PATCH API: description + descriptors are wrapped
-        # in the optionalValue envelope (unlike the flat create shape).
-        self._ctl.update_registry_record(
-            registryId=self.registry_id,
-            recordId=agent.id,
-            name=agent.name,  # plain string — NOT wrapped
-            # Both name fields, always: reads prefer displayName, so patching
-            # `name` alone makes a rename revert on the next read (E32).
-            displayName=_wrap_update_display_name(agent.name),
-            # Same min-length-1 guard as update(): a purpose-less agent patches the name,
-            # not "" — and this path matters MORE, because it runs unguarded on the
-            # registration provisioning hook where nothing catches a ParamValidationError.
-            description=_wrap_update_description(agent.purpose or agent.name),
-            descriptors=_wrap_update_descriptors_custom(
-                json.dumps(agent.to_envelope())
-            ),
-            recordVersion=_RECORD_VERSION,
-        )
-        return agent
-
-    def persist_marketplace(
-        self, agent_id: str, publication: Optional[MarketplacePublication]
-    ) -> Agent:
-        """Service-only write of the marketplace block (E33). ``None`` clears it.
-
-        The marketplace counterpart of ``persist_identity``, and service-only for the same
-        reason: ``AgentUpdate`` deliberately omits ``marketplace`` (a declared datasheet is an
-        ATTESTATION — a request body must never be able to forge one), so ``update()`` cannot
-        persist it. Read-modify-write: hydrate, set the block, and delegate the envelope write
-        to ``persist_identity`` so the three-level PATCH descriptors wrap lives in exactly ONE
-        place (see ``_wrap_update_descriptors_custom`` and test_registry_update_param_shape).
-
-        Takes an ``agent_id`` rather than an ``Agent`` because the caller (the marketplace
-        approve/unpublish path) holds only the id from its publish request, and re-reading is
-        what makes the block land on the CURRENT record rather than a stale copy.
-
-        Raises ``AgentNotFoundError`` when the id no longer resolves — a silent ``None`` would
-        let an approve report success on a write that never happened.
+    def persist_marketplace(self, agent_id: str, publication: Optional[MarketplacePublication]) -> Agent:
+        """Service-only write of the marketplace block; ``None`` clears it, an unpublish passes
+        ``published=False`` to keep the declared history. Read-modify-write through
+        ``persist_identity``. Raises ``AgentNotFoundError`` when the id no longer resolves, so an
+        approve cannot report success on a write that never happened.
         """
         agent = self.get(agent_id)
         if agent is None:
             raise AgentNotFoundError(f"Agent {agent_id!r} not found")
-        # None CLEARS the block; an unpublish instead passes a publication with
-        # published=False, which retains the declared history (E33 contract C2).
         agent.marketplace = publication
         return self.persist_identity(agent)
 
     def delete(self, agent_id: str) -> Optional[Agent]:
         prior = self.get(agent_id)
-        if prior is None:
+        if prior is None or not self._writer.delete(agent_id):
             return None
-        try:
-            self._ctl.delete_registry_record(
-                registryId=self.registry_id, recordId=agent_id
-            )
-        except ClientError as err:
-            if _is_not_found(err):
-                return None
-            raise
         return prior
 
-    # --- lifecycle ---------------------------------------------------------
-
     def submit_for_approval(self, agent_id: str) -> Optional[Agent]:
-        try:
-            self._ctl.submit_registry_record_for_approval(
-                registryId=self.registry_id, recordId=agent_id
-            )
-        except ClientError as err:
-            if _is_not_found(err):
-                return None
-            raise
+        if not self._writer.submit(agent_id):
+            return None
         return self.get(agent_id)
 
     def transition(self, agent_id: str, action: str, reason: str) -> Optional[Agent]:
+        """Apply a lifecycle action; None when the record is gone. Deprecating a published
+        marketplace product unlists it (``published=False`` keeps the declared history), and an
+        unlist failure propagates rather than leaving a deprecated record flagged published."""
         if action not in TRANSITION_TO_STATUS:
-            raise ValueError(
-                f"Unknown transition action {action!r}; "
-                f"valid actions: {sorted(TRANSITION_TO_STATUS)}"
+            raise IllegalTransitionError(
+                f"Unknown transition action {action!r}; valid actions: {sorted(TRANSITION_TO_STATUS)}",
+                kind="unknown_action",
             )
         if not reason or not reason.strip():
-            # statusReason is REQUIRED by UpdateRegistryRecordStatus (research §6).
-            raise ValueError("A non-empty reason is required for a status transition")
+            raise IllegalTransitionError(
+                "A non-empty reason is required for a status transition", kind="missing_reason"
+            )
 
         try:
-            self._ctl.update_registry_record_status(
-                registryId=self.registry_id,
-                recordId=agent_id,
-                status=TRANSITION_TO_STATUS[action],
-                statusReason=reason,
-            )
+            landed = self._writer.set_status(agent_id, TRANSITION_TO_STATUS[action], reason)
         except ClientError as err:
-            # Not-found first (mirror the other control-plane calls).
-            if _is_not_found(err):
-                return None
-            # The registry enforces legal status edges (research §5); an illegal
-            # edge (e.g. DRAFT->APPROVED) surfaces as a ValidationException — map
-            # it to a domain error so the route returns a clean 409, not a 500.
             error = err.response.get("Error", {})
             message = error.get("Message", "") or ""
             if error.get("Code") == "ValidationException" or "Invalid status transition" in message:
-                raise IllegalTransitionError(message or str(err)) from err
+                logger.warning(
+                    "[registry] the registry refused %r on record %s: %s", action, agent_id, message
+                )
+                raise IllegalTransitionError(
+                    f"Invalid status transition: {action!r} is not allowed from the agent's current state",
+                    kind="illegal_transition",
+                ) from err
             raise
+        if not landed:
+            return None
         agent = self.get(agent_id)
-        # E33 Amendment 2 / C12: deprecating a PUBLISHED marketplace product UNLISTS it.
-        # Only the DEPRECATED target does this — approve/reject never touch the block, which
-        # is what makes a deprecation STICK: a later lifecycle re-approve does not re-list the
-        # product, only a fresh publish request can.
-        #
-        # Ordering is lifecycle write FIRST, unlist SECOND, and an unlist failure PROPAGATES
-        # (the route error mapping surfaces it) rather than being swallowed: a silent failure
-        # would leave a deprecated record still flagged published with nobody told. That state
-        # is already refused by the read path's lifecycle gate (defense in depth), and the
-        # retryable path is transition-again or an admin unpublish.
         if (
             agent is not None
             and TRANSITION_TO_STATUS[action] == _LIFECYCLE_TO_STATUS[LifecycleState.DEPRECATED]
             and agent.marketplace is not None
             and agent.marketplace.published
         ):
-            # published=False (not None) keeps the declared datasheet as history — the C2
-            # unpublish semantics, reused verbatim.
             return self.persist_marketplace(
                 agent_id, agent.marketplace.model_copy(update={"published": False})
             )

@@ -1,4 +1,4 @@
-"""POST /agents/{id}/invoke route tests (Epic 6, Task T-ROUTES).
+"""POST /agents/{id}/invoke route tests.
 
 The invoke route does OBO (mocked GraphService.obo_exchange) → httpx bearer-POST to
 the AgentCore runtime (mocked). The runtime STREAMS SSE (text/event-stream); the
@@ -16,55 +16,33 @@ Exception→HTTP mapping under test:
   - boto3 control client is NOT used for invoke (httpx only)
 """
 
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-
-@pytest.fixture(autouse=True)
-def reset_modules():
-    import sys
-
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.agents",
-        "api.routes.grants",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_BACKEND_CLIENT_ID", "backend-client-id")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
 
 def _make_agent(**overrides):
-    from models.agent import Agent, AuthType, LifecycleState, Origin, Platform
+    from models.agent import Agent, AgentAuthType, LifecycleState, Origin, Platform
 
     now = datetime.now(timezone.utc)
-    base = dict(
+    base: dict[str, Any] = dict(
         id="rec-123",
         name="claims-triage-de",
         purpose="Triage claims",
         lifecycle_state=LifecycleState.APPROVED,
         origin=Origin.REGISTERED,
         platform=Platform.AWS_BEDROCK,
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         agent_arn="arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/agent-abc123",
         entra_sp_id="sp-obj-id",
         entra_app_audience="api://agp-agent-rec-123",
@@ -80,13 +58,14 @@ def _make_agent(**overrides):
 
 
 def _build_client(mock_registry=None, mock_graph=None):
-    """Also pre-seeds the E24 tenant-resolver singleton with an always-global stub —
+    """Also pre-seeds the tenant-resolver singleton with an always-global stub —
     `/invoke` now resolves `tenant_ctx`, and this file's fixtures predate tenant
     scoping (no `tenant_id`); global admin bypasses all filtering so behavior is
     unchanged."""
     import api.routes.agents as agents_module
     import api.routes.grants as grants_module
     import api.routes.users as users_module
+    from core.errors import install_error_handlers
     from services.tenant_resolver import TenantContext
 
     if mock_registry is not None:
@@ -103,6 +82,7 @@ def _build_client(mock_registry=None, mock_graph=None):
     users_module._tenant_resolver = _GlobalResolver()
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(agents_module.router, prefix="/api/v1")
     app.include_router(grants_module.router, prefix="/api/v1")
     app.include_router(grants_module.entra_router, prefix="/api/v1")
@@ -122,7 +102,7 @@ def _claims_for(role: str):
     }
 
 
-def _headers(token="fake-inbound-token"):
+def _headers(token="fake-inbound-token"):  # noqa: S107 — the test client's fake bearer, not a credential; expires 2027-10-23; added E49A-50A/T8
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -159,16 +139,22 @@ async def _fake_async_client_cm(response, capture):
     yield client
 
 
-def _patch_httpx(agents_module, response, capture):
-    """Patch the agents module's httpx.AsyncClient with one returning `response`.
+def _patch_httpx(response, capture):
+    """Patch `httpx.AsyncClient` with one returning `response`.
 
     Supports BOTH usage styles: `async with httpx.AsyncClient() as c:` and a bare
     `httpx.AsyncClient()` whose `.post` is awaited then `.aclose()`d.
+
+    Patched on the `httpx` MODULE, not on a route-module alias. It always was —
+    `agents_module.httpx` *is* the httpx module — but the alias implied a target that no longer
+    exists: the two invoke legs now live in `platform_adapters.aws` and `services.databricks_invoke`
+    and each imports httpx itself, so naming the module is the honest spelling of the same patch.
     """
+
     def _factory(*args, **kwargs):
         return _FakeAsyncClient(response, capture)
 
-    return patch.object(agents_module.httpx, "AsyncClient", _factory)
+    return patch.object(httpx, "AsyncClient", _factory)
 
 
 class _FakeAsyncClient:
@@ -192,8 +178,7 @@ class _FakeAsyncClient:
 
 
 SSE_BODY = (
-    'data: {"event": "start"}\n\n'
-    'data: {"message": {"role": "assistant", "content": [{"text": "hi"}]}}\n\n'
+    'data: {"event": "start"}\n\ndata: {"message": {"role": "assistant", "content": [{"text": "hi"}]}}\n\n'
 )
 
 
@@ -204,15 +189,13 @@ def test_invoke_assigned_sse_extracts_terminal_text(entra_settings):
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
-    response = _mock_httpx_response(
-        status_code=200, content_type="text/event-stream", text=SSE_BODY
-    )
+    response = _mock_httpx_response(status_code=200, content_type="text/event-stream", text=SSE_BODY)
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "what is 1+1?"},
@@ -243,7 +226,7 @@ def test_invoke_json_fallback_forwarded(entra_settings):
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(
         status_code=200,
@@ -253,7 +236,7 @@ def test_invoke_json_fallback_forwarded(entra_settings):
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "what is 1+1?"},
@@ -271,13 +254,13 @@ def test_invoke_forwards_raw_inbound_token_as_obo_assertion(entra_settings):
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "hi"},
@@ -286,7 +269,7 @@ def test_invoke_forwards_raw_inbound_token_as_obo_assertion(entra_settings):
 
     assert resp.status_code == 200, resp.text
     mock_graph.obo_exchange.assert_awaited_once_with(
-        "my-special-inbound-token", "api://agp-agent-rec-123"
+        "my-special-inbound-token", "api://agp-agent-rec-123", caller="viewer.user@example.com"
     )
 
 
@@ -299,13 +282,13 @@ def test_invoke_forwards_invoker_oid_in_runtime_payload(entra_settings):
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "hello"},
@@ -321,15 +304,13 @@ def test_invoke_forwards_invoker_oid_in_runtime_payload(entra_settings):
 
 
 def test_invoke_not_assigned_403(entra_settings):
-    from services.graph_service import NotAssignedError
+    from services.graph_errors import NotAssignedError
 
     mock_registry = MagicMock()
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
-    mock_graph.obo_exchange = AsyncMock(
-        side_effect=NotAssignedError("user is not assigned to the agent app")
-    )
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    mock_graph.obo_exchange = AsyncMock(side_effect=NotAssignedError("user is not assigned to the agent app"))
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.post(
@@ -343,15 +324,13 @@ def test_invoke_not_assigned_403(entra_settings):
 
 
 def test_invoke_obo_config_error_500(entra_settings):
-    from services.graph_service import OboConfigError
+    from services.graph_errors import OboConfigError
 
     mock_registry = MagicMock()
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
-    mock_graph.obo_exchange = AsyncMock(
-        side_effect=OboConfigError("OBO failed for a configuration reason")
-    )
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    mock_graph.obo_exchange = AsyncMock(side_effect=OboConfigError("OBO failed for a configuration reason"))
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.post(
@@ -370,12 +349,12 @@ def test_invoke_unprovisioned_409_no_obo_or_httpx(entra_settings):
     mock_registry.get.return_value = _make_agent(identity_status="pending")
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock()
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "hi"},
@@ -383,6 +362,7 @@ def test_invoke_unprovisioned_409_no_obo_or_httpx(entra_settings):
             )
 
     assert resp.status_code == 409
+    assert resp.json() == {"detail": "agent identity is not provisioned", "code": "invoke.not_provisioned"}
     mock_graph.obo_exchange.assert_not_called()
     assert capture == {}  # no httpx POST made
 
@@ -393,7 +373,7 @@ def test_invoke_runtime_rejects_token_502(entra_settings):
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(
         status_code=403,
@@ -403,7 +383,7 @@ def test_invoke_runtime_rejects_token_502(entra_settings):
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "hi"},
@@ -421,7 +401,7 @@ def test_invoke_timeout_504(entra_settings):
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     class _TimeoutClient(_FakeAsyncClient):
         async def post(self, url, **kwargs):
@@ -431,7 +411,7 @@ def test_invoke_timeout_504(entra_settings):
         return _TimeoutClient(None, {})
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with patch.object(agents_module.httpx, "AsyncClient", _factory):
+        with patch.object(httpx, "AsyncClient", _factory):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "hi"},
@@ -447,12 +427,12 @@ def test_invoke_viewer_can_invoke(entra_settings):
     mock_registry.get.return_value = _make_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "hi"},
@@ -470,12 +450,12 @@ def test_invoke_does_not_use_boto3_control_client(entra_settings):
     mock_registry.get.return_value = agent
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "hi"},
@@ -489,13 +469,92 @@ def test_invoke_does_not_use_boto3_control_client(entra_settings):
     assert not any("invoke" in name for name in called)
 
 
-# --- ?stage= (E36/T2, item 6) -------------------------------------------------
-#
+@pytest.mark.parametrize(
+    "region",
+    [
+        # The hostile-region case, end to end through the route it is reachable on.
+        "evil.example.com/x",
+        "us-east-1.evil.example.com",
+        "attacker@us-east-1",
+    ],
+)
+def test_invoke_hostile_agent_arn_region_never_puts_the_token_on_the_wire(entra_settings, region):
+    """`agent_arn` arrives from `PUT /agents/{id}` (and, before the write-time validator, unchecked),
+    and ARN segment 3 is interpolated into the AgentCore host — so a single field write pointed
+    the OBO'd bearer token at `bedrock-agentcore.evil.example.com`. The same class the app-URL
+    allowlist closed on the Databricks app fields and the workspace-URL check closed on
+    `workspace_url`.
+
+    The route runs the SAME check BEFORE the OBO exchange (step 1c), so for a record
+    already carrying a hostile ARN (grandfathered in before the write-time guard existed) the
+    exchange never runs at all — `obo_exchange.assert_not_called()` is the structural half of
+    that fix. `capture == {}` is the behavioural half: the httpx patch records every request, so
+    an empty capture means no bearer token left AGP either way.
+    """
+    mock_registry = MagicMock()
+    mock_registry.get.return_value = _make_agent(
+        agent_arn=f"arn:aws:bedrock-agentcore:{region}:111122223333:runtime/agent-abc123"
+    )
+    mock_graph = MagicMock()
+    mock_graph.obo_exchange = AsyncMock(return_value="agent-audience-token")
+    client, _agents_module = _build_client(mock_registry, mock_graph)
+
+    capture = {}
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        with _patch_httpx(_mock_httpx_response(text=SSE_BODY), capture):
+            resp = client.post(
+                "/api/v1/agents/rec-123/invoke",
+                json={"prompt": "hi"},
+                headers=_headers(),
+            )
+
+    assert resp.status_code == 502
+    assert resp.json() == {
+        "detail": "the agent could not be invoked [agent_arn_invalid]",
+        "code": "invoke.agent_arn_invalid",
+    }
+    assert capture == {}, "a bearer token was POSTed to an unvalidated host"
+    assert region not in resp.text
+    mock_graph.obo_exchange.assert_not_called()
+
+
+def test_invoke_maps_an_adapter_error_from_the_invoke_call_to_a_502(entra_settings):
+    """`AdapterError` is mapped for the WHOLE dispatch, not just for the adapter lookup.
+
+    Behavior-identical today — neither leg raises it from `invoke` — but the seam's own error type
+    is part of the verb's contract, so an adapter that started raising it would otherwise escape
+    as an unhandled 500 on the most-read surface in the product. Pinned with a stub adapter rather
+    than by waiting for a real caller to prove it.
+    """
+    from services.platform_adapter import AdapterError
+
+    mock_graph = MagicMock()
+    mock_graph.obo_exchange = AsyncMock(return_value="agent-audience-token")
+    mock_registry = MagicMock()
+    mock_registry.get.return_value = _make_agent()
+    client, agents_module = _build_client(mock_registry, mock_graph)
+
+    class _RefusingAdapter:
+        async def invoke(self, *a, **k):
+            raise AdapterError("nope", kind="platform_unsupported")
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        with patch.object(agents_module, "adapter_for", lambda *a, **k: _RefusingAdapter()):
+            resp = client.post(
+                "/api/v1/agents/rec-123/invoke",
+                json={"prompt": "hi"},
+                headers=_headers(),
+            )
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "the agent could not be invoked [platform_unsupported]"
+
+
 # The route used to invoke whatever the `agent_arn` SCALAR named — "whichever stage deployed
-# last" (C-A2) — so an operator who believed they were invoking dev could reach prod. `?stage=`
+# last") — so an operator who believed they were invoking dev could reach prod. `?stage=`
 # is OPTIONAL and ADDITIVE, copying `runtime_status`'s idiom: given a stage, THAT stage's runtime;
 # a stage the agent owns no runtime for is refused (404) rather than falling through to another
-# stage's runtime; omitted, the pre-E36 behaviour byte for byte.
+# stage's runtime; omitted, the earlier behaviour byte for byte.
 
 # dev and prod deliberately sit in DIFFERENT regions, because the runtime URL's host is derived
 # from the CHOSEN ARN's region segment — so the assertions prove the whole URL followed the stage,
@@ -529,13 +588,13 @@ def test_invoke_with_stage_targets_that_stages_runtime(entra_settings):
     mock_registry.get.return_value = _staged_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke?stage=prod",
                 json={"prompt": "hi"},
@@ -560,13 +619,13 @@ def test_invoke_unknown_stage_404_no_obo_or_httpx(entra_settings):
     mock_registry.get.return_value = _staged_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke?stage=staging",
                 json={"prompt": "hi"},
@@ -574,7 +633,7 @@ def test_invoke_unknown_stage_404_no_obo_or_httpx(entra_settings):
             )
 
     assert resp.status_code == 404
-    assert resp.json()["detail"] == "unknown stage"
+    assert resp.json() == {"detail": "unknown stage", "code": "invoke.unknown_stage"}
     mock_graph.obo_exchange.assert_not_called()
     assert capture == {}  # no httpx POST made
 
@@ -590,13 +649,13 @@ def test_invoke_legacy_scalar_only_record_refuses_an_explicit_stage(entra_settin
     mock_registry.get.return_value = _make_agent()  # scalar only, no `agent_arns`
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke?stage=dev",
                 json={"prompt": "hi"},
@@ -604,12 +663,13 @@ def test_invoke_legacy_scalar_only_record_refuses_an_explicit_stage(entra_settin
             )
 
     assert resp.status_code == 404
+    assert resp.json()["code"] == "invoke.unknown_stage"
     mock_graph.obo_exchange.assert_not_called()
     assert capture == {}
 
 
 def test_invoke_without_stage_keeps_the_scalars_runtime(entra_settings):
-    """No `?stage=` → the SCALAR's runtime, byte-identical to the pre-E36 behaviour.
+    """No `?stage=` → the SCALAR's runtime, byte-identical to the earlier behaviour.
 
     Asserted on a MULTI-stage agent, which is the only shape where "the scalar" and "the first
     map key" could differ — the additive parameter must not silently re-point existing callers.
@@ -619,13 +679,13 @@ def test_invoke_without_stage_keeps_the_scalars_runtime(entra_settings):
     mock_registry.get.return_value = _staged_agent()
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
-    client, agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    client, _agents_module = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
     response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-123/invoke",
                 json={"prompt": "hi"},
@@ -639,6 +699,7 @@ def test_invoke_without_stage_keeps_the_scalars_runtime(entra_settings):
 
 
 # --- _extract_sse_text direct unit tests (the SSE buffer/parse edge cases) ---
+
 
 def _extract(body: str):
     """Import the parser fresh (reset_modules pops api.routes.agents per test)."""
@@ -672,34 +733,12 @@ def test_extract_sse_empty_body_falls_back_to_raw(entra_settings):
 
 def test_extract_sse_concatenates_multi_text_parts(entra_settings):
     """Multiple text parts in the terminal message's content are joined."""
-    body = (
-        'data: {"message": {"role": "assistant", '
-        '"content": [{"text": "foo"}, {"text": "bar"}]}}\n\n'
-    )
+    body = 'data: {"message": {"role": "assistant", "content": [{"text": "foo"}, {"text": "bar"}]}}\n\n'
     assert _extract(body) == "foobar"
 
 
-# --- CAPTURED-BODY FENCE: producer and consumer against the SAME bytes (E28D/T3) ---
-#
-# Every test above uses a HAND-WRITTEN body, so they only ever pin this parser against our own
-# model of the template. The template's tests pin the handler against ITS reproduction of this
-# parser (`_buffered_client_view` in agent-templates/strands-agentcore/tests/test_agent.py). Two
-# halves, each tested against a model of the other, is exactly the gap that let a stream ship
-# whose whole "answer" was one emoji.
-#
-# These two tests close it. The fixtures are the template handler's OWN output, SSE-encoded the
-# way AgentCore encodes it, committed as bytes — see
-# tests/fixtures/generate_strands_agentcore_fixtures.py for the (offline) regeneration procedure.
-# The contract itself is documented for customers in the template's README ("Response contract").
-#
-# If one of these fails, a producer/consumer DISAGREEMENT is the finding — do not adjust the
-# expected string to match the parser without deciding which side is wrong.
-
 _FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
-# The exact string agent-templates/strands-agentcore/tests/test_agent.py pins on the producer
-# side (`_TERMINAL_MESSAGE`, and its `_buffered_client_view` assertion). Restated here so a
-# divergence fails loudly; the two literals must stay identical.
 _PRODUCER_PINNED_ANSWER = "The answer is 2 😊"
 
 
@@ -731,13 +770,8 @@ def test_extract_sse_captured_throttled_after_tool_body_yields_the_error(entra_s
     assert "toolResult" not in repr(extracted)
 
 
-# =============================================================================
-# E29/T7 — the DATABRICKS invoke branch (contract C-5, design §3)
-# =============================================================================
-#
 # Everything above this line is the AgentCore fence: the existing branch is byte-unchanged and
 # its tests are unmodified. What follows pins the second platform.
-#
 # Two shapes, one enforcement point. The Entra OBO exchange runs FIRST on BOTH binding modes —
 # it is where "is this user assigned to this agent?" is actually decided — and only then does
 # the route touch Databricks. In `federation` mode the OBO token is exchanged at the workspace
@@ -745,7 +779,6 @@ def test_extract_sse_captured_throttled_after_tool_body_yields_the_error(entra_s
 # token is DISCARDED after it has done its enforcement job and a per-agent service-principal
 # token is minted instead. `test_..._sp_secret_unassigned_403_before_any_databricks_call` is the
 # test that keeps that ordering honest: it asserts the Databricks fake was never hit.
-#
 # The fake is deliberately STRICTER than a MagicMock: an empty workspace URL, an empty subject
 # token or an empty credential is a `DatabricksError`, exactly as the real client's `_request`
 # would produce. A fake more generous than reality makes tests that cannot fail.
@@ -754,28 +787,24 @@ _DB_HANDLE = "https://claims-triage-1234.aws.databricksapps.com"
 _DB_WORKSPACE = "https://dbc-test.cloud.databricks.com"
 # No account id in an ARN anywhere (Global Constraints) — the account segment is legally empty
 # and `_SM_SECRET_ARN_RE` accepts it, so the fixture carries no AWS account number at all.
-_DB_AGENT_SECRET_ARN = (
-    "arn:aws:secretsmanager:us-east-1::secret:agp-dev/databricks/agents/rec-db-1-AbCdEf"
-)
-_DB_TENANT_SECRET_ARN = (
-    "arn:aws:secretsmanager:us-east-1::secret:agp-dev/databricks/ten-db-ZyXwVu"
-)
+_DB_AGENT_SECRET_ARN = "arn:aws:secretsmanager:us-east-1::secret:agp-dev/databricks/agents/rec-db-1-AbCdEf"
+_DB_TENANT_SECRET_ARN = "arn:aws:secretsmanager:us-east-1::secret:agp-dev/databricks/ten-db-ZyXwVu"
 # A sentinel that must never reach a response body, a log line, or an error message.
 _SP_SECRET_SENTINEL = "s3cr3t-sp-credential-DO-NOT-LEAK"
 
 
 def _make_databricks_agent(**overrides):
-    from models.agent import Agent, AuthType, LifecycleState, Origin, Platform
+    from models.agent import Agent, AgentAuthType, LifecycleState, Origin, Platform
 
     now = datetime.now(timezone.utc)
-    base = dict(
+    base: dict[str, Any] = dict(
         id="rec-db-1",
         name="claims-triage-db",
         purpose="Triage claims on Databricks",
         lifecycle_state=LifecycleState.APPROVED,
         origin=Origin.REGISTERED,
         platform=Platform.DATABRICKS,
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         agent_arn=None,
         runtime_handle=_DB_HANDLE,
         runtime_kind="app",
@@ -796,7 +825,7 @@ def _make_databricks_agent(**overrides):
 def _db_stage(workspace_url=_DB_WORKSPACE, **over):
     from models.tenant import DatabricksStageConfig
 
-    base = dict(
+    base: dict[str, Any] = dict(
         workspace_url=workspace_url,
         workspace_id="0",
         cloud="aws",
@@ -815,7 +844,7 @@ def _db_tenant(*, binding_mode="federation", stages=None, **over):
 
     if stages is None:
         stages = {"dev": _db_stage()}
-    base = dict(
+    base: dict[str, Any] = dict(
         id="ten-db",
         name="Claims (Databricks)",
         line_of_business="Claims",
@@ -879,7 +908,7 @@ class _FakeSecretsManager:
         self._bodies = dict(bodies or {})
         self.reads = []
 
-    def get_secret_value(self, SecretId):  # noqa: N803 — boto3's kwarg name
+    def get_secret_value(self, SecretId):
         self.reads.append(SecretId)
         if SecretId not in self._bodies:
             raise RuntimeError("ResourceNotFoundException")
@@ -889,9 +918,9 @@ class _FakeSecretsManager:
 def _db_identity_service(bodies=None):
     """A REAL `DatabricksIdentityService` over a fake Secrets Manager.
 
-    Real, not a stub, deliberately: the invoke path reuses T6's trusted-derivation rules
-    (`_owns_secret_arn`) and its body reader rather than reimplementing them, so the tests must
-    exercise the actual rules — including the foreign-ARN refusal below.
+    Real, not a stub, deliberately: the invoke path reuses the identity service's trusted-derivation
+    rules (`DatabricksAgentSecrets.owns_secret_arn`) and its body reader rather than reimplementing them,
+    so the tests must exercise the actual rules — including the foreign-ARN refusal below.
     """
     import json as _json
 
@@ -925,13 +954,11 @@ class _FakeTenantService:
 
         self.calls.append(tenant_id)
         if self.tenant is None or getattr(self.tenant, "id", None) != tenant_id:
-            raise TenantError("unknown tenant")
+            raise TenantError("unknown tenant", "not_found")
         return self.tenant
 
 
-def _build_databricks_client(
-    *, agent=None, tenant=None, databricks=None, identity=None, graph=None
-):
+def _build_databricks_client(*, agent=None, tenant=None, databricks=None, identity=None, graph=None):
     """`_build_client` plus the three Databricks-side singletons the branch reads.
 
     `reset_modules` pops `api.routes.agents` per test, so its module globals are already fresh;
@@ -939,29 +966,22 @@ def _build_databricks_client(
     unmodified), so its `_svc` is set explicitly on every call rather than relied upon.
     """
     mock_registry = MagicMock()
-    mock_registry.get.return_value = (
-        agent if agent is not None else _make_databricks_agent()
-    )
+    mock_registry.get.return_value = agent if agent is not None else _make_databricks_agent()
     mock_graph = graph
     if mock_graph is None:
         mock_graph = MagicMock()
         mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
 
-    client, agents_module = _build_client(
-        mock_registry=mock_registry, mock_graph=mock_graph
-    )
+    client, _ = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
 
+    import api.routes.agents as agents_module
     import api.routes.tenants as tenants_module
 
-    tenants_module._svc = _FakeTenantService(
-        tenant if tenant is not None else _db_tenant()
-    )
+    tenants_module._svc = _FakeTenantService(tenant if tenant is not None else _db_tenant())
 
     fake_db = databricks if databricks is not None else _FakeDatabricks()
     agents_module._databricks_workspace_svc = fake_db
-    agents_module._databricks_identity_svc = (
-        identity if identity is not None else _db_identity_service()
-    )
+    agents_module._databricks_identity_svc = identity if identity is not None else _db_identity_service()
     return client, agents_module, mock_graph, fake_db
 
 
@@ -971,7 +991,7 @@ def _invoke_db(client, agents_module, response=None, prompt="triage this claim",
         response = _mock_httpx_response(text=SSE_BODY)
     capture = {}
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for(role)):
-        with _patch_httpx(agents_module, response, capture):
+        with _patch_httpx(response, capture):
             resp = client.post(
                 "/api/v1/agents/rec-db-1/invoke",
                 json={"prompt": prompt},
@@ -980,12 +1000,10 @@ def _invoke_db(client, agents_module, response=None, prompt="triage this claim",
     return resp, capture
 
 
-# --- federation mode ---------------------------------------------------------
-
 def test_invoke_databricks_federation_exchanges_obo_token_then_posts(entra_settings):
     """The governed path end to end: OBO → RFC 8693 exchange at the workspace → bearer POST.
 
-    Pins all four halves of C-5's federation leg: the exchange gets the OBO token (not the raw
+    Pins all four halves of the federation leg: the exchange gets the OBO token (not the raw
     inbound one), the POST goes to the app's default `/api/v1/agent` route, the Authorization
     header carries the DATABRICKS token (not the Entra one), and the body is the same
     `{"prompt", "user_oid"}` contract the AgentCore branch sends.
@@ -997,7 +1015,7 @@ def test_invoke_databricks_federation_exchanges_obo_token_then_posts(entra_setti
     assert resp.status_code == 200, resp.text
     assert resp.json()["response"] == "hi"
     mock_graph.obo_exchange.assert_awaited_once_with(
-        "fake-inbound-token", "api://agp-agent-rec-db-1"
+        "fake-inbound-token", "api://agp-agent-rec-db-1", caller="viewer.user@example.com"
     )
     assert fake_db.exchange_calls == [(_DB_WORKSPACE, "obo-agent-token")]
     assert fake_db.mint_calls == []
@@ -1037,7 +1055,7 @@ def test_invoke_databricks_trailing_slash_handle_yields_one_slash(entra_settings
 def test_invoke_databricks_federation_exchange_failure_502_safe_code(entra_settings):
     """A failed token exchange → 502 with the fixed safe code, and NOTHING from upstream.
 
-    The upstream `DatabricksError.message` is composed safely by C-2, but this layer does not
+    The upstream `DatabricksError.message` is composed safely upstream, but this layer does not
     depend on that: it forwards neither the message nor the kind, so a workspace path or an
     echoed request form has no route into a response body.
     """
@@ -1062,10 +1080,8 @@ def test_invoke_databricks_federation_exchange_failure_502_safe_code(entra_setti
     assert capture == {}  # no POST was made with no token
 
 
-# --- sp_secret mode (DORMANT — E29/T14a) -------------------------------------
-#
 # The mode is no longer produced by the connect flow and is not consumable on a default
-# deployment (design §3B). These tests keep the capability PINNED by turning the gate on
+# deployment. These tests keep the capability PINNED by turning the gate on
 # explicitly — `sp_secret_invoke_gate_on(agents_module)` — so the leg cannot rot while it is
 # dormant. The gate-OFF refusal is pinned separately, further down.
 
@@ -1080,9 +1096,7 @@ def _sp_secret_invoke_gate_on(agents_module, monkeypatch) -> None:
     monkeypatch.setattr(agents_module.settings, "DATABRICKS_ALLOW_SP_SECRET_BINDING", True)
 
 
-def test_invoke_databricks_sp_secret_mints_m2m_and_discards_the_obo_token(
-    entra_settings, monkeypatch
-):
+def test_invoke_databricks_sp_secret_mints_m2m_and_discards_the_obo_token(entra_settings, monkeypatch):
     """sp_secret: the OBO exchange still runs, its token is DISCARDED, and the per-agent
     service-principal credential mints the token that is actually sent."""
     agent = _make_databricks_agent(
@@ -1102,9 +1116,7 @@ def test_invoke_databricks_sp_secret_mints_m2m_and_discards_the_obo_token(
     mock_graph.obo_exchange.assert_awaited_once()
     # ...and its token went nowhere near Databricks.
     assert fake_db.exchange_calls == []
-    assert fake_db.mint_calls == [
-        (_DB_WORKSPACE, "agent-sp-application-id", _SP_SECRET_SENTINEL)
-    ]
+    assert fake_db.mint_calls == [(_DB_WORKSPACE, "agent-sp-application-id", _SP_SECRET_SENTINEL)]
     assert capture["kwargs"]["headers"]["Authorization"] == "Bearer db-m2m-token"
 
 
@@ -1116,7 +1128,7 @@ def test_invoke_databricks_sp_secret_unassigned_403_before_any_databricks_call(e
     without it, sp_secret binding would mint a service-principal token for any caller who could
     reach the route, and the agent's Entra appRole assignments would govern nothing.
     """
-    from services.graph_service import NotAssignedError
+    from services.graph_errors import NotAssignedError
 
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(side_effect=NotAssignedError("not assigned"))
@@ -1142,14 +1154,12 @@ def test_invoke_databricks_sp_secret_unassigned_403_before_any_databricks_call(e
 
 
 def test_invoke_databricks_federation_unassigned_403_before_any_databricks_call(entra_settings):
-    from services.graph_service import NotAssignedError
+    from services.graph_errors import NotAssignedError
 
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(side_effect=NotAssignedError("not assigned"))
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        databricks=fake_db, graph=mock_graph
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(databricks=fake_db, graph=mock_graph)
 
     resp, capture = _invoke_db(client, agents_module)
 
@@ -1161,14 +1171,12 @@ def test_invoke_databricks_federation_unassigned_403_before_any_databricks_call(
 def test_invoke_databricks_obo_config_error_500(entra_settings):
     """The OBO taxonomy is UNCHANGED across platforms: a consent/backend misconfig is a 500
     with the re-provision hint, never a 403 and never a 502."""
-    from services.graph_service import OboConfigError
+    from services.graph_errors import OboConfigError
 
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock(side_effect=OboConfigError("no consent"))
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        databricks=fake_db, graph=mock_graph
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(databricks=fake_db, graph=mock_graph)
 
     resp, _capture = _invoke_db(client, agents_module)
 
@@ -1178,8 +1186,8 @@ def test_invoke_databricks_obo_config_error_500(entra_settings):
 
 
 def test_invoke_databricks_sp_secret_foreign_secret_arn_refused_502(entra_settings, monkeypatch):
-    """OB-2 on the INVOKE path: `databricks_sp_secret_arn` is client-settable, so an ARN this
-    service did not write FOR THIS AGENT is refused — never read, never minted from.
+    """The secret-pointer rule on the INVOKE path: `databricks_sp_secret_arn` is client-settable, so
+    an ARN this service did not write FOR THIS AGENT is refused — never read, never minted from.
 
     Without this, a caller could register an agent pointing at the TENANT's own workspace-SP
     secret (or another agent's) and have the invoke path mint a token from a credential the
@@ -1195,11 +1203,9 @@ def test_invoke_databricks_sp_secret_foreign_secret_arn_refused_502(entra_settin
         agent=agent,
         tenant=_db_tenant(binding_mode="sp_secret"),
         databricks=fake_db,
-        identity=_db_identity_service(
-            {_DB_TENANT_SECRET_ARN: '{"sp_client_secret": "tenant-credential"}'}
-        ),
+        identity=_db_identity_service({_DB_TENANT_SECRET_ARN: '{"sp_client_secret": "tenant-credential"}'}),
     )
-    # Gate ON: the OB-2 pointer rule must hold on the dormant leg too — it is the rule that
+    # Gate ON: the secret-pointer rule must hold on the dormant leg too — it is the rule that
     # would matter most on a deployment that deliberately enables it.
     _sp_secret_invoke_gate_on(agents_module, monkeypatch)
 
@@ -1211,9 +1217,7 @@ def test_invoke_databricks_sp_secret_foreign_secret_arn_refused_502(entra_settin
     assert capture == {}
 
 
-def test_invoke_databricks_sp_secret_without_a_stored_credential_502(
-    entra_settings, monkeypatch
-):
+def test_invoke_databricks_sp_secret_without_a_stored_credential_502(entra_settings, monkeypatch):
     """A record that names no per-agent credential (a half-provisioned sp_secret agent) is a
     502 with a safe code — not a crash, and not a call with an empty secret."""
     agent = _make_databricks_agent(binding_mode="sp_secret")
@@ -1230,9 +1234,7 @@ def test_invoke_databricks_sp_secret_without_a_stored_credential_502(
     assert fake_db.touched is False
 
 
-def test_invoke_databricks_sp_secret_never_leaks_the_credential(
-    entra_settings, caplog, monkeypatch
-):
+def test_invoke_databricks_sp_secret_never_leaks_the_credential(entra_settings, caplog, monkeypatch):
     """SENTINEL: the minted-from secret appears in NO response body and NO log line."""
     import logging as _logging
 
@@ -1279,46 +1281,36 @@ def test_invoke_databricks_token_mint_failure_502_safe_code(entra_settings, monk
     assert capture == {}
 
 
-# --- OB-4: the bearer token is never pointed at an unvalidated host ----------
-
 @pytest.mark.parametrize(
     "handle",
     [
-        "http://claims-triage-1234.aws.databricksapps.com",       # not https
-        "https://attacker.example.com",                            # foreign host
-        "https://evil-databricksapps.com",                         # suffix LOOKALIKE
-        "https://databricksapps.com",                              # the bare apex
-        "https://claims.aws.databricksapps.com.attacker.example",   # suffix in the middle
-        "https://claims.aws.databricksapps.com@attacker.example",   # userinfo — real host is the attacker
-        "https://attacker.example.com@claims-triage-1234.aws.databricksapps.com",  # credentials at a real host
-        "//claims-triage-1234.aws.databricksapps.com",             # scheme-relative
+        "http://claims-triage-1234.aws.databricksapps.com",  # not https
+        "https://attacker.example.com",  # foreign host
+        "https://evil-databricksapps.com",  # suffix LOOKALIKE
+        "https://databricksapps.com",  # the bare apex
+        "https://claims.aws.databricksapps.com.attacker.example",  # suffix in the middle
+        "https://claims.aws.databricksapps.com@attacker.example",  # userinfo — real host is the attacker
+        "https://attacker.example.com@claims-triage-1234.aws.databricksapps.com",
+        "//claims-triage-1234.aws.databricksapps.com",  # scheme-relative
         "javascript:alert(1)",
-        # FIX round 1 (Critical): these two pass `urlparse` AND the suffix test, but are
-        # invalid to httpx — see the dedicated test below for why that mattered.
-        "https://claims.aws.databricksapps.com/x\r\nX-Evil: 1",     # CRLF header injection
-        "https://claims\xad.aws.databricksapps.com/api",            # soft hyphen in the host
-        # FIX round 2 (Critical, remainder): an EMPTY/invalid punycode A-label. `httpx.URL()`
-        # constructs these happily — the IDNA encode is LAZY and only runs on `.host`.
+        "https://claims.aws.databricksapps.com/x\r\nX-Evil: 1",  # CRLF header injection
+        "https://claims\xad.aws.databricksapps.com/api",  # soft hyphen in the host
         "https://xn--.aws.databricksapps.com",
         "https://xn--a.aws.databricksapps.com",
         "https://xn--evil.aws.databricksapps.com",
     ],
 )
-def test_invoke_databricks_hostile_runtime_handle_refused_before_any_token(
-    entra_settings, handle
-):
-    """OB-4, EXECUTED over hostile inputs. A handle that is not an https Databricks-Apps URL is
-    refused with a 502 safe code, and the refusal lands before a token is even obtained — so
-    there is never a bearer credential in flight toward an unvalidated host.
+def test_invoke_databricks_hostile_runtime_handle_refused_before_any_token(entra_settings, handle):
+    """The app-URL allowlist, EXECUTED over hostile inputs. A handle that is not an https
+    Databricks-Apps URL is refused with a 502 safe code, and the refusal lands before a token is
+    even obtained — so there is never a bearer credential in flight toward an unvalidated host.
 
     `runtime_handle` reaches the record from registration, so it is attacker-influenced input on
     the one path that attaches a Databricks token to an outbound request.
     """
     agent = _make_databricks_agent(runtime_handle=handle)
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        agent=agent, databricks=fake_db
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(agent=agent, databricks=fake_db)
 
     resp, capture = _invoke_db(client, agents_module)
 
@@ -1335,10 +1327,8 @@ def test_invoke_databricks_hostile_runtime_handle_refused_before_any_token(
         "https://attacker.example.com/api/v1/agent",
         "https://evil-databricksapps.com/api/v1/agent",
         "https://attacker.example.com@claims-triage-1234.aws.databricksapps.com/api",
-        # FIX round 1 (Critical): httpx-invalid, urlparse-valid. Same rule, same field.
         "https://claims.aws.databricksapps.com/x\r\nX-Evil: 1",
         "https://claims\xad.aws.databricksapps.com/api",
-        # FIX round 2 (Critical, remainder) — same class, same rule, the other field.
         "https://xn--.aws.databricksapps.com/api/v1/agent",
         "https://xn--a.aws.databricksapps.com/api/v1/agent",
     ],
@@ -1350,9 +1340,7 @@ def test_invoke_databricks_hostile_endpoint_url_refused(entra_settings, endpoint
     """
     agent = _make_databricks_agent(endpoint_url=endpoint_url)
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        agent=agent, databricks=fake_db
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(agent=agent, databricks=fake_db)
 
     resp, capture = _invoke_db(client, agents_module)
 
@@ -1361,8 +1349,6 @@ def test_invoke_databricks_hostile_endpoint_url_refused(entra_settings, endpoint
     assert fake_db.touched is False
     assert capture == {}
 
-
-# --- stage / tenant / binding-mode resolution -------------------------------
 
 def test_invoke_databricks_multi_stage_picks_the_workspace_hosting_the_agent(entra_settings):
     """Two workspaces, and the handle is prefixed by exactly one of them → that one is used.
@@ -1385,7 +1371,7 @@ def test_invoke_databricks_multi_stage_picks_the_workspace_hosting_the_agent(ent
 
     resp, _capture = _invoke_db(client, agents_module)
 
-    # The handle is a workspace-hosted path, not a `.databricksapps.com` URL, so OB-4 refuses
+    # The handle is a workspace-hosted path, not a `.databricksapps.com` URL, so the allowlist refuses
     # the POST — but the STAGE resolution happened first and picked prod. Asserting on the
     # refusal alone would not prove that, so assert the code and that nothing was exchanged.
     assert resp.status_code == 502
@@ -1407,9 +1393,7 @@ def test_invoke_databricks_multi_stage_with_no_match_502_safe_code(entra_setting
         }
     )
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        tenant=tenant, databricks=fake_db
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(tenant=tenant, databricks=fake_db)
 
     resp, capture = _invoke_db(client, agents_module)
 
@@ -1423,9 +1407,9 @@ def test_invoke_databricks_two_stages_same_workspace_resolves(entra_settings):
     """dev + prod pointing at ONE workspace is the single-workspace case, not ambiguity.
 
     The tenant form requires BOTH stages complete, so a single-workspace operator
-    duplicates the same `workspace_url` into dev and prod — the E29 live test's exact
-    shape. The resolver must count DISTINCT workspaces, not stage entries; refusing
-    here made every form-created single-workspace tenant invoke-dead (livefix-5)."""
+    duplicates the same `workspace_url` into dev and prod. The resolver must count DISTINCT
+    workspaces, not stage entries; refusing here made every form-created single-workspace
+    tenant invoke-dead."""
     tenant = _db_tenant(
         stages={
             "dev": _db_stage(_DB_WORKSPACE),
@@ -1433,9 +1417,7 @@ def test_invoke_databricks_two_stages_same_workspace_resolves(entra_settings):
         }
     )
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        tenant=tenant, databricks=fake_db
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(tenant=tenant, databricks=fake_db)
 
     resp, capture = _invoke_db(client, agents_module)
 
@@ -1447,9 +1429,7 @@ def test_invoke_databricks_two_stages_same_workspace_resolves(entra_settings):
 def test_invoke_databricks_no_workspace_stage_502_safe_code(entra_settings):
     tenant = _db_tenant(stages={})
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        tenant=tenant, databricks=fake_db
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(tenant=tenant, databricks=fake_db)
 
     resp, _capture = _invoke_db(client, agents_module)
 
@@ -1462,9 +1442,7 @@ def test_invoke_databricks_unknown_tenant_502_safe_code(entra_settings):
     """A record whose tenant cannot be resolved is a 502 safe code, not a 500."""
     agent = _make_databricks_agent(tenant_id="ten-gone")
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        agent=agent, databricks=fake_db
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(agent=agent, databricks=fake_db)
 
     resp, _capture = _invoke_db(client, agents_module)
 
@@ -1474,7 +1452,7 @@ def test_invoke_databricks_unknown_tenant_502_safe_code(entra_settings):
 
 
 def test_invoke_databricks_binding_mode_comes_from_the_tenant_not_the_agent(entra_settings):
-    """The mode is the TENANT's (T6's rule). An agent record claiming `sp_secret` on a
+    """The mode is the TENANT's. An agent record claiming `sp_secret` on a
     federation tenant is invoked over FEDERATION — the client-settable field is not authority.
     """
     agent = _make_databricks_agent(
@@ -1495,7 +1473,7 @@ def test_invoke_databricks_binding_mode_comes_from_the_tenant_not_the_agent(entr
 
 
 def test_invoke_databricks_invoke_unavailable_has_its_own_actionable_refusal(entra_settings):
-    """E29/T14a (design §3B). ``invoke_unavailable`` is a DIFFERENT statement from "this tenant
+    """``invoke_unavailable`` is a DIFFERENT statement from "this tenant
     was never probed": the tenant WAS probed and cannot federate. It gets its own code and a
     sentence naming both missing grants, because ``binding_mode_unresolved`` would send the
     operator looking for an unconnected tenant instead of at their Databricks account."""
@@ -1515,7 +1493,7 @@ def test_invoke_databricks_invoke_unavailable_has_its_own_actionable_refusal(ent
 
 
 def test_invoke_databricks_sp_secret_is_refused_when_the_gate_is_off(entra_settings, monkeypatch):
-    """DEFAULT DEPLOYMENT (design §3B): the dormant binding is not consumable. A fully
+    """DEFAULT DEPLOYMENT: the dormant binding is not consumable. A fully
     provisioned sp_secret agent still does not mint a service-principal token — the refusal
     names the flag, so the operator sees a decision rather than a broken agent."""
     agent = _make_databricks_agent(
@@ -1554,8 +1532,6 @@ def test_invoke_databricks_unresolved_binding_mode_502_safe_code(entra_settings)
     assert fake_db.touched is False
 
 
-# --- the 409 gate + the shared response contract -----------------------------
-
 def test_invoke_databricks_unprovisioned_409_no_obo_or_databricks_call(entra_settings):
     agent = _make_databricks_agent(identity_status="pending")
     mock_graph = MagicMock()
@@ -1579,9 +1555,7 @@ def test_invoke_metadata_only_databricks_agent_409(entra_settings):
     agent = _make_databricks_agent(runtime_handle=None)
     mock_graph = MagicMock()
     mock_graph.obo_exchange = AsyncMock()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        agent=agent, graph=mock_graph
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(agent=agent, graph=mock_graph)
 
     resp, _capture = _invoke_db(client, agents_module)
 
@@ -1621,16 +1595,14 @@ def test_invoke_databricks_app_error_response_502(entra_settings):
 def test_invoke_databricks_timeout_504(entra_settings):
     import httpx as _httpx
 
-    client, agents_module, _graph, _db = _build_databricks_client()
+    client, _agents_module, _graph, _db = _build_databricks_client()
 
     class _TimeoutClient(_FakeAsyncClient):
         async def post(self, url, **kwargs):
             raise _httpx.TimeoutException("timed out")
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with patch.object(
-            agents_module.httpx, "AsyncClient", lambda *a, **k: _TimeoutClient(None, {})
-        ):
+        with patch.object(httpx, "AsyncClient", lambda *a, **k: _TimeoutClient(None, {})):
             resp = client.post(
                 "/api/v1/agents/rec-db-1/invoke",
                 json={"prompt": "hi"},
@@ -1643,16 +1615,14 @@ def test_invoke_databricks_timeout_504(entra_settings):
 def test_invoke_databricks_transport_failure_502(entra_settings):
     import httpx as _httpx
 
-    client, agents_module, _graph, _db = _build_databricks_client()
+    client, _agents_module, _graph, _db = _build_databricks_client()
 
     class _BrokenClient(_FakeAsyncClient):
         async def post(self, url, **kwargs):
             raise _httpx.ConnectError("no route")
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        with patch.object(
-            agents_module.httpx, "AsyncClient", lambda *a, **k: _BrokenClient(None, {})
-        ):
+        with patch.object(httpx, "AsyncClient", lambda *a, **k: _BrokenClient(None, {})):
             resp = client.post(
                 "/api/v1/agents/rec-db-1/invoke",
                 json={"prompt": "hi"},
@@ -1677,37 +1647,33 @@ def test_invoke_databricks_response_contract_mirrors_agentcore(entra_settings):
     resp, _capture = _invoke_db(client, agents_module, response=response)
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"response": {"answer": "the claim is covered"}}
+    assert resp.json() == {
+        "response": {"answer": "the claim is covered"},
+        "session_id": None,
+        "tool_calls": None,
+    }
 
 
 def test_invoke_databricks_sse_response_uses_the_same_extractor(entra_settings):
     client, agents_module, _graph, _db = _build_databricks_client()
     body = 'data: {"message": {"role": "assistant", "content": [{"text": "covered"}]}}\n\n'
-    response = _mock_httpx_response(
-        status_code=200, content_type="text/event-stream", text=body
-    )
+    response = _mock_httpx_response(status_code=200, content_type="text/event-stream", text=body)
 
     resp, _capture = _invoke_db(client, agents_module, response=response)
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"response": "covered"}
+    assert resp.json() == {"response": "covered", "session_id": None, "tool_calls": None}
 
 
 def test_invoke_databricks_plain_text_response_falls_back_to_text(entra_settings):
     client, agents_module, _graph, _db = _build_databricks_client()
-    response = _mock_httpx_response(
-        status_code=200, content_type="text/plain", text="not json at all"
-    )
+    response = _mock_httpx_response(status_code=200, content_type="text/plain", text="not json at all")
 
     resp, _capture = _invoke_db(client, agents_module, response=response)
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"response": "not json at all"}
+    assert resp.json() == {"response": "not json at all", "session_id": None, "tool_calls": None}
 
-
-# =============================================================================
-# FIX round 1 (E29/T7) — the httpx.InvalidURL escape, redirects, actionability
-# =============================================================================
 
 def test_httpx_invalid_url_is_not_an_http_error_subclass():
     """The FACT the Critical rests on, pinned so it cannot silently change under a bump.
@@ -1732,7 +1698,7 @@ def test_httpx_invalid_url_is_not_an_http_error_subclass():
     ],
 )
 def test_invoke_databricks_httpx_invalid_url_never_costs_a_token(entra_settings, handle):
-    """FIX round 1, CRITICAL. A URL that passes `urlparse` + OB-4 but is INVALID to httpx must
+    """A URL that passes `urlparse` and the allowlist but is INVALID to httpx must
     not reach the POST at all — and must never have cost a Databricks token.
 
     THE TWO-PART DEFECT this pins:
@@ -1743,15 +1709,13 @@ def test_invoke_databricks_httpx_invalid_url_never_costs_a_token(entra_settings,
        credential had already been obtained for a request that was never made — a real
        credential spent on an unvalidated URL, with no request to show for it.
 
-    Both halves are fixed by validating the URL through httpx's OWN parser inside OB-4, before
+    Both halves are fixed by validating the URL through httpx's OWN parser in the allowlist, before
     any token is obtained. So the assertion that matters here is `fake_db.touched is False`:
     not merely "no 500", but "no credential was ever minted".
     """
     agent = _make_databricks_agent(runtime_handle=handle)
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        agent=agent, databricks=fake_db
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(agent=agent, databricks=fake_db)
 
     resp, capture = _invoke_db(client, agents_module)
 
@@ -1762,7 +1726,7 @@ def test_invoke_databricks_httpx_invalid_url_never_costs_a_token(entra_settings,
 
 
 def test_invoke_databricks_ob4_validation_precedes_the_token(entra_settings):
-    """ORDERING, pinned directly rather than inferred: OB-4 runs BEFORE the token is obtained.
+    """ORDERING, pinned directly rather than inferred: the allowlist runs BEFORE the token is obtained.
 
     Every hostile-input test asserts `fake_db.touched is False`, which already implies this —
     but implication by absence is fragile: a refactor that moved the mint earlier would still
@@ -1771,9 +1735,7 @@ def test_invoke_databricks_ob4_validation_precedes_the_token(entra_settings):
     """
     agent = _make_databricks_agent(runtime_handle="https://attacker.example.com")
     fake_db = _FakeDatabricks()
-    client, agents_module, mock_graph, _db = _build_databricks_client(
-        agent=agent, databricks=fake_db
-    )
+    client, agents_module, mock_graph, _db = _build_databricks_client(agent=agent, databricks=fake_db)
 
     resp, _capture = _invoke_db(client, agents_module)
 
@@ -1785,17 +1747,17 @@ def test_invoke_databricks_ob4_validation_precedes_the_token(entra_settings):
 
 
 def test_invoke_databricks_does_not_follow_redirects(entra_settings):
-    """FIX round 1, MINOR. `follow_redirects=False` is EXPLICIT on the invoke POST, because it
-    silently carries OB-4's entire guarantee.
+    """`follow_redirects=False` is EXPLICIT on the invoke POST, because it
+    silently carries the allowlist's entire guarantee.
 
-    OB-4 validates the URL AGP requests. If the client followed redirects, a validated
+    The allowlist validates the URL AGP requests. If the client followed redirects, a validated
     `*.databricksapps.com` host answering `302 Location: https://attacker.example` would have
     httpx re-send the request — Authorization header included — to a host that was never
     validated. The allowlist would be enforced on the first hop only. httpx's default is
     already `False`, which is exactly why it is passed explicitly: a guarantee this load-bearing
     must not rest on an upstream default that a future version could flip.
     """
-    client, agents_module, _graph, _db = _build_databricks_client()
+    client, _agents_module, _graph, _db = _build_databricks_client()
     captured_kwargs = {}
 
     class _RecordingClient(_FakeAsyncClient):
@@ -1807,7 +1769,7 @@ def test_invoke_databricks_does_not_follow_redirects(entra_settings):
     capture = {}
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         with patch.object(
-            agents_module.httpx,
+            httpx,
             "AsyncClient",
             lambda *a, **k: _RecordingClient(response, capture, **k),
         ):
@@ -1822,7 +1784,7 @@ def test_invoke_databricks_does_not_follow_redirects(entra_settings):
 
 
 def test_invoke_databricks_unresolved_stage_detail_is_actionable(entra_settings):
-    """FIX round 1, IMPORTANT. The multi-workspace refusal SAYS what is wrong and where the fix
+    """The multi-workspace refusal SAYS what is wrong and where the fix
     lives — an operator reading `[workspace_stage_unresolved]` alone cannot act on it.
 
     Still a SAFE message: it names no workspace URL, no host, and no upstream text. It states
@@ -1835,7 +1797,7 @@ def test_invoke_databricks_unresolved_stage_detail_is_actionable(entra_settings)
             "prod": _db_stage("https://dbc-prod.cloud.databricks.com"),
         }
     )
-    client, agents_module, _graph, fake_db = _build_databricks_client(tenant=tenant)
+    client, agents_module, _graph, _fake_db = _build_databricks_client(tenant=tenant)
 
     resp, _capture = _invoke_db(client, agents_module)
 
@@ -1850,29 +1812,25 @@ def test_invoke_databricks_unresolved_stage_detail_is_actionable(entra_settings)
     assert _DB_WORKSPACE not in detail
 
 
-# =============================================================================
-# FIX round 2 (E29/T7) — the LAZY IDNA encode: the rest of the Critical's class
-# =============================================================================
-
 def test_httpx_url_construction_does_not_validate_idna():
-    """The MECHANISM behind fix round 2, pinned so the fix cannot quietly stop working.
+    """The mechanism behind the IDNA check, pinned so the fix cannot quietly stop working.
 
     `httpx.URL()` is LAZY: it stores the raw authority and only runs the IDNA encode when
     `.host` is accessed. So `httpx.URL(url)` on its own validates almost nothing about the
-    hostname — which is why round 1's validator (construct, discard) still let an
+    hostname — which is why a construct-and-discard validator still let an
     IDNA-invalid host through to the token mint.
 
     Also pins the exception lineage, which is the reason the escape reached a 502 at all rather
     than a 500: `idna.IDNAError` subclasses `UnicodeError` → `ValueError`, and is NOT an
     `httpx.HTTPError` or `httpx.InvalidURL`. The POST-site `ValueError` arm was therefore
-    LOAD-BEARING, not the defence-in-depth round 1's report claimed.
+    load-bearing, not defence in depth.
     """
     import httpx as _httpx
     import idna
 
     url = _httpx.URL("https://xn--.aws.databricksapps.com")  # constructs happily
     with pytest.raises(idna.IDNAError):
-        url.host  # ...and only NOW does it fail
+        _ = url.host
 
     assert issubclass(idna.IDNAError, ValueError)
     assert not issubclass(idna.IDNAError, _httpx.HTTPError)
@@ -1882,16 +1840,16 @@ def test_httpx_url_construction_does_not_validate_idna():
 @pytest.mark.parametrize(
     "handle",
     [
-        "https://xn--.aws.databricksapps.com",       # empty A-label: no punycode content
-        "https://xn--a.aws.databricksapps.com",      # decodes to a disallowed codepoint
-        "https://xn--evil.aws.databricksapps.com",   # ditto, and reads as a plausible host
+        "https://xn--.aws.databricksapps.com",  # empty A-label: no punycode content
+        "https://xn--a.aws.databricksapps.com",  # decodes to a disallowed codepoint
+        "https://xn--evil.aws.databricksapps.com",  # ditto, and reads as a plausible host
     ],
 )
 def test_invoke_databricks_invalid_idna_host_never_costs_a_token(entra_settings, handle):
-    """FIX round 2. An IDNA-invalid host is refused AT VALIDATION — before the token mint.
+    """An IDNA-invalid host is refused AT VALIDATION — before the token mint.
 
-    THE GAP ROUND 1 LEFT. Round 1 closed the two named inputs (CRLF, soft hyphen) by calling
-    `httpx.URL(url)` in the validator, but discarded the result — and because the IDNA encode is
+    A construct-and-discard validator closed the two named inputs (CRLF, soft hyphen) by calling
+    `httpx.URL(url)`, but discarded the result — and because the IDNA encode is
     lazy (see the test above), an invalid punycode A-label sailed through validation, cost a real
     Databricks token, and only failed afterwards when httpx built the request. The credential was
     spent on a URL that was never requested, which is the exact harm the Critical was about; the
@@ -1902,9 +1860,7 @@ def test_invoke_databricks_invalid_idna_host_never_costs_a_token(entra_settings,
     """
     agent = _make_databricks_agent(runtime_handle=handle)
     fake_db = _FakeDatabricks()
-    client, agents_module, _graph, _db = _build_databricks_client(
-        agent=agent, databricks=fake_db
-    )
+    client, agents_module, _graph, _db = _build_databricks_client(agent=agent, databricks=fake_db)
 
     resp, capture = _invoke_db(client, agents_module)
 
@@ -1936,10 +1892,8 @@ def test_invoke_databricks_invalid_idna_host_never_costs_a_token(entra_settings,
         ),
     ],
 )
-def test_invoke_databricks_valid_idn_and_authority_forms_still_accepted(
-    entra_settings, handle, expected_url
-):
-    """FIX round 2 must not over-reject. Forcing the IDNA encode rejects INVALID hosts only —
+def test_invoke_databricks_valid_idn_and_authority_forms_still_accepted(entra_settings, handle, expected_url):
+    """The IDNA check must not over-reject. Forcing the IDNA encode rejects INVALID hosts only —
     a valid internationalized label, an uppercase host and an explicit port all still invoke.
 
     This is the regression half of the fix. A validator tightened until it refuses everything is
@@ -1956,6 +1910,64 @@ def test_invoke_databricks_valid_idn_and_authority_forms_still_accepted(
     assert fake_db.exchange_calls == [(_DB_WORKSPACE, "obo-agent-token")]
 
 
+# The app-URL allowlist hardened the two client-settable APP fields. The workspace URL is the OTHER
+# outbound host on this path, and the FIRST one a credential reaches: federation posts the caller's OBO
+# assertion to `{workspace_url}/oidc/v1/token`, and the SP mint posts a client secret there. So
+# the same three shapes that cost a real Databricks token on the app fields are pinned here, at
+# the route, on the field they arrive on. The leg's own unit tests (tests/test_databricks_invoke.py)
+# cover WHICH candidate gets validated; these cover the wire outcome.
+
+
+@pytest.mark.parametrize(
+    "workspace_url",
+    [
+        # CRLF: the injection rides in the PATH, so the authority parses clean.
+        "https://dbc-test.cloud.databricks.com/x\r\nX-Evil: 1",
+        # A soft hyphen (U+00AD) is INVISIBLE in a tenant form and fails only at IDNA.
+        "https://dbc\xad-test.cloud.databricks.com",
+        "https://xn--.cloud.databricks.com",
+        "https://xn--a.cloud.databricks.com",
+    ],
+)
+def test_invoke_databricks_unusable_workspace_url_never_costs_a_credential(entra_settings, workspace_url):
+    """A workspace URL httpx cannot build a request from is refused BEFORE the exchange.
+
+    `fake_db.touched is False` is the assertion that matters, exactly as in the app-URL tests: not
+    merely "no 500", but "the caller's OBO assertion never left AGP". Without the check the
+    exchange is attempted first and the failure surfaces from inside the token call — after the
+    assertion has been posted, or (worse, on the lazy-IDNA shapes) with a credential spent on a
+    request that was never made.
+
+    The detail carries the code and NOTHING else: the workspace URL names the customer's
+    workspace and has no business in an invoke response.
+    """
+    tenant = _db_tenant(stages={"dev": _db_stage(workspace_url)})
+    fake_db = _FakeDatabricks()
+    client, agents_module, _graph, _db = _build_databricks_client(tenant=tenant, databricks=fake_db)
+
+    resp, capture = _invoke_db(client, agents_module)
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == ("the agent could not be invoked [workspace_url_invalid]")
+    assert fake_db.touched is False, "a credential was sent to an unusable workspace URL"
+    assert capture == {}
+
+
+def test_invoke_databricks_a_valid_idn_workspace_url_still_invokes(entra_settings):
+    """The rider must not over-reject. A legitimate internationalized workspace host encodes to
+    punycode and still invokes — and the exchange receives the URL UNCHANGED, so the string
+    validated is the string used (the allowlist's fourth rule, applied to this field)."""
+    workspace_url = "https://dbc-test.ß.databricks.com"
+    tenant = _db_tenant(stages={"dev": _db_stage(workspace_url)})
+    client, agents_module, _graph, fake_db = _build_databricks_client(tenant=tenant)
+
+    resp, capture = _invoke_db(client, agents_module)
+
+    assert resp.status_code == 200, resp.text
+    assert fake_db.exchange_calls == [(workspace_url, "obo-agent-token")]
+    assert capture["url"] == f"{_DB_HANDLE}/api/v1/agent"
+
+
 def test_invoke_databricks_query_string_endpoint_url_accepted(entra_settings):
     """A query string on `endpoint_url` is preserved and does not trip validation — the rule is
     about the HOST, and a customer's app route may legitimately carry parameters."""
@@ -1967,3 +1979,137 @@ def test_invoke_databricks_query_string_endpoint_url_accepted(entra_settings):
 
     assert resp.status_code == 200, resp.text
     assert capture["url"] == url
+
+
+def _invoke_runtime(response):
+    mock_registry = MagicMock()
+    mock_registry.get.return_value = _make_agent()
+    mock_graph = MagicMock()
+    mock_graph.obo_exchange = AsyncMock(return_value="obo-agent-token")
+    client, _ = _build_client(mock_registry=mock_registry, mock_graph=mock_graph)
+    capture = {}
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        with _patch_httpx(response, capture):
+            resp = client.post("/api/v1/agents/rec-123/invoke", json={"prompt": "hi"}, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    return resp.json(), capture
+
+
+def test_invoke_runtime_returns_the_session_id_header_it_sent(entra_settings):
+    body, capture = _invoke_runtime(_mock_httpx_response(text=SSE_BODY))
+
+    sent = capture["kwargs"]["headers"]["X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"]
+    assert body["session_id"] == sent
+    # An SSE body without a tool_calls event carries no tool-call source.
+    assert body["tool_calls"] is None
+
+
+def _sse(*events):
+    return "".join(f"data: {json.dumps(e)}\n\n" for e in events)
+
+
+_SSE_ANSWER = {"message": {"role": "assistant", "content": [{"text": "covered"}]}}
+
+
+def test_invoke_runtime_sse_tool_calls_event_is_taken_and_kept_out_of_the_text(entra_settings):
+    calls = [{"name": "get_policy", "args": {"policy_id": "P-1"}}]
+    stale = [{"name": "older", "args": {}}]
+    text = _sse({"tool_calls": stale}, {"data": "cov"}, _SSE_ANSWER, {"tool_calls": calls})
+    body, _ = _invoke_runtime(_mock_httpx_response(text=text))
+
+    assert body["tool_calls"] == calls  # the LAST tool_calls event wins
+    assert body["response"] == "covered"
+
+
+def test_invoke_runtime_sse_tool_calls_only_event_never_becomes_the_answer(entra_settings):
+    # No message-shaped event: the extractor's last-payload fallback must not land on tool_calls.
+    text = _sse({"result": "covered"}, {"tool_calls": []})
+    body, _ = _invoke_runtime(_mock_httpx_response(text=text))
+
+    assert body["tool_calls"] == []
+    assert body["response"] == "covered"
+
+
+def test_invoke_runtime_sse_without_tool_calls_event_is_none(entra_settings):
+    body, _ = _invoke_runtime(_mock_httpx_response(text=_sse({"data": "x"}, _SSE_ANSWER)))
+    assert body["tool_calls"] is None
+    assert body["response"] == "covered"
+
+
+def test_invoke_runtime_sse_malformed_tool_calls_event_is_ignored(entra_settings):
+    text = _sse(_SSE_ANSWER, {"tool_calls": "nope"}) + 'data: {"tool_calls": [\n\n'
+    body, _ = _invoke_runtime(_mock_httpx_response(text=text))
+    assert body["tool_calls"] is None
+    assert body["response"] == "covered"
+
+
+def test_invoke_runtime_sse_drops_nameless_tool_calls(entra_settings):
+    calls = [
+        {"name": "get_policy", "args": {"policy_id": "P-1"}},
+        {"name": None, "args": {}},
+        {"args": {"x": 1}},
+        "not-a-call",
+        {"name": "lookup", "args": "not-an-object"},
+    ]
+    body, _ = _invoke_runtime(_mock_httpx_response(text=_sse(_SSE_ANSWER, {"tool_calls": calls})))
+    assert body["tool_calls"] == [
+        {"name": "get_policy", "args": {"policy_id": "P-1"}},
+        {"name": "lookup", "args": {}},
+    ]
+
+
+def test_invoke_runtime_json_body_tool_calls_pass_through(entra_settings):
+    calls = [{"name": "get_policy", "args": {"policy_id": "P-1"}}]
+    text = json.dumps({"answer": "covered", "tool_calls": calls})
+    body, _ = _invoke_runtime(_mock_httpx_response(content_type="application/json", text=text))
+
+    assert body["tool_calls"] == calls
+    # The response itself is unchanged: the parsed JSON body, as before.
+    assert body["response"] == {"answer": "covered", "tool_calls": calls}
+
+
+def test_invoke_runtime_json_body_without_tool_calls_is_none(entra_settings):
+    body, _ = _invoke_runtime(_mock_httpx_response(content_type="application/json", text='{"answer": "x"}'))
+    assert body["tool_calls"] is None
+    assert body["session_id"]
+
+
+def test_invoke_runtime_non_list_tool_calls_is_none(entra_settings):
+    body, _ = _invoke_runtime(
+        _mock_httpx_response(content_type="application/json", text='{"answer": "x", "tool_calls": "nope"}')
+    )
+    assert body["tool_calls"] is None
+
+
+def test_invoke_route_passes_both_keys_through_from_the_adapter(entra_settings):
+    mock_graph = MagicMock()
+    mock_graph.obo_exchange = AsyncMock(return_value="agent-audience-token")
+    mock_registry = MagicMock()
+    mock_registry.get.return_value = _make_agent()
+    client, agents_module = _build_client(mock_registry, mock_graph)
+    envelope = {
+        "response": "ok",
+        "session_id": "s" * 64,
+        "tool_calls": [{"name": "t", "args": {}}],
+    }
+
+    class _StubAdapter:
+        async def invoke(self, *a, **k):
+            return envelope
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        with patch.object(agents_module, "adapter_for", lambda *a, **k: _StubAdapter()):
+            resp = client.post("/api/v1/agents/rec-123/invoke", json={"prompt": "hi"}, headers=_headers())
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == envelope
+
+
+def test_invoke_databricks_returns_null_session_id_and_tool_calls(entra_settings):
+    client, agents_module, _graph, _db = _build_databricks_client()
+    response = _mock_httpx_response(status_code=200, content_type="text/plain", text="answer")
+
+    resp, _capture = _invoke_db(client, agents_module, response=response)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"response": "answer", "session_id": None, "tool_calls": None}

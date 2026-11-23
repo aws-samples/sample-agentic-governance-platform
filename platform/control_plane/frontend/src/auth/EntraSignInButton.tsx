@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useAuth } from './AuthContext';
+import { useAuth } from './useAuth';
 
 export default function EntraSignInButton() {
   const { signInRedirect } = useAuth();
@@ -16,7 +16,6 @@ export default function EntraSignInButton() {
       setError(msg);
       setLoading(false);
     }
-    // On success, the browser navigates away; no setLoading(false) needed.
   };
 
   return (

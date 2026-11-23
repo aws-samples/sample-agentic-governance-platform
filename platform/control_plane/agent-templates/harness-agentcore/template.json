@@ -1,0 +1,11 @@
+{
+  "id": "harness-agentcore",
+  "name": "AgentCore Harness (preview)",
+  "framework": "harness",
+  "infra_template_id": "agentcore-harness",
+  "description": "Config-driven agent on the Bedrock AgentCore harness — no code, no container; harness.yaml is the deploy artifact.",
+  "aws_services": ["bedrock", "agentcore"],
+  "tags": ["starter", "config", "harness", "preview"],
+  "version": "1.0.0",
+  "preview": true
+}

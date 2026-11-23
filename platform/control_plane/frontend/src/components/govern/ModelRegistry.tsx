@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
-import { MODELS, MODEL_DETAILS, tooltipStyle } from './mockData';
+import { MODELS, MODEL_DETAILS } from './mockData';
+import { tooltipStyle } from '../shared/chartTheme';
 import ModelDrawer from './ModelDrawer';
 import { ComingSoonBanner } from '../shared/comingSoon';
 
@@ -17,6 +18,27 @@ const statusBg: Record<string, string> = {
   'Production':     'bg-emerald-50 text-emerald-700 border-emerald-200',
   'Pending Review': 'bg-amber-50 text-amber-700 border-amber-200',
 };
+
+function aggregateEvalHistory() {
+  const byDate: Record<string, { safety: number[]; quality: number[]; latency: number[] }> = {};
+  Object.values(MODEL_DETAILS).forEach(d => {
+    d.evalHistory.forEach(e => {
+      if (!byDate[e.date]) byDate[e.date] = { safety: [], quality: [], latency: [] };
+      byDate[e.date].safety.push(e.safety);
+      byDate[e.date].quality.push(e.quality);
+      byDate[e.date].latency.push(e.latency);
+    });
+  });
+  const mean = (xs: number[]) => Math.round(xs.reduce((a, b) => a + b, 0) / xs.length);
+  return Object.entries(byDate).sort(([a], [b]) => a.localeCompare(b)).map(([date, xs]) => ({
+    date,
+    safety: mean(xs.safety),
+    quality: mean(xs.quality),
+    latency: mean(xs.latency),
+  }));
+}
+
+const AGGREGATE_EVAL = aggregateEvalHistory();
 
 export default function ModelRegistry() {
   const [filter, setFilter] = useState<'all' | 'Tier 1' | 'Tier 2' | 'Tier 3'>('all');
@@ -40,26 +62,6 @@ export default function ModelRegistry() {
   const attested = Object.values(MODEL_DETAILS).filter(d => d.attestation.sr11_7.attested).length;
   const pendingAttestation = MODELS.length - attested;
 
-  // Aggregate eval history: for each date, mean score across all models that have it
-  const aggregateEval = useMemo(() => {
-    const byDate: Record<string, { safety: number[]; quality: number[]; latency: number[] }> = {};
-    Object.values(MODEL_DETAILS).forEach(d => {
-      d.evalHistory.forEach(e => {
-        if (!byDate[e.date]) byDate[e.date] = { safety: [], quality: [], latency: [] };
-        byDate[e.date].safety.push(e.safety);
-        byDate[e.date].quality.push(e.quality);
-        byDate[e.date].latency.push(e.latency);
-      });
-    });
-    const mean = (xs: number[]) => Math.round(xs.reduce((a, b) => a + b, 0) / xs.length);
-    return Object.entries(byDate).sort(([a], [b]) => a.localeCompare(b)).map(([date, xs]) => ({
-      date,
-      safety: mean(xs.safety),
-      quality: mean(xs.quality),
-      latency: mean(xs.latency),
-    }));
-  }, []);
-
   return (
     <div className="min-h-[calc(100vh-4rem)] relative">
       <div className="relative max-w-7xl mx-auto px-6 py-10">
@@ -77,7 +79,6 @@ export default function ModelRegistry() {
           </div>
         </div>
 
-        {/* Summary KPIs */}
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
           {[
             { label: 'Models Registered', value: MODELS.length,                 sub: `${MODELS.filter(m => m.status === 'Production').length} in production` },
@@ -94,7 +95,6 @@ export default function ModelRegistry() {
           ))}
         </div>
 
-        {/* Fleet eval trend */}
         <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm mb-6">
           <div className="flex items-center justify-between mb-3">
             <div className="text-sm font-semibold text-slate-900">Fleet-Wide Eval Trend</div>
@@ -105,7 +105,7 @@ export default function ModelRegistry() {
             </div>
           </div>
           <ResponsiveContainer width="100%" height={200}>
-            <LineChart data={aggregateEval}>
+            <LineChart data={AGGREGATE_EVAL}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
               <XAxis dataKey="date" tick={{ fill: '#94a3b8', fontSize: 10 }} />
               <YAxis domain={[50, 100]} tick={{ fill: '#94a3b8', fontSize: 10 }} />
@@ -117,7 +117,6 @@ export default function ModelRegistry() {
           </ResponsiveContainer>
         </div>
 
-        {/* Filters */}
         <div className="flex flex-wrap items-center gap-3 mb-4">
           <input
             type="text"
@@ -158,7 +157,6 @@ export default function ModelRegistry() {
           </div>
         </div>
 
-        {/* Registry table */}
         <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 shadow-sm overflow-hidden mb-6">
           <table className="w-full text-sm">
             <thead>
@@ -207,7 +205,6 @@ export default function ModelRegistry() {
           </table>
         </div>
 
-        {/* Attestation Board */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
           <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm">
             <div className="text-sm font-semibold text-slate-900 mb-3">SR 11-7 Attestation Board</div>
@@ -257,7 +254,6 @@ export default function ModelRegistry() {
           </div>
         </div>
 
-        {/* Approval Pipeline (pending models) */}
         <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm mb-6">
           <div className="text-sm font-semibold text-slate-900 mb-3">Approval Pipeline — Pending Models</div>
           <div className="space-y-4">

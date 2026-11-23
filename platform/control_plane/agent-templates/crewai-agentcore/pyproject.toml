@@ -1,0 +1,78 @@
+[project]
+name = "crewai-agentcore-agent"
+version = "1.0.0"
+# CrewAI itself allows >=3.10, but the FLOOR here is 3.11 to match the Dockerfile's
+# python:3.11-slim base and the strands template — one Python across the catalog is what makes
+# `pip install -e ".[dev]"` in CI reproduce what the image runs.
+requires-python = ">=3.11"
+dependencies = [
+    # Minor-CAPPED, not just floored. Same reasoning as the ruff pin below, and it matters more
+    # here: this file ships VERBATIM into customer repositories, and the Dockerfile's install pins
+    # every dependency through the `constraints.txt` compiled from these ranges — so an unbounded
+    # range lets the next regeneration pin a different major than the one that was tested. CrewAI moves
+    # fast and has renamed public symbols across majors (the `Agent`/`Task`/`Crew`/`LLM` surface
+    # `src/main.py` imports is 1.x); an unbounded floor would let a 2.0 land as a silent
+    # ImportError in every materialized repo at once, which is exactly how the ruff 0.16 float
+    # broke every template build simultaneously.
+    "crewai>=1.15,<2.0",
+    "bedrock-agentcore>=1.9.0,<2.0",
+    # OTEL: the CrewAI instrumentation emits the crew/agent/LLM spans, and the HTTP OTLP exporter
+    # is what ships them to Langfuse. BOTH are declared explicitly, plus the SDK — unlike the
+    # Strands template, which gets a wired provider from its `strands-agents[otel]` extra, CrewAI
+    # ships no equivalent, so an undeclared exporter would be a ModuleNotFoundError at module
+    # IMPORT (i.e. the container never reaches `app.run()` and the runtime crash-loops) the moment
+    # a Langfuse secret is present. That exact fault has already been shipped once in this catalog,
+    # which is why the import is also wrapped in `src/main.py`.
+    "opentelemetry-instrumentation-crewai>=0.36",
+    "opentelemetry-exporter-otlp-proto-http>=1.30,<2.0",
+    "opentelemetry-sdk>=1.30,<2.0",
+    # Read the per-agent Langfuse project key from AWS Secrets Manager at import.
+    # (bedrock-agentcore already pulls in botocore/boto3, but declare it so the SM read is explicit.)
+    "boto3>=1.34.0",
+    # E42: `src/main.py` signs its CloudWatch (X-Ray OTLP) span export with botocore SigV4 (via boto3
+    # above) through a `requests.Session`. requests already arrives with the OTLP HTTP exporter;
+    # declared directly because this template imports it itself.
+    "requests>=2.31,<3.0",
+]
+
+[project.optional-dependencies]
+# ruff is CAPPED, not just floored — kept identical to the strands template on purpose. `ruff>=0.6`
+# once floated to 0.16.1 and broke the lint job in every repo materialized from a template at once
+# (ruff's DEFAULT rule set widened). A linter that selects its own rules from whatever shipped that
+# week is not a gate, it is a lottery. Pin the minor, and pair it with the explicit
+# [tool.ruff.lint] select below.
+dev = ["pytest>=8.0", "ruff>=0.16,<0.17", "pip-audit>=2.7"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+# Matches the strands template: the prose comments explain AgentCore/CrewAI traps at the line they
+# apply to, and 110 keeps E501 meaningful without reflowing every explanation.
+line-length = 110
+
+[tool.ruff.lint]
+# SELECT EXPLICITLY. With no `select`, ruff lints against its own evolving defaults, so a new
+# release silently changes the gate under a repo nobody touched. This list is what the template is
+# written to satisfy; a maintainer who wants more can extend it deliberately.
+# E/F = pycodestyle + pyflakes, I = isort, B = bugbear, S = bandit security (kept: this ships into
+# customer agents), BLE = blind-except, RUF = ruff's own.
+select = ["E", "F", "I", "B", "S", "BLE", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert with `assert` (S101) and may hardcode dummy credentials (S105/S106).
+"tests/**" = ["S101", "S105", "S106"]
+# `src/main.py` imports crewai BELOW two module-level statements, and both are load-bearing: the
+# Langfuse block must configure the OTEL env before the exporter it points at is constructed, and
+# CREWAI_DISABLE_TELEMETRY must be set before crewai reads it at import. A top-of-file import
+# captures the un-configured values and the traces silently never appear / the vendor export stays
+# on. E402 is the rule that forbids exactly that ordering, so it is ignored HERE, deliberately —
+# do NOT "fix" the ordering in that file to satisfy it.
+"src/main.py" = ["E402"]
+
+[tool.pytest.ini_options]
+# The tests import via the `src.` package prefix (e.g. `from src.config import Config`), matching
+# how the app runs at runtime (`python -m src.main` in the Dockerfile). Bare `pytest` (as CI's
+# build.yml runs it) does NOT put cwd on sys.path, so `src` won't resolve without this.
+pythonpath = ["."]

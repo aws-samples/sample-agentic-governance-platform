@@ -1,13 +1,12 @@
-"""Connections admin route tests (Epic 19, Task T4).
+"""Connections admin route tests.
 
-Exercises the REAL require_role/current_principal path against a mocked
-verify_entra_token (no live Entra) and a FAKE ConnectionService patched onto the
-router's module-level ``_svc`` (no live AWS / Secrets Manager). Mirrors
-test_users_admin_routes.py for the app/client + admin/non-admin auth-override
-idiom (reset cached modules, build a minimal app with only the connections
-router, patch verify_entra_token to inject the caller's role claim).
+The real ``require_role`` / ``current_principal`` path runs against a mocked ``verify_entra_token``;
+a fake ``ConnectionService`` is patched onto the router module's ``_svc`` and the ``AppError``
+handler renders ``ConnectionError`` from its table. The list is OPERATOR-read; every mutation is
+ADMIN. No read model carries a credential.
 """
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,17 +15,16 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from models.connection import (
-    AuthType,
-    Connection,
-    ConnStatus,
-    Provider,
-)
-from services.connection_service import ConnectionError
+from models.connection import Connection, ConnectionAuthType, ConnStatus, Provider
+from services.connection_service import ConnectionError, ConnectionService
+from services.github_app_auth import GitHubAppAuthError
+from services.github_repo_errors import GitHubRepoError
+from services.template_rollout_service import RolloutError
+
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
 
 def _gen_pem() -> str:
-    """Generate a throwaway RSA private-key PEM (no fixed key material committed)."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     return key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -35,53 +33,28 @@ def _gen_pem() -> str:
     ).decode("ascii")
 
 
-@pytest.fixture(autouse=True)
-def reset_modules():
-    import sys
-
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.connections",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_BACKEND_CLIENT_ID", "backend-client-id")
-    monkeypatch.setenv("ENTRA_SPA_CLIENT_ID", "spa-client-id")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
-
-
-def _build_client(fake_svc, projects=None):
+def _build_client(fake_svc, projects=None, rollout_svc=None):
+    """The delete route composes the project service for its referential check, so a fake with
+    ``list_projects()`` is patched in too; the reconcile routes read ``_rollout_svc``."""
     import api.routes.connections as connections_module
     import api.routes.projects as projects_module
+    from core.errors import install_error_handlers
 
-    connections_module._svc = fake_svc  # the lazy ConnectionService singleton
+    connections_module._svc = fake_svc
+    connections_module._rollout_svc = rollout_svc
 
-    # The delete route composes the ProjectService singleton for its referential-integrity
-    # guard (E23/T10). Patch it with a fake exposing list_projects() so the route never
-    # builds a live ProjectService (which would touch AWS/GitHub).
     fake_project_svc = MagicMock()
     fake_project_svc.list_projects.return_value = list(projects or [])
     projects_module._svc = fake_project_svc
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(connections_module.router, prefix="/api/v1")
     return TestClient(app)
 
 
 def _svc_with(**methods):
-    """A fake ConnectionService whose named methods return/raise as configured."""
+    """A fake ConnectionService whose named methods return or raise as configured."""
     s = MagicMock()
     for name, val in methods.items():
         setattr(s, name, MagicMock(**val))
@@ -102,12 +75,12 @@ def _headers():
 
 
 def _sample_connection(**overrides) -> Connection:
-    data = {
+    data: dict[str, Any] = {
         "id": "conn-1",
         "provider": Provider.GITHUB,
         "org": "acme",
         "base_url": None,
-        "auth_type": AuthType.PAT,
+        "auth_type": ConnectionAuthType.PAT,
         "status": ConnStatus.CONNECTED,
         "status_detail": None,
         "account_login": "acme-bot",
@@ -122,8 +95,6 @@ def _sample_connection(**overrides) -> Connection:
     return Connection(**data)
 
 
-# --- RBAC: GET list is OPERATOR-read; every mutation stays ADMIN (viewer 403 on all) ---
-
 def test_list_viewer_forbidden(entra_settings):
     s = _svc_with(list_connections={"return_value": []})
     client = _build_client(s)
@@ -134,9 +105,8 @@ def test_list_viewer_forbidden(entra_settings):
 
 
 def test_list_operator_allowed(entra_settings):
-    # Operators CONSUME the trust boundary — they read connections to pick one + resolve
-    # org names when provisioning projects. The read model carries NO secret, so GET is
-    # OPERATOR-gated (mutations stay ADMIN).
+    """Operators read connections to pick one when provisioning a project; the read model carries
+    no secret, so the list is OPERATOR-gated."""
     s = _svc_with(list_connections={"return_value": [_sample_connection()]})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
@@ -144,12 +114,11 @@ def test_list_operator_allowed(entra_settings):
     assert resp.status_code == 200
     body = resp.json()
     assert body[0]["id"] == "conn-1"
-    assert "token" not in body[0]  # read model carries no secret
+    assert "token" not in body[0]
     s.list_connections.assert_called_once()
 
 
 def test_post_operator_forbidden(entra_settings):
-    # Create is a MUTATION — admin only.
     s = _svc_with(create_connection={"return_value": _sample_connection()})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
@@ -210,8 +179,6 @@ def test_delete_viewer_forbidden(entra_settings):
     s.delete_connection.assert_not_called()
 
 
-# --- POST happy path: 201 + NO token leaked ---------------------------------
-
 def test_post_creates_connection_201_no_token_in_body(entra_settings):
     s = _svc_with(create_connection={"return_value": _sample_connection()})
     client = _build_client(s)
@@ -223,19 +190,16 @@ def test_post_creates_connection_201_no_token_in_body(entra_settings):
         )
     assert resp.status_code == 201
     body = resp.json()
-    assert "token" not in body  # the read model NEVER carries the PAT
+    assert "token" not in body
     assert body["id"] == "conn-1"
     assert body["status"] == "connected"
-    # created_by is taken from the validated principal, never the body.
     _, kwargs = s.create_connection.call_args
     assert kwargs["created_by"] == "admin@x.com"
 
 
-# --- PUT /{id}/key happy path: 200 + updated Connection, admin-gated ---------
-
 def test_put_key_replaces_key_200(entra_settings):
     updated = _sample_connection(
-        auth_type=AuthType.GITHUB_APP,
+        auth_type=ConnectionAuthType.GITHUB_APP,
         app_id="123456",
         installation_id="78910",
         account_login="acme-app",
@@ -251,21 +215,15 @@ def test_put_key_replaces_key_200(entra_settings):
         )
     assert resp.status_code == 200
     body = resp.json()
-    assert "private_key" not in body  # the read model NEVER carries the key
+    assert "private_key" not in body
     assert body["id"] == "conn-1"
     assert body["status"] == "connected"
     s.replace_key.assert_called_once_with("conn-1", new_pem)
 
 
-# --- error mapping: verify_failed → 400 with the curated reason --------------
-
 def test_post_verify_failed_400_surfaces_reason(entra_settings):
     s = _svc_with(
-        create_connection={
-            "side_effect": ConnectionError(
-                "token did not authenticate", kind="verify_failed"
-            )
-        }
+        create_connection={"side_effect": ConnectionError("token did not authenticate", kind="verify_failed")}
     )
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
@@ -275,23 +233,109 @@ def test_post_verify_failed_400_surfaces_reason(entra_settings):
             headers=_headers(),
         )
     assert resp.status_code == 400
-    assert resp.json()["detail"] == "token did not authenticate"
+    assert resp.json() == {"detail": "token did not authenticate", "code": "connection.verify_failed"}
 
 
-# --- error mapping: not_found → 404 fixed literal on /{id}/test --------------
+_FAKE_TOKEN = "ghs_" + "a" * 36
+_FAKE_PAT = "ghp_" + "a" * 36
+_UPSTREAM_BODY = f'{{"message": "Bad credentials", "token": "{_FAKE_TOKEN}"}}'
+_MALFORMED_BASE_URLS = [
+    pytest.param("https://ghe.acme.dev\x00/api/v3", "InvalidURL", id="nul-byte"),
+    pytest.param("https://xn--zzz-.acme.dev/api/v3", "IDNAError", id="bad-idna-label"),
+]
 
-def test_test_connection_not_found_404(entra_settings):
-    s = _svc_with(
-        test_connection={"side_effect": ConnectionError("Unknown connection", kind="not_found")}
-    )
+
+def test_connection_error_detail_for_verify_failed_carries_no_upstream_body(entra_settings):
+    """``verify_failed`` sends the message to the client, so the message must be safe by
+    construction: through the real service, a minter that saw a provider body raises its fixed
+    text, and neither the body nor a token-shaped string reaches the detail."""
+
+    def _minter(*args, **kwargs):
+        assert "ghs_" in _UPSTREAM_BODY
+        raise GitHubAppAuthError("GitHub declined the installation token request (HTTP 401)")
+
+    svc = ConnectionService(secrets_client=MagicMock(), mint_installation_token=_minter)
+    client = _build_client(svc)
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        resp = client.post(
+            "/api/v1/admin/connections",
+            json={
+                "provider": "github",
+                "org": "acme",
+                "auth_type": "github_app",
+                "app_id": "555",
+                "installation_id": "222",
+                "private_key": _gen_pem(),
+            },
+            headers=_headers(),
+        )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "GitHub declined the installation token request (HTTP 401)"
+    assert "ghs_" not in resp.text
+    assert "Bad credentials" not in resp.text
+
+
+@pytest.mark.parametrize("base_url, failure", _MALFORMED_BASE_URLS)
+def test_connection_error_detail_for_verify_failed_on_a_malformed_base_url_pat(
+    entra_settings, base_url, failure
+):
+    """A ``base_url`` httpx refuses to send to (a NUL byte, a label IDNA refuses to encode) is
+    ``verify_failed`` on the PAT path, not a 500: the real service and verifier over a real client that
+    never reaches the network, and the detail is the verifier's unreachable sentence, never the token."""
+    svc = ConnectionService(secrets_client=MagicMock())
+    client = _build_client(svc)
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        resp = client.post(
+            "/api/v1/admin/connections",
+            json={"provider": "github", "org": "acme", "token": _FAKE_PAT, "base_url": base_url},
+            headers=_headers(),
+        )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "connection.verify_failed"
+    assert resp.json()["detail"].startswith("could not reach github")
+    assert "ghp_" not in resp.text
+
+
+@pytest.mark.parametrize("base_url, failure", _MALFORMED_BASE_URLS)
+def test_connection_error_detail_for_verify_failed_on_a_malformed_base_url_app(
+    entra_settings, base_url, failure
+):
+    """The same malformed ``base_url`` on the GitHub App path fails at the real minter with its fixed
+    text plus the exception's type name, never the URL or the key."""
+    svc = ConnectionService(secrets_client=MagicMock())
+    client = _build_client(svc)
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        resp = client.post(
+            "/api/v1/admin/connections",
+            json={
+                "provider": "github",
+                "org": "acme",
+                "auth_type": "github_app",
+                "app_id": "555",
+                "installation_id": "222",
+                "private_key": _gen_pem(),
+                "base_url": base_url,
+            },
+            headers=_headers(),
+        )
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "detail": f"could not reach GitHub to mint installation token ({failure})",
+        "code": "connection.verify_failed",
+    }
+    assert "ghe.acme.dev" not in resp.text
+
+
+def test_connections_not_found_is_404(entra_settings):
+    """The domain route's wire for ``not_found``, the row ``builds.py``, ``github_link.py`` and
+    ``projects.py`` render through the same table."""
+    s = _svc_with(test_connection={"side_effect": ConnectionError("Unknown connection", kind="not_found")})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.post("/api/v1/admin/connections/conn-x/test", headers=_headers())
     assert resp.status_code == 404
-    assert resp.json()["detail"] == "Connection not found"
+    assert resp.json() == {"detail": "Connection not found", "code": "connection.not_found"}
 
-
-# --- DELETE happy path: 204 -------------------------------------------------
 
 def test_delete_connection_204(entra_settings):
     s = _svc_with(delete_connection={"return_value": None})
@@ -303,9 +347,7 @@ def test_delete_connection_204(entra_settings):
     s.delete_connection.assert_called_once_with("conn-1")
 
 
-# --- E23/T10: referential-integrity guard — block delete while a project refs it ---
-
-def _project_ref(connection_id: str) -> "Project":
+def _project_ref(connection_id: str):
     from models.project import Project
 
     return Project(
@@ -325,12 +367,14 @@ def test_delete_connection_blocked_when_projects_reference_it(entra_settings):
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
         resp = client.delete("/api/v1/admin/connections/conn-1", headers=_headers())
     assert resp.status_code == 409
-    assert resp.json()["detail"] == "Connection has projects; delete them first"
-    s.delete_connection.assert_not_called()  # service never reached
+    assert resp.json() == {
+        "detail": "Connection has projects; delete them first",
+        "code": "connection.has_projects",
+    }
+    s.delete_connection.assert_not_called()
 
 
 def test_delete_connection_succeeds_when_no_projects_reference_it(entra_settings):
-    # A project exists but references a DIFFERENT connection — no block.
     s = _svc_with(delete_connection={"return_value": None})
     client = _build_client(s, projects=[_project_ref("other-conn")])
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
@@ -339,14 +383,8 @@ def test_delete_connection_succeeds_when_no_projects_reference_it(entra_settings
     s.delete_connection.assert_called_once_with("conn-1")
 
 
-# --------------------------------------------------------------------------- #
-# App-via-Manifest routes (E20/U2)
-# --------------------------------------------------------------------------- #
-
 _REDIRECT = "https://app.example.com/ops/connections/callback"
 
-
-# --- manifest/start: 200 with org-scoped post_url + manifest + state ---------
 
 def test_manifest_start_returns_post_url_manifest_state(entra_settings):
     s = _svc_with(create_manifest_state={"return_value": "st-123"})
@@ -360,16 +398,12 @@ def test_manifest_start_returns_post_url_manifest_state(entra_settings):
     assert resp.status_code == 200
     body = resp.json()
     assert body["state"] == "st-123"
-    assert body["post_url"].startswith(
-        "https://github.com/organizations/acme/settings/apps/new?state="
-    )
+    assert body["post_url"].startswith("https://github.com/organizations/acme/settings/apps/new?state=")
     assert body["manifest"]["redirect_url"] == _REDIRECT
     assert body["manifest"]["name"] == "agp-acme"
     _, kwargs = s.create_manifest_state.call_args
     assert kwargs.get("created_by", "admin@x.com")
 
-
-# --- manifest/start: non-github provider → 400 -------------------------------
 
 def test_manifest_start_non_github_400(entra_settings):
     s = _svc_with(create_manifest_state={"return_value": "st-123"})
@@ -381,15 +415,15 @@ def test_manifest_start_non_github_400(entra_settings):
             headers=_headers(),
         )
     assert resp.status_code == 400
-    assert resp.json()["detail"] == "Invalid request"
+    assert resp.json() == {"detail": "Invalid request", "code": "connection.bad_request"}
     s.create_manifest_state.assert_not_called()
 
 
-# --- manifest/callback: resolved → 200 needs_install=false -------------------
-
 def test_manifest_callback_resolved_200(entra_settings):
     connected = _sample_connection(
-        auth_type=AuthType.GITHUB_APP, app_id="555", installation_id="222",
+        auth_type=ConnectionAuthType.GITHUB_APP,
+        app_id="555",
+        installation_id="222",
         account_login="acme-app",
     )
     s = _svc_with(complete_manifest={"return_value": (connected, False, None)})
@@ -409,12 +443,13 @@ def test_manifest_callback_resolved_200(entra_settings):
     s.complete_manifest.assert_called_once_with("tempcode", "st-123")
 
 
-# --- manifest/callback: not installed → 200 needs_install=true + install_url -
-
 def test_manifest_callback_not_installed_200(entra_settings):
     pending = _sample_connection(
-        auth_type=AuthType.GITHUB_APP, app_id="555", installation_id=None,
-        status=ConnStatus.PENDING, account_login=None,
+        auth_type=ConnectionAuthType.GITHUB_APP,
+        app_id="555",
+        installation_id=None,
+        status=ConnStatus.PENDING,
+        account_login=None,
     )
     install_url = "https://github.com/apps/agp-acme-provisioning/installations/new"
     s = _svc_with(complete_manifest={"return_value": (pending, True, install_url)})
@@ -431,11 +466,11 @@ def test_manifest_callback_not_installed_200(entra_settings):
     assert body["connection"]["status"] == "pending"
 
 
-# --- {id}/finalize happy path: 200 connected ---------------------------------
-
 def test_finalize_connects_200(entra_settings):
     connected = _sample_connection(
-        auth_type=AuthType.GITHUB_APP, app_id="555", installation_id="222",
+        auth_type=ConnectionAuthType.GITHUB_APP,
+        app_id="555",
+        installation_id="222",
         account_login="acme-app",
     )
     s = _svc_with(finalize_app_connection={"return_value": connected})
@@ -455,7 +490,9 @@ def test_finalize_connects_200(entra_settings):
 
 def test_finalize_empty_body_auto_resolves(entra_settings):
     connected = _sample_connection(
-        auth_type=AuthType.GITHUB_APP, app_id="555", installation_id="222",
+        auth_type=ConnectionAuthType.GITHUB_APP,
+        app_id="555",
+        installation_id="222",
     )
     s = _svc_with(finalize_app_connection={"return_value": connected})
     client = _build_client(s)
@@ -468,8 +505,6 @@ def test_finalize_empty_body_auto_resolves(entra_settings):
     assert resp.status_code == 200
     s.finalize_app_connection.assert_called_once_with("conn-1", None)
 
-
-# --- RBAC: the three new routes require ADMIN (403 for a viewer) -------------
 
 def test_manifest_start_viewer_forbidden(entra_settings):
     s = _svc_with(create_manifest_state={"return_value": "st"})
@@ -510,21 +545,12 @@ def test_finalize_viewer_forbidden(entra_settings):
     s.finalize_app_connection.assert_not_called()
 
 
-# --------------------------------------------------------------------------- #
-# The ADMIN OAuth-client paste (E27B/T9)
-# --------------------------------------------------------------------------- #
-#
-# GitHub exposes an App's client SECRET through no API after creation, so for an org whose App
-# already exists this one-time paste is the ONLY way to enable per-user linking. These tests pin
-# the three things that make it safe: it is ADMIN-gated, the pasted secret never appears in the
-# response, and a GitHub Enterprise connection is refused rather than stored into a dead end.
-
-_PASTED_SECRET = "s3cr3t"  # noqa: S105 — a fake, asserted to be ABSENT from every response
+_PASTED_SECRET = "s3cr3t"
 
 
 def _app_connection(**overrides) -> Connection:
-    data = {
-        "auth_type": AuthType.GITHUB_APP,
+    data: dict[str, Any] = {
+        "auth_type": ConnectionAuthType.GITHUB_APP,
         "app_id": "555",
         "installation_id": "222",
         "account_login": "acme-app",
@@ -534,10 +560,8 @@ def _app_connection(**overrides) -> Connection:
 
 
 def _oauth_svc_with(**methods):
-    """``_svc_with`` plus a ``get_connection`` default, which the paste route reads for its
-    github.com pre-check. A bare ``MagicMock`` would answer that read with a MagicMock whose
-    ``.base_url`` is TRUTHY — i.e. it would model a GitHub Enterprise connection and every test
-    below would trip the refusal instead of the behaviour it is actually asserting."""
+    """``_svc_with`` plus a ``get_connection`` default for the paste route's github.com pre-check:
+    a bare ``MagicMock``'s ``.base_url`` is truthy and would model a GitHub Enterprise connection."""
     methods.setdefault("get_connection", {"return_value": _app_connection(base_url=None)})
     return _svc_with(**methods)
 
@@ -561,8 +585,6 @@ def test_set_oauth_client_returns_the_connection_and_never_the_secret(entra_sett
 
 
 def test_set_oauth_client_requires_admin(entra_settings):
-    # An OPERATOR may READ the connections list, but pasting a client secret is a
-    # trust-boundary mutation — ADMIN only.
     s = _oauth_svc_with(set_oauth_client={"return_value": _app_connection()})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
@@ -589,13 +611,9 @@ def test_set_oauth_client_viewer_forbidden(entra_settings):
 
 
 def test_set_oauth_client_mismatch_is_400_with_a_fixed_detail(entra_settings):
-    # The service verifies the pasted client_id against GET /app BEFORE storing; a pair from a
-    # different App is verify_failed → 400 with the curated (secret-free) reason.
     s = _oauth_svc_with(
         set_oauth_client={
-            "side_effect": ConnectionError(
-                "client_id does not match the App", kind="verify_failed"
-            )
+            "side_effect": ConnectionError("client_id does not match the App", kind="verify_failed")
         }
     )
     client = _build_client(s)
@@ -612,9 +630,7 @@ def test_set_oauth_client_mismatch_is_400_with_a_fixed_detail(entra_settings):
 
 def test_set_oauth_client_unknown_connection_is_404(entra_settings):
     s = _oauth_svc_with(
-        set_oauth_client={
-            "side_effect": ConnectionError("Unknown connection", kind="not_found")
-        }
+        set_oauth_client={"side_effect": ConnectionError("Unknown connection", kind="not_found")}
     )
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
@@ -628,11 +644,8 @@ def test_set_oauth_client_unknown_connection_is_404(entra_settings):
 
 
 def test_set_oauth_client_refuses_a_github_enterprise_connection(entra_settings):
-    # THE DEAD END THIS CLOSES: the service would store a base_url connection's pair happily,
-    # but get_oauth_client_credentials refuses every base_url connection (the OAuth legs are
-    # github.com-only), so the admin's one-shot paste would vanish into a surface that can never
-    # use it — while has_oauth_client/oauth_client_ready both read TRUE and hint at nothing.
-    # Refused here, at the only reachable writer, so the paste is never wasted.
+    """The service would store a ``base_url`` connection's pair, but the OAuth legs are
+    github.com-only, so the one-shot paste is refused here before anything is written."""
     s = _svc_with(
         get_connection={"return_value": _app_connection(base_url="https://ghe.acme.dev/api/v3")},
         set_oauth_client={"return_value": _app_connection()},
@@ -645,15 +658,12 @@ def test_set_oauth_client_refuses_a_github_enterprise_connection(entra_settings)
             headers=_headers(),
         )
     assert resp.status_code == 400
-    assert resp.json()["detail"] == (
-        "Per-user GitHub linking is available for github.com connections only"
-    )
+    assert resp.json()["detail"] == ("Per-user GitHub linking is available for github.com connections only")
     assert _PASTED_SECRET not in resp.text
-    s.set_oauth_client.assert_not_called()  # nothing stored — no partial state
+    s.set_oauth_client.assert_not_called()
 
 
 def test_set_oauth_client_allows_a_github_dot_com_connection(entra_settings):
-    # The mirror of the refusal: base_url None ⇒ the paste proceeds.
     s = _svc_with(
         get_connection={"return_value": _app_connection(base_url=None)},
         set_oauth_client={"return_value": _app_connection(client_id="Iv1.abc", has_oauth_client=True)},
@@ -683,18 +693,13 @@ def test_set_oauth_client_secret_error_is_502(entra_settings):
             headers=_headers(),
         )
     assert resp.status_code == 502
-    assert resp.json()["detail"] == "Secret store operation failed"
+    assert resp.json() == {"detail": "Secret store operation failed", "code": "connection.secret_error"}
     assert _PASTED_SECRET not in resp.text
 
 
-# --- manifest/start now registers the USER callback slot too (E27B/T9) --------
-
-
 def test_manifest_start_includes_the_link_callback_url(entra_settings):
-    # Two DIFFERENT slots on one App: redirect_url is where the ADMIN lands after creating it,
-    # callback_urls is where an END USER lands after authorizing it. callback_urls is settable at
-    # creation time only, so the manifest must carry it or per-user linking is impossible without
-    # org-admin UI work. Derived from the SPA-supplied redirect_url's origin.
+    """``redirect_url`` is where the admin lands after creating the App; ``callback_urls`` is where
+    an end user lands after authorizing it, settable at creation only, derived from the same origin."""
     s = _svc_with(create_manifest_state={"return_value": "st-123"})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
@@ -706,13 +711,12 @@ def test_manifest_start_includes_the_link_callback_url(entra_settings):
     assert resp.status_code == 200
     m = resp.json()["manifest"]
     assert m["callback_urls"] == ["https://agp.example/ops/github-link/callback"]
-    assert m["redirect_url"] == "https://agp.example/ops/connections/callback"  # unchanged
+    assert m["redirect_url"] == "https://agp.example/ops/connections/callback"
 
 
 def test_manifest_start_link_callback_matches_the_pinned_path(entra_settings):
-    # The path is imported from the link service, never re-typed: GitHub matches a redirect_uri
-    # against a registered callback BYTE-FOR-BYTE, so a drifted literal here silently breaks
-    # every link at authorize time.
+    """GitHub matches a redirect_uri against a registered callback byte for byte, so the path is
+    the link service's constant; scheme and port are preserved and only the path is swapped."""
     from services.github_user_link import LINK_CALLBACK_PATH
 
     s = _svc_with(create_manifest_state={"return_value": "st-123"})
@@ -724,15 +728,10 @@ def test_manifest_start_link_callback_matches_the_pinned_path(entra_settings):
             headers=_headers(),
         )
     assert resp.status_code == 200
-    # Port and scheme preserved; only the PATH is swapped.
-    assert resp.json()["manifest"]["callback_urls"] == [
-        f"https://agp.example:8443{LINK_CALLBACK_PATH}"
-    ]
+    assert resp.json()["manifest"]["callback_urls"] == [f"https://agp.example:8443{LINK_CALLBACK_PATH}"]
 
 
 def test_manifest_start_link_callback_drops_query_and_fragment(entra_settings):
-    # T7's _validate_redirect_uri refuses a redirect_uri carrying a query or fragment, so a
-    # registered callback that carried one could never be matched by a real link attempt.
     s = _svc_with(create_manifest_state={"return_value": "st-123"})
     client = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
@@ -745,6 +744,121 @@ def test_manifest_start_link_callback_drops_query_and_fragment(entra_settings):
             headers=_headers(),
         )
     assert resp.status_code == 200
-    assert resp.json()["manifest"]["callback_urls"] == [
-        "https://agp.example/ops/github-link/callback"
+    assert resp.json()["manifest"]["callback_urls"] == ["https://agp.example/ops/github-link/callback"]
+
+
+_RECONCILE_ROUTES = [
+    ("reconcile", "get", "/api/v1/admin/connections/conn-1/rollout/reconcile", None),
+    ("rollout", "post", "/api/v1/admin/connections/conn-1/rollout", {"template_names": []}),
+    ("adopt", "post", "/api/v1/admin/connections/conn-1/templates/adopt", {"repo_name": "x"}),
+]
+_ROLLOUT_KINDS = [
+    ("not_found", 404, "Unknown base template"),
+    ("repo_not_found", 404, "Repository not found in the org"),
+    ("conflict", 409, "Template already registered"),
+    ("rollout_error", 502, "Template rollout failed"),
+    ("validation", 422, "Invalid template name or connection id"),
+]
+
+
+def _reconcile_call(client, method, path, body):
+    if body is None:
+        return client.get(path, headers=_headers())
+    return client.post(path, json=body, headers=_headers())
+
+
+@pytest.mark.parametrize(
+    "kind,status,detail", _ROLLOUT_KINDS, ids=[f"{kind} is {status}" for kind, status, _ in _ROLLOUT_KINDS]
+)
+@pytest.mark.parametrize(
+    "svc_method,method,path,body", _RECONCILE_ROUTES, ids=[r[0] for r in _RECONCILE_ROUTES]
+)
+def test_connections_rollout_error_kinds_render_the_route_map(
+    svc_method, method, path, body, kind, status, detail, entra_settings
+):
+    """``RolloutError`` renders through its table on every route that lets it escape: each kind's
+    status and fixed detail, never the service's message."""
+    rollout = MagicMock()
+    getattr(rollout, svc_method).side_effect = RolloutError("secret internals", kind=kind)
+    client = _build_client(_svc_with(), rollout_svc=rollout)
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        resp = _reconcile_call(client, method, path, body)
+    assert resp.status_code == status
+    assert resp.json() == {"detail": detail, "code": f"rollout.{kind}"}
+    assert "secret internals" not in resp.text
+
+
+@pytest.mark.parametrize(
+    "svc_method,method,path,body", _RECONCILE_ROUTES, ids=[r[0] for r in _RECONCILE_ROUTES]
+)
+def test_connections_github_repo_error_is_502(svc_method, method, path, body, entra_settings):
+    rollout = MagicMock()
+    getattr(rollout, svc_method).side_effect = GitHubRepoError("secret internals")
+    client = _build_client(_svc_with(), rollout_svc=rollout)
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        resp = _reconcile_call(client, method, path, body)
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "Template rollout failed", "code": "github_repo.provider_error"}
+    assert "secret internals" not in resp.text
+
+
+@pytest.mark.parametrize(
+    "svc_method,method,path,body", _RECONCILE_ROUTES, ids=[r[0] for r in _RECONCILE_ROUTES]
+)
+def test_connections_reconcile_routes_render_connection_not_found(
+    svc_method, method, path, body, entra_settings
+):
+    rollout = MagicMock()
+    getattr(rollout, svc_method).side_effect = ConnectionError("Unknown connection", kind="not_found")
+    client = _build_client(_svc_with(), rollout_svc=rollout)
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        resp = _reconcile_call(client, method, path, body)
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Connection not found", "code": "connection.not_found"}
+
+
+def test_the_reconcile_read_answers_every_origin_and_state_with_todays_bytes(entra_settings):
+    from services.template_rollout_service import ReconcileItem, ReconcileView
+
+    rollout = MagicMock()
+    rollout.reconcile.return_value = ReconcileView(
+        templates=[
+            ReconcileItem(
+                name="seed-a", origin="seed", state="registered_present", default_branch="main", head_sha="a1"
+            ),
+            ReconcileItem(name="uploaded", origin="registry", state="registered_missing"),
+            ReconcileItem(name="theirs", origin="org", state="unregistered_present"),
+        ],
+        infra_repo=ReconcileItem(name="infra", origin="seed", state="seed_absent"),
+    )
+    client = _build_client(_svc_with(), rollout_svc=rollout)
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        resp = client.get("/api/v1/admin/connections/conn-1/rollout/reconcile", headers=_headers())
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [(row["origin"], row["state"]) for row in body["templates"]] == [
+        ("seed", "registered_present"),
+        ("registry", "registered_missing"),
+        ("org", "unregistered_present"),
     ]
+    assert body["infra_repo"] == {
+        "name": "infra",
+        "origin": "seed",
+        "state": "seed_absent",
+        "default_branch": None,
+        "head_sha": None,
+        "infra_template_id": None,
+    }
+
+
+def test_reconcile_item_view_origin_and_state_are_closed():
+    from pydantic import ValidationError
+
+    from api.routes.connections import ReconcileItemView
+
+    row = {"name": "t", "origin": "seed", "state": "seed_absent"}
+    with pytest.raises(ValidationError):
+        ReconcileItemView.model_validate({**row, "state": "quarantined"})
+    with pytest.raises(ValidationError):
+        ReconcileItemView.model_validate({**row, "origin": "elsewhere"})

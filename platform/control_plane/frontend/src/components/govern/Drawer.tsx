@@ -32,12 +32,10 @@ export default function Drawer({ open, onClose, title, subtitle, children, width
 
   return (
     <div className="fixed inset-0 z-50" aria-modal="true" role="dialog">
-      {/* backdrop */}
       <div
         className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-fade-in"
         onClick={onClose}
       />
-      {/* panel */}
       <div
         className={`absolute right-0 top-0 h-full w-full ${WIDTH[width]} bg-white shadow-2xl border-l border-slate-200 flex flex-col animate-slide-in-right`}
       >

@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""Migrate an EXISTING pre-E25 / E25 install to E25B (cross-account runtime deploy).
+"""Migrate an EXISTING install to the cross-account runtime deploy model.
 
-This is an OPERATOR / CONTROLLER step run as part of deploying the E25B version. It
-ORCHESTRATES existing services only — it provisions nothing of its own and writes no
-new data model. E25B makes agent runtimes deploy CROSS-ACCOUNT; the operator-facing
-consequences for an existing install (and how this script addresses each) are:
+This is an OPERATOR / CONTROLLER step run as part of deploying the cross-account version.
+It ORCHESTRATES existing services only — it provisions nothing of its own and writes no
+new data model. Agent runtimes now deploy CROSS-ACCOUNT; the operator-facing consequences
+for an existing install (and how this script addresses each) are:
 
   1. **The operator's own ``terraform apply`` (NOT this script) DELETES the platform
      ``agentcore_runtime_exec_role`` module and changes the buildspec so it no longer
@@ -13,8 +13,8 @@ consequences for an existing install (and how this script addresses each) are:
      (``runtime-module/agentcore_runtime.zip`` on the state bucket). This script does
      NOT run terraform — it must be run AFTER the apply (see the ORDER below).
 
-  2. **The per-org ``agp-runtime-infra`` GitHub repo must be updated to the E25B
-     module.** CRITICAL: the pre-E25B module declared ``exec_role_arn`` as a REQUIRED
+  2. **The per-org ``agp-runtime-infra`` GitHub repo must be updated to the current
+     module.** CRITICAL: the previous module declared ``exec_role_arn`` as a REQUIRED
      variable (no default). After the apply the buildspec stops passing it, so an org
      still running the OLD module fails ``terraform`` with "No value for required
      variable exec_role_arn". The backend rollout SKIPS existing repos by default, so
@@ -22,27 +22,24 @@ consequences for an existing install (and how this script addresses each) are:
      connected org it re-pushes ``agp-runtime-infra`` from the fresh S3 module zip via
      ``RolloutService.rollout(template_names=[], overwrite=True, overwrite_infra=True)``
      — that call touches ONLY the forced infra repo, no base templates.
-     NOTE (E28D/T8): ``overwrite_infra`` is the flag that does the forcing. ``overwrite``
-     governs TEMPLATE repos only and no longer reaches the infra repo at all, so a call
-     that omits ``overwrite_infra`` gets ``action="skipped"`` on an existing repo — i.e.
-     this script's core job would silently not happen. It is passed explicitly, and Step 2
+     ``overwrite_infra`` is the flag that does the forcing. ``overwrite`` governs
+     TEMPLATE repos only and never reaches the infra repo, so a call that omits
+     ``overwrite_infra`` gets ``action="skipped"`` on an existing repo — i.e. this
+     script's core job would silently not happen. It is passed explicitly, and Step 2
      counts an org as done ONLY when the infra item's action is ``overwritten``/``created``
      (a ``skipped`` is reported as such and makes the run exit nonzero).
-     NOTE (E28C/T3): "overwrite" is no longer delete+recreate. It is now an idempotent
-     ONE-commit push of the module files onto the existing repo, so the repository, its
-     history and its issues survive — and a re-run whose bytes are unchanged writes no
-     commit at all. Same outcome for this migration (the module files end up current),
-     without destroying an org's repo to get there.
+     "Overwrite" is an idempotent ONE-commit push of the module files onto the existing
+     repo, so the repository, its history and its issues survive — and a re-run whose
+     bytes are unchanged writes no commit at all.
 
   3. **Already-deployed runtimes point at the now-deleted platform exec role.** They
      need a re-push to self-provision an in-account role. This script DETECTS + REPORTS
      them (Step 3) — it does NOT auto-trigger any build (report-only in both modes).
 
-  4. **E25B does NOT change the tenant/agent/repo DATA model** — there is no E25B-only
-     DynamoDB migration. BUT the operator may be coming from PRE-E25 (before the
-     E24/E25 tenant reshape), so Step 1 CHAINS the existing E24/E25 tenant migration
-     (``seed_default_tenant.run``). It is idempotent: on an already-E25 install it
-     stamps nothing.
+  4. **The tenant/agent/repo DATA model does not change** — there is no DynamoDB
+     migration of its own. BUT the operator may be coming from an install that predates
+     tenants, so Step 1 CHAINS the existing tenant migration (``seed_default_tenant.run``).
+     It is idempotent: on an install that already has tenants it stamps nothing.
 
 STEPS (in order; each dry-run-aware; each prints a per-step summary):
 
@@ -80,15 +77,18 @@ account, agent registry id, tenants/projects tables) this script also resolves:
   - the **connections table** (``<PROJECT_NAME>-cp-<ENVIRONMENT>-<last-6-of-account>-
     connections`` — Terraform's naming rule, ``--connections-table`` overrides);
   - the **connections secret prefix** (``connections_secret_prefix`` in the tfvars,
-    else the backend default ``agp-dev/git-connections/``);
-  - the **runtime-module S3 bucket + key** (the state bucket
-    ``<name_prefix>-tf-state`` — or the operator's ``STATE_BACKEND_BUCKET_NAME_PREFIX``
-    — and the fixed key ``runtime-module/agentcore_runtime.zip``).
+    else the backend default ``agp-dev/git-connections/``, which mirrors
+    ``CONNECTIONS_SECRET_PREFIX`` in ``core/config.py`` as a literal);
+  - the **runtime-module S3 bucket + key**: CLI > ``runtime_module_bucket`` in the tfvars
+    > the operator's ``STATE_BACKEND_BUCKET_NAME_PREFIX`` (used verbatim as the bucket
+    name) > the derived state bucket ``<name_prefix>-tf-state`` (Terraform's own rule);
+    the key is fixed at ``runtime-module/agentcore_runtime.zip`` unless the tfvars or
+    ``--runtime-module-key`` say otherwise.
 
 ``--dry-run`` makes ZERO mutating calls: it PLANS and prints (Step 1 stamps nothing,
 Step 2 lists orgs but never overwrites a repo, Step 3 is read-only). A real run makes
-the calls. Re-running is safe (idempotent): the tenant step stamps nothing, a repo
-overwrite is delete+recreate (same result), the runtime report is read-only.
+the calls. Re-running is safe (idempotent): the tenant step stamps nothing, an unchanged
+re-push writes no commit, the runtime report is read-only.
 
 Run from the backend dir (PYTHONPATH=src is required — src/ is not a package):
 
@@ -115,57 +115,34 @@ import os
 import sys
 from pathlib import Path
 
-# The seed script lives beside this one in scripts/. Put the scripts dir on sys.path so
-# ``import seed_default_tenant`` resolves both when this file is run directly AND when a
-# test imports it as ``scripts.migrate_to_e25b`` (the scripts dir is not otherwise on the
-# path). seed_default_tenant is stdlib-only at import top, so importing it is import-safe.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-import seed_default_tenant as seed  # noqa: E402 — after the sys.path shim
+import seed_default_tenant as seed  # noqa: E402 — the sibling resolves only after the sys.path shim above; expires 2027-10-23; added E49A-50A/T17
 
 logger = logging.getLogger("migrate_to_e25b")
 
-# --- E25B-only config (on top of the seed's resolved values) -------------------
-# The connections table is named by Terraform's rule, same as tenants/projects.
 CONNECTIONS_TABLE_SUFFIX = "connections"
-# The state bucket (which stages the runtime-module zip) is "<name_prefix>-tf-state"
-# when the operator leaves STATE_BACKEND_BUCKET_NAME_PREFIX empty (root main.tf /
-# modules/state_backend/main.tf); the runtime_module.tf uploads the zip to a FIXED key.
 STATE_BUCKET_SUFFIX = "tf-state"
 DEFAULT_RUNTIME_MODULE_KEY = "runtime-module/agentcore_runtime.zip"
-# Backend default (core/config.py CONNECTIONS_SECRET_PREFIX) — used when the tfvars
-# doesn't carry one. The secret prefix is not account/region-specific (no hardcoded ids).
-DEFAULT_CONNECTIONS_SECRET_PREFIX = "agp-dev/git-connections/"
-
-# Base-template scaffolds ship in the image beside backend/ (config.py resolves
-# AGENT_TEMPLATES_DIR to control_plane/agent-templates). Step 2 passes template_names=[]
-# so this dir is never read — RolloutService still needs it constructed, so we compute
-# the same default (overridable via --agent-templates-dir).
+DEFAULT_CONNECTIONS_SECRET_PREFIX = "agp-dev/git-connections/"  # noqa: S105 — a secret's name prefix, not a credential; expires 2027-10-23; added E49A-50A/T17
 DEFAULT_AGENT_TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "agent-templates"
-
-# The forced per-org infra repo whose action we report per org (from the rollout module).
-try:  # keep import lazy-safe: the service imports httpx, which the image ships.
-    from services.template_rollout_service import INFRA_REPO_NAME
-except Exception:  # noqa: BLE001 — module-import must not hard-require the service tree.
-    INFRA_REPO_NAME = "agp-runtime-infra"
-
-# The only infra-repo actions that mean "this org now runs the E25B module" (``_ensure_infra``
-# derives its word from the repo's state: "overwritten" = re-pushed on top, "created" = the repo
-# was absent and was made). Anything else — notably "skipped", which is what a rollout WITHOUT
-# ``overwrite_infra=True`` returns for an existing repo — means the migration did NOT happen for
-# that org, so it must not be counted as a success.
+INFRA_REPO_NAME = "agp-runtime-infra"
 _DONE_ACTIONS = frozenset({"overwritten", "created"})
 
 
 def _resolve_e25b_config(args) -> dict:
-    """Resolve every runtime value E25B needs. Reuses the seed's resolver verbatim for
-    the shared values (region, account, agent/mcp registry ids, tenants/projects tables),
-    then derives the E25B-only values the seed way (CLI > terraform.tfvars > Terraform
-    naming rule / backend default). NO hardcoded account ids or regions anywhere.
+    """Resolve every runtime value this migration needs. Reuses the seed's resolver
+    verbatim for the shared values (region, account, agent/mcp registry ids,
+    tenants/projects tables), then derives this script's own values the seed way (CLI >
+    terraform.tfvars > Terraform naming rule / backend default): the connections table,
+    the connections secret prefix, the runtime-module bucket (CLI > ``RUNTIME_MODULE_BUCKET``
+    > ``STATE_BACKEND_BUCKET_NAME_PREFIX`` verbatim > the derived ``<name_prefix>-tf-state``)
+    and key, and the agent-templates dir the rollout service requires but Step 2 never
+    reads. NO hardcoded account ids or regions anywhere.
     """
-    base = seed._resolve_runtime_config(args)  # region/account/registries/tables
+    base = seed._resolve_runtime_config(args)
     infra_dir = Path(args.infra_dir) if args.infra_dir else seed.DEFAULT_INFRA_DIR
     infra = seed._load_infra_config(infra_dir)
     account_id = base["account_id"]
@@ -179,22 +156,14 @@ def _resolve_e25b_config(args) -> dict:
         or DEFAULT_CONNECTIONS_SECRET_PREFIX
     )
 
-    # Runtime-module bucket: CLI > infra RUNTIME_MODULE_BUCKET > the operator's explicit
-    # state-bucket prefix (STATE_BACKEND_BUCKET_NAME_PREFIX, used verbatim as the bucket
-    # name) > the derived default "<name_prefix>-tf-state" (Terraform's own rule). The
-    # runtime_module.tf key is fixed; infra RUNTIME_MODULE_KEY / --runtime-module-key win.
     runtime_module_bucket = (
         args.runtime_module_bucket
         or infra.get("RUNTIME_MODULE_BUCKET")
         or infra.get("STATE_BACKEND_BUCKET_NAME_PREFIX")
-        or seed._derive_table_name(
-            infra, account_id, STATE_BUCKET_SUFFIX, infra_dir=infra_dir
-        )
+        or seed._derive_table_name(infra, account_id, STATE_BUCKET_SUFFIX, infra_dir=infra_dir)
     )
     runtime_module_key = (
-        args.runtime_module_key
-        or infra.get("RUNTIME_MODULE_KEY")
-        or DEFAULT_RUNTIME_MODULE_KEY
+        args.runtime_module_key or infra.get("RUNTIME_MODULE_KEY") or DEFAULT_RUNTIME_MODULE_KEY
     )
 
     agent_templates_dir = args.agent_templates_dir or str(DEFAULT_AGENT_TEMPLATES_DIR)
@@ -210,21 +179,21 @@ def _resolve_e25b_config(args) -> dict:
 
 
 def _build_e25b_services(config: dict):
-    """Construct the two E25B-only services (ConnectionService + RolloutService) from the
-    resolved infra config — mirrors ``connections.py``'s ``get_rollout_service``. Lazy
+    """Construct this migration's two services (ConnectionService + RolloutService) from
+    the resolved infra config — mirrors ``connections.py``'s ``get_rollout_service``. Lazy
     (main()-only) so importing this module never triggers boto3/service imports.
 
     The RolloutService gets a real provider client and S3 client; Step 2 only exercises the
     FORCED infra-repo path (``template_names=[]``), so the agent templates dir is never read
-    — it is still required by the constructor.
+    and the template registry is never consulted — both are still required by the
+    constructor (reconcile reads the registry).
 
     ``known_repo_names`` is deliberately NOT passed: it exists for the reconcile surface's adopt
-    picker (E28C/T3), and this script never reconciles. Reconcile fails closed without it, which
-    is the intended posture — an operator script must not be able to offer an adopt list built
-    from an under-subtracted inventory.
+    picker, and this script never reconciles. Reconcile fails closed without it, which is the
+    intended posture — an operator script must not be able to offer an adopt list built from
+    an under-subtracted inventory.
     """
-    import boto3
-
+    from core.aws_clients import client
     from services.connection_service import ConnectionService
     from services.github_repo_service import GitHubRepoService
     from services.template_registry import TemplateRegistry
@@ -239,15 +208,10 @@ def _build_e25b_services(config: dict):
         GitHubRepoService(),
         connection_service,
         agent_templates_dir=config["agent_templates_dir"],
-        s3_client=boto3.client("s3", region_name=config["region"]),
+        s3_client=client("s3", region=config["region"]),
         runtime_module_bucket=config["runtime_module_bucket"],
         runtime_module_key=config["runtime_module_key"],
-        # The template catalog (E28B/T2). Step 2 only rolls out the FORCED infra repo
-        # (``template_names=[]``), which is never registered — but the constructor requires
-        # the registry, and reconcile reads it.
-        template_registry=TemplateRegistry(
-            table_name=config["projects_table"], region=config["region"]
-        ),
+        template_registry=TemplateRegistry(table_name=config["projects_table"], region=config["region"]),
     )
     return connection_service, rollout_service
 
@@ -261,8 +225,8 @@ def _overwrite_infra_repos(connection_service, rollout_service, *, dry_run: bool
     the failure count; the overwrite itself is idempotent (an unchanged re-push writes no
     commit at all).
 
-    ``overwrite_infra=True`` is what forces the infra repo (E28D/T8 narrowed ``overwrite``
-    to TEMPLATE repos only) — and the count is derived from the infra item's ACTION, never
+    ``overwrite_infra=True`` is what forces the infra repo (``overwrite`` governs TEMPLATE
+    repos only) — and the count is derived from the infra item's ACTION, never
     from "the call did not raise": only ``overwritten``/``created`` count as done. A
     ``skipped`` (or a missing infra item) is reported honestly and counted as a failure,
     because for THIS script a skip means its core job did not happen.
@@ -282,12 +246,8 @@ def _overwrite_infra_repos(connection_service, rollout_service, *, dry_run: bool
             print(f"  {org} -> would-overwrite")
             continue
         try:
-            result = rollout_service.rollout(
-                conn_id, template_names=[], overwrite=True, overwrite_infra=True
-            )
-            infra_item = next(
-                (i for i in result.items if i.name == INFRA_REPO_NAME), None
-            )
+            result = rollout_service.rollout(conn_id, template_names=[], overwrite=True, overwrite_infra=True)
+            infra_item = next((i for i in result.items if i.name == INFRA_REPO_NAME), None)
             action = getattr(infra_item, "action", "unknown") if infra_item else "unknown"
             if action in _DONE_ACTIONS:
                 overwritten += 1
@@ -302,9 +262,9 @@ def _overwrite_infra_repos(connection_service, rollout_service, *, dry_run: bool
                     action,
                 )
             print(f"  {org} -> {action}")
-        except Exception as exc:  # noqa: BLE001 — log + continue, don't abort the migration
+        except Exception as exc:
             failures += 1
-            logger.error("  failed to overwrite %s in org %r: %s — continuing", INFRA_REPO_NAME, org, exc)
+            logger.exception("  failed to overwrite %s in org %r: %s — continuing", INFRA_REPO_NAME, org, exc)
             print(f"  {org} -> failed")
     return overwritten, len(connections), failures
 
@@ -354,10 +314,10 @@ def run(
     region=None,
     **wiring,
 ) -> int:
-    """Run the three E25B migration steps in order. Returns an exit code (nonzero if the
+    """Run the three migration steps in order. Returns an exit code (nonzero if the
     chained tenant step reported a stamp failure OR any org's infra-repo overwrite
     failed). Services are parameters (built in ``main()``; in-memory fakes in tests) so
-    this performs no service construction and no config access. ``**wiring`` (the E25
+    this performs no service construction and no config access. ``**wiring`` (the
     ``*_ecr_uri`` / ``*_role_arn`` values) passes straight through to the seed step.
     """
     print("=== Step 1: tenant migration (chained E24/E25 seed) ===")
@@ -374,9 +334,7 @@ def run(
     )
 
     print("=== Step 2: overwrite 'agp-runtime-infra' per connected org ===")
-    ow, total, ow_failures = _overwrite_infra_repos(
-        connection_service, rollout_service, dry_run=dry_run
-    )
+    ow, total, ow_failures = _overwrite_infra_repos(connection_service, rollout_service, dry_run=dry_run)
     if dry_run:
         print(f"  [dry-run] {total} org(s) would be overwritten (no repo touched).")
     else:
@@ -433,7 +391,6 @@ def parse_args(argv=None):
             "writes): it lists the orgs that WOULD be overwritten and reports runtimes.\n"
         ),
     )
-    # --- shared with seed_default_tenant (feed _resolve_runtime_config) ---
     parser.add_argument(
         "--group-id",
         default=None,
@@ -453,10 +410,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--region",
         default=None,
-        help=(
-            "AWS region for the stack (default: aws_region in terraform.tfvars; no "
-            "hardcoded fallback)."
-        ),
+        help=("AWS region for the stack (default: aws_region in terraform.tfvars; no hardcoded fallback)."),
     )
     parser.add_argument(
         "--infra-dir",
@@ -478,9 +432,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--mcp-registry-id",
         default=None,
-        help=(
-            "MCP registry id (same note as --agent-registry-id — pass it explicitly)."
-        ),
+        help=("MCP registry id (same note as --agent-registry-id — pass it explicitly)."),
     )
     parser.add_argument(
         "--tenants-table",
@@ -492,7 +444,6 @@ def parse_args(argv=None):
         default=None,
         help="Projects DynamoDB table name override (default: derived by Terraform's rule).",
     )
-    # --- E25B-only ---
     parser.add_argument(
         "--connections-table",
         default=None,
@@ -555,8 +506,6 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Resolve the tenant's Entra group BEFORE importing settings/services — the script
-    # must not require full env config just to tell the caller what's missing.
     group_id = args.group_id or os.environ.get(seed.GROUP_ID_ENV_VAR, "")
     if not group_id:
         logger.error(
@@ -567,10 +516,7 @@ def main(argv=None) -> int:
 
     try:
         config = _resolve_e25b_config(args)
-        # The seed step's four services + this migration's two, both from the infra config.
-        tenant_service, agent_service, mcp_server_service, project_service = (
-            seed._build_services(config)
-        )
+        tenant_service, agent_service, mcp_server_service, project_service = seed._build_services(config)
         connection_service, rollout_service = _build_e25b_services(config)
         return run(
             group_id=group_id,
@@ -581,15 +527,11 @@ def main(argv=None) -> int:
             project_service=project_service,
             connection_service=connection_service,
             rollout_service=rollout_service,
-            account_id=(
-                None
-                if config["account_id"] == seed.ACCOUNT_PLACEHOLDER
-                else config["account_id"]
-            ),
+            account_id=(None if config["account_id"] == seed.ACCOUNT_PLACEHOLDER else config["account_id"]),
             region=config["region"],
         )
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        logger.error("E25B migration failed: %s", exc)
+    except Exception as exc:
+        logger.exception("E25B migration failed: %s", exc)
         logger.error(
             "Runtime config comes from the INFRASTRUCTURE folder's terraform.tfvars "
             "(--infra-dir, default %s), not the backend's own settings. Check that: "

@@ -1,11 +1,16 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { mcpServersApi } from '../../api/client';
-import type { McpServer, LifecycleState, McpServerKind } from '../../api/client';
-import { useUser } from '../../contexts/UserContext';
-import { AgentAvatar, lifecycleBadge, emailAlias, kindBadge, tenantBadge } from './agentUi';
+import type { LifecycleState, McpServer, Kind } from '../../api/client';
+import { useLoad } from '../../api/useLoad';
+import { useUser } from '../../contexts/useUser';
+import { AgentAvatar } from './agentUi';
+import { lifecycleBadge, emailAlias, kindBadge, tenantBadge } from './agentBadges';
+import { mcpEndpoint } from './mcpRepoOwnership';
 import { resolveTenantName } from './tenantUi';
 import { useTenantDirectory } from './useTenantDirectory';
+
+const NO_SERVERS: McpServer[] = [];
 
 const LIFECYCLE_OPTIONS: { value: LifecycleState; label: string }[] = [
   { value: 'proposed', label: 'Proposed' },
@@ -15,7 +20,7 @@ const LIFECYCLE_OPTIONS: { value: LifecycleState; label: string }[] = [
   { value: 'deprecated', label: 'Deprecated' },
 ];
 
-const KIND_OPTIONS: { value: McpServerKind; label: string }[] = [
+const KIND_OPTIONS: { value: Kind; label: string }[] = [
   { value: 'gateway', label: 'Gateway' },
   { value: 'standard', label: 'Standard' },
 ];
@@ -23,56 +28,29 @@ const KIND_OPTIONS: { value: McpServerKind; label: string }[] = [
 export default function McpServerCatalog() {
   const navigate = useNavigate();
 
-  // Tenant name resolution (E24): rows carry tenant_id; names come from the
-  // caller's memberships, widened by the admin directory when available.
   const { user } = useUser();
   const tenantDirectory = useTenantDirectory((user?.role_level ?? 0) >= 2);
 
-  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  // server-side filter (re-fetches)
   const [filterLifecycle, setFilterLifecycle] = useState<'all' | LifecycleState>('all');
-  // client-side filters
   const [search, setSearch] = useState('');
-  const [filterKind, setFilterKind] = useState<'all' | McpServerKind>('all');
+  const [filterKind, setFilterKind] = useState<'all' | Kind>('all');
   const [filterBusinessUnit, setFilterBusinessUnit] = useState<string>('all');
 
-  // Bumped to force a re-fetch (e.g. Retry) even when filters are unchanged.
-  const [reloadNonce, setReloadNonce] = useState(0);
+  const { state, reload } = useLoad(
+    () =>
+      mcpServersApi.list(filterLifecycle === 'all' ? undefined : { lifecycle_state: filterLifecycle }),
+    [filterLifecycle],
+    'Failed to load MCP servers.',
+  );
+  const mcpServers = state.data ?? NO_SERVERS;
+  const loading = state.kind === 'loading';
 
-  // Load (re-fetches when the server-side lifecycle filter changes).
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    mcpServersApi
-      .list(filterLifecycle === 'all' ? undefined : { lifecycle_state: filterLifecycle })
-      .then((res) => {
-        if (cancelled) return;
-        setMcpServers(res);
-        setError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Failed to load MCP servers.');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [filterLifecycle, reloadNonce]);
-
-  // Distinct Lines of Business from the loaded rows (cleaner than a static list).
   const businessUnits = useMemo(() => {
     const set = new Set<string>();
     for (const m of mcpServers) if (m.business_unit) set.add(m.business_unit);
     return Array.from(set).sort((x, y) => x.localeCompare(y));
   }, [mcpServers]);
 
-  // Client-side filters: text search (name + owner_email), kind, business_unit.
   const rows = useMemo(() => {
     const q = search.trim().toLowerCase();
     return mcpServers.filter((m) => {
@@ -103,7 +81,6 @@ export default function McpServerCatalog() {
         </button>
       </div>
 
-        {/* Compact filter row (M365-style: a single tight band above the table). */}
         <div className="bg-white/70 backdrop-blur rounded-xl border border-slate-200/60 shadow-sm p-2.5 mb-3">
           <div className="grid grid-cols-1 md:grid-cols-12 gap-2">
             <div className="md:col-span-5">
@@ -133,7 +110,7 @@ export default function McpServerCatalog() {
                 aria-label="Filter by kind"
                 className="w-full px-3 py-1.5 text-sm rounded-lg border border-slate-300 bg-white"
                 value={filterKind}
-                onChange={(e) => setFilterKind(e.target.value as 'all' | McpServerKind)}
+                onChange={(e) => setFilterKind(e.target.value as 'all' | Kind)}
               >
                 <option value="all">All kinds</option>
                 {KIND_OPTIONS.map((o) => (
@@ -157,12 +134,12 @@ export default function McpServerCatalog() {
           </div>
         </div>
 
-        {error ? (
+        {state.kind === 'error' ? (
           <div className="bg-white/70 backdrop-blur rounded-xl border border-red-200/70 shadow-sm p-6">
             <h3 className="text-sm font-semibold text-red-700">Couldn’t load MCP servers</h3>
-            <p className="text-sm text-slate-600 mt-1">{error}</p>
+            <p className="text-sm text-slate-600 mt-1">{state.message}</p>
             <button
-              onClick={() => setReloadNonce((n) => n + 1)}
+              onClick={reload}
               className="mt-3 px-3 py-1.5 rounded-lg bg-white border border-slate-300 text-slate-700 text-xs font-medium hover:bg-slate-50 transition-colors"
             >
               Retry
@@ -197,8 +174,24 @@ export default function McpServerCatalog() {
                     resolveTenantName(m.tenant_id, user?.tenants, tenantDirectory),
                   );
                   return (
-                    <tr key={m.id} className="hover:bg-blue-50/40 transition-colors">
-                      {/* MCP server: avatar + name link + tiny endpoint sublabel. */}
+                    <tr
+                      key={m.id}
+                      onClick={(e) => {
+                        if ((e.target as HTMLElement).closest('a')) return;
+                        navigate(`/mcp-servers/${m.id}`);
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`Open ${m.name}`}
+                      onKeyDown={(e) => {
+                        if ((e.target as HTMLElement).closest('a')) return;
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          navigate(`/mcp-servers/${m.id}`);
+                        }
+                      }}
+                      className="cursor-pointer hover:bg-blue-50/40 transition-colors"
+                    >
                       <td className="px-4 py-2">
                         <div className="flex items-center gap-2.5">
                           <AgentAvatar name={m.name} size="sm" />
@@ -210,7 +203,7 @@ export default function McpServerCatalog() {
                               {m.name}
                             </Link>
                             <span className="block text-xs text-slate-500 truncate">
-                              {m.endpoint_url ? m.endpoint_url : 'No endpoint set'}
+                              {mcpEndpoint(m)?.url ?? 'No endpoint set'}
                             </span>
                           </div>
                         </div>

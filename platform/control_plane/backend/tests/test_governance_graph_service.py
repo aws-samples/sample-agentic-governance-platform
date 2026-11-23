@@ -1,4 +1,4 @@
-"""GovernanceGraphService aggregation tests (Epic 11, Task 4).
+"""GovernanceGraphService aggregation tests.
 
 The service composes the registry lists (``agent_service.list()`` /
 ``mcp_service.list()`` — sync boto3) + the async ``GraphService`` reads
@@ -17,19 +17,17 @@ decorated ``@pytest.mark.asyncio`` explicitly (same as ``test_graph_service.py``
 """
 
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from models.agent import Agent, LifecycleState, Origin, Platform
-from models.mcp_server import Kind
+from models.agent import Agent, IdentityStatus, LifecycleState, Origin, Platform
+from models.mcp_server import CedarEnforcementMode, Kind, McpServer
 from models.mcp_server import LifecycleState as McpLifecycleState
-from models.mcp_server import McpServer
 
 _NOW = datetime.now(timezone.utc)
 
-
-# --- builders (real model instances so enum .value coercion is exercised) ----
 
 def _agent(
     *,
@@ -47,7 +45,7 @@ def _agent(
         lifecycle_state=LifecycleState.APPROVED,
         platform=Platform.AWS_BEDROCK,
         origin=Origin.REGISTERED,
-        identity_status="provisioned" if provisioned else "none",
+        identity_status=IdentityStatus.PROVISIONED if provisioned else IdentityStatus.NONE,
         entra_sp_id=entra_sp_id if provisioned else None,
         invoker_role_id=invoker_role_id,
         admin_role_id=admin_role_id,
@@ -64,7 +62,7 @@ def _mcp(
     entra_sp_id="mcp-sp-1",
     invoker_role_id="mcp-inv-guid",
     admin_role_id="mcp-adm-guid",
-    cedar_enforcement_mode="enforce",
+    cedar_enforcement_mode: CedarEnforcementMode = "enforce",
     tenant_id=None,
     published=False,
     shared=False,
@@ -78,7 +76,7 @@ def _mcp(
         invoker_role_id=invoker_role_id,
         admin_role_id=admin_role_id,
         cedar_enforcement_mode=cedar_enforcement_mode,
-        identity_status="provisioned",
+        identity_status=IdentityStatus.PROVISIONED,
         tenant_id=tenant_id,
         published=published,
         shared=shared,
@@ -121,8 +119,6 @@ def _edges_by_type(graph, edge_type):
     return [e for e in graph.edges if e.type == edge_type]
 
 
-# --- node assembly -----------------------------------------------------------
-
 @pytest.mark.asyncio
 async def test_build_node_assembly_includes_all_entities_and_skips_unprovisioned():
     """2 agents (1 provisioned, 1 not) + 2 MCPs → 4 entity nodes with prefixed
@@ -134,17 +130,16 @@ async def test_build_node_assembly_includes_all_entities_and_skips_unprovisioned
     graph = _empty_graph()
 
     svc = _make_service(agents=[prov, unprov], mcps=[m1, m2], graph=graph)
-    out = await svc.build()
+    out = await svc.build(ctx=_ctx(is_global=True))
 
-    # 4 entity nodes (no principals — empty assignments)
     assert _node_by_id(out, "agent:a-prov") is not None
     assert _node_by_id(out, "agent:a-unprov") is not None
     assert _node_by_id(out, "mcp:m-1") is not None
     assert _node_by_id(out, "mcp:m-2") is not None
     assert len([n for n in out.nodes if n.type in ("agent", "mcp")]) == 4
 
-    # ref_id is the bare id; metadata enums coerced to plain strings
     agent_node = _node_by_id(out, "agent:a-prov")
+    assert agent_node is not None
     assert agent_node.ref_id == "a-prov"
     assert agent_node.label == "prov-agent"
     assert agent_node.metadata == {
@@ -154,6 +149,7 @@ async def test_build_node_assembly_includes_all_entities_and_skips_unprovisioned
         "platform": "aws_bedrock",
     }
     mcp_node = _node_by_id(out, "mcp:m-1")
+    assert mcp_node is not None
     assert mcp_node.ref_id == "m-1"
     assert mcp_node.metadata == {
         "kind": "gateway",
@@ -161,17 +157,13 @@ async def test_build_node_assembly_includes_all_entities_and_skips_unprovisioned
         "identity_status": "provisioned",
     }
 
-    # Provisioned agent's sp WAS read; the unprovisioned agent's sp NEVER was.
     called_sps = {c.args[0] for c in graph.list_assignments.call_args_list}
     assert "sp-prov" in called_sps
     assert "a-unprov" not in called_sps
     assert None not in called_sps
-    # the unprovisioned agent has no sp at all → exactly one provisioned agent read
     assert graph.list_assignments.await_count == 1
     assert graph.list_agent_mcp_grants.await_count == 1
 
-
-# --- user/group edges + dedup across agents ----------------------------------
 
 @pytest.mark.asyncio
 async def test_build_user_group_dedup_two_agents_one_user_node_two_edges():
@@ -222,9 +214,8 @@ async def test_build_user_group_dedup_two_agents_one_user_node_two_edges():
     graph.list_assignments.side_effect = assignments
 
     svc = _make_service(agents=[a, b], mcps=[], graph=graph)
-    out = await svc.build()
+    out = await svc.build(ctx=_ctx(is_global=True))
 
-    # ONE user node, ONE group node (deduped by principalId across agents)
     user_nodes = [n for n in out.nodes if n.type == "user"]
     group_nodes = [n for n in out.nodes if n.type == "group"]
     assert len(user_nodes) == 1
@@ -237,7 +228,6 @@ async def test_build_user_group_dedup_two_agents_one_user_node_two_edges():
     assert group_nodes[0].metadata == {"principal_type": "Group"}
 
     access = _edges_by_type(out, "access")
-    # user→A, group→A, user→B  (the ServicePrincipal assignment is skipped)
     assert len(access) == 3
     by_id = {e.id: e for e in access}
     assert by_id["assign-1"].source == "user:user-oid"
@@ -249,12 +239,9 @@ async def test_build_user_group_dedup_two_agents_one_user_node_two_edges():
     assert by_id["assign-3"].source == "user:user-oid"
     assert by_id["assign-3"].target == "agent:a-B"
     assert by_id["assign-3"].role == "Invoker"
-    # ServicePrincipal principal produced NO edge and NO node
     assert "assign-sp" not in by_id
     assert not any("other-agent-sp" in n.id for n in out.nodes)
 
-
-# --- role mapping ------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_build_role_mapping_invoker_admin_unknown():
@@ -262,22 +249,35 @@ async def test_build_role_mapping_invoker_admin_unknown():
     a = _agent(id="a-1", entra_sp_id="sp-1", invoker_role_id="inv-guid", admin_role_id="adm-guid")
     graph = _empty_graph()
     graph.list_assignments.side_effect = lambda sp: [
-        {"id": "e-inv", "principalId": "u1", "principalDisplayName": "U1",
-         "principalType": "User", "appRoleId": "inv-guid"},
-        {"id": "e-adm", "principalId": "u2", "principalDisplayName": "U2",
-         "principalType": "User", "appRoleId": "adm-guid"},
-        {"id": "e-unk", "principalId": "u3", "principalDisplayName": "U3",
-         "principalType": "User", "appRoleId": "legacy-guid"},
+        {
+            "id": "e-inv",
+            "principalId": "u1",
+            "principalDisplayName": "U1",
+            "principalType": "User",
+            "appRoleId": "inv-guid",
+        },
+        {
+            "id": "e-adm",
+            "principalId": "u2",
+            "principalDisplayName": "U2",
+            "principalType": "User",
+            "appRoleId": "adm-guid",
+        },
+        {
+            "id": "e-unk",
+            "principalId": "u3",
+            "principalDisplayName": "U3",
+            "principalType": "User",
+            "appRoleId": "legacy-guid",
+        },
     ]
 
     svc = _make_service(agents=[a], mcps=[], graph=graph)
-    out = await svc.build()
+    out = await svc.build(ctx=_ctx(is_global=True))
 
     roles = {e.id: e.role for e in _edges_by_type(out, "access")}
     assert roles == {"e-inv": "Invoker", "e-adm": "Admin", "e-unk": "Unknown"}
 
-
-# --- agent→mcp reverse-join filter -------------------------------------------
 
 @pytest.mark.asyncio
 async def test_build_agent_mcp_reverse_join_drops_unknown_resource():
@@ -287,14 +287,22 @@ async def test_build_agent_mcp_reverse_join_drops_unknown_resource():
     m = _mcp(id="m-1", entra_sp_id="mcp-sp-1", invoker_role_id="mcp-inv", admin_role_id="mcp-adm")
     graph = _empty_graph()
     graph.list_agent_mcp_grants.side_effect = lambda sp: [
-        {"id": "grant-known", "resourceId": "mcp-sp-1",
-         "resourceDisplayName": "internal-claims-mcp", "appRoleId": "mcp-inv"},
-        {"id": "grant-graph", "resourceId": "graph-sp-id",
-         "resourceDisplayName": "Microsoft Graph", "appRoleId": "some-graph-role"},
+        {
+            "id": "grant-known",
+            "resourceId": "mcp-sp-1",
+            "resourceDisplayName": "internal-claims-mcp",
+            "appRoleId": "mcp-inv",
+        },
+        {
+            "id": "grant-graph",
+            "resourceId": "graph-sp-id",
+            "resourceDisplayName": "Microsoft Graph",
+            "appRoleId": "some-graph-role",
+        },
     ]
 
     svc = _make_service(agents=[a], mcps=[m], graph=graph)
-    out = await svc.build()
+    out = await svc.build(ctx=_ctx(is_global=True))
 
     can_call = _edges_by_type(out, "can_call")
     assert len(can_call) == 1
@@ -305,35 +313,38 @@ async def test_build_agent_mcp_reverse_join_drops_unknown_resource():
     assert edge.role == "Invoker"
 
 
-# --- has_policy (no Cedar/AWS call) ------------------------------------------
-
 @pytest.mark.asyncio
 async def test_build_has_policy_from_enforcement_mode_no_cedar_call():
     """has_policy True for an enforce MCP, False for a none MCP; NO list_policies /
     extra AWS call is made (has_policy comes only from the listed field)."""
     a = _agent(id="a-1", entra_sp_id="sp-1", invoker_role_id="x", admin_role_id="y")
-    m_enforce = _mcp(id="m-enf", entra_sp_id="sp-enf", invoker_role_id="enf-inv",
-                     admin_role_id="enf-adm", cedar_enforcement_mode="enforce")
-    m_none = _mcp(id="m-none", entra_sp_id="sp-none", invoker_role_id="none-inv",
-                  admin_role_id="none-adm", cedar_enforcement_mode="none")
+    m_enforce = _mcp(
+        id="m-enf",
+        entra_sp_id="sp-enf",
+        invoker_role_id="enf-inv",
+        admin_role_id="enf-adm",
+        cedar_enforcement_mode="enforce",
+    )
+    m_none = _mcp(
+        id="m-none",
+        entra_sp_id="sp-none",
+        invoker_role_id="none-inv",
+        admin_role_id="none-adm",
+        cedar_enforcement_mode="none",
+    )
     graph = _empty_graph()
     graph.list_agent_mcp_grants.side_effect = lambda sp: [
-        {"id": "g-enf", "resourceId": "sp-enf", "resourceDisplayName": "enf",
-         "appRoleId": "enf-inv"},
-        {"id": "g-none", "resourceId": "sp-none", "resourceDisplayName": "none",
-         "appRoleId": "none-inv"},
+        {"id": "g-enf", "resourceId": "sp-enf", "resourceDisplayName": "enf", "appRoleId": "enf-inv"},
+        {"id": "g-none", "resourceId": "sp-none", "resourceDisplayName": "none", "appRoleId": "none-inv"},
     ]
 
     svc = _make_service(agents=[a], mcps=[m_enforce, m_none], graph=graph)
-    out = await svc.build()
+    out = await svc.build(ctx=_ctx(is_global=True))
 
     policy = {e.id: e.has_policy for e in _edges_by_type(out, "can_call")}
     assert policy == {"g-enf": True, "g-none": False}
 
-    # No Cedar / extra AWS call: the graph_service AsyncMock has NO list_policies
-    # attribute access, and the registry services were only ``.list()``-ed.
     assert not hasattr(graph, "list_policies") or not graph.list_policies.called
-    # the graph_service was only used for the read methods we expect
     assert graph.list_assignments.await_count == 1
     assert graph.list_agent_mcp_grants.await_count == 1
 
@@ -347,20 +358,24 @@ async def test_build_does_not_call_any_cedar_or_write_method():
     graph = _empty_graph()
 
     svc = _make_service(agents=[a], mcps=[m], graph=graph)
-    await svc.build()
+    await svc.build(ctx=_ctx(is_global=True))
 
     forbidden = [
-        "assign_app_role", "revoke_app_role", "grant_agent_obo_consent",
-        "create_agent_app", "set_assignment_required", "add_agent_password",
-        "list_policies", "add_policy", "delete_policy", "set_enforcement",
+        "assign_app_role",
+        "revoke_app_role",
+        "grant_agent_obo_consent",
+        "create_agent_app",
+        "set_assignment_required",
+        "add_agent_password",
+        "list_policies",
+        "add_policy",
+        "delete_policy",
+        "set_enforcement",
     ]
     for name in forbidden:
         attr = getattr(graph, name, None)
-        # An AsyncMock auto-creates attributes on access; assert none was CALLED.
         assert attr is None or not getattr(attr, "called", False), f"{name} was called"
 
-
-# --- per-agent Graph error tolerance -----------------------------------------
 
 @pytest.mark.asyncio
 async def test_build_per_agent_graph_error_is_tolerated():
@@ -375,37 +390,40 @@ async def test_build_per_agent_graph_error_is_tolerated():
         if sp == "sp-bad":
             raise RuntimeError("Graph blew up for this agent")
         if sp == "sp-good":
-            return [{"id": "ok-1", "principalId": "u-1", "principalDisplayName": "U1",
-                     "principalType": "User", "appRoleId": "g-inv"}]
+            return [
+                {
+                    "id": "ok-1",
+                    "principalId": "u-1",
+                    "principalDisplayName": "U1",
+                    "principalType": "User",
+                    "appRoleId": "g-inv",
+                }
+            ]
         return []
 
     async def grants(sp):
         if sp == "sp-good":
-            return [{"id": "cc-1", "resourceId": "mcp-sp-1",
-                     "resourceDisplayName": "m", "appRoleId": "mcp-inv"}]
+            return [
+                {"id": "cc-1", "resourceId": "mcp-sp-1", "resourceDisplayName": "m", "appRoleId": "mcp-inv"}
+            ]
         return []
 
     graph.list_assignments.side_effect = assignments
     graph.list_agent_mcp_grants.side_effect = grants
 
     svc = _make_service(agents=[good, bad], mcps=[m], graph=graph)
-    out = await svc.build()  # must NOT raise
+    out = await svc.build(ctx=_ctx(is_global=True))
 
-    # both agents are nodes
     assert _node_by_id(out, "agent:a-good") is not None
     assert _node_by_id(out, "agent:a-bad") is not None
-    # good agent's edges present
     access = _edges_by_type(out, "access")
     can_call = _edges_by_type(out, "can_call")
     assert [e.id for e in access] == ["ok-1"]
     assert [e.id for e in can_call] == ["cc-1"]
     assert access[0].target == "agent:a-good"
-    # the bad agent contributed NO edges
     assert all(e.target != "agent:a-bad" for e in out.edges)
     assert all(e.source != "agent:a-bad" for e in out.edges)
 
-
-# --- E24/T8 — tenant-scoped induced subgraph ----------------------------------
 
 def _ctx(*, is_global=False, tenant_ids=()):
     from services.tenant_resolver import TenantContext
@@ -417,27 +435,57 @@ def _tenant_fixture():
     """2 tenants: ten-1 owns agent a-1 + MCP m-1; ten-2 owns agent a-2 + MCP m-2;
     m-shared (ten-2, shared=True) and m-pub (ten-2, published=True, NOT shared).
     Graph wiring: a-1 → m-1 + m-2 + m-shared; a-2 → m-2. One user on each agent."""
-    a1 = _agent(id="a-1", entra_sp_id="sp-a1", invoker_role_id="a1-inv",
-                admin_role_id="a1-adm", tenant_id="ten-1")
-    a2 = _agent(id="a-2", entra_sp_id="sp-a2", invoker_role_id="a2-inv",
-                admin_role_id="a2-adm", tenant_id="ten-2")
-    m1 = _mcp(id="m-1", entra_sp_id="msp-1", invoker_role_id="m1-inv",
-              admin_role_id="m1-adm", tenant_id="ten-1")
-    m2 = _mcp(id="m-2", entra_sp_id="msp-2", invoker_role_id="m2-inv",
-              admin_role_id="m2-adm", tenant_id="ten-2")
-    m_shared = _mcp(id="m-shared", entra_sp_id="msp-shared", invoker_role_id="ms-inv",
-                    admin_role_id="ms-adm", tenant_id="ten-2", shared=True)
-    m_pub = _mcp(id="m-pub", entra_sp_id="msp-pub", invoker_role_id="mp-inv",
-                 admin_role_id="mp-adm", tenant_id="ten-2", published=True)
+    a1 = _agent(
+        id="a-1", entra_sp_id="sp-a1", invoker_role_id="a1-inv", admin_role_id="a1-adm", tenant_id="ten-1"
+    )
+    a2 = _agent(
+        id="a-2", entra_sp_id="sp-a2", invoker_role_id="a2-inv", admin_role_id="a2-adm", tenant_id="ten-2"
+    )
+    m1 = _mcp(
+        id="m-1", entra_sp_id="msp-1", invoker_role_id="m1-inv", admin_role_id="m1-adm", tenant_id="ten-1"
+    )
+    m2 = _mcp(
+        id="m-2", entra_sp_id="msp-2", invoker_role_id="m2-inv", admin_role_id="m2-adm", tenant_id="ten-2"
+    )
+    m_shared = _mcp(
+        id="m-shared",
+        entra_sp_id="msp-shared",
+        invoker_role_id="ms-inv",
+        admin_role_id="ms-adm",
+        tenant_id="ten-2",
+        shared=True,
+    )
+    m_pub = _mcp(
+        id="m-pub",
+        entra_sp_id="msp-pub",
+        invoker_role_id="mp-inv",
+        admin_role_id="mp-adm",
+        tenant_id="ten-2",
+        published=True,
+    )
     graph = _empty_graph()
 
     async def assignments(sp):
         if sp == "sp-a1":
-            return [{"id": "acc-1", "principalId": "u-1", "principalDisplayName": "U1",
-                     "principalType": "User", "appRoleId": "a1-inv"}]
+            return [
+                {
+                    "id": "acc-1",
+                    "principalId": "u-1",
+                    "principalDisplayName": "U1",
+                    "principalType": "User",
+                    "appRoleId": "a1-inv",
+                }
+            ]
         if sp == "sp-a2":
-            return [{"id": "acc-2", "principalId": "u-2", "principalDisplayName": "U2",
-                     "principalType": "User", "appRoleId": "a2-inv"}]
+            return [
+                {
+                    "id": "acc-2",
+                    "principalId": "u-2",
+                    "principalDisplayName": "U2",
+                    "principalType": "User",
+                    "appRoleId": "a2-inv",
+                }
+            ]
         return []
 
     async def grants(sp):
@@ -472,18 +520,16 @@ async def test_build_scoped_caller_gets_induced_subgraph_no_dangling_edges():
     assert node_ids == {"agent:a-1", "mcp:m-1", "mcp:m-shared", "user:u-1"}
     edge_ids = {e.id for e in out.edges}
     assert edge_ids == {"acc-1", "cc-1", "cc-shared"}
-    # every edge endpoint is an included node (induced subgraph — no dangling)
     for e in out.edges:
         assert e.source in node_ids
         assert e.target in node_ids
-    # the foreign agent's Graph reads were never fanned out
     called_sps = {c.args[0] for c in graph.list_assignments.call_args_list}
     assert called_sps == {"sp-a1"}
 
 
 @pytest.mark.asyncio
 async def test_build_admin_graph_unchanged():
-    """is_global ctx (and ctx=None) → the FULL graph: all nodes, all edges."""
+    """is_global ctx → the FULL graph: all nodes, all edges."""
     agents, mcps, graph = _tenant_fixture()
     svc = _make_service(agents=agents, mcps=mcps, graph=graph)
 
@@ -491,22 +537,40 @@ async def test_build_admin_graph_unchanged():
 
     node_ids = {n.id for n in out.nodes}
     assert node_ids == {
-        "agent:a-1", "agent:a-2", "mcp:m-1", "mcp:m-2", "mcp:m-shared",
-        "mcp:m-pub", "user:u-1", "user:u-2",
+        "agent:a-1",
+        "agent:a-2",
+        "mcp:m-1",
+        "mcp:m-2",
+        "mcp:m-shared",
+        "mcp:m-pub",
+        "user:u-1",
+        "user:u-2",
     }
     assert {e.id for e in out.edges} == {"acc-1", "acc-2", "cc-1", "cc-2", "cc-shared", "cc-3"}
 
 
 @pytest.mark.asyncio
-async def test_build_no_ctx_is_full_graph():
-    """ctx=None (default) keeps the pre-E24 behavior — full graph."""
+async def test_build_without_ctx_is_a_type_error():
+    """A call that omits the scope is refused before any Graph read."""
     agents, mcps, graph = _tenant_fixture()
     svc = _make_service(agents=agents, mcps=mcps, graph=graph)
+    untyped: Any = svc.build
 
-    out = await svc.build()
+    with pytest.raises(TypeError):
+        await untyped()
+    graph.list_assignments.assert_not_called()
 
-    assert {n.id for n in out.nodes} >= {"agent:a-1", "agent:a-2", "mcp:m-2", "mcp:m-pub"}
-    assert {e.id for e in out.edges} == {"acc-1", "acc-2", "cc-1", "cc-2", "cc-shared", "cc-3"}
+
+@pytest.mark.asyncio
+async def test_build_with_ctx_none_raises():
+    """``ctx=None`` is not a scope: the build raises before any Graph read."""
+    agents, mcps, graph = _tenant_fixture()
+    svc = _make_service(agents=agents, mcps=mcps, graph=graph)
+    untyped: Any = svc.build
+
+    with pytest.raises((TypeError, AttributeError)):
+        await untyped(ctx=None)
+    graph.list_assignments.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -521,8 +585,6 @@ async def test_build_scoped_caller_with_no_tenants_gets_empty_graph():
     assert {n.id for n in out.nodes} == {"mcp:m-shared"}
     assert out.edges == []
 
-
-# --- get_principal -----------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_get_principal_user_resolves_group_names_skipping_failures():
@@ -558,7 +620,6 @@ async def test_get_principal_user_resolves_group_names_skipping_failures():
     assert detail.user_principal_name == "maria.bauer@example.onmicrosoft.com"
     assert detail.mail == "maria.bauer@example.com"
     assert detail.job_title == "Claims Officer"
-    # g-ok resolved; g-bad failure skipped (not fatal)
     assert detail.group_names == ["Contoso-Claims-Officers"]
 
 
@@ -567,8 +628,7 @@ async def test_get_principal_group_kind_no_group_names():
     """group kind → group_names == [] (no membership resolve for groups)."""
     graph = AsyncMock()
     graph.get_principal = AsyncMock(
-        return_value={"id": "grp-oid", "displayName": "Contoso-Claims-Officers",
-                      "mail": "claims@example.com"}
+        return_value={"id": "grp-oid", "displayName": "Contoso-Claims-Officers", "mail": "claims@example.com"}
     )
     graph.list_member_group_ids = AsyncMock(return_value=["should-not-be-used"])
 
@@ -585,21 +645,61 @@ async def test_get_principal_group_kind_no_group_names():
 
 
 @pytest.mark.asyncio
-async def test_get_principal_bad_kind_raises_value_error():
-    """A kind other than user/group → ValueError (the primary call is never made)."""
+async def test_get_principal_bad_kind_is_invalid_kind_400():
+    """A kind other than user/group is the ``invalid_kind`` 400 and the primary call is never made."""
+    from services.governance_graph_service import GovernanceGraphError
+
     graph = AsyncMock()
     graph.get_principal = AsyncMock(return_value={})
     svc = _make_service(agents=[], mcps=[], graph=graph)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(GovernanceGraphError) as exc_info:
         await svc.get_principal("oid", "servicePrincipal")
+    assert (exc_info.value.kind, exc_info.value.status_code) == ("invalid_kind", 400)
+    assert exc_info.value.detail == "kind must be 'user' or 'group'"
     graph.get_principal.assert_not_awaited()
 
 
 @pytest.mark.asyncio
+async def test_get_principal_graph_404_is_principal_not_found():
+    """A Graph 404 on the primary read is the ``principal_not_found`` 404 with the fixed detail."""
+    from services.governance_graph_service import GovernanceGraphError
+    from services.graph_errors import GraphError
+
+    graph = AsyncMock()
+    graph.get_principal = AsyncMock(side_effect=GraphError(404, "Request_ResourceNotFound", "Resource gone"))
+    svc = _make_service(agents=[], mcps=[], graph=graph)
+
+    with pytest.raises(GovernanceGraphError) as exc_info:
+        await svc.get_principal("missing-oid", "user")
+    assert (exc_info.value.kind, exc_info.value.status_code) == ("principal_not_found", 404)
+    assert exc_info.value.detail == "principal not found"
+
+
+@pytest.mark.asyncio
+async def test_get_principal_other_graph_error_is_principal_lookup_failed():
+    """Any other Graph failure on the primary read or the membership read is the fixed 502."""
+    from services.governance_graph_service import GovernanceGraphError
+    from services.graph_errors import GraphError
+
+    graph = AsyncMock()
+    graph.get_principal = AsyncMock(return_value={"displayName": "Maria"})
+    graph.list_member_group_ids = AsyncMock(
+        side_effect=GraphError(403, "Authorization_RequestDenied", "denied")
+    )
+    svc = _make_service(agents=[], mcps=[], graph=graph)
+
+    with pytest.raises(GovernanceGraphError) as exc_info:
+        await svc.get_principal("user-oid", "user")
+    assert (exc_info.value.kind, exc_info.value.status_code) == ("principal_lookup_failed", 502)
+    assert exc_info.value.detail == "failed to resolve the principal"
+    assert "denied" not in exc_info.value.detail
+
+
+@pytest.mark.asyncio
 async def test_get_principal_primary_error_propagates():
-    """A GraphError from the PRIMARY get_principal call propagates (the route maps
-    404→404 / other→502); it is NOT swallowed like the per-group resolves."""
+    """A non-Graph error from the PRIMARY get_principal call propagates; it is NOT swallowed like
+    the per-group resolves."""
     graph = AsyncMock()
     graph.get_principal = AsyncMock(side_effect=RuntimeError("graph 404"))
     svc = _make_service(agents=[], mcps=[], graph=graph)

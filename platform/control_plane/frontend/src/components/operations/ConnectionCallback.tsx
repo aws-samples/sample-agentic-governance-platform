@@ -1,29 +1,8 @@
-// ConnectionCallback — the GitHub App Manifest callback landing (Epic 20 / U4).
-//
-// Last step of the App-via-Manifest browser flow. In U3 the AddConnectionModal
-// POSTs a hidden manifest form to GitHub; GitHub creates the App and redirects
-// the operator back to `/ops/connections/callback?code=&state=`. This page
-// converts that code into a Connection and, if the App isn't installed yet,
-// walks the operator through installing it.
-//
-// Correctness load-bearers:
-//   • The manifest `code` is SINGLE-USE — calling manifestCallback twice fails.
-//     A useRef ran-once guard makes the on-mount conversion fire exactly once
-//     (React 19 StrictMode double-invokes effects in dev).
-//   • CSRF echo: the returned `state` must equal the value the modal stashed in
-//     localStorage['agp_manifest_state'] (localStorage, not sessionStorage — the
-//     modal opens GitHub in a new tab and this callback lands there); we validate +
-//     clear it before any backend call (resolveCallbackParams). A mismatch never
-//     touches the backend.
-//   • A callback can error AFTER a pending Connection exists (by-design). The
-//     install step is still reachable via finalize() on that pending row, so an
-//     error here does NOT mean nothing was created — the operator retries from
-//     Org Connections.
-
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { connectionsApi } from '../../api/client';
-import type { Connection } from '../../api/client';
+import type { Connection, ManifestCallbackResponse } from '../../api/client';
+import { safeLocalStorage } from '../../api/safeLocalStorage';
 import OpsPage from './OpsPage';
 import { OPS_CARD, OPS_PRIMARY_BTN } from './opsUi';
 import { AGP_MANIFEST_STATE_KEY, resolveCallbackParams } from './connectionCallbackParams';
@@ -44,34 +23,26 @@ export default function ConnectionCallback() {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [installUrl, setInstallUrl] = useState<string | null>(null);
 
-  // Manual-install-ID fallback.
   const [showManual, setShowManual] = useState(false);
   const [installationId, setInstallationId] = useState('');
   const [finalizing, setFinalizing] = useState(false);
 
-  // Ran-once guard — the manifest code is single-use; StrictMode double-invokes
-  // effects in dev, so a second manifestCallback would fail on a spent code.
+  // Decision: docs/adr/frontend-loading-state.md
   const ranRef = useRef(false);
 
   useEffect(() => {
     if (ranRef.current) return;
     ranRef.current = true;
 
-    // localStorage (NOT sessionStorage): the modal opens GitHub in a new tab and this callback
-    // lands in that new tab — sessionStorage is per-tab and would be empty here.
-    const sessionState = window.localStorage.getItem(AGP_MANIFEST_STATE_KEY);
+    const sessionState = safeLocalStorage.getItem(AGP_MANIFEST_STATE_KEY);
     const resolved = resolveCallbackParams(searchParams, sessionState);
-    // CSRF state is single-use — clear it whether the echo matched or not.
-    window.localStorage.removeItem(AGP_MANIFEST_STATE_KEY);
+    safeLocalStorage.removeItem(AGP_MANIFEST_STATE_KEY);
 
-    if ('error' in resolved) {
-      setError(resolved.error);
-      setPhase('error');
-      return;
-    }
-
-    connectionsApi
-      .manifestCallback({ code: resolved.code, state: resolved.state })
+    const exchange =
+      'error' in resolved
+        ? Promise.reject<ManifestCallbackResponse>(new Error(resolved.error))
+        : connectionsApi.manifestCallback({ code: resolved.code, state: resolved.state });
+    exchange
       .then((res) => {
         setConnection(res.connection);
         if (res.needs_install) {
@@ -87,7 +58,6 @@ export default function ConnectionCallback() {
       });
   }, [searchParams]);
 
-  // Finalize the pending connection. Empty installationId → auto-resolve ({}).
   const handleFinalize = useCallback(
     async (id: string, manualId?: string) => {
       if (finalizing) return;
@@ -114,11 +84,6 @@ export default function ConnectionCallback() {
     <OpsPage
       title="Connect GitHub App"
       subtitle="Finishing the GitHub App handshake for your organization."
-      // E28/T8: back to the Organization connections SECTION, not just to Settings. The
-      // `/ops/admin` redirect this used to rely on lands on the General tab, one click short
-      // of the panel the operator was configuring — and a <Navigate> drops the fragment, so
-      // this cannot be fixed at the redirect. The anchor is the `settingsSections.ts` section
-      // id, and Settings resolves the owning tab from it.
       backTo="/ops/settings#org-connections"
     >
       <div className={`${OPS_CARD} p-6 max-w-xl space-y-4`}>
@@ -134,15 +99,6 @@ export default function ConnectionCallback() {
                 ? `${connection.org} is connected and ready to use.`
                 : 'Your GitHub App is connected and ready to use.'}
             </p>
-            {/* THE SEEDING ROUTE (E28C/T6, design D-C3). Connecting an org stays WRITE-FREE — this
-                handshake created no repository — so the cold start needs a pointer rather than a
-                page that looks finished and is empty.
-
-                It is a LINK the operator clicks, never a redirect: routing them automatically would
-                make "Nothing is created until you confirm" a promise about a screen they did not ask
-                for, and the whole reason this surface exists is that its preview IS the consent. The
-                `seed=1` param only switches the prompt on; the surface still executes nothing until
-                a confirm. */}
             {connection && (
               <p className="text-sm text-slate-600">
                 Nothing has been created in {connection.org} yet. Seed AGP’s starter templates, or

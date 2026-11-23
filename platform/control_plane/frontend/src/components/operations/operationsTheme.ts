@@ -1,11 +1,3 @@
-/**
- * Section = which top-level platform you're in, derived purely from the URL
- * (Epic 17). No state/context — the Sidebar calls sectionFromPath(location.pathname)
- * to choose the nav config (OPERATIONS_NAV vs GOVERNANCE_NAV) and the theme.
- * The governance theme reproduces Sidebar.tsx's existing literals so Governance
- * is visually unchanged; operations is a lighter slate sidebar with emerald
- * accents and a matching emerald/teal-tinted page background.
- */
 export type Section = 'governance' | 'operations';
 
 export function sectionFromPath(pathname: string): Section {
@@ -13,34 +5,34 @@ export function sectionFromPath(pathname: string): Section {
 }
 
 export interface SectionTheme {
-  asideClassName: string;       // extra classes on <aside> (borders)
-  asideBackground: string;      // inline style `background`
-  pageBackground: string;       // <main> ombre gradient (inline style `background`)
-  logoBorder: string;           // logo container bottom border
-  logoBadge: string;            // AGP square badge bg+text
-  logoText: string;             // wordmark text color
-  logoTitle: string;            // wordmark text + aria-label (per-section product name)
-  navActive: string;            // active leaf link bg+text
-  navInactive: string;          // inactive leaf link text+hover
-  navActiveBar: string;         // active left accent bar color (before:bg-*)
-  navIconActive: string;        // active leaf icon color
-  navIconInactive: string;      // inactive leaf icon color
-  groupHeader: string;          // collapsible group header label text
-  subActive: string;            // active child link
-  subInactive: string;          // inactive child link
-  divider: string;              // inter-zone divider border color
-  collapseBg: string;           // collapse-button bg (expanded state)
-  collapseBgCollapsed: string;  // collapse-button bg (collapsed rail state)
-  collapseBorder: string;       // collapse-button border
-  collapseChevron: string;      // collapse-button chevron color+hover
-  switchTo: string;             // reciprocal switch-link target
-  switchLabel: string;          // switch-link text. Governance's trailing → is added in JSX (Task 6); operations bakes its leading ← in here.
-  switchClassName: string;      // reciprocal switch-link styling
-  userBorder: string;           // border above the user box
-  userButtonHover: string;      // user button hover bg
-  userAvatar: string;           // user avatar circle bg+text
-  userName: string;             // user display-name text
-  userSub: string;              // user role/sub text
+  asideClassName: string;
+  asideBackground: string; // a CSS background value, not classes
+  pageBackground: string; // a CSS background value, not classes
+  logoBorder: string;
+  logoBadge: string;
+  logoText: string;
+  logoTitle: string;
+  navActive: string;
+  navInactive: string;
+  navActiveBar: string;
+  navIconActive: string;
+  navIconInactive: string;
+  groupHeader: string;
+  subActive: string;
+  subInactive: string;
+  divider: string;
+  collapseBg: string;
+  collapseBgCollapsed: string;
+  collapseBorder: string;
+  collapseChevron: string;
+  switchTo: string;
+  switchLabel: string;
+  switchClassName: string;
+  userBorder: string;
+  userButtonHover: string;
+  userAvatar: string;
+  userName: string;
+  userSub: string;
 }
 
 export const SECTION_THEME: Record<Section, SectionTheme> = {

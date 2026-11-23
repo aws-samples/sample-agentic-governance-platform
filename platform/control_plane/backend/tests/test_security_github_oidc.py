@@ -1,4 +1,4 @@
-"""Unit tests for GitHub Actions OIDC JWT validation (E22/T6).
+"""Unit tests for GitHub Actions OIDC JWT validation.
 
 Mirrors test_security_entra.py: a real RSA keypair signs test tokens, PyJWKClient is
 patched to return our public key, settings come from monkeypatched env.
@@ -17,6 +17,7 @@ from fastapi import HTTPException
 @pytest.fixture(autouse=True)
 def reset_module():
     import sys
+
     for mod in ["core.security_github_oidc", "core.config"]:
         sys.modules.pop(mod, None)
     yield
@@ -63,9 +64,12 @@ def make_token(rsa_key_pair, issuer, audience):
         claims.update(overrides)
         claims = {k: v for k, v in claims.items() if v is not None}
         return pyjwt.encode(
-            claims, rsa_key_pair["private_pem"], algorithm="RS256",
+            claims,
+            rsa_key_pair["private_pem"],
+            algorithm="RS256",
             headers={"kid": rsa_key_pair["kid"]},
         )
+
     return _make
 
 
@@ -74,6 +78,7 @@ def patched_jwks(rsa_key_pair):
     class FakeSigningKey:
         def __init__(self, key):
             self.key = key
+
     fake_key = FakeSigningKey(rsa_key_pair["public_key"])
     with patch("jwt.PyJWKClient.get_signing_key_from_jwt", return_value=fake_key):
         yield
@@ -94,9 +99,7 @@ def test_valid_token_returns_claims(make_token, patched_jwks, configured_setting
     assert claims.ref == "refs/heads/main"
 
 
-def test_immutable_id_subject_customization_claim_shapes(
-    make_token, patched_jwks, configured_settings
-):
+def test_immutable_id_subject_customization_claim_shapes(make_token, patched_jwks, configured_settings):
     """Orgs with immutable-ID subject customization mint tokens whose ``sub`` carries the
     ``@<orgId>``/``@<repoId>`` suffixes, but ``repository_owner`` remains the bare login
     (per GitHub OIDC docs the ``@id`` form appears only in ``sub``). This documents the
@@ -115,9 +118,7 @@ def test_immutable_id_subject_customization_claim_shapes(
     assert claims.repository_owner == "AgenticOps-Platform"
     assert claims.repository == "AgenticOps-Platform/my-test-agent"
     # The immutable-ID markers are confined to the sub claim.
-    assert claims.sub == (
-        "repo:AgenticOps-Platform@296866902/my-test-agent@1302865558:ref:refs/heads/main"
-    )
+    assert claims.sub == ("repo:AgenticOps-Platform@296866902/my-test-agent@1302865558:ref:refs/heads/main")
     assert "@296866902" not in claims.repository_owner
 
 
@@ -153,7 +154,7 @@ def test_expired_token_returns_401(make_token, patched_jwks, configured_settings
 
 
 def test_token_expired_within_leeway_is_accepted(make_token, patched_jwks, configured_settings):
-    """E36/T17: a token that expired 30 s ago is still accepted — clock-skew leeway.
+    """A token that expired 30 s ago is still accepted: clock-skew leeway.
 
     Same shared JWT_LEEWAY_SECONDS=60 as the Entra path: skew here breaks deploys
     (the `POST /builds/runtime` trigger), not logins. No env override is set, so this
@@ -169,7 +170,7 @@ def test_token_expired_within_leeway_is_accepted(make_token, patched_jwks, confi
 
 
 def test_token_expired_beyond_leeway_is_rejected(make_token, patched_jwks, configured_settings):
-    """E36/T17: leeway is a 60 s grace, not an amnesty — 120 s past expiry still 401s."""
+    """Leeway is a 60 s grace, not an amnesty: 120 s past expiry still 401s."""
     from core.security_github_oidc import verify_github_oidc_token
 
     now = int(dt.datetime.now(dt.timezone.utc).timestamp())
@@ -199,8 +200,8 @@ def test_garbage_token_returns_401(configured_settings):
 
 
 def test_captures_actor_and_event_name(make_token, patched_jwks, configured_settings):
-    """E27A: "who merged to main" is OIDC-proven, not body-asserted — GitHub mints `actor`
-    and `event_name` on every Actions token, so the validator must carry them through."""
+    """ "Who merged to main" is OIDC-proven, not body-asserted: GitHub mints `actor` and
+    `event_name` on every Actions token, so the validator must carry them through."""
     from core.security_github_oidc import verify_github_oidc_token
 
     token = make_token(actor="jorge", event_name="push")

@@ -1,4 +1,16 @@
 
+locals {
+  # Langfuse v4 serves the v3 ingestion and read APIs only in the `legacy` and `dual` write modes,
+  # and the backend reads /api/public/traces and /api/public/metrics. Upstream removes both modes
+  # in a later major; README.md lists what the move to `events_only` needs first.
+  v4_migration_env = [
+    { name = "LANGFUSE_MIGRATION_V4_WRITE_MODE", value = "legacy" },
+    { name = "LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR", value = "dual_write" },
+    { name = "LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN", value = "false" },
+    { name = "LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL", value = "false" },
+  ]
+}
+
 resource "aws_ecs_task_definition" "langfuse_worker" {
   family                   = "${var.name}-langfuse-worker"
   network_mode             = "awsvpc"
@@ -27,7 +39,7 @@ resource "aws_ecs_task_definition" "langfuse_worker" {
           "awslogs-stream-prefix" = "ecs"
         }
       }
-      environment = [
+      environment = concat([
         {
           name  = "NODE_ENV"
           value = "production"
@@ -204,7 +216,7 @@ resource "aws_ecs_task_definition" "langfuse_worker" {
           name  = "AUTH_DISABLE_USERNAME_PASSWORD"
           value = local.enable_sso ? "true" : "false"
         }
-      ]
+      ], local.v4_migration_env)
       secrets = [
         {
           name      = "DATABASE_PASSWORD"
@@ -274,7 +286,7 @@ resource "aws_ecs_task_definition" "langfuse" {
           "awslogs-stream-prefix" = "ecs"
         }
       }
-      environment = [
+      environment = concat([
         {
           name  = "NODE_ENV"
           value = "production"
@@ -432,7 +444,7 @@ resource "aws_ecs_task_definition" "langfuse" {
           value = var.langfuse_init_user_password
         }
 
-      ]
+      ], local.v4_migration_env)
       secrets = [
         {
           name      = "DATABASE_PASSWORD"
@@ -535,11 +547,16 @@ resource "aws_ecs_task_definition" "clickhouse" {
         }
       ]
       healthCheck = {
-        command     = ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8123/ping || exit 1"]
-        interval    = 30
-        timeout     = 5
-        retries     = 3
-        startPeriod = 60
+        command  = ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8123/ping || exit 1"]
+        interval = 30
+        timeout  = 5
+        retries  = 10
+        # ClickHouse loads every part from EFS before it answers /ping, which on a store with
+        # a few months of traces takes well over the old 60 s + 3x30 s budget: ECS killed each
+        # replacement task at ~150 s, mid-load, and with minimum_healthy_percent = 0 the old task
+        # was already gone, so a plain task-def roll took the store down (2026-10-04). 300 s is
+        # the ECS maximum; 10 retries extend the window to ~10 min.
+        startPeriod = 300
       }
       mountPoints = [
         {
@@ -599,7 +616,13 @@ resource "aws_ecs_service" "langfuse" {
 
   enable_execute_command = var.enable_execute_command
 
-  depends_on = [aws_lb_listener.langfuse]
+  # Langfuse fixes the order of a roll: the web container migrates Postgres and ClickHouse on
+  # start and needs the pinned ClickHouse release already serving, and a worker that starts
+  # before those migrations end fails the background migrations it validates against them.
+  # Each service therefore waits for the one before it: ClickHouse, web, worker.
+  wait_for_steady_state = true
+
+  depends_on = [aws_lb_listener.langfuse, aws_ecs_service.clickhouse]
 
   tags = {
     Name = "${local.tag_name} Langfuse Service"
@@ -644,6 +667,8 @@ resource "aws_ecs_service" "clickhouse" {
 
   enable_execute_command = var.enable_execute_command
 
+  wait_for_steady_state = true
+
   tags = {
     Name = "${local.tag_name} ClickHouse Service"
   }
@@ -667,6 +692,8 @@ resource "aws_ecs_service" "langfuse-worker" {
   }
 
   enable_execute_command = var.enable_execute_command
+
+  depends_on = [aws_ecs_service.langfuse]
 
   tags = {
     Name = "${local.tag_name} Langfuse Worker Service"
@@ -745,6 +772,15 @@ resource "aws_service_discovery_service" "clickhouse" {
 resource "aws_efs_file_system" "clickhouse" {
   creation_token = "${var.name}-clickhouse"
   encrypted      = true
+  # ELASTIC, not the default bursting. ClickHouse sustains ~800 KiB/s against this volume
+  # (system logs + ingestion + merges); bursting baseline for a ~4 GB file system is
+  # ~190 KiB/s, so the 2 TiB burst-credit pool is a countdown, not a buffer. Live, it hit
+  # zero 37 days after the first deploy (2026-09-15); permitted throughput fell to the
+  # 1 MiB/s floor and a ClickHouse cold start then took ~9 min — far past the container
+  # health check — so the next task replacement (2026-09-23) became an unrecoverable
+  # crash loop and Langfuse lost 12h of traces. Elastic scales with demand and has no
+  # credit balance to exhaust. (Changing the mode is allowed once per 24h.)
+  throughput_mode = "elastic"
 
   tags = {
     Name = "${local.tag_name} ClickHouse EFS"

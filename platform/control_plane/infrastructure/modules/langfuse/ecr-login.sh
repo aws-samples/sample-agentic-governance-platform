@@ -39,7 +39,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"
 # shellcheck source=../../scripts/container-engine.sh
 source "$SCRIPT_DIR/../../scripts/container-engine.sh"
-resolve_container_engine || exit 1
+# No engine is not an error HERE. This resource exists only to serialize one `docker login`
+# ahead of the parallel mirrors; with no engine there is no credential store to write and
+# nothing to serialize. The demo pipeline (.gitlab-ci.yml) applies Terraform on a runner with
+# no engine, and a tag bump re-triggers this resource because its `tags` trigger changed — so
+# failing here aborted an apply whose only real work was rolling task definitions onto images
+# already present in ECR. Anything that genuinely must be pulled or built still fails loudly,
+# in mirror-image.sh, which resolves an engine only after finding the tag absent from ECR.
+if ! resolve_container_engine; then
+  echo "ECR login: no container engine on this host — nothing to authenticate, skipping."
+  exit 0
+fi
 CE="$CONTAINER_ENGINE"
 
 STATE_DIR="${TMPDIR:-/tmp}"

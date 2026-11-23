@@ -1,14 +1,3 @@
-// Marketplace — the tabbed shell collapsing the two catalog pages behind one
-// /marketplace destination (Epic 15). A slim header band carries the
-// [ Agents | MCP Servers ] pill tab bar; the active tab body is the existing
-// MarketplaceAgents / MarketplaceMcps page, reused unchanged. The active tab is
-// derived from the router pathname (pure marketplaceTabFromPath) so deep-links
-// to /marketplace/agents · /marketplace/mcps and browser back/forward work;
-// clicking a tab navigates to its canonical child path.
-//
-// Each body owns its own page wrapper + <h1>, so the tab bar sits in its own
-// slim band above the body rather than competing with the body heading.
-
 import { useLocation, useNavigate } from 'react-router-dom';
 import { MARKETPLACE_TABS, marketplaceTabFromPath } from './marketplaceTabs';
 import MarketplaceAgents from './MarketplaceAgents';
@@ -21,8 +10,6 @@ export default function Marketplace() {
 
   return (
     <div className="min-h-[calc(100vh-4rem)] relative">
-      {/* Slim header band — the pill tab bar (AgentDetail idiom: active tint +
-          shadow-sm pill, transition-colors only, no scale/translate motion). */}
       <div className="relative max-w-7xl mx-auto px-6 pt-6">
         <div className="flex items-center gap-1 p-1 bg-slate-100/80 rounded-xl w-fit overflow-x-auto">
           {MARKETPLACE_TABS.map((tab) => (
@@ -37,7 +24,6 @@ export default function Marketplace() {
         </div>
       </div>
 
-      {/* Active tab body — the existing catalog page, reused unchanged. */}
       {active === 'agents' ? <MarketplaceAgents /> : <MarketplaceMcps />}
     </div>
   );

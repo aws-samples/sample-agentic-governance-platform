@@ -1,0 +1,74 @@
+# Copy to env/<ENV_NAME>.tfvars (env/dev.tfvars for the default name) and fill in every <placeholder>.
+# Your copy is git-ignored. The two secrets never go in a file: export
+# TF_VAR_entra_backend_client_secret and TF_VAR_langfuse_admin_password in your shell.
+
+aws_region   = "us-east-1"
+app_name     = "control-plane"
+project_name = "agp"
+
+# With create_langfuse = true the environment name must be dev or prod.
+create_langfuse = true
+
+# An account-wide image repository for a branch pipeline; a laptop deploy does not use it.
+create_shared_resources = false
+naming_environment = null
+
+# true makes the stack destroyable (S3 force_destroy, no DynamoDB deletion protection, no secret
+# recovery window), which scripts/destroy-full.sh needs. Set false on a stack you intend to keep.
+ephemeral = true
+
+# Leave empty to create a new VPC from vpc_cidr and availability_zones.
+vpc_id             = ""
+public_subnet_ids  = []
+private_subnet_ids = []
+vpc_cidr           = "10.0.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# Leave hosted_zone_id empty to serve the UI from the CloudFront domain.
+domain_name    = "agp-platform.example.com"
+hosted_zone_id = ""
+
+# Empty on the first deploy. Afterwards set it to "<api_endpoint>/api/v1" and deploy again.
+agp_api_url = ""
+
+ecs_task_cpu      = 512
+ecs_task_memory   = 1024
+ecs_desired_count = 2
+ecs_min_capacity  = 1
+ecs_max_capacity  = 4
+
+project_archive_retention_days   = 7
+codebuild_compute_type           = "BUILD_GENERAL1_SMALL"
+state_backend_bucket_name_prefix = ""
+state_backend_lock_table_name    = ""
+
+tags = {
+  Project   = "agp"
+  Component = "control-plane"
+  ManagedBy = "terraform"
+}
+owner       = "platform-team"
+cost_center = "ai-platform"
+
+# From the two Entra app registrations (docs/entra-setup.md).
+auth_provider           = "entra"
+entra_tenant_id         = "<tenant-guid>"
+entra_tenant_domain     = "<tenant-domain>"
+entra_audience          = "api://agp"
+entra_spa_client_id     = "<spa-app-client-id>"
+entra_spa_scope         = "api://agp/Access.Default"
+entra_backend_client_id = "<backend-app-client-id>"
+product_mode            = "governance"
+
+# Registries are found or created by name: a second environment in the same account needs its own names.
+agent_registry_name   = "agp-agents"
+agent_registry_region = "us-east-1"
+mcp_registry_name     = "agp-mcp-servers"
+mcp_registry_region   = "us-east-1"
+
+clickhouse_version   = "26.3.66.4"
+langfuse_admin_email = "<you@example.com>"
+
+# Account-wide for the region, so destroying one stack switches it off for every other; every span is billed as CloudWatch Logs ingestion.
+enable_transaction_search              = true
+transaction_search_indexing_percentage = 1

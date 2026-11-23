@@ -119,6 +119,16 @@ resource "aws_iam_role_policy" "exec" {
       { Effect = "Allow", Action = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"], Resource = var.ecr_repo_arn != "" ? var.ecr_repo_arn : "*" },
       { Effect = "Allow", Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], Resource = "*" },
       { Effect = "Allow", Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"], Resource = "*" },
+      # E42 — span export to the X-Ray OTLP traces endpoint (xray.<region>.amazonaws.com/v1/traces,
+      # SigV4 service "xray"), which feeds aws/spans for the eval judges. The four actions are the
+      # AgentCore execution-role set (= AWSXrayWriteOnlyPolicy); X-Ray has no resource-level scoping.
+      # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html
+      # E42/T15 — plus xray:PutSpans ("upload OpenTelemetry spans to AWS X-Ray") and
+      # xray:PutSpansForIndexing ("upload spans to AWS X-Ray to be indexed"), the OTLP span actions
+      # that AWSXrayWriteOnlyPolicy predates. Both are Write with no resource types.
+      # https://docs.aws.amazon.com/service-authorization/latest/reference/list_xray.html
+      # https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-OTLPEndpoint.html
+      { Effect = "Allow", Action = ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets", "xray:PutSpans", "xray:PutSpansForIndexing"], Resource = "*" },
       # E28C/T5 (D-C5) — the OTHER HALF of the Langfuse fix, and without it the first half
       # changes nothing. The platform provisions one Langfuse project + key per agent and passes
       # only the Secrets Manager NAME to the container (LANGFUSE_SECRET_NAME); the agent resolves
@@ -193,6 +203,16 @@ resource "aws_iam_role_policy" "exec" {
           "arn:aws:bedrock-agentcore:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:workload-identity-directory/default",
           "arn:aws:bedrock-agentcore:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:workload-identity-directory/default/*",
         ]
+      },
+      # E45/NIGHT-D1: GetResourceOauth2Token reads the provider's client secret from the vault's
+      # Secrets Manager entry AS THIS ROLE, so without this every gateway tool call of a Strands
+      # agent AccessDenied (live: fnol_studio_t1_dev). Same grant as agentcore_harness, scoped by
+      # the per-agent provider prefix (AGENT_CRED_PROVIDER_PREFIX, `agp-agent-obo-{id}`) since this
+      # module has no provider ARN; trailing `*` covers the id and the 6-char ARN suffix.
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = ["arn:aws:secretsmanager:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:secret:bedrock-agentcore-identity!default/oauth2/agp-agent-obo-*"]
       }
     ]
   })

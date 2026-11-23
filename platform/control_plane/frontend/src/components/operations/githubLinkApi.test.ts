@@ -1,24 +1,18 @@
-// Task-10 tests for the per-user GitHub link SURFACE (Epic 26B): the api-client's
-// route paths, the error-copy classifier the cards read, and a source assertion that
-// the two `.tsx` files stayed presentation-only.
-//
-// Why the classifier's tests live HERE and not in `githubLink.test.ts`: this file is
-// Task 10's, `githubLink.test.ts` is Task 5's (reviewed and pinned). The function it
-// covers is exported from `githubLink.ts` because that is the cohesive home for link
-// logic — the module, not the test file, is what the components import.
-//
-// Importing `client.ts` runs no network: the module body only constructs the axios
-// instance and its interceptors.
-
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, expectTypeOf } from 'vitest';
 import { GITHUB_LINK_PATHS } from '../../api/client';
-import { classifyLinkError, LINK_RETRY_HINT } from './githubLink';
-// Vite's `?raw` rather than `node:fs`: `tsconfig.app.json` sets `types: ["vite/client"]`
-// only, so Node's typings are not in this project — and `vite/client` is exactly what
-// declares `*?raw`. The explicit `.tsx` is load-bearing: `./GitHubLink` resolves to
-// `GitHubLink.ts` first, which on a case-insensitive filesystem is `githubLink.ts`.
-import gitHubLinkSrc from './GitHubLink.tsx?raw';
-import gitHubLinkCallbackSrc from './GitHubLinkCallback.tsx?raw';
+import { ApiFailure, type ErrorCode } from '../../api/failure';
+import { AUTH_401_HALT_MESSAGE } from '../../api/authRetry';
+import { failureOf } from '../../api/loadState';
+import { stripComments } from '../../rawSource';
+import {
+  LINK_ERROR_CODES,
+  LINK_RETRY_HINT,
+  classifyLinkError,
+  classifyLinkFailure,
+  type LinkErrorKind,
+} from './githubLinkModel';
+import gitHubLinkRaw from './GitHubLink.tsx?raw';
+import gitHubLinkCallbackRaw from './GitHubLinkCallback.tsx?raw';
 
 describe('GITHUB_LINK_PATHS', () => {
   it('pins the five link route paths', () => {
@@ -29,10 +23,7 @@ describe('GITHUB_LINK_PATHS', () => {
     expect(GITHUB_LINK_PATHS.unlink('c-1')).toBe('/api/v1/me/github-link/c-1');
   });
 
-  it('scopes every path to /me — the oid comes from the principal, never from a path param', () => {
-    // A link route that took an oid in the path would let one human address another's
-    // link. The whole router is mounted under /me for that reason; a drift away from it
-    // is the one shape of this API that would be a privacy bug rather than a 404.
+  it('scopes every path to /me — the oid comes from the principal, never from a path param, so one human can never address another\'s link', () => {
     for (const path of [
       GITHUB_LINK_PATHS.view,
       GITHUB_LINK_PATHS.start,
@@ -45,107 +36,134 @@ describe('GITHUB_LINK_PATHS', () => {
   });
 });
 
-// The api-client's response interceptor replaces the AxiosError with
-// `new Error(response.data.detail)` — the STATUS is gone by the time a component sees
-// it, so the route's FIXED detail literal is the only thing left to classify on. These
-// strings are therefore a contract, copied verbatim from the brief's `_ERROR_DETAIL`.
-//
-// This object is the mutation barrier for all EIGHT literals. The classifier returns the
-// `.kind` it recognized (`null` on a fall-through), so `expect(kind).toBe('<kind>')` fails
-// the moment a literal is removed from or reworded in `DETAIL_KINDS`. Before that, five of
-// the eight were unpinned: the terminal branch and the fall-through both answer
-// `{message: raw, retryable: false}`, so deleting a terminal literal changed nothing any
-// assertion could see.
-const DETAIL = {
-  not_found: 'GitHub link not found',
-  bad_request: 'Invalid request',
-  conflict: 'That GitHub account is already linked to another user',
-  oauth_client_missing:
-    'This org connection has no GitHub OAuth client — ask an admin to add one',
-  refresh_in_progress: 'GitHub token refresh in progress — retry',
-  link_revoked: 'Your GitHub authorization was revoked — reconnect your account',
-  provider_error: 'GitHub request failed',
-  secret_error: 'Secret store operation failed',
-} as const;
+function apiFailure({ status, code, detail = '', message = detail }: { status: number; code: ErrorCode | null; detail?: string; message?: string }): ApiFailure {
+  return new ApiFailure(status, code, detail, message);
+}
 
-describe('classifyLinkError', () => {
-  it('marks a token-refresh collision retryable (two ECS tasks contend on the same row)', () => {
-    // 409 refresh_in_progress happens under NORMAL operation — the other task holds the
-    // claim for at most 60s. Presenting it as a terminal failure would tell the human to
-    // give up on a link that is fine.
-    const out = classifyLinkError(new Error(DETAIL.refresh_in_progress), 'fallback');
+const REFUSAL: Record<LinkErrorKind, ApiFailure> = {
+  not_found: apiFailure({ status: 404, code: 'github_link.not_found', detail: 'GitHub link not found' }),
+  bad_request: apiFailure({ status: 400, code: 'github_link.bad_request', detail: 'Invalid request' }),
+  conflict: apiFailure({
+    status: 409,
+    code: 'github_link.conflict',
+    detail: 'That GitHub account is already linked to another user',
+  }),
+  oauth_client_missing: apiFailure({
+    status: 409,
+    code: 'github_link.oauth_client_missing',
+    detail: 'This org connection has no GitHub OAuth client — ask an admin to add one',
+  }),
+  refresh_in_progress: apiFailure({
+    status: 409,
+    code: 'github_link.refresh_in_progress',
+    detail: 'GitHub token refresh in progress — retry',
+  }),
+  link_revoked: apiFailure({
+    status: 409,
+    code: 'github_link.link_revoked',
+    detail: 'Your GitHub authorization was revoked — reconnect your account',
+  }),
+  provider_error: apiFailure({ status: 502, code: 'github_link.provider_error', detail: 'GitHub request failed' }),
+  secret_error: apiFailure({ status: 502, code: 'github_link.secret_error', detail: 'Secret store operation failed' }),
+};
+
+describe('LINK_ERROR_CODES — typed on the generated ErrorCode', () => {
+  it('satisfies Record<LinkErrorKind, readonly ErrorCode[]>, so a renamed backend code fails tsc where this table names it', () => {
+    expectTypeOf(LINK_ERROR_CODES).toExtend<Record<LinkErrorKind, readonly ErrorCode[]>>();
+  });
+
+  it('names at least one code per kind and no code under two kinds', () => {
+    const all = Object.values(LINK_ERROR_CODES).flat();
+    for (const codes of Object.values(LINK_ERROR_CODES)) expect(codes.length).toBeGreaterThan(0);
+    expect(new Set(all).size).toBe(all.length);
+  });
+
+  it('keys not_found on both codes the route answers 404 with: the link row missing and the connection missing', () => {
+    expect(classifyLinkFailure(REFUSAL.not_found)).toBe('not_found');
+    expect(
+      classifyLinkFailure(apiFailure({ status: 404, code: 'github_link.connection_missing', detail: 'GitHub link not found' })),
+    ).toBe('not_found');
+  });
+
+  it('classifies by code alone: the detail under no code is unrecognised, a reworded detail under the code is not', () => {
+    expect(classifyLinkFailure(apiFailure({ status: 404, code: null, detail: 'GitHub link not found' }))).toBeNull();
+    expect(classifyLinkFailure(apiFailure({ status: 409, code: 'github_link.refresh_in_progress', detail: 'reworded' }))).toBe(
+      'refresh_in_progress',
+    );
+  });
+});
+
+describe('classifyLinkError — the route\'s eight kinds, each pinned by the code it recovers', () => {
+  it('marks a token-refresh collision retryable: the other ECS task holds the claim for at most 60 s, so a terminal verdict would tell the human to give up on a link that is fine', () => {
+    const out = classifyLinkError(REFUSAL.refresh_in_progress, 'fallback');
     expect(out.kind).toBe('refresh_in_progress');
     expect(out.retryable).toBe(true);
     expect(out.message).toContain(LINK_RETRY_HINT);
   });
 
   it('marks a Secrets Manager blip retryable', () => {
-    const out = classifyLinkError(new Error(DETAIL.secret_error), 'fallback');
+    const out = classifyLinkError(REFUSAL.secret_error, 'fallback');
     expect(out.kind).toBe('secret_error');
     expect(out.retryable).toBe(true);
     expect(out.message).toContain(LINK_RETRY_HINT);
   });
 
   it('marks a GitHub transport failure retryable', () => {
-    const out = classifyLinkError(new Error(DETAIL.provider_error), 'fallback');
+    const out = classifyLinkError(REFUSAL.provider_error, 'fallback');
     expect(out.kind).toBe('provider_error');
     expect(out.retryable).toBe(true);
     expect(out.message).toContain(LINK_RETRY_HINT);
   });
 
-  it('marks a revoked authorization terminal — the remedy is reconnect, not retry', () => {
-    // Retrying a revoked grant re-probes a dead token and returns the same answer. The
-    // card flips to `revoked` and offers Reconnect; a "try again" hint here would send
-    // the human round a loop that cannot succeed.
-    const out = classifyLinkError(new Error(DETAIL.link_revoked), 'fallback');
+  it('marks a revoked authorization terminal — the remedy is reconnect, not retry: a retry re-probes a dead token and gets the same answer', () => {
+    const out = classifyLinkError(REFUSAL.link_revoked, 'fallback');
     expect(out.kind).toBe('link_revoked');
     expect(out.retryable).toBe(false);
     expect(out.message).not.toContain(LINK_RETRY_HINT);
   });
 
   it('recognizes not-found as not-found, and terminal', () => {
-    const out = classifyLinkError(new Error(DETAIL.not_found), 'fallback');
+    const out = classifyLinkError(REFUSAL.not_found, 'fallback');
     expect(out.kind).toBe('not_found');
     expect(out.retryable).toBe(false);
   });
 
   it('recognizes bad-request as bad-request, and terminal', () => {
-    const out = classifyLinkError(new Error(DETAIL.bad_request), 'fallback');
+    const out = classifyLinkError(REFUSAL.bad_request, 'fallback');
     expect(out.kind).toBe('bad_request');
     expect(out.retryable).toBe(false);
   });
 
   it('recognizes an account already linked elsewhere as conflict, and terminal', () => {
-    const out = classifyLinkError(new Error(DETAIL.conflict), 'fallback');
+    const out = classifyLinkError(REFUSAL.conflict, 'fallback');
     expect(out.kind).toBe('conflict');
     expect(out.retryable).toBe(false);
   });
 
   it('recognizes a missing OAuth client as oauth-client-missing, and terminal', () => {
-    const out = classifyLinkError(new Error(DETAIL.oauth_client_missing), 'fallback');
+    const out = classifyLinkError(REFUSAL.oauth_client_missing, 'fallback');
     expect(out.kind).toBe('oauth_client_missing');
     expect(out.retryable).toBe(false);
   });
 
-  it('recognizes every one of the eight backend literals — none may drift unnoticed', () => {
-    // The whole-table sweep. Each `.kind` here is asserted on its own above too, but this
-    // is the one assertion that fails if the backend GAINS a kind the frontend never
-    // learned about: `DETAIL` is copied from `_ERROR_DETAIL`, so an entry with no match
-    // classifies as `null`.
-    for (const [kind, detail] of Object.entries(DETAIL)) {
-      const out = classifyLinkError(new Error(detail), 'fallback');
+  it('recognizes every one of the eight backend codes and shows the detail as sent', () => {
+    for (const [kind, failure] of Object.entries(REFUSAL)) {
+      const out = classifyLinkError(failure, 'fallback');
       expect(out.kind, `${kind} fell through to the fallback`).toBe(kind);
-      expect(out.message).toContain(detail);
+      expect(out.message).toContain(failure.message);
     }
   });
 
-  it('falls back on an unrecognized error, and treats it as terminal', () => {
-    // An unknown message is more likely a bug than contention; inviting a retry on it
-    // would be a guess presented as advice. `kind: null` is what distinguishes this from
-    // a recognized terminal detail — the two are otherwise byte-identical, which is why
-    // the terminal literals were previously unpinned.
+  it('answers the error\'s own message, or the caller\'s text when it has none, as terminal with kind null: an unknown failure is more likely a bug than contention', () => {
     expect(classifyLinkError(new Error('Network Error'), 'Could not reach AGP.')).toEqual({
       message: 'Network Error',
+      retryable: false,
+      kind: null,
+    });
+    expect(
+      classifyLinkError(apiFailure({ status: 404, code: 'connection.not_found', detail: 'Connection not found' }), 'Could not reach AGP.'),
+    ).toEqual({
+      message: 'Connection not found',
       retryable: false,
       kind: null,
     });
@@ -166,27 +184,34 @@ describe('classifyLinkError', () => {
     });
   });
 
-  it('never inherits a prototype key as a kind', () => {
-    // `DETAIL_KINDS` is a plain object indexed by an attacker-influenced-ish string (the
-    // response body), so `'toString'` or `'constructor'` must classify as unknown rather
-    // than returning `Object.prototype`'s member.
-    for (const key of ['toString', 'constructor', 'hasOwnProperty', '__proto__']) {
-      expect(classifyLinkError(new Error(key), 'fallback').kind).toBe(null);
-    }
+  it('shows the interceptor’s 401 copy as sent when the load state carries its codeless 401 failure', () => {
+    const fallback = 'Could not load your GitHub links.';
+    const state = failureOf(new ApiFailure(401, null, undefined, AUTH_401_HALT_MESSAGE), fallback);
+    expect(state.failure).toMatchObject({ status: 401, code: null, message: AUTH_401_HALT_MESSAGE });
+    expect(classifyLinkError(state.failure ?? state.message, fallback)).toEqual({
+      message: AUTH_401_HALT_MESSAGE,
+      retryable: false,
+      kind: null,
+    });
+    expect(stripComments(gitHubLinkRaw)).toContain(
+      "classifyLinkError(state.failure ?? state.message, 'Could not load your GitHub links.')",
+    );
   });
 });
 
-describe('component thinness', () => {
-  // `.tsx` is never rendered under vitest (no jsdom, and only `src/**/*.test.ts` is
-  // collected), so a source assertion is the only available check that the components
-  // stayed presentation-only — Task 5's module owns every card string and every
-  // status→copy decision.
+describe('component thinness — the two .tsx files stay presentation-only, read raw so a copied string in a comment cannot seed a drift either', () => {
   const SOURCES = [
-    { file: 'GitHubLink.tsx', src: gitHubLinkSrc },
-    { file: 'GitHubLinkCallback.tsx', src: gitHubLinkCallbackSrc },
+    { file: 'GitHubLink.tsx', src: gitHubLinkRaw },
+    { file: 'GitHubLinkCallback.tsx', src: gitHubLinkCallbackRaw },
   ];
 
-  it('keeps all card copy in githubLink.ts', () => {
+  it('reads both components as code, so the guards below are not vacuous', () => {
+    for (const { file, src } of SOURCES) {
+      expect(stripComments(src).length, file).toBeGreaterThan(1000);
+    }
+  });
+
+  it('keeps all card copy in githubLinkModel.ts', () => {
     for (const { file, src } of SOURCES) {
       expect(src, file).not.toContain('Linked as');
       expect(src, file).not.toContain('Connect your GitHub account');
@@ -194,22 +219,14 @@ describe('component thinness', () => {
     }
   });
 
-  it('keeps the status→copy derivation in githubLink.ts', () => {
+  it('keeps the status→copy derivation in githubLinkModel.ts: the one status literal a .tsx may read is refreshing, for the rotation spinner; the two derived states are not', () => {
     for (const { file, src } of SOURCES) {
-      // A `.tsx` that branches on the wire status string is re-deriving what
-      // `deriveLinkCardState` already decided, untestably. The ONE legitimate read of
-      // `status` is the rotation spinner (`status === 'refreshing'`), which
-      // `LinkCardState` deliberately folds into `linked` — so that literal is allowed
-      // and the two that name a derived state are not.
       expect(src, file).not.toContain("'unlinked'");
       expect(src, file).not.toContain("'revoked'");
     }
   });
 
-  it('never hardcodes the callback path — buildLinkRedirectUrl owns it', () => {
-    // Four tasks depend on `/ops/github-link/callback` byte-for-byte; a second literal
-    // is how it drifts. The route registration in App.tsx is the one place the string
-    // is unavoidable, and it is not one of these files.
+  it('never hardcodes the callback path — buildLinkRedirectUrl owns it, and the route table in routes.ts is the one unavoidable second literal', () => {
     for (const { file, src } of SOURCES) {
       expect(src, file).not.toContain('/ops/github-link/callback');
     }

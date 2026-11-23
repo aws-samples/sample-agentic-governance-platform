@@ -14,9 +14,13 @@ agent then runs prompt-only) — it MUST NOT raise out of an invoke. An agent th
 because one env var is malformed is strictly worse than one that answers without tools.
 """
 
+import hashlib
 import json
 import logging
 from typing import Mapping
+
+# Bedrock ConverseStream's toolSpec.name limit.
+_MAX_TOOL_NAME = 64
 
 logger = logging.getLogger(__name__)
 
@@ -79,5 +83,17 @@ def namespace_tool_name(label: str, name: str) -> str:
     Tools from every wired MCP are advertised to the model as ``{label}__{name}`` so names can
     never collide across servers and a tool call is traceable to its source MCP. The label is the
     deterministic slug the platform assigned to the MCP record.
+
+    Bedrock rejects a tool name over 64 chars, and a gateway advertises every tool as
+    ``<target>___<tool>``, so a long name first drops the target, then is cut with a short
+    hash of the full name (unique and stable). Only the model-facing name changes; the call
+    still goes to the gateway's own tool name.
     """
-    return f"{label}__{name}"
+    full = f"{label}__{name}"
+    if len(full) <= _MAX_TOOL_NAME:
+        return full
+    short = f"{label}__{name.split('___', 1)[-1]}"
+    if len(short) <= _MAX_TOOL_NAME:
+        return short
+    digest = hashlib.sha1(full.encode(), usedforsecurity=False).hexdigest()[:6]
+    return f"{short[: _MAX_TOOL_NAME - 7]}_{digest}"

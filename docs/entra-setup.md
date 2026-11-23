@@ -12,7 +12,7 @@ be done whenever, as long as it is before the post-apply seed.
 
 Within the backend steps the order also matters: **step 5 must exist before step 6 will let you
 save.** After each step there is a `key = value` block to fill in as you go; step 12 assembles them
-into the two config files.
+into the variables file.
 
 After the twelve steps comes the reference half of this document:
 [where every value goes](#where-every-value-goes),
@@ -32,8 +32,8 @@ consent right: an Application Developer can register the apps but not consent to
 > ⚠️ **This file is tracked by git** (`docs/**` is not ignored), so anything you type below can be
 > committed. Five of the six values are identifiers and not secret. **The client secret in step 4 is
 > a real credential** — a bearer token for your directory's whole app-management surface. Its
-> template is here for completeness, but the safe home is `secrets.auto.tfvars`, which *is* ignored
-> via `.gitignore:6:**/*.tfvars`. If you fill step 4 in here, either keep this copy outside the working
+> template is here for completeness, but it belongs in no file: the deploy reads it from
+> `TF_VAR_entra_backend_client_secret` in your shell. If you fill step 4 in here, either keep this copy outside the working
 > tree or clear it before committing.
 
 ---
@@ -148,22 +148,20 @@ No values from this step.
 It's already on screen. In the **Essentials** panel at the top of **Overview**, the second field is
 **Application (client) ID**, a GUID with a copy-to-clipboard icon beside it.
 
-- Click the copy icon → paste into `entra_backend_client_id` in `secrets.auto.tfvars`.
+- Click the copy icon → paste into `entra_backend_client_id` in your variables file,
+  `platform/control_plane/infrastructure/env/<ENV_NAME>.tfvars`.
 
 **While you're here:** the same panel shows **Directory (tenant) ID**. That's the tenant GUID — copy
-it now into both `entra_tenant_id` and `VITE_ENTRA_TENANT_ID` and save yourself a trip to the tenant
+it now into `entra_tenant_id` and save yourself a trip to the tenant
 Overview page.
 
 Do not confuse **Object ID** (also in this panel) with the client ID. Object ID is the directory
 record's own identifier and no AGP variable wants it.
 
 ```ini
-# → secrets.auto.tfvars
+# → env/<ENV_NAME>.tfvars
 entra_backend_client_id =
 entra_tenant_id         =
-
-# → frontend/.env          (same GUID as entra_tenant_id)
-VITE_ENTRA_TENANT_ID    =
 ```
 
 ---
@@ -183,7 +181,7 @@ This is the one-shot value. Have the file open before you click Add.
 The secret now appears as a row in the table with four columns: **Description | Expires | Value |
 Secret ID**.
 
-- Copy the **Value** column — it has its own copy icon. Paste it into `entra_backend_client_secret`.
+- Copy the **Value** column — it has its own copy icon. It is the value of `TF_VAR_entra_backend_client_secret`.
 - **Ignore Secret ID.** It's the metadata handle, not the credential, and pasting it produces a stack
   that deploys fine and then fails every Graph call.
 
@@ -192,7 +190,7 @@ the secret and create a new one. Also note the expiry date somewhere: when it la
 fails at once and sign-in keeps working, which is a confusing combination to debug cold.
 
 ```ini
-# → secrets.auto.tfvars       ⚠️ credential — see the warning at the top of this file
+# → export TF_VAR_entra_backend_client_secret   ⚠️ credential — see the warning at the top of this file
 entra_backend_client_secret =
 
 # not a variable — for your own calendar
@@ -254,12 +252,12 @@ Leave `AGENT_APP_AUDIENCE_PREFIX` (`api://agp-agent-`) and `MCP_APP_AUDIENCE_PRE
 (`api://agp-mcp-`) at `core/config.py:180-181` **unchanged** — different namespaces, for the per-agent
 and per-MCP registrations the platform mints, and collision-safe via the id they append.
 
-Then paste this same string as the first half of `VITE_ENTRA_SPA_SCOPE` in `frontend/.env`. It has to
-be byte-identical in the Entra field, `entra_audience`, and that `VITE_` key — mismatches show up as a
+Then use this same string as the first half of `entra_spa_scope`. It has to
+be byte-identical in the Entra field, `entra_audience`, and that scope — mismatches show up as a
 `401 Invalid audience` on every call, with nothing indicating which of the three is wrong.
 
 ```ini
-# → secrets.auto.tfvars
+# → env/<ENV_NAME>.tfvars
 entra_audience =
 ```
 
@@ -286,8 +284,8 @@ than relying on the code's fallback.
 If sub-step 1 instead prompts you to set an Application ID URI, you skipped step 5.
 
 ```ini
-# → frontend/.env             the FULL string: <step 5 value>/<scope name>
-VITE_ENTRA_SPA_SCOPE =
+# → env/<ENV_NAME>.tfvars     the FULL string: <step 5 value>/<scope name>
+entra_spa_scope =
 
 # not a variable — recorded only if you renamed it from Access.Default
 scope_name           =
@@ -516,11 +514,8 @@ of the Application ID URI. Fill only one and a fraction of otherwise valid token
 distinguishing them from the rest.
 
 ```ini
-# → secrets.auto.tfvars
+# → env/<ENV_NAME>.tfvars
 entra_spa_client_id      =
-
-# → frontend/.env          (same GUID)
-VITE_ENTRA_SPA_CLIENT_ID =
 
 # confirmed in the portal (yes / no)
 platform_is_spa_not_web  =
@@ -591,7 +586,7 @@ PYTHONPATH=src venv/bin/python scripts/seed_default_tenant.py \
 `export DEFAULT_TENANT_GROUP_ID=<guid>` works instead of the flag
 (`seed_default_tenant.py:106,795`).
 
-> **Do not put it in `secrets.auto.tfvars` or `frontend/.env`.** `variables.tf:265-268` records that
+> **Do not put it in the variables file.** `variables.tf:265-268` records that
 > `default_tenant_group_id` used to be declared and was removed when the seed stopped being a Terraform
 > `local-exec`; no module consumes it now, so it would be an undeclared variable with no effect.
 >
@@ -609,45 +604,33 @@ group_members_added =    # yes / no — editable later; only affects operators a
 
 ---
 
-## Step 12 — Transfer into the two config files
+## Step 12 — Transfer into the variables file
 
-Everything above, collected. Paste your filled values into the real files; these blocks are the shape
-each file should end up in. (The full variable-by-variable reference, including the traps on each
-side, is [Where every value goes](#where-every-value-goes) below.)
-
-`platform/control_plane/infrastructure/secrets.auto.tfvars`
+Everything above, collected. Paste your filled values into
+`platform/control_plane/infrastructure/env/<ENV_NAME>.tfvars`; this block is the shape of its Entra part.
+(The full variable-by-variable reference, including the traps, is
+[Where every value goes](#where-every-value-goes) below.)
 
 ```hcl
-entra_tenant_id             = ""   # step 3
-entra_audience              = ""   # step 5
-entra_backend_client_id     = ""   # step 3
-entra_backend_client_secret = ""   # step 4 — the Value column, never the Secret ID
-entra_spa_client_id         = ""   # step 10
-langfuse_admin_password     = ""   # not from Entra — nothing validates it; this becomes the real login
-langfuse_admin_email        = ""   # not from Entra — same
+entra_tenant_id         = ""   # step 3
+entra_tenant_domain     = ""   # not from a registration — Identity → Overview → Primary domain
+entra_audience          = ""   # step 5
+entra_backend_client_id = ""   # step 3
+entra_spa_client_id     = ""   # step 10
+entra_spa_scope         = ""   # step 6 — full string, e.g. api://agp/Access.Default
+langfuse_admin_email    = ""   # not from Entra — nothing validates it; this becomes the real login
 ```
 
-> Fill in the file named `secrets.auto.tfvars`, **not** `secrets.auto.tfvars.example`. The example is
-> tracked by git; the real one is ignored. They sit side by side with near-identical contents, and a real
-> client secret typed into the wrong one is staged by the next `git add .`.
-
-`platform/control_plane/frontend/.env`
+The two secrets go in no file. Export them in the shell that runs the deploy:
 
 ```bash
-VITE_ENTRA_TENANT_ID=            # step 3 — same GUID as entra_tenant_id
-VITE_ENTRA_SPA_SCOPE=            # step 6 — full string, e.g. api://agp/Access.Default
-VITE_ENTRA_SPA_CLIENT_ID=        # step 10 — same GUID as entra_spa_client_id
-VITE_ENTRA_TENANT_DOMAIN=        # not from a registration — Identity → Overview → Primary domain
+export TF_VAR_entra_backend_client_secret='...'   # step 4 — the Value column, never the Secret ID
+export TF_VAR_langfuse_admin_password='...'       # not from Entra — letters, numbers, one special character
 ```
 
-> `VITE_ENTRA_TENANT_DOMAIN` is the one value nothing checks for you. `deploy-full.sh:148` refuses to
-> deploy while any of the four required `VITE_` variables is unusable, but `frontend_var_unusable`
-> (`deploy-full.sh:86`) only rejects empty strings, `<…>` stubs, and all-zero GUIDs. A leftover
-> `contoso.onmicrosoft.com` looks like a real domain to that test and sails through the preflight.
-
-- [ ] Confirm `git check-ignore -v secrets.auto.tfvars` prints `.gitignore:6:**/*.tfvars`, run from
-      the `infrastructure` directory — from anywhere else it matches the bare filename and proves
-      nothing.
+> `entra_tenant_domain` is the one value nothing checks for you. The deploy refuses an empty value, a
+> `<…>` stub and an all-zero GUID, but a leftover `contoso.onmicrosoft.com` looks like a real domain and
+> sails through.
 
 Three actions on the **backend** registration produce no value to record, but the platform does not work
 without them:
@@ -674,26 +657,16 @@ assignment_required =
 
 ## Where every value goes
 
-Your Entra values live in two gitignored files — `secrets.auto.tfvars` and the frontend `.env`. A third,
-`terraform.tfvars`, carries no Entra values but the deploy expects it, so copy all three from the tracked
-examples:
+Your Entra identifiers live in one file, `platform/control_plane/infrastructure/env/<ENV_NAME>.tfvars`,
+and the client secret in the `TF_VAR_entra_backend_client_secret` environment variable; step 2 of
+[Bootstrapping](../README.md#bootstrapping) covers the file's other keys. The frontend has no file of its
+own to fill: the deploy bakes its `VITE_*` values from Terraform outputs of the same variables.
 
-```bash
-cd platform/control_plane/infrastructure && cp terraform.tfvars.example terraform.tfvars
-cp secrets.auto.tfvars.example secrets.auto.tfvars && cd ../frontend && cp .env.example .env
-cd ../infrastructure   # go back — the check-ignore in step 12 must run where the file actually is
-```
+> **Set the two Langfuse values.** Nothing validates `langfuse_admin_email` or
+> `TF_VAR_langfuse_admin_password`, and they seed the real Langfuse admin login. The password needs letters,
+> numbers, and one special character.
 
-`terraform.tfvars` ships with defaults that work as-is for a single-account dev deploy; step 2 of
-[Bootstrapping](../README.md#bootstrapping) covers the few keys most people touch. Terraform **auto-loads
-any `*.auto.tfvars`**, so there is no `-var-file` flag to remember.
-
-> **Replace the two Langfuse placeholders in `secrets.auto.tfvars`.** The example ships
-> `langfuse_admin_password = "REPLACE_WITH_A_STRONG_PASSWORD"` and `langfuse_admin_email = "admin@example.com"`,
-> and nothing validates them — both default to `""`, so `terraform apply` succeeds and seeds Langfuse with the
-> literal placeholder as its admin password. The password needs letters, numbers, and one special character.
-
-### Backend — `platform/control_plane/infrastructure/secrets.auto.tfvars`
+### Backend — the Terraform variables
 
 Every variable below is declared in `variables.tf` and reaches the backend container as an environment
 variable through the ECS task definition.
@@ -712,45 +685,42 @@ defaults mean **Terraform will not stop you** from applying with the Entra value
 healthy, and every authenticated API request then fails with a bare `500 Internal server error` whose real
 reason (`ENTRA_TENANT_ID is not configured`) goes to CloudWatch, not to the client.
 
-### Frontend — `platform/control_plane/frontend/.env`
+### Frontend — baked from Terraform outputs
 
 The SPA declares exactly seven variables in `platform/control_plane/frontend/src/vite-env.d.ts`, and reads six of them:
 
 | `VITE_*` key | Value from | Read by |
 |---|---|---|
 | `VITE_API_URL` | `terraform output -raw api_endpoint` — **post-apply** | the API client |
-| `VITE_AUTH_PROVIDER` | `entra` | **nothing in the SPA** — the fail-fast guard no longer consults it (below). Still written by `deploy-full.sh`, and still expected to match the backend's `AUTH_PROVIDER` |
+| `VITE_AUTH_PROVIDER` | `entra` | **nothing in the SPA** — the fail-fast guard no longer consults it (below). Still written by the deploy, and still expected to match the backend's `AUTH_PROVIDER` |
 | `VITE_ENTRA_TENANT_ID` | Tenant ID (step 3) — same value as `entra_tenant_id` | `msalConfig.ts` → MSAL authority |
-| `VITE_ENTRA_TENANT_DOMAIN` | Tenant domain (step 12) | display only in the UI, and no Terraform twin — **but `deploy-full.sh` refuses to deploy without it** |
+| `VITE_ENTRA_TENANT_DOMAIN` | Tenant domain (step 12) | display only in the UI, set by `entra_tenant_domain` — **the deploy refuses to build without it** |
 | `VITE_ENTRA_SPA_CLIENT_ID` | SPA client ID (step 10) — same value as `entra_spa_client_id` | `msalConfig.ts` → MSAL `clientId` |
 | `VITE_ENTRA_SPA_REDIRECT_URI` | `<frontend_url>/auth/callback` — **post-apply**, [below](#after-the-first-apply-close-the-redirect-uri-loop) | `msalConfig.ts` |
 | `VITE_ENTRA_SPA_SCOPE` | `<application-id-uri>/<scope-name>`, e.g. `api://agp/Access.Default` (steps 5–6) | `msalConfig.ts` → `apiScopes` |
 
-Fill in the five you already know; the other two come from the first deploy. Four of the five are a hard deploy gate:
-`deploy-full.sh` resolves `VITE_ENTRA_TENANT_ID`, `VITE_ENTRA_TENANT_DOMAIN`, `VITE_ENTRA_SPA_CLIENT_ID`, and
-`VITE_ENTRA_SPA_SCOPE` in preflight, and exits with *"Refusing to deploy"* if any is empty, still angle-bracketed, or
-an all-zero GUID. `VITE_ENTRA_SPA_REDIRECT_URI` is exempt — it does not exist until the first apply.
+You fill in none of them by hand: `deploy-frontend.sh` writes `frontend/.env.production` from Terraform
+outputs and refuses to build while any value is empty, still angle-bracketed, or an all-zero GUID.
+`frontend/.env`, copied from `.env.example`, serves `npm run dev` against an already-deployed API and never
+reaches a deployed bundle.
 
 Two of them are a hard **build** gate as well. `auth/authConfigGuard.ts` throws at module load when
 `VITE_ENTRA_TENANT_ID` or `VITE_ENTRA_SPA_CLIENT_ID` is missing, angle-bracketed, or an all-zero GUID — the same
-predicate the preflight uses, deliberately, so the two gates cannot disagree about what "configured" means. The guard
+predicate the deploy uses, deliberately, so the two gates cannot disagree about what "configured" means. The guard
 is **unconditional**: `VITE_AUTH_PROVIDER` used to gate it, which made it inert on every build path that does not
 write that key (`deploy-frontend.sh`, a bare `npm run build`, CI) and shipped an empty client ID against the `/common`
 multi-tenant authority instead — a sign-in that completes against the wrong directory and then fails every API call
 on issuer. A configured tree is unaffected: Vite loads `.env` as the base file in both dev and production modes.
 
-> **`.env` is where you edit; `.env.production` is what the build reads.** `deploy-full.sh` reads `.env` and
-> regenerates `.env.production` from it, and Vite ranks `.env.production` above `.env` for a production build.
-> So editing `.env` and then running the frontend-only `deploy-frontend.sh` — which generates nothing — ships
-> the previous values and reports success. See step 5 of [Bootstrapping](../README.md#bootstrapping) for the
-> two supported ways out; both scripts live in `platform/control_plane/infrastructure/scripts/`.
+> **`.env.production` is written by every deploy and by nothing else.** A hand edit there is overwritten by
+> the next deploy, and nothing in `frontend/.env` reaches a deployed bundle.
 
 ### Values with no variable
 
 Four things you configure in Entra have no Terraform variable or `VITE_*` key, and are fixed by convention. The three
 app-role values are backend defaults in `core/config.py`, so renaming them in Entra means changing backend
 configuration. The scope name `Access.Default` is not: it only ever appears as the second half of
-`VITE_ENTRA_SPA_SCOPE`, so renaming it means setting that key (step 6), nothing backend-side. Which app registration
+`entra_spa_scope`, so renaming it means setting that variable (step 6), nothing backend-side. Which app registration
 holds the `Platform.*` assignments defaults to the backend app, overridable only through the
 `ENTRA_PLATFORM_APP_CLIENT_ID` backend setting, which Terraform does not wire. And the **group object ID** for the
 default tenant seed (step 11) is passed as `--group-id` to `platform/control_plane/backend/scripts/seed_default_tenant.py`
@@ -840,15 +810,14 @@ agent_identity_service, mcp_identity_service}.py`.*
 redirect URI is a CloudFront domain that does not exist until Terraform has created it. Deploy, then read the two
 values back from `platform/control_plane/infrastructure`: `terraform output -raw frontend_url` (e.g.
 `https://d111111abcdef8.cloudfront.net`) and `terraform output -raw api_endpoint` (e.g.
-`https://abc123.execute-api.us-east-1.amazonaws.com/dev`). Then update **both** sides — one is Entra
-configuration, the other a build-time constant baked into the JavaScript bundle:
+`https://abc123.execute-api.us-east-1.amazonaws.com/dev`). Then register it in Entra; the
+platform side is a build-time constant the deploy has already baked into the JavaScript bundle:
 
 1. **In the SPA app registration** → **Authentication** → the *Single-page application* platform → add
    `<frontend_url>/auth/callback` as a redirect URI.
-2. **In `platform/control_plane/frontend/.env`** → set `VITE_ENTRA_SPA_REDIRECT_URI` to that exact same
-   string, and `VITE_API_URL` to the `api_endpoint` value.
-3. **Rebuild and redeploy the frontend.** `deploy-full.sh` re-reads `.env`, regenerates `.env.production`,
-   and redeploys; `deploy-frontend.sh` requires you to copy both values into `.env.production` yourself.
+2. **Nothing on the platform side.** The deploy already baked that same URI into the bundle as
+   `VITE_ENTRA_SPA_REDIRECT_URI`, derived from the `frontend_url` output, and `VITE_API_URL` from
+   `api_endpoint`.
 
 The two strings must match byte for byte, trailing slash included. MSAL compares the redirect URI it sends
 against the registered list exactly; a mismatch fails with `AADSTS50011`.
@@ -904,8 +873,8 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 Both must be `401`. A `200` means the backend is running with the local dev-auth bypass (`USE_DEV_AUTH` or
 `DEBUG`), which skips token validation entirely and must never be set in a deployed environment. A `500` means
-the Entra tfvars were never filled in ([the backend table above](#backend--platformcontrol_planeinfrastructuresecretsautotfvars))
-— the validator raises before it ever parses the token; fix `secrets.auto.tfvars`, re-apply, and re-run both
+the Entra tfvars were never filled in ([the backend table above](#backend--the-terraform-variables))
+— the validator raises before it ever parses the token; fix the variables file, deploy again, and re-run both
 commands.
 
 > **Six endpoints are deliberately public** and answer without a bearer token. They are a decision, not a
@@ -924,7 +893,7 @@ commands.
 |---|---|---|
 | Every API call returns `401 Invalid audience (accepted [...])` | The Application ID URI, `entra_audience`, and the URI half of `VITE_ENTRA_SPA_SCOPE` are not identical | Make all three match (step 5). The error message lists what the backend accepted. |
 | `401 Invalid issuer (expected https://login.microsoftonline.com/<guid>/v2.0)` | `entra_tenant_id` points at a different tenant than the one that issued the token — or the backend app's token version was left at v1 (step 5 sub-step 1) | Fix `entra_tenant_id` and re-apply, or set `requestedAccessTokenVersion: 2` |
-| `500 Internal server error` on every authenticated call, but `/health` is fine | The Entra tfvars were never filled in — they default to `""` and Terraform applies anyway. The real message, `ENTRA_TENANT_ID is not configured`, is in CloudWatch, not in the response | Fill `secrets.auto.tfvars` (step 12), re-apply |
+| `500 Internal server error` on every authenticated call, but `/health` is fine | The Entra tfvars were never filled in — they default to `""` and Terraform applies anyway. The real message, `ENTRA_TENANT_ID is not configured`, is in CloudWatch, not in the response | Fill the variables file (step 12), deploy again |
 | `401 Invalid token: signing key lookup failed` | The tenant's JWKS endpoint is unreachable, or the token is not an Entra RS256 JWT | Check egress from the ECS task; confirm the token came from MSAL |
 | Signed in fine, but everything that saves returns `403 Requires operator role or higher` | The user holds no recognised `Platform.*` role, so they were defaulted to `VIEWER` | Assign a role **on the backend app** ([Assign users](#assign-users-to-platform-roles)) |
 | `AADSTS50105` at sign-in | Assignment required is on and the user has no role assignment | Assign a role ([Assign users](#assign-users-to-platform-roles)) |
@@ -937,8 +906,8 @@ commands.
 | Roles you assigned never appear in the token | They were defined or assigned on the SPA app registration | Move them to the backend app (step 7; [Assign users](#assign-users-to-platform-roles)) |
 | A once-working deployment starts failing all Graph calls at the same time | The backend client secret expired | Generate a new one, update `entra_backend_client_secret`, re-apply (step 4) |
 
-**Rotating the client secret.** Generate a new secret in the Entra portal, replace the value in
-`secrets.auto.tfvars`, and re-apply. Terraform updates the Secrets Manager secret, and ECS picks up the new
+**Rotating the client secret.** Generate a new secret in the Entra portal, export it as
+`TF_VAR_entra_backend_client_secret`, and deploy again. Terraform updates the Secrets Manager secret, and ECS picks up the new
 value on the next task replacement. Delete the old secret in Entra only once the new tasks are healthy.
 
 ## Related

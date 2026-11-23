@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Seed representative demo MCP servers into the AWS Agent Registry (Epic 5, Task 7).
+"""Seed representative demo MCP servers into the AWS Agent Registry.
 
 This is a USER / CONTROLLER step: it makes live AWS calls (via
 ``McpServerRegistryService`` -> ``bedrock-agentcore-control``, Bedrock AgentCore,
@@ -13,7 +13,12 @@ What it does:
   1. Build ~7 ``McpServerCreate`` payloads (defined as data below) spread across
      both kinds (gateway / standard), business units, regions, data
      classifications, and a lifecycle mix. Each carries 3-5 schema-valid declared
-     tools (``name`` / ``description`` / ``input_schema`` as a real JSON Schema).
+     tools (``name`` / ``description`` / ``input_schema`` as a real JSON Schema; the
+     plain dicts are coerced to ``McpTool`` by Pydantic). Each entry's ``lifecycle``
+     key is a seed-only directive, not an ``McpServerCreate`` field: ``"proposed"``
+     (stays DRAFT), ``"pending_approval"`` (submit), ``"approved"`` (submit + approve)
+     or ``"deprecated"`` (submit + approve + deprecate). It is dropped before the
+     payload is built.
   2. For each: ``service.create(McpServerCreate(**fields), created_by="seed")``.
      Idempotent — a name that already exists raises ``NameTakenError`` which is
      caught + logged ("skip, already exists"), so re-running does not duplicate.
@@ -61,31 +66,7 @@ import sys
 
 logger = logging.getLogger("seed_mcp_servers")
 
-
-# ---------------------------------------------------------------------------
-# Demo MCP-server data (module-level constants — pure data, no AWS, import-safe).
-#
-# Each dict is the kwargs for an McpServerCreate. Spread per the plan / Task 7:
-#   - kind: both gateway and standard represented.
-#   - business_unit: Claims, Sales/CRM, Underwriting, Platform, ...
-#   - region: DE, EU.
-#   - data_classification: Public / Internal / Confidential.
-#   - lifecycle: mostly approved, >=1 deprecated, 1 pending_approval.
-#   - names: realistic, unique, kebab-case (native record name charset).
-#
-# `available_tools` are plain dicts using the snake `input_schema` key — Pydantic
-# coerces them to McpTool (the field is list[McpTool]) when the McpServerCreate
-# is constructed. Each input_schema is a real JSON Schema object.
-#
-# The `lifecycle` key is NOT an McpServerCreate field — it is a seed-only
-# directive telling the script which lifecycle to drive the created server into.
-# It is popped off before constructing the McpServerCreate. Values:
-#   "proposed" (stays DRAFT), "pending_approval" (submit),
-#   "approved" (submit + approve), "deprecated" (submit + approve + deprecate).
-# ---------------------------------------------------------------------------
-
 DEMO_MCP_SERVERS: list[dict] = [
-    # --- Claims (gateway, DE, Confidential, approved) --------------------
     {
         "name": "internal-claims-mcp",
         "description": "Read-only access to motor and property claims records for the DE market.",
@@ -131,10 +112,11 @@ DEMO_MCP_SERVERS: list[dict] = [
         ],
         "lifecycle": "approved",
     },
-    # --- Sales / CRM (gateway, EU, Internal, approved, read+write) -------
     {
         "name": "salesforce-mcp",
-        "description": "Salesforce CRM access for sales agents: read accounts/opportunities and log activities.",
+        "description": (
+            "Salesforce CRM access for sales agents: read accounts/opportunities and log activities."
+        ),
         "kind": "gateway",
         "owner_email": "lars.svensson@contoso.onmicrosoft.com",
         "business_unit": "Sales",
@@ -193,7 +175,6 @@ DEMO_MCP_SERVERS: list[dict] = [
         ],
         "lifecycle": "approved",
     },
-    # --- Web search (standard, EU, Public, approved) ---------------------
     {
         "name": "web-search-mcp",
         "description": "General-purpose public web search and page retrieval for grounding agents.",
@@ -241,7 +222,6 @@ DEMO_MCP_SERVERS: list[dict] = [
         ],
         "lifecycle": "approved",
     },
-    # --- Underwriting / Pricing (gateway, EU, Confidential, pending) -----
     {
         "name": "pricing-tools-mcp",
         "description": "Pricing and rating calculators for underwriting quote generation.",
@@ -296,7 +276,6 @@ DEMO_MCP_SERVERS: list[dict] = [
         ],
         "lifecycle": "pending_approval",
     },
-    # --- Directory graph (standard, EU, Internal, approved) --------------
     {
         "name": "directory-graph-mcp",
         "description": "Microsoft Graph directory lookups: users, groups, and org structure.",
@@ -340,7 +319,6 @@ DEMO_MCP_SERVERS: list[dict] = [
         ],
         "lifecycle": "approved",
     },
-    # --- Document store (standard, DE, Confidential, approved) -----------
     {
         "name": "document-store-mcp",
         "description": "Read-only retrieval over the DE document repository for grounding and citations.",
@@ -381,7 +359,6 @@ DEMO_MCP_SERVERS: list[dict] = [
         ],
         "lifecycle": "approved",
     },
-    # --- Legacy policy (standard, DE, Internal, DEPRECATED) --------------
     {
         "name": "legacy-policy-mcp",
         "description": "Legacy policy-administration system bridge — superseded by the new policy API.",
@@ -426,11 +403,6 @@ DEMO_MCP_SERVERS: list[dict] = [
 ]
 
 
-# Lifecycle directives the seed understands (the `lifecycle` key in
-# DEMO_MCP_SERVERS). "proposed" / "pending_approval" leave the record short of
-# APPROVED; "approved" drives submit+approve; "deprecated" drives
-# submit+approve+deprecate (DEPRECATED requires APPROVED first per the native
-# lifecycle — research §5).
 _VALID_LIFECYCLES = {"proposed", "pending_approval", "approved", "deprecated"}
 
 
@@ -439,12 +411,11 @@ def _build_mcp_create(fields: dict):
     `lifecycle` directive). Pure Pydantic — no AWS. The plain-dict tools in
     `available_tools` are coerced to McpTool by Pydantic (the field is
     list[McpTool]). Imported lazily so importing this module triggers no
-    settings/AWS setup."""
+    settings/AWS setup. ``tenant_id`` is required on McpServerCreate: demo MCP servers
+    belong to the seed ``"default"`` tenant unless the entry says otherwise."""
     from models.mcp_server import McpServerCreate
 
     payload = {k: v for k, v in fields.items() if k != "lifecycle"}
-    # E24: tenant_id is REQUIRED on McpServerCreate — demo MCP servers belong to
-    # the seed "default" tenant unless the DEMO_MCP_SERVERS entry says otherwise.
     payload.setdefault("tenant_id", "default")
     return McpServerCreate(**payload)
 
@@ -493,13 +464,14 @@ def dry_run() -> int:
 def _drive_lifecycle(service, mcp, lifecycle: str) -> None:
     """Drive a freshly-created MCP server into its target lifecycle state.
 
-    Defensive: any transition failure is logged and swallowed so one bad
-    transition can't abort the whole seed. DEPRECATED requires APPROVED first
-    (research §5), so the deprecate path approves before deprecating.
+    Seeding is best-effort: any failed transition, whatever its class, is logged with its
+    traceback and swallowed so one bad transition can't abort the whole seed. DEPRECATED
+    requires APPROVED first (research §5), so the deprecate path approves before
+    deprecating.
     """
     try:
         if lifecycle == "proposed":
-            return  # stays DRAFT — nothing to do
+            return
         if lifecycle == "pending_approval":
             service.submit_for_approval(mcp.id)
             logger.info("    submitted %r for approval -> pending_approval", mcp.name)
@@ -509,11 +481,10 @@ def _drive_lifecycle(service, mcp, lifecycle: str) -> None:
             service.transition(mcp.id, "approve", "Seed: approved for demo")
             logger.info("    approved %r", mcp.name)
             if lifecycle == "deprecated":
-                # DEPRECATED is reachable only from APPROVED (research §5).
                 service.transition(mcp.id, "deprecate", "Seed: deprecated for demo")
                 logger.info("    deprecated %r", mcp.name)
-    except Exception as exc:  # noqa: BLE001 — keep seeding even if a transition fails
-        logger.warning(
+    except Exception as exc:
+        logger.exception(
             "    lifecycle transition for %r (target %s) failed: %s — continuing",
             mcp.name,
             lifecycle,
@@ -527,7 +498,6 @@ def seed(registry_id: str, region: str) -> int:
     Imports + service construction + AWS calls all happen here (NOT at module
     top-level) so importing this module is side-effect-free.
     """
-    from models.mcp_server import McpServerCreate  # noqa: F401 — built via _build_mcp_create
     from services.mcp_server_service import McpServerRegistryService, NameTakenError
 
     service = McpServerRegistryService(registry_id=registry_id, region=region)
@@ -543,8 +513,8 @@ def seed(registry_id: str, region: str) -> int:
             logger.info("  skip, already exists: %r", name)
             skipped += 1
             continue
-        except Exception as exc:  # noqa: BLE001 — log + continue, don't abort the seed
-            logger.error("  failed to create %r: %s — continuing", name, exc)
+        except Exception as exc:
+            logger.exception("  failed to create %r: %s — continuing", name, exc)
             continue
 
         logger.info("  created %r -> id=%s (target lifecycle: %s)", name, mcp.id, lifecycle)
@@ -595,12 +565,9 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # --dry-run never constructs the service or calls AWS — pure Pydantic.
     if args.dry_run:
         return dry_run()
 
-    # Defaults from settings; imported here (not at module top) so importing this
-    # module never triggers Settings() validation or any AWS setup.
     from core.config import settings
 
     registry_id = args.registry_id or settings.MCP_REGISTRY_ID
@@ -620,8 +587,8 @@ def main(argv=None) -> int:
 
     try:
         return seed(registry_id=registry_id, region=region)
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        logger.error("Seeding failed: %s", exc)
+    except Exception as exc:
+        logger.exception("Seeding failed: %s", exc)
         logger.error(
             "Check that: (1) AWS credentials are configured with the registry "
             "permissions (research §8); (2) MCP_REGISTRY_ID=%r is a real, "

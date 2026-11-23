@@ -1,9 +1,9 @@
-"""Tests for the E28/T5 runtime-status read surface (design D9, contract C2).
+"""Tests for the runtime-status read surface.
 
 Two layers, both fully mocked (no live AWS):
 
   1. ``AgentIdentityService.runtime_status`` — the boto3 ``get_agent_runtime`` status →
-     C2 enum mapping. The control client is a ``MagicMock`` exactly as in
+     closed-union mapping. The control client is a ``MagicMock`` exactly as in
      ``test_agent_identity_service.py``.
   2. ``GET /agents/{agent_id}/runtime`` — the route, on the SAME tenant + VIEWER gate as
      the per-agent metrics/traces routes (``agents.py`` — reads are tenant-wide by design,
@@ -13,7 +13,7 @@ Two layers, both fully mocked (no live AWS):
      ``AgentRegistryService`` and a seeded tenant-resolver stub.
 
 The load-bearing invariants:
-  - every native ``AgentRuntimeStatus`` value maps to a C2 slot;
+  - every native ``AgentRuntimeStatus`` value maps to a slot of the closed union;
   - ``ResourceNotFoundException`` → ``not_deployed`` (definitively gone);
   - ANY other ``ClientError`` (incl. the AMBIGUOUS AccessDenied) and any transport error →
     ``unknown``, NEVER ``failed`` — an unreachable control plane is not a broken runtime;
@@ -23,6 +23,7 @@ The load-bearing invariants:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,25 +31,16 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-# A realistic runtime ARN. The account-id segment is what must never reach a response
-# field other than ``runtime_arn`` itself (which is ``agent.agent_arn``, already public
-# on every agent route).
+pytestmark = pytest.mark.usefixtures("reset_modules")
+
 ACCOUNT_SEGMENT = "123456789012"
 RUNTIME_RID = "agent_governance_test_agent-wdOmsREOEj"
-RUNTIME_ARN = (
-    f"arn:aws:bedrock-agentcore:us-east-1:{ACCOUNT_SEGMENT}:runtime/{RUNTIME_RID}"
-)
-# An ECR container URI — it CARRIES the account id, so only the image TAG may ever be
-# surfaced from it.
+RUNTIME_ARN = f"arn:aws:bedrock-agentcore:us-east-1:{ACCOUNT_SEGMENT}:runtime/{RUNTIME_RID}"
 CONTAINER_URI = f"{ACCOUNT_SEGMENT}.dkr.ecr.us-east-1.amazonaws.com/agp-agent:sha-abc123"
 
 
-# ---------------------------------------------------------------------------
-# Layer 1 — service: the boto3 → C2 mapping
-# ---------------------------------------------------------------------------
-
 def _make_agent(*, agent_arn: str | None = RUNTIME_ARN, agent_id: str = "rec-abc123"):
-    from models.agent import Agent, AuthType, LifecycleState, Platform
+    from models.agent import Agent, AgentAuthType, LifecycleState, Platform
 
     now = datetime.now(timezone.utc)
     return Agent(
@@ -57,7 +49,7 @@ def _make_agent(*, agent_arn: str | None = RUNTIME_ARN, agent_id: str = "rec-abc
         purpose="Triage inbound motor claims",
         lifecycle_state=LifecycleState.APPROVED,
         platform=Platform.AWS_BEDROCK,
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         agent_arn=agent_arn,
         tenant_id="ten-1",
         created_at=now,
@@ -79,9 +71,7 @@ def _svc(control):
 
 
 def _client_error(code: str, message: str = "boom"):
-    return ClientError(
-        {"Error": {"Code": code, "Message": message}}, "GetAgentRuntime"
-    )
+    return ClientError({"Error": {"Code": code, "Message": message}}, "GetAgentRuntime")
 
 
 @pytest.mark.parametrize(
@@ -103,10 +93,7 @@ def test_every_native_status_maps_to_its_c2_slot(native, expected):
     result = _svc(control).runtime_status(_make_agent())
 
     assert result.status == expected
-    # RID-not-ARN: the control call takes the ARN's last "/"-segment.
-    assert control.get_agent_runtime.call_args.kwargs == {
-        "agentRuntimeId": RUNTIME_RID
-    }
+    assert control.get_agent_runtime.call_args.kwargs == {"agentRuntimeId": RUNTIME_RID}
 
 
 def test_native_status_enum_is_fully_covered():
@@ -114,7 +101,7 @@ def test_native_status_enum_is_fully_covered():
 
     This is the guard against a silent gap: a new native status added by AgentCore must
     fail HERE (loudly, offline) rather than degrade a live runtime to "unknown" in the UI.
-    A SUBSET check, not equality — the map also carries the pre-T5 defensive
+    A SUBSET check, not equality — the map also carries the defensive
     ``DELETE_FAILED``/``FAILED`` that botocore does not declare.
     """
     from botocore.loaders import Loader
@@ -130,7 +117,7 @@ def test_native_status_enum_is_fully_covered():
 
 
 def test_mapping_agrees_with_the_pre_existing_failed_set():
-    """The provisioning path's ``_FAILED_STATUSES`` and the T5 map must not disagree about
+    """The provisioning path's ``_FAILED_STATUSES`` and the status map must not disagree about
     what "failed" means — two sets naming the same concept differently is how a status ends
     up fatal to a deploy but green in the UI."""
     from services.agent_identity_service import (
@@ -145,7 +132,7 @@ def test_mapping_agrees_with_the_pre_existing_failed_set():
 
 
 def test_every_mapped_value_is_in_the_closed_union():
-    """No producer may emit a status the C2/C3 union does not contain — the frontend's
+    """No producer may emit a status the closed union does not contain — the frontend's
     lookup tables have no default branch, so an unlisted value would render nothing."""
     from models.agent import RUNTIME_STATUSES
     from services.agent_identity_service import _NATIVE_TO_RUNTIME_STATUS
@@ -154,7 +141,7 @@ def test_every_mapped_value_is_in_the_closed_union():
 
 
 def test_deleting_is_unknown_not_failed():
-    """``DELETING`` has no slot in the C2 closed union (adding a 7th would break the C3
+    """``DELETING`` has no slot in the closed union (adding a 7th would break the
     frontend pin), so it degrades to ``unknown`` with a truthful hint — never ``failed``,
     which would report an intentional teardown as a fault."""
     control = MagicMock()
@@ -204,8 +191,7 @@ def test_no_agent_arn_is_not_deployed_without_calling_aws():
 
 @pytest.mark.parametrize(
     "code",
-    ["AccessDeniedException", "ThrottlingException", "ValidationException",
-     "InternalServerException"],
+    ["AccessDeniedException", "ThrottlingException", "ValidationException", "InternalServerException"],
 )
 def test_other_client_errors_are_unknown_never_failed(code):
     """AccessDenied is AMBIGUOUS — a LIVE runtime behind an IAM/SCP/region misconfig
@@ -318,53 +304,14 @@ def test_shape_carries_agent_id_stage_and_checked_at():
 
     assert result.agent_id == "rec-abc123"
     assert result.runtime_arn == RUNTIME_ARN
-    # ``stage`` is free-form (D8). This agent is a LEGACY record — one ``agent_arn``, no
-    # ``agent_arns`` map — so the probed runtime cannot be attributed to a stage, and reporting
-    # one would be a fabrication. E28A/T1 gave a map-bearing record a real stage; see the
-    # per-stage block at the end of this file.
     assert result.stage == "unknown"
-    # ISO-8601 UTC, parseable.
     datetime.fromisoformat(result.checked_at.replace("Z", "+00:00"))
-
-
-# ---------------------------------------------------------------------------
-# Layer 2 — route: GET /agents/{agent_id}/runtime
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(autouse=True)
-def reset_modules():
-    """Drop cached auth/config/route modules so monkeypatched env is honored."""
-    import sys
-
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.agents",
-        "api.routes.users",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("DEBUG", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
 
 
 def _context(*, is_global=False, tenant_ids=()):
     from services.tenant_resolver import TenantContext
 
-    return TenantContext(
-        is_global=is_global, tenant_ids=frozenset(tenant_ids), tenants=()
-    )
+    return TenantContext(is_global=is_global, tenant_ids=frozenset(tenant_ids), tenants=())
 
 
 class _FakeResolver:
@@ -379,6 +326,7 @@ def _build_client(mock_svc, ctx, mock_identity=None):
     """Minimal app with ONLY the agents router + mocked registry/identity/resolver."""
     import api.routes.agents as agents_module
     import api.routes.users as users_module
+    from core.errors import install_error_handlers
 
     agents_module._svc = mock_svc
     if mock_identity is not None:
@@ -386,6 +334,7 @@ def _build_client(mock_svc, ctx, mock_identity=None):
     users_module._tenant_resolver = _FakeResolver(ctx)
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(agents_module.router, prefix="/api/v1")
     return TestClient(app), agents_module
 
@@ -409,10 +358,10 @@ def _headers():
 
 def _runtime_status(**overrides):
     """What the probe hands the route. ``RuntimeStatusWithEnv`` — the service's real return type
-    since E36/T12 — so the handler's access to the live env is exercised, not stubbed around."""
+    so the handler's access to the live env is exercised, not stubbed around."""
     from services.agent_identity_service import RuntimeStatusWithEnv
 
-    base = dict(
+    base: dict[str, Any] = dict(
         agent_id="own",
         stage="unknown",
         status="ready",
@@ -431,9 +380,7 @@ def test_route_returns_runtime_status_for_a_visible_agent(entra_settings):
     mock_identity.runtime_status.return_value = _runtime_status()
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ):
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
@@ -442,7 +389,6 @@ def test_route_returns_runtime_status_for_a_visible_agent(entra_settings):
     assert body["agent_id"] == "own"
     assert body["stage"] == "unknown"
     assert body["image_tag"] == "sha-abc123"
-    # The route handed the RESOLVED agent to the service (not a raw id).
     assert mock_identity.runtime_status.call_args[0][0].id == "own"
 
 
@@ -453,23 +399,16 @@ def test_route_foreign_tenant_404_is_byte_identical_to_missing(entra_settings):
     mock_svc.get.side_effect = lambda agent_id: (
         _make_agent(agent_id="foreign") if agent_id == "foreign" else None
     )
-    # A foreign agent: visible tenant set is ten-1, the record's is ten-2.
     foreign = _make_agent(agent_id="foreign")
     foreign.tenant_id = "ten-2"
-    mock_svc.get.side_effect = lambda agent_id: (
-        foreign if agent_id == "foreign" else None
-    )
+    mock_svc.get.side_effect = lambda agent_id: foreign if agent_id == "foreign" else None
     mock_identity = MagicMock()
     mock_identity.runtime_status.return_value = _runtime_status()
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ):
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         foreign_resp = client.get("/api/v1/agents/foreign/runtime", headers=_headers())
-        missing_resp = client.get(
-            "/api/v1/agents/truly-missing/runtime", headers=_headers()
-        )
+        missing_resp = client.get("/api/v1/agents/truly-missing/runtime", headers=_headers())
 
     assert foreign_resp.status_code == 404
     assert missing_resp.status_code == 404
@@ -487,9 +426,7 @@ def test_route_is_viewer_gated_not_operator_gated(entra_settings):
     mock_identity.runtime_status.return_value = _runtime_status()
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ):
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
@@ -524,9 +461,7 @@ def test_route_never_500s_when_the_probe_degrades(entra_settings):
     )
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ):
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
@@ -544,9 +479,7 @@ def test_route_response_body_contains_no_account_id_outside_the_arn(entra_settin
     )
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ):
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     body = resp.json()
@@ -556,19 +489,6 @@ def test_route_response_body_contains_no_account_id_outside_the_arn(entra_settin
         assert ACCOUNT_SEGMENT not in value
         assert "arn:aws" not in value
 
-
-# ---------------------------------------------------------------------------
-# E28A/T1 — `stage` reports a REAL stage once the map can attribute the runtime
-# ---------------------------------------------------------------------------
-# This is the function the pre-E28A comment predicted would change ("when a per-stage ARN
-# lands, this is the one function that changes"). It hardcoded `stage="unknown"` because the
-# record named ONE runtime and could not say which stage owned it.
-#
-# FRONTEND CONTRACT (do not break): `runtimeScope` in the ops repo-detail tabs returns
-# `kind: 'stage'` the moment a probe names a real stage, which is what stops the environment
-# strip saying "not attributable per stage". So a stage name here is EVIDENCE, and a guessed
-# one would manufacture per-stage evidence out of an agent-level fact — the exact error that
-# module refuses. A legacy record must therefore still answer `unknown`.
 
 DEV_RID = "agent_governance_test_agent_dev-aaaaaaaaaa"
 PROD_RID = "agent_governance_test_agent_prod-bbbbbbbbbb"
@@ -583,7 +503,7 @@ def _mapped_agent(**overrides):
 
 
 def test_stage_names_the_real_stage_when_the_map_attributes_the_probed_runtime():
-    """The scalar mirrors whichever stage deployed last (C-A2), so the map key naming it IS
+    """The scalar mirrors whichever stage deployed last, so the map key naming it IS
     the probed runtime's stage — a fact, not a guess."""
     control = MagicMock()
     control.get_agent_runtime.return_value = {"status": "READY"}
@@ -592,7 +512,6 @@ def test_stage_names_the_real_stage_when_the_map_attributes_the_probed_runtime()
 
     assert result.stage == "prod"
     assert result.runtime_arn == PROD_ARN
-    # The SAME runtime is probed as before — this changes attribution, not which ARN is read.
     assert control.get_agent_runtime.call_args.kwargs["agentRuntimeId"] == PROD_RID
 
 
@@ -661,7 +580,7 @@ def test_stage_stays_reported_when_the_probe_degrades_to_unknown_status():
 
 
 def test_no_runtime_at_all_is_not_deployed_with_the_unknown_stage():
-    """Nothing provisioned (E20 pre-registration): no map, no scalar, no AWS call."""
+    """Nothing provisioned (pre-registration): no map, no scalar, no AWS call."""
     control = MagicMock()
 
     result = _svc(control).runtime_status(_make_agent(agent_arn=None))
@@ -672,7 +591,7 @@ def test_no_runtime_at_all_is_not_deployed_with_the_unknown_stage():
 
 
 def test_route_forwards_an_explicit_stage_to_the_probe(entra_settings):
-    """E28A/T1: `?stage=` is OPTIONAL and ADDITIVE. When given, the route hands it to the
+    """`?stage=` is OPTIONAL and ADDITIVE. When given, the route hands it to the
     probe so the reading describes THAT stage's runtime."""
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent(agent_id="own")
@@ -680,19 +599,16 @@ def test_route_forwards_an_explicit_stage_to_the_probe(entra_settings):
     mock_identity.runtime_status.return_value = _runtime_status(stage="prod")
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ):
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get("/api/v1/agents/own/runtime?stage=prod", headers=_headers())
 
     assert resp.status_code == 200
     assert resp.json()["stage"] == "prod"
-    # Positionally after the agent — the same shape the service signature takes.
     assert mock_identity.runtime_status.call_args[0][1] == "prod"
 
 
 def test_route_omitting_the_stage_passes_None_not_a_guess(entra_settings):
-    """The default must stay the pre-E28A behaviour: no stage named ⇒ probe the scalar's
+    """The default must stay the scalar-only behaviour: no stage named ⇒ probe the scalar's
     runtime. Defaulting to "dev" here would silently report on the wrong runtime."""
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent(agent_id="own")
@@ -700,25 +616,11 @@ def test_route_omitting_the_stage_passes_None_not_a_guess(entra_settings):
     mock_identity.runtime_status.return_value = _runtime_status()
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ):
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
     assert mock_identity.runtime_status.call_args[0][1] is None
-
-
-# ---------------------------------------------------------------------------
-# E36/T12 — reconcile-on-read: the probe's live env feeds the MCP heal
-# ---------------------------------------------------------------------------
-# A runtime replacement wipes the backend-injected `MCP_SERVERS`, and the platform gets no
-# signal. This read already fetches the live `environmentVariables` and used to discard them, so
-# the detection is free — the probe now CARRIES the env to the handler, which hands it to
-# `reconcile_runtime_mcp_env`. A write on a GET is an accepted, explicit spec decision.
-#
-# SECURITY: the env is an INTERNAL hand-off. It is never serialized — `response_model`
-# is still `RuntimeStatus`, which has no such field, and this route is VIEWER-gated.
 
 
 def _granted_agent(agent_id: str = "own"):
@@ -736,21 +638,18 @@ def test_route_hands_the_live_env_to_the_reconciler(entra_settings):
     mock_identity = MagicMock()
     live_env = {"CREDENTIAL_PROVIDER_NAME": "agp-agent-obo-own"}
     mock_identity.runtime_status.return_value = _runtime_status(environment_variables=live_env)
-    client, agents_module = _build_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_identity
-    )
+    client, agents_module = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ), patch.object(
-        agents_module, "reconcile_runtime_mcp_env", new_callable=AsyncMock
-    ) as reconcile:
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")),
+        patch.object(agents_module, "reconcile_runtime_mcp_env", new_callable=AsyncMock) as reconcile,
+    ):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "ready"
     called_agent, called_env = reconcile.call_args[0]
-    assert called_agent.id == "own"  # the RESOLVED agent, as the probe got
+    assert called_agent.id == "own"
     assert called_env == live_env
 
 
@@ -768,13 +667,12 @@ def test_route_never_serializes_the_live_env(entra_settings):
             "SOME_TOKEN": "super-secret-value",
         }
     )
-    client, agents_module = _build_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_identity
-    )
+    client, agents_module = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ), patch.object(agents_module, "reconcile_runtime_mcp_env", new_callable=AsyncMock):
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")),
+        patch.object(agents_module, "reconcile_runtime_mcp_env", new_callable=AsyncMock),
+    ):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
@@ -795,13 +693,14 @@ def test_route_still_200s_when_the_heal_fails(entra_settings):
     mock_identity.runtime_status.return_value = _runtime_status(environment_variables={"OTHER": "x"})
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ), patch(
-        "services.agent_mcp_env.rebuild_runtime_mcp_env",
-        new_callable=AsyncMock,
-        side_effect=RuntimeError("AccessDenied"),
-    ) as rebuild:
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")),
+        patch(
+            "services.agent_mcp_env.rebuild_runtime_mcp_env",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("AccessDenied"),
+        ) as rebuild,
+    ):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
@@ -813,16 +712,15 @@ def test_route_does_not_reconcile_an_agent_without_grants(entra_settings):
     """The self-limiting half of the trigger, at the route level: no grants ⇒ the read stays a
     pure read. This is what keeps write-on-a-GET confined to the wiped-runtime case."""
     mock_svc = MagicMock()
-    mock_svc.get.return_value = _make_agent(agent_id="own")  # no mcp_server_ids
+    mock_svc.get.return_value = _make_agent(agent_id="own")
     mock_identity = MagicMock()
     mock_identity.runtime_status.return_value = _runtime_status(environment_variables=None)
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ), patch(
-        "services.agent_mcp_env.rebuild_runtime_mcp_env", new_callable=AsyncMock
-    ) as rebuild:
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")),
+        patch("services.agent_mcp_env.rebuild_runtime_mcp_env", new_callable=AsyncMock) as rebuild,
+    ):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
@@ -838,20 +736,20 @@ def test_route_does_not_reconcile_off_a_degraded_read(entra_settings):
     mock_svc.get.return_value = _granted_agent()
     mock_identity = MagicMock()
     mock_identity.runtime_status.return_value = _runtime_status(
-        status="unknown", detail="the control plane could not be reached",
+        status="unknown",
+        detail="the control plane could not be reached",
         environment_variables=None,
     )
     client, _ = _build_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_identity)
 
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ), patch(
-        "services.agent_mcp_env.rebuild_runtime_mcp_env", new_callable=AsyncMock
-    ) as rebuild:
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")),
+        patch("services.agent_mcp_env.rebuild_runtime_mcp_env", new_callable=AsyncMock) as rebuild,
+    ):
         resp = client.get("/api/v1/agents/own/runtime", headers=_headers())
 
     assert resp.status_code == 200
-    assert resp.json()["status"] == "unknown"  # the read is still reported, unchanged
+    assert resp.json()["status"] == "unknown"
     rebuild.assert_not_awaited()
 
 
@@ -866,7 +764,7 @@ def test_probe_carries_the_live_env_it_already_read():
 
     result = _svc(control).runtime_status(_make_agent())
 
-    assert result.status == "ready"  # the C2 contract is untouched
+    assert result.status == "ready"
     assert result.environment_variables == {"MCP_SERVERS": "[]", "FOO": "bar"}
 
 

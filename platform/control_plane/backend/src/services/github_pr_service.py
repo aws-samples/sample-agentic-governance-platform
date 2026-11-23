@@ -1,86 +1,41 @@
-"""Pull-request verbs on a GitHub repository, AS THE LINKED HUMAN (E28/T14 — D14+D15).
+"""Pull-request verbs on a GitHub repository, as the linked human.
 
 A thin ``httpx`` client in the shape of :mod:`services.github_repo_service`: a base URL, a
-per-request ``Authorization: Bearer {token}`` header, an injectable ``httpx.Client`` (tests back
-it with ``httpx.MockTransport``; production builds a real one), and SAFE error messages only.
+per-request ``Authorization: Bearer {token}`` header, an injectable ``httpx.Client`` and safe error
+messages. Unlike that module, which acts as AGP itself under an org-scoped App-minted token, every
+verb here is a human's act attributed to a GitHub account, so this module takes its token as a
+parameter and has no way to obtain one: it imports no credential seam, mints nothing and reads no
+secret store. That is the mechanism behind the self-approval refusal: were an App token reachable,
+a human with a broken link would fall back to it and AGP, never the author of anyone's pull
+request, would approve the human's own. ``test_the_service_module_cannot_reach_an_app_token``
+reads this file's source and fails on any such import.
 
-WHY THIS IS A SEPARATE MODULE, and the invariant that shape enforces
---------------------------------------------------------------------
-``github_repo_service`` is AGP acting as ITSELF: every verb there runs under an org-scoped
-App-minted token, which is correct for materializing a repo — the platform really is the actor.
-A pull request is different. Opening, approving and merging one are acts of a HUMAN, attributed
-to a GitHub account, and AGP's job is to carry the human's own authority rather than to
-substitute its own.
-
-So this module **takes its token as a parameter and has no way to obtain one.** It imports no
-credential seam, mints nothing, and reads no secret store — the caller (the route) resolves the
-E27B linked-user token and hands it over. That is not a stylistic choice: it is the mechanism
-behind D15. If this module could reach an App-minted token, a human with a broken link would
-silently fall back to it, and because AGP's App is never the author of anybody's pull request,
-**every self-approval refusal below would be bypassed** — AGP would approve a human's own PR on
-their behalf, which is precisely the reviewer-independence the gate exists to provide. A
-structural test (``test_the_service_module_cannot_reach_an_app_token``) reads this file's raw
-source and fails on any of those imports appearing, because an import added later is exactly the
-change a reviewer would otherwise have to catch by eye.
-
-NOTHING IS PERSISTED. GitHub is the system of record for a pull request; a cached AGP copy would
-be a second answer to a question that has one authority, and would go stale the moment anyone
-pushed. Every verb reads through.
-
-``can_approve`` IS COMPUTED, NOT DISCOVERED (D15)
--------------------------------------------------
-GitHub answers ``422`` for a review on your own PR. Discovering the refusal there means the
-button was already offered and clicked, so the projection decides it up front from the viewer's
-own login — and :meth:`GitHubPrService.approve_pull_request` refuses locally, without a second
-attempt under any other credential. The provider's own 422 is still mapped to the same refusal,
-because a defence that exists in two places must agree in both.
-
-Logins are compared CASE-INSENSITIVELY: GitHub logins are case-insensitive, so
-``Lars-Svensson`` and ``lars-svensson`` are one human, and a case-sensitive compare would offer
-a self-approval the provider then refuses.
-
-FAIL CLOSED ON UNKNOWN STANDING. A blank ``viewer_login`` means AGP cannot establish which
-account it would be reviewing as — so it refuses. Permitting it would risk exactly the
-self-approval this module exists to prevent, and "we could not tell" is not evidence of
-independence.
-
-SAFE MESSAGES ONLY. A provider body can echo attacker-influenced content, so no
-:class:`GitHubPrError` message ever carries one — only a fixed string plus the status code.
-Bodies ARE read, to CLASSIFY a failure into a ``.kind``, and then discarded. Transport failures
-surface the exception TYPE only and are re-raised ``from None``, because a chained exception's
-args can carry a URL with auth material (the ``github_user_oauth`` rule).
+Nothing is persisted; GitHub is the system of record and every verb reads through.
+``can_approve`` is computed from the viewer's own login (case-insensitively, as GitHub logins are)
+before the affordance is offered, :meth:`GitHubPrService.approve_pull_request` refuses locally
+without a second attempt, and the provider's own 422 maps to the same refusal. A blank
+``viewer_login`` fails closed. Provider bodies are read to classify a failure into a kind and then
+discarded; a transport failure surfaces the exception type only, re-raised ``from None``.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from collections.abc import Mapping
+from typing import Any, Callable, ClassVar, List, Optional
 
 import httpx
 
+from core.errors import AppError, Outcome
 from models.repository import PullRequestView
 
 logger = logging.getLogger(__name__)
 
 GITHUB_DEFAULT_BASE = "https://api.github.com"
 
-# How many pull requests one page of the tab shows. The Ops surface is a summary, not a PR
-# browser: an operator opens it to see what is outstanding on THIS repo, and a repo with more
-# than this many open PRs is a repo whose PRs are read on GitHub. No pagination follow, so the
-# tab cannot spend N round-trips on a page nobody scrolls.
 _PER_PAGE = 30
-
-# ``state=all`` deliberately, not ``open``. A merged PR is the most interesting row on this
-# surface — it is what registered the prod candidate an OWNER then promotes — so hiding closed
-# ones would omit the reason production is about to change.
 _LIST_STATE = "all"
 
-# The refusal reasons. FIXED sentences: they are rendered verbatim to an operator beside a
-# suppressed button, so each states the cause and offers no remedy it cannot deliver.
-#
-# NOTE none of the non-self reasons may contain the substring "own" (a test asserts it), because
-# that is how the UI and the tests tell "this is YOUR pull request" apart from every other
-# reason an approval is unavailable. It rules out the word "unknown" here, which contains it.
 _REASON_SELF = "You opened this pull request — GitHub does not accept your own review."
 _REASON_NOT_OPEN = "This pull request is no longer open, so it accepts no further review."
 _REASON_NO_VIEWER = (
@@ -89,61 +44,56 @@ _REASON_NO_VIEWER = (
 )
 
 
-class GitHubPrError(Exception):
-    """A pull-request operation failed. Carries a SAFE message (never the token, never the
-    provider body) plus a ``.kind`` the route maps to a FIXED HTTP detail.
+class GitHubPrError(AppError):
+    """A pull-request operation failed. The message is fixed text plus at most an HTTP status,
+    never the token or a provider body; the client sees the fixed detail of the kind.
 
-    The kinds, and why each is distinct rather than collapsed:
+    ``capability_missing`` is the org's App lacking the ``pull_requests`` grant (a manual per-org
+    grant GitHub does not retro-apply to an existing App), which the frontend resolves to a
+    hidden tab; ``self_approval`` is the author reviewing their own pull request;
+    ``not_approvable`` is a closed pull request or an unresolvable viewer; ``not_mergeable`` is
+    the provider refusing the merge; ``conflict`` is a request GitHub declined as asked (a
+    duplicate, a stale head); ``no_commits`` is a head branch not ahead of the base;
+    ``not_found`` is a repository or pull request this token cannot see; ``connection_unavailable``
+    is the project's org connection gone or unreadable, so AGP cannot address the provider at all
+    (the same wire as a provider failure, which is what the console shows for it); ``provider_error``
+    is anything else, including a transport failure.
 
-    ``capability_missing``
-        The org's App is not granted ``pull_requests``. This is a MANUAL per-org grant and
-        GitHub does not retro-apply a manifest permission change to an already-created App, so
-        it is an ordinary and expected state for an org onboarded before this feature — the
-        frontend resolves it to a HIDDEN tab. It must never be a 500, because a 500 renders a
-        BROKEN tab, which is worse than no tab.
-    ``self_approval``
-        D15's refusal. Its own kind so the UI can state the actual reason rather than "failed".
-    ``not_approvable``
-        A review cannot be taken for a reason that is NOT the caller being the author — the PR
-        is closed, or AGP cannot establish whose account it would act as. Kept apart from
-        ``self_approval`` so the two never wear each other's copy.
-    ``not_mergeable``
-        The provider refuses the merge (checks, protection, an unmergeable state). A state, not
-        a fault.
-    ``conflict``
-        The request cannot be satisfied as asked — a duplicate PR, a stale head. Also a state.
-    ``no_commits``
-        There is nothing to open a pull request FOR: the head branch is not ahead of the base.
-        Its own kind because it is the 422 an operator meets by accident, and because the
-        ``conflict`` copy stated two causes this is not — a duplicate pull request and a moved
-        branch — which is a surface asserting what it never established. Collapsing it back
-        would restore that.
-    ``not_found``
-        The repository or PR is not visible to this token.
-    ``provider_error``
-        Anything else, including a transport failure. The only kind that means "AGP does not
-        know what happened".
+    ``kind`` is keyword-only, so a positional second argument is a ``TypeError`` rather than a
+    kind the table never saw.
     """
 
-    # ``kind`` is KEYWORD-ONLY on purpose. The test guard that compares the kinds this module can
-    # produce against the route's ``_PR_ERROR`` table reads the AST for ``kind=`` keywords, the
-    # default below, and locals named ``kind`` — it cannot see a positional second argument. With
-    # a positional-capable signature, ``GitHubPrError("x", "new_kind")`` is ordinary Python that
-    # slips past the guard and ships an unmapped kind as a 502 "GitHub request failed" on a
-    # request GitHub answered fine. Forbidding the form makes the guard exhaustive by
-    # construction instead of by convention.
+    domain: ClassVar[str] = "github_pr"
+    kinds: ClassVar[Mapping[str, Outcome]] = {
+        "capability_missing": Outcome(403, "pull requests are not enabled for this organization"),
+        "not_found": Outcome(404, "pull request not found"),
+        "self_approval": Outcome(409, "you cannot approve your own pull request"),
+        "not_approvable": Outcome(409, "this pull request cannot be approved"),
+        "not_mergeable": Outcome(409, "this pull request cannot be merged yet"),
+        "conflict": Outcome(409, "GitHub declined the request for this pull request"),
+        "no_commits": Outcome(409, "there are no commits between these branches"),
+        "provider_error": Outcome(502, "GitHub request failed"),
+        "connection_unavailable": Outcome(502, "GitHub request failed"),
+    }
+
     def __init__(self, message: str, *, kind: str = "provider_error") -> None:
-        super().__init__(message)
-        self.kind = kind
+        super().__init__(message, kind)
+
+
+class GitHubPrDuplicateError(GitHubPrError):
+    """The 422 "a pull request already exists" for this head. Its one row is the parent's
+    ``conflict`` row, so the wire is unchanged, but a caller that just re-cut the head branch can
+    tell it from every other 422."""
+
+    kinds: ClassVar[Mapping[str, Outcome]] = {"conflict": GitHubPrError.kinds["conflict"]}
+
+    def __init__(self, message: str, *, kind: str = "conflict") -> None:
+        super().__init__(message, kind=kind)
 
 
 def _message_of(resp: httpx.Response) -> str:
-    """GitHub's ``message`` (+ any ``errors[].message``), for CLASSIFICATION ONLY.
-
-    Read to decide a ``.kind`` and then DISCARDED — it is never folded into a
-    :class:`GitHubPrError` message, because a provider body can echo attacker-influenced
-    content and this epic has already had to truncate a field that carried an AWS account id.
-    Lowercased here because every caller matches substrings against it."""
+    """GitHub's ``message`` plus any ``errors[].message``, lowercased, for classification only;
+    it is never folded into a :class:`GitHubPrError` message."""
     try:
         body = resp.json()
     except ValueError:
@@ -163,17 +113,12 @@ def _text(value) -> str:
 
 
 class GitHubPrService:
-    """Pull-request verbs under a CALLER-SUPPLIED user token. ``client`` is injectable."""
+    """Pull-request verbs under a caller-supplied user token. ``client`` is injectable and carries
+    no pre-set auth, so one client never leaks one human's token onto another's call."""
 
     def __init__(self, *, client: Optional[httpx.Client] = None) -> None:
-        # A caller-supplied client carries NO pre-set auth — auth is per-request, so one client
-        # can never leak one human's token onto another's call.
         self._client = client
         self._owns_client = client is None
-
-    # ------------------------------------------------------------------ #
-    # The verbs
-    # ------------------------------------------------------------------ #
 
     def list_pull_requests(
         self,
@@ -184,15 +129,11 @@ class GitHubPrService:
         viewer_login: str,
         base_url: Optional[str] = None,
     ) -> List[PullRequestView]:
-        """The repo's pull requests, projected onto :class:`PullRequestView`.
+        """The repo's pull requests projected onto :class:`PullRequestView`.
 
-        A ``403`` here is THE capability signal: it is what an org whose App lacks
-        ``pull_requests`` answers, and the frontend resolves that one kind to a hidden tab.
-
-        A malformed ROW is skipped rather than fatal. One unusable entry in a provider list must
-        not blank a tab that could still show the readable ones — and a non-list body answers
-        ``[]``, because "the provider said something unexpected" is not a list of pull requests
-        but is also not a reason to 500 a page."""
+        A 403 here is the capability signal the frontend resolves to a hidden tab. A malformed
+        row is skipped rather than fatal, and a non-list body answers ``[]``: a provider surprise
+        is not a list of pull requests, but it is not a reason to 500 a page either."""
         resp = self._request(
             "GET",
             f"{self._base(base_url)}/repos/{org}/{repo}/pulls",
@@ -229,11 +170,9 @@ class GitHubPrService:
     ) -> PullRequestView:
         """Open a pull request as the linked human.
 
-        ``base`` is OMITTED ENTIRELY when the caller named none, rather than defaulted: a
-        tenant's branch set is open (D8), so "no base" means "the repository's own default
-        branch" — a fact the PROVIDER holds. Writing a literal here would be the same hardcode
-        the design forbids one layer up. ``body`` is omitted the same way, so an absent
-        description is absent instead of an empty comment."""
+        ``base`` is omitted entirely when the caller named none, so "no base" means the
+        repository's own default branch, a fact the provider holds; ``body`` is omitted the same
+        way, so an absent description is absent instead of an empty comment."""
         payload = {"title": title, "head": head}
         if base:
             payload["base"] = base
@@ -258,19 +197,11 @@ class GitHubPrService:
         viewer_login: str,
         base_url: Optional[str] = None,
     ) -> PullRequestView:
-        """Approve someone ELSE's pull request as the linked human (D15).
+        """Approve someone else's pull request as the linked human.
 
-        THE ORDER IS THE POINT. The PR is READ first and the refusal is decided locally, so a
-        self-approval never reaches the review endpoint — and there is NO retry under any other
-        credential, because this module holds none to retry with. That is what makes "refused
-        with a reason and no App-token retry" observable in a test: the review POST simply does
-        not happen.
-
-        The provider's own 422 is mapped to the SAME refusal. Two defences against one mistake
-        must agree, or the weaker one becomes a second opinion.
-
-        The answer is a FRESH read of the PR rather than the review object, so the caller sees
-        the pull request as it now is instead of an optimistic local edit."""
+        The pull request is read first and the refusal is decided locally, so a self-approval
+        never reaches the review endpoint and there is no retry under any other credential. The
+        answer is a fresh read of the pull request rather than the review object."""
         pr_url = f"{self._base(base_url)}/repos/{org}/{repo}/pulls/{number}"
         current = _require_view(
             self._request("GET", pr_url, token, what="read the pull request"),
@@ -278,10 +209,11 @@ class GitHubPrService:
             what="read the pull request",
         )
         if not current.can_approve:
-            # Refused HERE, before any write. The reason travels with the refusal so the route
-            # need not re-derive it, and the kind keeps D15's case distinct from every other.
-            kind = "self_approval" if current.approve_blocked_reason == _REASON_SELF else "not_approvable"
-            raise GitHubPrError("the pull request cannot be approved by this account", kind=kind)
+            if current.approve_blocked_reason == _REASON_SELF:
+                raise GitHubPrError(
+                    "the pull request cannot be approved by this account", kind="self_approval"
+                )
+            raise GitHubPrError("the pull request cannot be approved by this account", kind="not_approvable")
 
         self._request(
             "POST",
@@ -308,13 +240,9 @@ class GitHubPrService:
     ) -> PullRequestView:
         """Merge a pull request as the linked human.
 
-        NO merge METHOD is sent: the repository's own configured default is the right one, and
-        naming one here would override a repo setting an org deliberately chose. NO ``sha``
-        either — sending a stale one turns "the branch moved" into a confusing 409, while
-        omitting it lets the provider merge what is actually there.
-
-        The answer is a FRESH read, so a successful merge reports ``state: merged`` rather than
-        the ``merged: true`` acknowledgement, which is not a pull request."""
+        No merge method is sent (the repository's configured default is the right one) and no
+        ``sha`` either (a stale one turns "the branch moved" into a confusing 409). The answer is
+        a fresh read, so a successful merge reports ``state: merged``."""
         pr_url = f"{self._base(base_url)}/repos/{org}/{repo}/pulls/{number}"
         self._request("PUT", f"{pr_url}/merge", token, what="merge the pull request", json={})
         return _require_view(
@@ -323,19 +251,14 @@ class GitHubPrService:
             what="read the pull request",
         )
 
-    # ------------------------------------------------------------------ #
-    # Transport
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _base(base_url: Optional[str]) -> str:
         return (base_url or GITHUB_DEFAULT_BASE).rstrip("/")
 
     def _request(self, method: str, url: str, token: str, *, what: str, **kwargs) -> httpx.Response:
-        """One request under the caller's token, with the status→kind mapping applied.
-
-        The token is a per-request header and is NEVER logged or folded into an exception. The
-        client is closed only when this service owns it, the ``github_repo_service`` idiom."""
+        """One request under the caller's token, with the status-to-kind mapping applied. The
+        token is a per-request header and is never logged or folded into an exception; the
+        client is closed only when this service owns it."""
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -344,8 +267,6 @@ class GitHubPrService:
         try:
             resp = client.request(method, url, headers=headers, **kwargs)
         except httpx.HTTPError as exc:
-            # Never surface the exception VALUE — a URL in it can carry auth material. Type only,
-            # and ``from None`` so the chained original cannot leak it either.
             logger.exception("[pr] transport failure while trying to %s", what)
             raise GitHubPrError(
                 f"could not reach GitHub to {what} ({type(exc).__name__})", kind="provider_error"
@@ -359,34 +280,19 @@ class GitHubPrService:
         raise _error_for(resp, what)
 
 
-# --------------------------------------------------------------------------- #
-# The status → kind mapping
-# --------------------------------------------------------------------------- #
-
-
 def _error_for(resp: httpx.Response, what: str) -> GitHubPrError:
-    """Classify a non-2xx into a ``.kind``. The body is read to DECIDE and then dropped.
+    """Classify a non-2xx into a kind; the body is read to decide and then dropped.
 
-    ``403`` is the capability signal and is the reason this mapping exists at all: GitHub
-    answers it when the App is not granted ``pull_requests``, and that state must be
-    distinguishable from every other failure so the frontend can hide the tab instead of
-    rendering a broken one.
-
-    ``405`` and ``409`` are the merge's two ordinary refusals — the provider will not merge, or
-    the branch moved. Neither is a fault.
-
-    ``422`` is a validation refusal and needs the body to tell three very different things
-    apart: a review on one's own pull request (D15's refusal), a head branch with no commits
-    ahead of the base, and everything else (a duplicate PR, a rejected field). Only the
-    CLASSIFICATION crosses; the text does not — which is exactly why the no-commits case needs
-    its own kind rather than the generic bucket's copy."""
+    403 is the capability signal. 405 and 409 are the merge's two ordinary refusals. 422 needs the
+    body to tell apart a review on one's own pull request, a head branch with no commits ahead of
+    the base (stated by GitHub in ``errors[].message``, which :func:`_message_of` concatenates),
+    a duplicate pull request and everything else."""
     status = resp.status_code
     message = _message_of(resp)
 
     if status == 403:
         return GitHubPrError(
-            "GitHub declined: this App is not granted pull-request access for the org "
-            f"(HTTP {status})",
+            f"GitHub declined: this App is not granted pull-request access for the org (HTTP {status})",
             kind="capability_missing",
         )
     if status == 404:
@@ -395,69 +301,38 @@ def _error_for(resp: httpx.Response, what: str) -> GitHubPrError:
             kind="not_found",
         )
     if status == 405:
-        return GitHubPrError(
-            f"GitHub declined the merge (HTTP {status})", kind="not_mergeable"
-        )
+        return GitHubPrError(f"GitHub declined the merge (HTTP {status})", kind="not_mergeable")
     if status == 409:
-        return GitHubPrError(
-            f"GitHub reported a conflicting state (HTTP {status})", kind="conflict"
-        )
+        return GitHubPrError(f"GitHub reported a conflicting state (HTTP {status})", kind="conflict")
     if status == 422:
-        # A self-review refusal reaches here only if the local check was bypassed (a login AGP
-        # could not resolve). It must still read as the SAME refusal, never as a server fault.
         if "own pull request" in message or "own pull-request" in message:
             return GitHubPrError(
                 f"GitHub refused a review by the pull request's author (HTTP {status})",
                 kind="self_approval",
             )
-        # "No commits between main and dev" — the ONE 422 an operator meets by accident, and the
-        # generic fallback below described it as two things it is not (a duplicate PR, a moved
-        # branch). GitHub states it in ``errors[].message`` rather than ``message``, which
-        # ``_message_of`` already concatenates and lowercases. Matched BEFORE the fallback,
-        # because the fallback matches everything.
         if "no commits between" in message:
             return GitHubPrError(
                 f"GitHub found no commits between the two branches (HTTP {status})",
                 kind="no_commits",
             )
-        return GitHubPrError(
-            f"GitHub declined the request as invalid (HTTP {status})", kind="conflict"
-        )
+        if "a pull request already exists" in message:
+            return GitHubPrDuplicateError(
+                f"GitHub reports a pull request already exists for this head (HTTP {status})",
+                kind="conflict",
+            )
+        return GitHubPrError(f"GitHub declined the request as invalid (HTTP {status})", kind="conflict")
     logger.warning("[pr] GitHub answered HTTP %s while trying to %s", status, what)
-    return GitHubPrError(
-        f"GitHub failed to {what} (HTTP {status})", kind="provider_error"
-    )
-
-
-# --------------------------------------------------------------------------- #
-# The projection
-# --------------------------------------------------------------------------- #
+    return GitHubPrError(f"GitHub failed to {what} (HTTP {status})", kind="provider_error")
 
 
 def _project(item, viewer_login: str) -> Optional[PullRequestView]:
-    """One provider PR object → one :class:`PullRequestView`, or ``None`` when unusable.
+    """One provider PR object onto one :class:`PullRequestView`, or ``None`` when unusable.
 
-    A PROJECTION, never a pass-through: only the fields the Ops surface renders cross, so a
-    provider body cannot reach a client through this.
-
-    ``state`` IS DERIVED. GitHub's own ``state`` is only ``open``/``closed`` — a merged PR is
-    ``closed`` there — and on this surface the merged case is the interesting one, because it is
-    what registered the prod candidate an OWNER then promotes. Reporting a shipped PR as merely
-    "closed" would lose the one distinction that matters.
-
-    ``author`` falls back to EMPTY, never to a login. A deleted GitHub account leaves
-    ``user: null``; defaulting it to the viewer would suppress an approve on a PR they did not
-    write, and defaulting it to anything else would assert an identity nobody established.
-
-    ``mergeable`` IS ONLY TRUSTED AS ``False``. It stays three-valued, but note what the two
-    non-false values do NOT distinguish. The LIST endpoint omits the key altogether — verified
-    against live GitHub: ``GET /repos/{o}/{r}/pulls`` sends no ``mergeable``, while
-    ``GET /pulls/{n}`` answers ``mergeable: true`` for the same pull request — and a single-PR read
-    answers ``null`` while its async computation is in flight. The fold below turns both into
-    ``None`` deliberately, so no consumer can claim "the provider is still checking": that is
-    indistinguishable here from "nobody ever asked", and a tab that asserted it said so on every
-    row forever (E28 finding #7). Absent must nonetheless never become ``False``, because that is
-    the reading that suppresses a merge which would have succeeded."""
+    A projection, never a pass-through. ``state`` is derived: GitHub's own is only ``open`` or
+    ``closed``, and a merged pull request is the interesting row on this surface. ``author`` falls
+    back to empty, never to a login: a deleted account leaves ``user: null``. ``mergeable`` is
+    only trusted as ``False``: the list endpoint omits the key and a single read answers ``null``
+    while computing, and both fold to ``None`` so no consumer can claim "still checking"."""
     if not isinstance(item, dict):
         return None
     number = item.get("number")
@@ -473,10 +348,6 @@ def _project(item, viewer_login: str) -> Optional[PullRequestView]:
 
     mergeable = item.get("mergeable")
     if not isinstance(mergeable, bool):
-        # Anything that is not a real boolean is "nothing was established" — which is the honest
-        # reading of GitHub's ``null`` AND of a body that omitted the key, and deliberately does
-        # not tell the two apart. See the docstring: a consumer that distinguished them would be
-        # distinguishing something this value does not carry.
         mergeable = None
 
     can_approve, reason = _approval_standing(state, author, viewer_login)
@@ -490,24 +361,14 @@ def _project(item, viewer_login: str) -> Optional[PullRequestView]:
         can_approve=can_approve,
         approve_blocked_reason=reason,
         mergeable=mergeable,
+        merge_commit_sha=(_text(item.get("merge_commit_sha")) or None) if merged else None,
     )
 
 
-def _approval_standing(state: str, author: str, viewer_login: str) -> "tuple[bool, Optional[str]]":
-    """May the linked human approve this pull request, and if not, WHY (D15)?
-
-    Three refusals, in this order, each with its own sentence:
-
-    1. **Not open.** GitHub takes no review on a closed or merged PR, so an approve button there
-       is an affordance whose every click is refused.
-    2. **No resolvable viewer.** AGP cannot say which account it would review as, so it refuses
-       — the fail-closed direction, since permitting it risks exactly the self-approval below.
-    3. **The viewer IS the author.** D15's refusal, compared case-insensitively because GitHub
-       logins are.
-
-    A PR with NO author is approvable: there is nobody for the viewer to be, so nothing
-    establishes a self-approval. Refusing it would suppress a legitimate review over a deleted
-    account."""
+def _approval_standing(state: str, author: str, viewer_login: str) -> tuple[bool, Optional[str]]:
+    """May the linked human approve this pull request, and if not, why: a closed pull request
+    takes no review, an unresolvable viewer fails closed, and the author may not review their
+    own. A pull request with no author is approvable."""
     if state != "open":
         return False, _REASON_NOT_OPEN
     viewer = viewer_login.strip()
@@ -519,9 +380,8 @@ def _approval_standing(state: str, author: str, viewer_login: str) -> "tuple[boo
 
 
 def _require_view(resp: httpx.Response, viewer_login: str, *, what: str) -> PullRequestView:
-    """Project a single-PR response, or raise. A 2xx whose body is not a pull request is a
-    provider surprise, not a pull request — and answering a fabricated one would be worse than
-    saying so."""
+    """Project a single-PR response, or raise: a 2xx whose body is not a pull request is a
+    provider surprise, not a pull request."""
     try:
         body = resp.json()
     except ValueError:
@@ -532,3 +392,19 @@ def _require_view(resp: httpx.Response, viewer_login: str, *, what: str) -> Pull
             f"GitHub returned an unusable response while trying to {what}", kind="provider_error"
         )
     return view
+
+
+def provider_coordinates(
+    read_connection: Callable[[str], Any], connection_id: str
+) -> tuple[str, Optional[str]]:
+    """The org and API base of the repository's connection, read through ``read_connection`` (the
+    connection store's get, passed in because this module holds no credential seam). A connection the
+    store refuses or no longer has is ``connection_unavailable``: the repository record is fine, but
+    the provider cannot be addressed."""
+    try:
+        connection = read_connection(connection_id)
+    except AppError as err:
+        raise GitHubPrError(
+            f"the repository's connection is unavailable ({err.kind})", kind="connection_unavailable"
+        ) from err
+    return connection.org, connection.base_url

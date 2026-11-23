@@ -1,0 +1,12 @@
+{
+  "id": "gateway-agentcore",
+  "name": "AgentCore Gateway (preview)",
+  "framework": "agentcore-gateway",
+  "infra_template_id": "agentcore-gateway",
+  "artifact_kind": "mcp_server",
+  "description": "Expose an existing REST API as governed MCP tools — an OpenAPI spec and gateway.yaml become an AgentCore Gateway with API-key outbound auth.",
+  "aws_services": ["agentcore", "secretsmanager"],
+  "tags": ["starter", "config", "mcp", "gateway", "preview"],
+  "version": "1.0.0",
+  "preview": true
+}

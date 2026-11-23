@@ -1,4 +1,3 @@
-// projectDetailTabs.test.ts — the registry + the roving-tabindex keyboard model.
 import { describe, expect, it } from 'vitest';
 import {
   PROJECT_DETAIL_TABS,
@@ -21,15 +20,11 @@ describe('PROJECT_DETAIL_TABS', () => {
   });
 });
 
-// The page frame must not blank on a REVALIDATION: doing so unmounts both tab bodies, and
-// a role mutation triggers one on every grant / change / revoke — which reset the Access
-// tab's `rosterLoaded`, replayed its Grant pop-in and doubled its roster read.
-describe('showPageSkeleton', () => {
+describe('showPageSkeleton — the frame never blanks on a revalidation, which would unmount both tab bodies and replay the Access tab\'s roster load on every role mutation', () => {
   it('blanks the page on the FIRST load, when there is nothing to keep showing', () => {
     expect(showPageSkeleton(true, false)).toBe(true);
   });
-  it('does NOT blank while revalidating an already-loaded page', () => {
-    // The regression this pins: `loading` alone remounted both tabs per mutation.
+  it('does NOT blank while revalidating an already-loaded page: loading alone once remounted both tabs per mutation', () => {
     expect(showPageSkeleton(true, true)).toBe(false);
   });
   it('never blanks once the load settles', () => {
@@ -39,9 +34,7 @@ describe('showPageSkeleton', () => {
 });
 
 describe('tabId / tabPanelId', () => {
-  it('gives a tab and its panel DISTINCT ids', () => {
-    // aria-controls points at the panel and aria-labelledby back at the tab; if the two
-    // derivations collided the relationship would be self-referential.
+  it('gives a tab and its panel DISTINCT ids: aria-controls and aria-labelledby would otherwise point at themselves', () => {
     for (const key of KEYS) expect(tabId(key)).not.toBe(tabPanelId(key));
   });
   it('is unique per tab', () => {
@@ -63,9 +56,7 @@ describe('nextTabKey', () => {
     expect(nextTabKey(['a', 'b', 'c'], 'b', 'Home')).toBe('a');
     expect(nextTabKey(['a', 'b', 'c'], 'b', 'End')).toBe('c');
   });
-  it('returns null for keys outside the model so the press is left alone', () => {
-    // Enter/Space must keep activating the focused tab as a plain button, and Tab must
-    // still leave the tablist — swallowing them would break the single-tab-stop pattern.
+  it('returns null for keys outside the model so the press is left alone: Enter and Space keep activating the tab, and Tab still leaves the tablist', () => {
     for (const k of ['Enter', ' ', 'Tab', 'Escape', 'ArrowDown', 'a']) {
       expect(nextTabKey(['a', 'b'], 'a', k)).toBeNull();
     }

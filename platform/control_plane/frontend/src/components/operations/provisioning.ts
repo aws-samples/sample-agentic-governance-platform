@@ -1,20 +1,9 @@
-// Pure provisioning stage machine for the Operations Build & Run demo (Epic 18).
-// Models the staged "spin up an account / ship a build" choreography as plain
-// data: an ordered list of ProvStage, advanced one beat at a time by the pure
-// `advance` reducer. Both the Experiments page (Task 6, account provisioning) and
-// the Deployments page (Task 7, live CI/CD provisioning) drive their animated
-// checklists off these exact shapes — keep the keys, labels, and signatures
-// stable. No UI, no timers, no randomness here. House style mirrors demoData.ts:
-// TS interfaces + pure functions (map/spread, no mutation).
-
-// ─────────────────────────── Stages ───────────────────────────
 export interface ProvStage {
   key: string;
   label: string;
   status: 'idle' | 'running' | 'done';
 }
 
-/** Experiment (sandbox account) provisioning beats: allocate → sync → grant → ready. */
 export function experimentStages(): ProvStage[] {
   return [
     { key: 'allocate', label: 'Allocate sandbox account', status: 'idle' },
@@ -24,11 +13,6 @@ export function experimentStages(): ProvStage[] {
   ];
 }
 
-/**
- * Deployment (live CI/CD) provisioning beats — consumed by Task 7. The CI/CD trio
- * (build / scan / deploy) is required; the scaffolding beats (pick template /
- * create repository / register Entra app) lead into it.
- */
 export function deploymentStages(): ProvStage[] {
   return [
     { key: 'template', label: 'Pick template', status: 'idle' },
@@ -40,12 +24,6 @@ export function deploymentStages(): ProvStage[] {
   ];
 }
 
-/**
- * Pure single-beat advance: the first `running` stage flips to `done`; otherwise
- * the first `idle` stage flips to `running`. Returns a fresh array with fresh
- * stage objects — the input is never mutated. When every stage is `done` the
- * input is returned unchanged (idempotent at completion), so a loop converges.
- */
 export function advance(stages: ProvStage[]): ProvStage[] {
   const runningIdx = stages.findIndex((s) => s.status === 'running');
   if (runningIdx !== -1) {
@@ -58,17 +36,10 @@ export function advance(stages: ProvStage[]): ProvStage[] {
   return stages.map((s) => ({ ...s }));
 }
 
-/** True only when every stage is `done`. */
 export function isComplete(stages: ProvStage[]): boolean {
   return stages.every((s) => s.status === 'done');
 }
 
-/**
- * Deterministic mock AWS account id of shape `aws://NNNN-NNNN-NNNN` — 12 digits
- * derived from `seed` arithmetic (no Math.random, no Date), so the same seed
- * always yields the same id. A large odd multiplier + offset spreads small seeds
- * into a full 12-digit space; the result is taken modulo 1e12 and zero-padded.
- */
 export function mockAccountId(seed: number): string {
   const n = (Math.abs(Math.trunc(seed)) * 2654435761 + 4471209388561) % 1_000_000_000_000;
   const digits = String(n).padStart(12, '0');

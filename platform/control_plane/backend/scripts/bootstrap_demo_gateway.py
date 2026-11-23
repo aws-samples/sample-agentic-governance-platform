@@ -8,7 +8,9 @@ register-only platform flow needs to point at:
   1. Lambda execution role   `agp-demo-mcp-lambda-exec-role`  (trusts lambda.amazonaws.com,
      + AWSLambdaBasicExecutionRole for CloudWatch logs).
   2. The demo Lambda          `agp-demo-mcp-tools`             (python3.12, inline code
-     implementing the `echo`/`add` tools of `_DEMO_TOOL_SCHEMA`).
+     implementing the `echo`/`add` tools of `_DEMO_TOOL_SCHEMA`; the source is the module
+     constant `LAMBDA_HANDLER_SRC` rather than a zipped file so it stays parseable offline
+     with `ast.parse`).
   3. Gateway service role     `agp-demo-gateway-role`          (trusts
      bedrock-agentcore.amazonaws.com, + lambda:InvokeFunction scoped to the demo
      Lambda ARN — least privilege, NOT `*`).
@@ -21,7 +23,7 @@ register-only platform flow needs to point at:
 Then it prints the `gatewayUrl` + `gatewayArn` (verbatim from GetGateway) to paste
 into the UI to register the MCP server.
 
-Safety guarantees (the reviewer checks these hardest):
+Safety guarantees:
   * IDEMPOTENT — every create is get-or-create keyed on the `agp-demo-*` name, so
     re-running converges (never errors on "already exists", never duplicates). A
     partial failure (role made, Lambda failed) resumes cleanly on re-run.
@@ -61,17 +63,11 @@ import logging
 import os
 import sys
 
-# Reuse create_example_gateway's builders/pollers VERBATIM (no copy-paste of their
-# bodies). `scripts/` is not a regular package (no __init__.py), but with the backend
-# dir on sys.path Python treats `scripts` as an implicit namespace package, so
-# `import scripts.create_example_gateway` works under `PYTHONPATH=src` (cwd is the
-# backend dir). To stay robust when invoked as `python scripts/bootstrap_demo_gateway.py`
-# from elsewhere, ensure the backend dir (this file's parent's parent) is on sys.path.
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from scripts.create_example_gateway import (  # noqa: E402 — after sys.path shim
+from scripts.create_example_gateway import (  # noqa: E402 — `scripts.` resolves only after the sys.path shim above; expires 2027-10-23; added E49A-50A/T17
     _DEFAULT_TENANT_ID,
     _DEMO_TOOL_SCHEMA,
     _PLACEHOLDER_AUDIENCE,
@@ -80,12 +76,7 @@ from scripts.create_example_gateway import (  # noqa: E402 — after sys.path sh
     build_create_target_kwargs,
     create_example_gateway,
 )
-
-# The IAM/Lambda primitives + constants used to live here; they are now extracted
-# VERBATIM into the shared `demo_gateway_common` module so this bootstrap and the
-# new `bootstrap_demo_use_cases` import them with zero copy-paste. The behavior is
-# unchanged — this script just imports what it used to define.
-from scripts.demo_gateway_common import (  # noqa: E402 — after sys.path shim
+from scripts.demo_gateway_common import (  # noqa: E402 — `scripts.` resolves only after the sys.path shim above; expires 2027-10-23; added E49A-50A/T17
     _GATEWAY_INVOKE_POLICY_NAME,
     _GATEWAY_TRUST_POLICY,
     _LAMBDA_BASIC_EXEC_POLICY_ARN,
@@ -101,16 +92,6 @@ from scripts.demo_gateway_common import (  # noqa: E402 — after sys.path shim
 
 logger = logging.getLogger("bootstrap_demo_gateway")
 
-# The inline Lambda handler source. It is assigned to a module constant (rather than
-# zipped from a file on disk) so the embedded code is offline-parseable: a verify step
-# `ast.parse`s LAMBDA_HANDLER_SRC to catch a syntax error without ever deploying.
-#
-# AgentCore lambda-target contract (research §8.1, §6.2): the Gateway invokes the
-# Lambda with the tool ARGS as the `event` and the tool NAME in the client context at
-# `context.client_context.custom["bedrockAgentCoreToolName"]`. The gateway prefixes the
-# tool name with the target name joined by "___" (e.g. "agp-demo-target___echo"), so we
-# split on "___" and take the last segment. This exact event/context shape IS the
-# AgentCore lambda-target contract — keep it in sync with the gateway target config.
 LAMBDA_HANDLER_SRC = '''\
 """agp-demo-mcp-tools — demo Lambda backing the AgentCore Gateway inline-lambda target.
 
@@ -169,16 +150,16 @@ def bootstrap(region: str, prefix: str, tenant_id: str) -> dict:
     The caller gates this behind the non-dry-run branch, so a dry-run never constructs
     a client or makes a call. Every step is get-or-create; re-running converges.
 
-    `tenant_id` builds the create-time placeholder discoveryUrl (a sane default the
-    platform re-sets at registration — see create_example_gateway.build_create_gateway_kwargs).
+    `tenant_id` builds the create-time discoveryUrl, which CreateGateway fetches and
+    validates, so it must be a real tenant (see
+    create_example_gateway.build_create_gateway_kwargs).
     """
-    import boto3  # imported lazily so a dry-run never constructs a client
+    from core.aws_clients import client
 
     names = _names(prefix)
-    iam = boto3.client("iam", region_name=region)
-    lam = boto3.client("lambda", region_name=region)
+    iam = client("iam", region=region)
+    lam = client("lambda", region=region)
 
-    # 1) Lambda execution role (+ basic-exec managed policy for CloudWatch logs).
     exec_role_arn, exec_role_created = ensure_role(
         iam,
         names["exec_role"],
@@ -186,15 +167,10 @@ def bootstrap(region: str, prefix: str, tenant_id: str) -> dict:
         "Agentic Governance Platform demo MCP-tools Lambda execution role (dev helper).",
     )
     if exec_role_created:
-        # Only attach on a fresh create — a found role was already set up by a prior run.
         ensure_attached_policy(iam, names["exec_role"], _LAMBDA_BASIC_EXEC_POLICY_ARN)
 
-    # 2) The demo Lambda (inline echo/add handler). Pass LAMBDA_HANDLER_SRC to the
-    # shared ensure_lambda (it takes the handler source as a parameter now); the
-    # description defaults to the echo/add string, so this is byte-identical to before.
     lambda_arn = ensure_lambda(lam, names["lambda"], exec_role_arn, LAMBDA_HANDLER_SRC)
 
-    # 3) Gateway service role (+ least-privilege lambda:InvokeFunction on the demo Lambda).
     gateway_role_arn, gateway_role_created = ensure_role(
         iam,
         names["gateway_role"],
@@ -202,7 +178,6 @@ def bootstrap(region: str, prefix: str, tenant_id: str) -> dict:
         "Agentic Governance Platform demo gateway service role (dev helper).",
     )
     if gateway_role_created:
-        # Only put the inline policy on a fresh create — a found role was already set up.
         ensure_inline_policy(
             iam,
             names["gateway_role"],
@@ -210,11 +185,6 @@ def bootstrap(region: str, prefix: str, tenant_id: str) -> dict:
             _gateway_invoke_policy_doc(lambda_arn),
         )
 
-    # 4) The gateway + inline-lambda target — REUSE create_example_gateway verbatim.
-    # create_example_gateway() is get-or-create-free, but its create_gateway/
-    # create_gateway_target use deterministic uuid5 clientTokens (build_*_kwargs), so a
-    # racing/retried create with the same name+token is idempotent at the API. It waits
-    # both to READY and returns the GetGateway response (gatewayUrl/gatewayArn verbatim).
     gw_ready = create_example_gateway(
         gateway_name=names["gateway"],
         role_arn=gateway_role_arn,
@@ -247,12 +217,7 @@ def bootstrap(region: str, prefix: str, tenant_id: str) -> dict:
 def _print_dry_run(region: str, prefix: str, tenant_id: str) -> None:
     """Print every resource the script WOULD create — ZERO boto3 calls."""
     names = _names(prefix)
-    lambda_arn_placeholder = (
-        f"arn:aws:lambda:{region}:<account-id>:function:{names['lambda']}"
-    )
-    # Build the gateway/target kwargs with the REUSED builders so the dry-run shows
-    # exactly what the live path sends — including the CUSTOM_JWT placeholder authorizer
-    # (the gateway is born locked; the type is immutable post-create).
+    lambda_arn_placeholder = f"arn:aws:lambda:{region}:<account-id>:function:{names['lambda']}"
     gw_kwargs = build_create_gateway_kwargs(
         names["gateway"],
         f"arn:aws:iam::<account-id>:role/{names['gateway_role']}",
@@ -268,66 +233,104 @@ def _print_dry_run(region: str, prefix: str, tenant_id: str) -> None:
 
     print(f"\n[1/4] IAM role {names['exec_role']!r} (Lambda execution role)")
     print("  get-or-create via iam.get_role(RoleName=...) -> on NoSuchEntity, iam.create_role(")
-    print(_indent(json.dumps({
-        "RoleName": names["exec_role"],
-        "AssumeRolePolicyDocument": _LAMBDA_TRUST_POLICY,
-    }, indent=2), 4))
+    print(
+        _indent(
+            json.dumps(
+                {
+                    "RoleName": names["exec_role"],
+                    "AssumeRolePolicyDocument": _LAMBDA_TRUST_POLICY,
+                },
+                indent=2,
+            ),
+            4,
+        )
+    )
     print("  )")
-    print(f"  then iam.attach_role_policy(RoleName={names['exec_role']!r}, "
-          f"PolicyArn={_LAMBDA_BASIC_EXEC_POLICY_ARN!r})")
+    print(
+        f"  then iam.attach_role_policy(RoleName={names['exec_role']!r}, "
+        f"PolicyArn={_LAMBDA_BASIC_EXEC_POLICY_ARN!r})"
+    )
 
     print(f"\n[2/4] Lambda {names['lambda']!r} (inline echo/add handler)")
-    print("  get-or-create via lambda.get_function(FunctionName=...) -> on "
-          "ResourceNotFoundException, lambda.create_function(")
-    print(_indent(json.dumps({
-        "FunctionName": names["lambda"],
-        "Runtime": _LAMBDA_RUNTIME,
-        "Role": f"arn:aws:iam::<account-id>:role/{names['exec_role']}",
-        "Handler": _LAMBDA_HANDLER,
-        "Code": {"ZipFile": "<in-memory zip of index.py from LAMBDA_HANDLER_SRC>"},
-        "Timeout": 15,
-        "MemorySize": 128,
-    }, indent=2), 4))
+    print(
+        "  get-or-create via lambda.get_function(FunctionName=...) -> on "
+        "ResourceNotFoundException, lambda.create_function("
+    )
+    print(
+        _indent(
+            json.dumps(
+                {
+                    "FunctionName": names["lambda"],
+                    "Runtime": _LAMBDA_RUNTIME,
+                    "Role": f"arn:aws:iam::<account-id>:role/{names['exec_role']}",
+                    "Handler": _LAMBDA_HANDLER,
+                    "Code": {"ZipFile": "<in-memory zip of index.py from LAMBDA_HANDLER_SRC>"},
+                    "Timeout": 15,
+                    "MemorySize": 128,
+                },
+                indent=2,
+            ),
+            4,
+        )
+    )
     print("  )  # bounded retry on InvalidParameterValueException (IAM eventual consistency)")
-    print("  inline handler implements the _DEMO_TOOL_SCHEMA tools: "
-          f"{[t['name'] for t in _DEMO_TOOL_SCHEMA]}")
-    print("  (reads tool name from context.client_context.custom['bedrockAgentCoreToolName'], "
-          "split on '___')")
+    print(
+        f"  inline handler implements the _DEMO_TOOL_SCHEMA tools: {[t['name'] for t in _DEMO_TOOL_SCHEMA]}"
+    )
+    print(
+        "  (reads tool name from context.client_context.custom['bedrockAgentCoreToolName'], split on '___')"
+    )
 
     print(f"\n[3/4] IAM role {names['gateway_role']!r} (gateway service role)")
     print("  get-or-create via iam.get_role(RoleName=...) -> on NoSuchEntity, iam.create_role(")
-    print(_indent(json.dumps({
-        "RoleName": names["gateway_role"],
-        "AssumeRolePolicyDocument": _GATEWAY_TRUST_POLICY,
-    }, indent=2), 4))
+    print(
+        _indent(
+            json.dumps(
+                {
+                    "RoleName": names["gateway_role"],
+                    "AssumeRolePolicyDocument": _GATEWAY_TRUST_POLICY,
+                },
+                indent=2,
+            ),
+            4,
+        )
+    )
     print("  )")
-    print(f"  then iam.put_role_policy(RoleName={names['gateway_role']!r}, "
-          f"PolicyName={_GATEWAY_INVOKE_POLICY_NAME!r}, PolicyDocument=")
+    print(
+        f"  then iam.put_role_policy(RoleName={names['gateway_role']!r}, "
+        f"PolicyName={_GATEWAY_INVOKE_POLICY_NAME!r}, PolicyDocument="
+    )
     print(_indent(json.dumps(_gateway_invoke_policy_doc(lambda_arn_placeholder), indent=2), 4))
     print("  )  # lambda:InvokeFunction scoped to the demo Lambda ARN (least privilege, NOT '*')")
 
-    print(f"\n[4/4] Gateway {names['gateway']!r} + target {names['target']!r} "
-          "(REUSING create_example_gateway builders)")
+    print(
+        f"\n[4/4] Gateway {names['gateway']!r} + target {names['target']!r} "
+        "(REUSING create_example_gateway builders)"
+    )
     print("  bedrock-agentcore-control.CreateGateway(")
     print(_indent(json.dumps(gw_kwargs, indent=2), 4))
     print("  )")
-    print("  # gateway is BORN LOCKED: authorizerType=CUSTOM_JWT + placeholder "
-          f"allowedAudience=[{_PLACEHOLDER_AUDIENCE!r}] + a default discoveryUrl.")
-    print("  # The type is IMMUTABLE post-create; the platform overwrites the "
-          "customJWTAuthorizer (real discoveryUrl + audience) at registration.")
+    print(
+        "  # gateway is BORN LOCKED: authorizerType=CUSTOM_JWT + placeholder "
+        f"allowedAudience=[{_PLACEHOLDER_AUDIENCE!r}] + a default discoveryUrl."
+    )
+    print(
+        "  # The type is IMMUTABLE post-create; the platform overwrites the "
+        "customJWTAuthorizer (real discoveryUrl + audience) at registration."
+    )
     print("  # then poll GetGateway(gatewayIdentifier=<gatewayId>) until status==READY")
     print("  bedrock-agentcore-control.CreateGatewayTarget(")
     print(_indent(json.dumps(tgt_kwargs, indent=2), 4))
     print("  )")
-    print("  # then poll GetGatewayTarget(...) until status==READY, then print "
-          "gatewayUrl + gatewayArn (verbatim) to register the MCP server")
+    print(
+        "  # then poll GetGatewayTarget(...) until status==READY, then print "
+        "gatewayUrl + gatewayArn (verbatim) to register the MCP server"
+    )
 
-    print("\nTo clean up afterwards, delete these agp-demo-* resources (this script "
-          "NEVER deletes anything):")
+    print("\nTo clean up afterwards, delete these agp-demo-* resources (this script NEVER deletes anything):")
     print(f"  - IAM role {names['exec_role']}  (detach AWSLambdaBasicExecutionRole first)")
     print(f"  - Lambda function {names['lambda']}")
-    print(f"  - IAM role {names['gateway_role']}  (delete inline policy "
-          f"{_GATEWAY_INVOKE_POLICY_NAME} first)")
+    print(f"  - IAM role {names['gateway_role']}  (delete inline policy {_GATEWAY_INVOKE_POLICY_NAME} first)")
     print(f"  - Gateway {names['gateway']} (delete its target {names['target']} first)")
 
     print("\nDry run OK: resource shapes printed, no AWS calls made.")
@@ -404,19 +407,13 @@ def main(argv=None) -> int:
     )
 
     if args.dry_run:
-        # ZERO boto3 calls — we never construct a client on this path.
         _print_dry_run(args.region, args.name_prefix, args.tenant_id)
         return 0
 
     try:
-        summary = bootstrap(
-            region=args.region, prefix=args.name_prefix, tenant_id=args.tenant_id
-        )
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        # botocore exceptions (ClientError, EndpointConnectionError, NoCredentials,
-        # UnknownServiceError, AccessDenied, etc.) plus the poll TimeoutError/
-        # RuntimeError are caught broadly so the user never sees a raw traceback.
-        logger.error("Failed to bootstrap the demo gateway: %s", exc)
+        summary = bootstrap(region=args.region, prefix=args.name_prefix, tenant_id=args.tenant_id)
+    except Exception as exc:
+        logger.exception("Failed to bootstrap the demo gateway: %s", exc)
         logger.error(
             "Check that: (1) AWS credentials are configured with IAM "
             "(create_role/attach_role_policy/put_role_policy/get_role), Lambda "

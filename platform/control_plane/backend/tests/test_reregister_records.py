@@ -1,4 +1,4 @@
-"""Offline tests for the E32 re-registration driver (injected services, no AWS/Graph).
+"""Offline tests for the re-registration driver (injected services, no AWS/Graph).
 
 The script under test WRITES TO LIVE SYSTEMS when run for real (it creates registry
 records), so the property these tests exist to pin down is MECHANICAL, not cosmetic: in
@@ -16,13 +16,16 @@ tests below pins that refusal.
 Both registry services are injected. No boto3 client and no httpx client is ever
 constructed here, so the conftest non-loopback socket guard has nothing to trip on.
 
-Mirrors ``tests/test_backfill_langfuse_projects.py``: the backend dir goes on ``sys.path``
-so ``import scripts.<mod>`` resolves, and the script itself is import-safe (stdlib-only at
-module top; models/services/boto3 are imported lazily inside functions).
+The backend dir goes on ``sys.path`` so ``import scripts.<mod>`` resolves, as in
+``tests/test_backfill_langfuse_projects.py``; the script itself is import-safe (stdlib-only
+at module top; models/services/boto3 are imported lazily inside functions).
+``_EXAMPLE_ACCOUNT`` is the AWS documentation example account id, the same placeholder
+``tests/conftest.py`` uses.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -31,33 +34,20 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# The backend dir on sys.path makes `scripts` importable as a namespace package
-# (same shim as tests/test_backfill_langfuse_projects.py).
 _BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from scripts.reregister_records import (  # noqa: E402
-    build_plan,
-    parse_args,
-    read_old_records,
-    reregister,
-)
+_reregister_records = importlib.import_module("scripts.reregister_records")
+build_plan = _reregister_records.build_plan
+parse_args = _reregister_records.parse_args
+read_old_records = _reregister_records.read_old_records
+reregister = _reregister_records.reregister
 
-# The AWS documentation example account id (the same placeholder tests/conftest.py uses).
-# The live account id is NEVER baked into the repo — it arrives via CLI args / settings.
 _EXAMPLE_ACCOUNT = "123456789012"
-_GATEWAY_ARN = (
-    f"arn:aws:bedrock-agentcore:us-east-1:{_EXAMPLE_ACCOUNT}:gateway/agp-support-mcp-abc123"
-)
-_RUNTIME_ARN = (
-    f"arn:aws:bedrock-agentcore:us-east-1:{_EXAMPLE_ACCOUNT}:runtime/agp-fnol-agent-xyz789"
-)
+_GATEWAY_ARN = f"arn:aws:bedrock-agentcore:us-east-1:{_EXAMPLE_ACCOUNT}:gateway/agp-support-mcp-abc123"
+_RUNTIME_ARN = f"arn:aws:bedrock-agentcore:us-east-1:{_EXAMPLE_ACCOUNT}:runtime/agp-fnol-agent-xyz789"
 
-
-# ===========================================================================
-# The three tests from the task brief (verbatim contract)
-# ===========================================================================
 
 def test_dry_run_makes_no_writes():
     agents, mcps = MagicMock(), MagicMock()
@@ -85,13 +75,14 @@ def test_live_run_creates_and_reports_new_id():
     plan = [{"old_id": "OLD1", "name": "fnol-agent", "kind": "agent", "envelope": {}}]
     out = reregister(plan, dry_run=False, agent_service=agents, mcp_service=mcps)
     agents.create.assert_called_once()
-    assert out[0] == {"old_id": "OLD1", "new_id": "NEW1", "name": "fnol-agent",
-                      "kind": "agent", "status": "created"}
+    assert out[0] == {
+        "old_id": "OLD1",
+        "new_id": "NEW1",
+        "name": "fnol-agent",
+        "kind": "agent",
+        "status": "created",
+    }
 
-
-# ===========================================================================
-# Zero-writes property — the mechanical proof, asserted on the mocks
-# ===========================================================================
 
 def test_dry_run_calls_nothing_at_all_on_any_collaborator():
     """--dry-run performs ZERO writes: no create, and in fact NOT ONE call of any name on
@@ -133,7 +124,6 @@ def test_dry_run_calls_nothing_at_all_on_any_collaborator():
         mcp_service=mcps,
     )
 
-    # Not one call — not create, not get, not list — on either service double.
     assert agents.mock_calls == []
     assert mcps.mock_calls == []
     agents.create.assert_not_called()
@@ -169,8 +159,7 @@ def test_dry_run_does_not_even_dereference_a_collaborator():
             "old_id": "OLDM",
             "name": "support-mcp",
             "kind": "mcp",
-            "envelope": {"entra_app_id": "app-old-mcp", "gateway_arn": _GATEWAY_ARN,
-                         "kind": "gateway"},
+            "envelope": {"entra_app_id": "app-old-mcp", "gateway_arn": _GATEWAY_ARN, "kind": "gateway"},
             "server_json": {"description": "IT support", "version": "1.0.0"},
             "tools": [],
         },
@@ -193,10 +182,6 @@ def test_live_and_dry_run_together_is_refused():
     with pytest.raises(SystemExit):
         parse_args(["--live", "--dry-run"])
 
-
-# ===========================================================================
-# build_plan gating
-# ===========================================================================
 
 def test_build_plan_keeps_gateway_wired_mcp_and_skips_unwired():
     records = [
@@ -245,10 +230,6 @@ def test_build_plan_keeps_runtime_arn_only_record():
     records = [{"recordId": "R1", "displayName": "r", "_envelope": {"runtime_arn": _RUNTIME_ARN}}]
     assert [p["old_id"] for p in build_plan(records, kind="mcp")] == ["R1"]
 
-
-# ===========================================================================
-# OLD-namespace read path (old schema keys)
-# ===========================================================================
 
 def test_read_old_records_reads_the_old_agent_schema():
     """Agents live at ``descriptors.custom.inlineContent`` in the OLD namespace (the ported
@@ -347,9 +328,35 @@ def test_read_old_records_skips_a_malformed_record_without_aborting():
     assert [r["recordId"] for r in records] == ["OK"]
 
 
-# ===========================================================================
-# Live re-registration — payload fidelity
-# ===========================================================================
+@pytest.mark.parametrize(
+    "bad_descriptor",
+    [
+        {"server": {"inlineContent": json.dumps({"name": "agp/bad", "_meta": "governance: none"})}},
+        {
+            "server": {"inlineContent": json.dumps({"name": "agp/bad", "_meta": {}})},
+            "tools": {"inlineContent": json.dumps(["ticket_lookup"])},
+        },
+    ],
+    ids=["meta-not-an-object", "tools-not-an-object"],
+)
+def test_read_old_records_skips_an_mcp_record_whose_payload_has_the_wrong_shape(bad_descriptor):
+    """A hand-written ``_meta`` or tools payload that is not an object is skipped with the other
+    malformed shapes instead of aborting the read."""
+    ctl = MagicMock()
+    ctl.list_registry_records.return_value = {"registryRecords": [{"recordId": "BAD"}, {"recordId": "OK"}]}
+    good = {"server": {"inlineContent": json.dumps({"name": "agp/ok", "_meta": {}})}}
+
+    def _get(registryId, recordId):
+        return {
+            "recordId": recordId,
+            "name": recordId.lower(),
+            "descriptors": {"mcp": bad_descriptor if recordId == "BAD" else good},
+        }
+
+    ctl.get_registry_record.side_effect = _get
+    records = read_old_records("REG", "mcp", control_client=ctl)
+    assert [r["recordId"] for r in records] == ["OK"]
+
 
 def test_live_run_carries_gateway_arn_verbatim_into_the_new_mcp_record():
     """Registering an MCP only REFERENCES its gateway by ARN — it never creates one — so
@@ -377,16 +384,14 @@ def test_live_run_carries_gateway_arn_verbatim_into_the_new_mcp_record():
                 "version": "1.2.0",
                 "remotes": [{"type": "streamable-http", "url": "https://gw.example.test/mcp"}],
             },
-            "tools": [
-                {"name": "ticket_lookup", "description": "Look up", "inputSchema": {"type": "object"}}
-            ],
+            "tools": [{"name": "ticket_lookup", "description": "Look up", "inputSchema": {"type": "object"}}],
         }
     ]
 
     out = reregister(plan, dry_run=False, agent_service=agents, mcp_service=mcps)
 
     req = mcps.create.call_args.args[0]
-    assert req.gateway_arn == _GATEWAY_ARN  # verbatim, byte-identical
+    assert req.gateway_arn == _GATEWAY_ARN
     assert req.name == "support-mcp"
     assert req.kind.value == "gateway"
     assert req.description == "IT support desk tools"
@@ -400,7 +405,7 @@ def test_live_run_carries_gateway_arn_verbatim_into_the_new_mcp_record():
 
 
 def test_live_run_does_not_carry_the_old_entra_identity_onto_the_new_record():
-    """The re-registered record gets a FRESH, self-consistent identity (the locked E32
+    """The re-registered record gets a FRESH, self-consistent identity (the locked
     decision — no id crosswalk). The old ``entra_app_id`` must NOT be replayed onto the
     new payload: ``AgentCreate`` has no such field, and copying it would re-point the new
     record at the superseded app registration this run is about to delete."""
@@ -429,7 +434,7 @@ def test_live_run_does_not_carry_the_old_entra_identity_onto_the_new_record():
 
     req = agents.create.call_args.args[0]
     assert not hasattr(req, "entra_app_id")
-    assert req.agent_arn == _RUNTIME_ARN  # the runtime handle DOES carry through
+    assert req.agent_arn == _RUNTIME_ARN
     assert req.name == "fnol-agent"
     assert req.purpose == "First notice of loss intake"
     assert req.platform.value == "aws_bedrock"
@@ -444,10 +449,6 @@ def test_live_run_defaults_tenant_id_when_the_old_envelope_predates_multi_tenanc
     reregister(plan, dry_run=False, agent_service=agents, mcp_service=mcps)
     assert agents.create.call_args.args[0].tenant_id == "default"
 
-
-# ===========================================================================
-# Idempotency + resilience
-# ===========================================================================
 
 def test_name_taken_is_logged_and_skipped_not_fatal():
     """A name that already exists raises NameTakenError → log + skip; the run continues
@@ -485,26 +486,11 @@ def test_unknown_kind_is_reported_not_raised():
     mcps.create.assert_not_called()
 
 
-# ===========================================================================
-# Grants + Entra cleanup are NOT done by this script — the flags refuse
-#
-# `service.create()` provisions NO Entra identity: it stamps identity_status="pending",
-# and the real provisioning hook is the route-level background task at
-# `api/routes/agents.py:322` (`mcp_servers.py:237`), which a service-layer script cannot
-# reach. Two consequences these tests pin down:
-#   * a created record can never carry `entra_sp_id` (not a field on `AgentCreate`), so
-#     `apply_agent_mcp_grant` — whose Graph principal IS `entra_sp_id` — could never run;
-#   * the new record has no identity at all, so deleting the superseded Entra app would
-#     destroy the only working one.
-# The earlier tests here asserted a grant happy path on `MagicMock(entra_sp_id="sp-new")`
-# — a shape production cannot produce — which is exactly what hid a 100% grant skip. They
-# are gone: `reregister()` no longer takes `apply_grants`/`delete_old_apps`/`grant_fn`/
-# `delete_app_fn` at all, and the flags exit 2 with the manual procedure instead.
-# ===========================================================================
-
 def test_reregister_does_not_accept_the_grant_or_delete_parameters_at_all():
     """The strongest available guard against the defect coming back: there is no parameter
-    to pass, so no caller can re-enable a grant or an Entra delete from this script."""
+    to pass, so no caller can re-enable a grant or an Entra delete from this script. The
+    earlier tests here asserted a grant happy path on ``MagicMock(entra_sp_id="sp-new")``, a
+    shape production cannot produce, which is exactly what hid a 100% grant skip."""
     import inspect as _inspect
 
     params = set(_inspect.signature(reregister).parameters)
@@ -524,12 +510,10 @@ def test_the_script_contains_no_call_to_the_grant_or_entra_delete_helpers():
     called = {
         node.func.id if isinstance(node.func, ast.Name) else node.func.attr
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, (ast.Name, ast.Attribute))
+        if isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute))
     }
     assert "apply_agent_mcp_grant" not in called
     assert "delete_agent_app" not in called
-    # Nor may they be imported for use elsewhere.
     imported = {
         alias.name
         for node in ast.walk(tree)
@@ -543,10 +527,11 @@ def test_the_script_contains_no_call_to_the_grant_or_entra_delete_helpers():
 def test_the_refused_flags_exit_2_with_guidance_and_build_no_client(flag, monkeypatch, caplog):
     """Both flags REFUSE rather than warn-and-continue, in dry-run AND in --live, and the
     refusal happens before any service/client is constructed — so no AWS or Graph call can
-    precede it. The message must name the manual procedure."""
+    precede it. The message must name the manual procedure. Registry ids ARE supplied, so
+    the refusal cannot be confused with the missing-id usage error."""
     from scripts import reregister_records as mod
 
-    def _explode(*args, **kwargs):  # pragma: no cover — must never be reached
+    def _explode(*args, **kwargs):
         raise AssertionError("a client was constructed before the refusal")
 
     monkeypatch.setattr(mod, "_build_services", _explode)
@@ -555,9 +540,7 @@ def test_the_refused_flags_exit_2_with_guidance_and_build_no_client(flag, monkey
     for argv in ([flag], [flag, "--live"]):
         caplog.clear()
         with caplog.at_level("ERROR"):
-            # Registry ids ARE supplied, so the refusal cannot be confused with the
-            # missing-id usage error — and it must fire before that check anyway.
-            rc = mod.main(argv + ["--agent-registry-id", "OLD-A", "--mcp-registry-id", "OLD-M"])
+            rc = mod.main([*argv, "--agent-registry-id", "OLD-A", "--mcp-registry-id", "OLD-M"])
         assert rc == 2, f"{argv} must exit 2 (the usage-error code), not run"
         message = "\n".join(record.getMessage() for record in caplog.records)
         assert "REFUSED" in message
@@ -591,9 +574,10 @@ def test_a_created_record_is_reported_as_needing_manual_reprovisioning(capsys):
 def test_the_dry_run_summary_does_not_claim_a_reprovision_step():
     """Nothing was created, so there is nothing to re-provision — the dry-run footer stays
     the unambiguous 'nothing was written' line."""
-    from scripts.reregister_records import print_summary
-    import io
     import contextlib
+    import io
+
+    from scripts.reregister_records import print_summary
 
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer):
@@ -606,10 +590,6 @@ def test_the_dry_run_summary_does_not_claim_a_reprovision_step():
     assert "reprovision" not in out
 
 
-# ===========================================================================
-# CLI surface
-# ===========================================================================
-
 def test_cli_kind_defaults_to_both_and_region_to_us_east_1():
     args = parse_args([])
     assert args.kind == "both"
@@ -619,7 +599,7 @@ def test_cli_kind_defaults_to_both_and_region_to_us_east_1():
 
 
 def test_main_dry_run_requires_the_old_registry_id_for_the_selected_kind():
+    """Nothing to read from → a clear non-zero exit, and no client is ever constructed."""
     from scripts.reregister_records import main
 
-    # Nothing to read from → a clear non-zero exit, and no client is ever constructed.
     assert main(["--kind", "agent"]) == 2

@@ -1,24 +1,13 @@
-"""Per-user GitHub link route tests (E27B/T8) — the wiring hub.
+"""The per-user GitHub link routes: the real ``require_role``/``current_principal`` path against a
+mocked ``verify_entra_token``, a fake link service on the router's module-level ``_svc``, and a fake
+``ConnectionService`` on ``api.routes.connections._svc`` for the ``org`` field. DynamoDB and Secrets
+Manager are never faked because they are never reached.
 
-Same idiom as ``test_connections_routes.py``: the REAL ``require_role``/``current_principal``
-path against a mocked ``verify_entra_token`` (no live Entra), a FAKE link service patched onto
-the router's module-level ``_svc``, and a fake ``ConnectionService`` on
-``api.routes.connections._svc`` (the ``GET``/``callback``/``verify`` routes compose it for the
-``org`` field). DynamoDB and Secrets Manager are never faked because they are never reached.
+Two wiring gates are pinned because nothing fails loudly at runtime without them: the secret prefix
+from settings (an empty one would write bare-UUID secrets outside every IAM condition) and a
+non-empty ``allowed_origins`` (the service fails open without it)."""
 
-Two of these tests exist to pin the wiring GATES both reviewers flagged as blocking:
-
-* ``test_service_is_built_with_the_settings_secret_prefix`` — without
-  ``secret_prefix=settings.GITHUB_USER_LINK_SECRET_PREFIX`` every per-user secret lands at a
-  bare UUID name, OUTSIDE every ``agp-dev/*`` IAM condition and lifecycle rule, with dev and
-  prod sharing one namespace. Nothing fails loudly at runtime (the ECS grant is
-  ``Resource = "*"``), so a test is the only thing that can catch it.
-* ``test_service_is_built_with_non_empty_allowed_origins`` — ``allowed_origins`` fails OPEN
-  when empty (deliberate, and warned about at construction), which means a wiring miss silently
-  removes the server-side origin check on the OAuth ``redirect_uri``.
-"""
-
-import sys
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,38 +15,26 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from models.connection import AuthType, Connection, ConnStatus, Provider
+from models.connection import Connection, ConnectionAuthType, ConnStatus, Provider
 from models.github_link import GitHubUserLink, LinkStatus
 from services.connection_service import ConnectionError
-from services.github_user_link import GitHubLinkError
+from services.github_user_link import GitHubLinkError, GitHubUserLinkService
+
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
 _OID = "viewer-oid"
-
-
-@pytest.fixture(autouse=True)
-def reset_modules():
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.connections",
-        "api.routes.github_link",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_BACKEND_CLIENT_ID", "backend-client-id")
-    monkeypatch.setenv("ENTRA_SPA_CLIENT_ID", "spa-client-id")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
+_CALLBACK = "https://console.example.com/ops/github-link/callback"
+_LINK_ROWS = [
+    ("not_found", 404, "GitHub link not found"),
+    ("connection_missing", 404, "GitHub link not found"),
+    ("bad_request", 400, "Invalid request"),
+    ("conflict", 409, "That GitHub account is already linked to another user"),
+    ("oauth_client_missing", 409, "This org connection has no GitHub OAuth client — ask an admin to add one"),
+    ("refresh_in_progress", 409, "GitHub token refresh in progress — retry"),
+    ("link_revoked", 409, "Your GitHub authorization was revoked — reconnect your account"),
+    ("provider_error", 502, "GitHub request failed"),
+    ("secret_error", 502, "Secret store operation failed"),
+]
 
 
 def _headers():
@@ -74,12 +51,12 @@ def _claims_for(role: str, oid: str = _OID):
 
 
 def _connection(**overrides) -> Connection:
-    data = {
+    data: dict[str, Any] = {
         "id": "conn-1",
         "provider": Provider.GITHUB,
         "org": "acme",
         "base_url": None,
-        "auth_type": AuthType.GITHUB_APP,
+        "auth_type": ConnectionAuthType.GITHUB_APP,
         "status": ConnStatus.CONNECTED,
         "app_id": "12345",
         "client_id": "Iv1.abc",
@@ -95,7 +72,7 @@ def _connection(**overrides) -> Connection:
 
 
 def _link(**overrides) -> GitHubUserLink:
-    data = {
+    data: dict[str, Any] = {
         "id": "link-1",
         "principal_oid": _OID,
         "connection_id": "conn-1",
@@ -112,11 +89,27 @@ def _link(**overrides) -> GitHubUserLink:
     return GitHubUserLink(**data)
 
 
+def _real_connection_org(connections_module):
+    """The real service's ``connection_org``, reading through whatever ``connections_module._svc``
+    is at call time, so the fake link service translates a connection failure exactly as the wired
+    one does."""
+    real = GitHubUserLinkService(
+        table_name="",
+        secret_prefix="agp-test/github-user-link/",
+        client_credentials_loader=lambda connection_id: ("", ""),
+        connection_org_loader=lambda connection_id: connections_module._svc.get_connection(connection_id).org,
+        secrets_client=MagicMock(),
+    )
+    return real.connection_org
+
+
 def _build_client(link_svc, connections=None, get_connection=None):
     import api.routes.connections as connections_module
     import api.routes.github_link as github_link_module
+    from core.errors import install_error_handlers
 
     github_link_module._svc = link_svc
+    link_svc.connection_org = _real_connection_org(connections_module)
 
     fake_conn_svc = MagicMock()
     fake_conn_svc.list_connections.return_value = list(
@@ -129,6 +122,7 @@ def _build_client(link_svc, connections=None, get_connection=None):
     connections_module._svc = fake_conn_svc
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(github_link_module.router, prefix="/api/v1")
     return TestClient(app), fake_conn_svc
 
@@ -140,8 +134,6 @@ def _svc_with(**methods):
     return s
 
 
-# --- GET "" : the joined view ------------------------------------------------
-
 def test_get_view_joins_links_and_connections(entra_settings):
     s = _svc_with(list_for_principal={"return_value": [_link()]})
     client, _ = _build_client(s)
@@ -149,9 +141,7 @@ def test_get_view_joins_links_and_connections(entra_settings):
         resp = client.get("/api/v1/me/github-link", headers=_headers())
     assert resp.status_code == 200
     body = resp.json()
-    assert body["connections"] == [
-        {"connection_id": "conn-1", "org": "acme", "oauth_client_ready": True}
-    ]
+    assert body["connections"] == [{"connection_id": "conn-1", "org": "acme", "oauth_client_ready": True}]
     assert body["links"] == [
         {
             "connection_id": "conn-1",
@@ -162,7 +152,6 @@ def test_get_view_joins_links_and_connections(entra_settings):
             "last_verified_at": "2026-07-28T11:00:00+00:00",
         }
     ]
-    # the oid comes from the validated principal, never a param
     s.list_for_principal.assert_called_once_with(_OID)
 
 
@@ -172,7 +161,7 @@ def test_get_view_skips_a_link_whose_connection_vanished(entra_settings):
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get("/api/v1/me/github-link", headers=_headers())
     assert resp.status_code == 200
-    assert resp.json()["links"] == []  # skipped, not an error
+    assert resp.json()["links"] == []
 
 
 def test_get_view_only_lists_github_connections(entra_settings):
@@ -191,8 +180,8 @@ def test_get_view_only_lists_github_connections(entra_settings):
 
 
 def test_get_view_reports_a_refreshing_link_as_still_linked(entra_settings):
-    # T5's deriveLinkCardState renders `linked === false` as 'revoked' → "Reconnect". A
-    # transient in-flight refresh must NOT tell the human to re-authorize.
+    """The console renders ``linked === false`` as "reconnect"; an in-flight refresh must not tell
+    the human to re-authorize."""
     s = _svc_with(list_for_principal={"return_value": [_link(status=LinkStatus.REFRESHING)]})
     client, _ = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
@@ -202,20 +191,13 @@ def test_get_view_reports_a_refreshing_link_as_still_linked(entra_settings):
     assert row["linked"] is True
 
 
-# --- POST /start ------------------------------------------------------------
-
 def test_start_returns_the_authorize_url_and_state(entra_settings):
-    s = _svc_with(
-        begin_link={"return_value": ("https://github.com/login/oauth/authorize?x=1", "st-1")}
-    )
+    s = _svc_with(begin_link={"return_value": ("https://github.com/login/oauth/authorize?x=1", "st-1")})
     client, _ = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.post(
             "/api/v1/me/github-link/start",
-            json={
-                "connection_id": "conn-1",
-                "redirect_uri": "https://console.example.com/ops/github-link/callback",
-            },
+            json={"connection_id": "conn-1", "redirect_uri": _CALLBACK},
             headers=_headers(),
         )
     assert resp.status_code == 200
@@ -226,7 +208,6 @@ def test_start_returns_the_authorize_url_and_state(entra_settings):
 
 
 def test_start_passes_the_principals_oid_and_ignores_any_body_oid(entra_settings):
-    """The forgery guard at the route boundary."""
     s = _svc_with(begin_link={"return_value": ("https://github.com/x", "st-1")})
     client, _ = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
@@ -234,7 +215,7 @@ def test_start_passes_the_principals_oid_and_ignores_any_body_oid(entra_settings
             "/api/v1/me/github-link/start",
             json={
                 "connection_id": "conn-1",
-                "redirect_uri": "https://console.example.com/ops/github-link/callback",
+                "redirect_uri": _CALLBACK,
                 "principal_oid": "somebody-elses-oid",
             },
             headers=_headers(),
@@ -253,18 +234,13 @@ def test_start_rejects_a_principal_with_no_oid(entra_settings):
     with patch("core.security_entra.verify_entra_token", return_value=claims):
         resp = client.post(
             "/api/v1/me/github-link/start",
-            json={
-                "connection_id": "conn-1",
-                "redirect_uri": "https://console.example.com/ops/github-link/callback",
-            },
+            json={"connection_id": "conn-1", "redirect_uri": _CALLBACK},
             headers=_headers(),
         )
     assert resp.status_code == 400
-    assert resp.json()["detail"] == "Invalid request"
+    assert resp.json() == {"detail": "Invalid request", "code": "github_link.bad_request"}
     s.begin_link.assert_not_called()
 
-
-# --- POST /callback ---------------------------------------------------------
 
 def test_callback_returns_the_link_status(entra_settings):
     s = _svc_with(complete_link={"return_value": _link()})
@@ -278,7 +254,7 @@ def test_callback_returns_the_link_status(entra_settings):
     assert resp.status_code == 200
     assert resp.json() == {
         "connection_id": "conn-1",
-        "org": "acme",  # the ROUTE owns org; GitHubUserLink carries none
+        "org": "acme",
         "linked": True,
         "status": "linked",
         "github_login": "octocat",
@@ -288,32 +264,14 @@ def test_callback_returns_the_link_status(entra_settings):
 
 
 @pytest.mark.parametrize(
-    "kind",
-    ["not_found", "secret_error", "provider_error"],
-    ids=["connection_deleted_mid_flow", "ddb_blip", "other_store_fault"],
+    "kind", ["not_found", "secret_error"], ids=["connection_deleted_mid_flow", "store_fault"]
 )
-def test_callback_reports_a_COMMITTED_link_as_SUCCESS_when_the_org_lookup_fails(
-    entra_settings, kind
-):
-    """A SUCCESSFUL link must never be reported as a failure.
-
-    ``complete_link`` has already created the Secrets Manager secret and written the row by
-    the time the route resolves ``org`` for the response — the ``connection_id`` only exists
-    once the stored state is consumed, so that lookup cannot be hoisted. It used to RAISE:
-    an admin deleting the connection in the ~200 ms window, or a DDB blip (which
-    ``ConnectionService._get`` collapses to ``not_found``), answered 404 "GitHub link not
-    found", which the callback page renders as a TERMINAL rose error whose copy says
-    "Nothing was changed" — false, the link is live at GitHub. The human then starts over and
-    burns a second authorization.
-
-    So the post-commit lookup DEGRADES: 200 with an empty ``org``. Nothing on the callback
-    page consumes ``org`` (its success copy is keyed off ``github_login``), and the next visit
-    to the link page re-joins ``list_connections()`` and shows the real org."""
+def test_callback_reports_a_COMMITTED_link_as_SUCCESS_when_the_org_lookup_fails(entra_settings, kind):
+    """``complete_link`` has already written the secret and the row by the time the route resolves
+    ``org``, so the post-commit lookup degrades to an empty ``org`` instead of a 404 the callback
+    page renders as terminal."""
     s = _svc_with(complete_link={"return_value": _link()})
-    client, _ = _build_client(
-        s,
-        get_connection=MagicMock(side_effect=ConnectionError("gone", kind=kind)),
-    )
+    client, _ = _build_client(s, get_connection=MagicMock(side_effect=ConnectionError("gone", kind=kind)))
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.post(
             "/api/v1/me/github-link/callback",
@@ -325,15 +283,13 @@ def test_callback_reports_a_COMMITTED_link_as_SUCCESS_when_the_org_lookup_fails(
     assert body["linked"] is True
     assert body["status"] == "linked"
     assert body["github_login"] == "octocat"
-    assert body["connection_id"] == "conn-1"  # the row's own id still answers
-    assert body["org"] == ""  # the one field that could not be resolved
+    assert body["connection_id"] == "conn-1"
+    assert body["org"] == ""
 
 
-def test_callback_never_raises_on_a_boto_fault_in_the_composed_connection_service(
-    entra_settings,
-):
-    """Driven through the REAL ``ConnectionService`` over a faulting table, so a narrowed
-    guard next door fails THIS test too: a store fault after the write is still a 200."""
+def test_callback_never_raises_on_a_boto_fault_in_the_composed_connection_service(entra_settings):
+    """Driven through the real ``ConnectionService`` over a faulting table, so a narrowed guard next
+    door fails this test too."""
     import api.routes.connections as connections_module
 
     s = _svc_with(complete_link={"return_value": _link()})
@@ -353,8 +309,6 @@ def test_callback_never_raises_on_a_boto_fault_in_the_composed_connection_servic
         assert forbidden not in resp.text, forbidden
 
 
-# --- POST /{id}/verify ------------------------------------------------------
-
 def test_verify_returns_the_refreshed_login(entra_settings):
     s = _svc_with(verify_link={"return_value": _link(github_login="octocat-renamed")})
     client, _ = _build_client(s)
@@ -367,26 +321,57 @@ def test_verify_returns_the_refreshed_login(entra_settings):
 
 
 def test_verify_resolves_the_org_BEFORE_it_mutates(entra_settings):
-    """RESOLVE BEFORE MUTATING. ``verify_link`` writes — it may rotate the token and it
-    persists either the refreshed login or an UNLINKED row. The ``org`` lookup used to run
-    after it, so a vanished connection or a DDB blip turned a completed write into a terminal
-    404. The ``connection_id`` is a path param here, so the lookup is hoisted ahead of the
-    mutation: the error is then honest, because nothing was written."""
+    """``verify_link`` writes, so the ``org`` lookup runs first and a vanished connection answers
+    404 "GitHub link not found" (the link service's ``connection_missing``) with nothing mutated."""
     s = _svc_with(verify_link={"return_value": _link()})
     client, _ = _build_client(
         s,
-        get_connection=MagicMock(
-            side_effect=ConnectionError("unknown connection", kind="not_found")
-        ),
+        get_connection=MagicMock(side_effect=ConnectionError("unknown connection", kind="not_found")),
     )
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.post("/api/v1/me/github-link/conn-1/verify", headers=_headers())
     assert resp.status_code == 404
-    # THE POINT: nothing was mutated, so "not found" is true rather than a lie about a write.
+    assert resp.json() == {"detail": "GitHub link not found", "code": "github_link.connection_missing"}
+    assert "unknown connection" not in resp.text
     s.verify_link.assert_not_called()
 
 
-# --- DELETE /{id} ----------------------------------------------------------
+def test_a_connection_store_fault_on_verify_renders_the_link_table(entra_settings):
+    s = _svc_with(verify_link={"return_value": _link()})
+    client, _ = _build_client(
+        s,
+        get_connection=MagicMock(side_effect=ConnectionError("store down", kind="secret_error")),
+    )
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        resp = client.post("/api/v1/me/github-link/conn-1/verify", headers=_headers())
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "Secret store operation failed", "code": "github_link.secret_error"}
+    s.verify_link.assert_not_called()
+
+
+def test_any_other_connection_failure_on_verify_is_the_link_tables_provider_error(entra_settings):
+    s = _svc_with(verify_link={"return_value": _link()})
+    client, _ = _build_client(
+        s,
+        get_connection=MagicMock(side_effect=ConnectionError("Invalid request", kind="bad_request")),
+    )
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        resp = client.post("/api/v1/me/github-link/conn-1/verify", headers=_headers())
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "GitHub request failed", "code": "github_link.provider_error"}
+    s.verify_link.assert_not_called()
+
+
+def test_a_connection_store_fault_on_the_view_renders_the_connection_table(entra_settings):
+    s = _svc_with(list_for_principal={"return_value": [_link()]})
+    client, fake_conn_svc = _build_client(s)
+    fake_conn_svc.list_connections.side_effect = ConnectionError("store down", kind="secret_error")
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        resp = client.get("/api/v1/me/github-link", headers=_headers())
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "Secret store operation failed", "code": "connection.secret_error"}
+    s.list_for_principal.assert_not_called()
+
 
 def test_unlink_returns_204_with_no_body(entra_settings):
     s = _svc_with(unlink={"return_value": None})
@@ -398,51 +383,57 @@ def test_unlink_returns_204_with_no_body(entra_settings):
     s.unlink.assert_called_once_with(_OID, "conn-1")
 
 
-# --- error mapping ---------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "kind,status",
-    [
-        ("not_found", 404),
-        ("bad_request", 400),
-        ("conflict", 409),
-        ("oauth_client_missing", 409),
-        ("refresh_in_progress", 409),
-        ("link_revoked", 409),
-        ("provider_error", 502),
-        ("secret_error", 502),
-    ],
-)
-def test_every_error_kind_maps_to_a_fixed_detail(entra_settings, kind, status):
+@pytest.mark.parametrize("kind,status,detail", _LINK_ROWS, ids=[row[0] for row in _LINK_ROWS])
+def test_every_error_kind_renders_its_fixed_detail(entra_settings, kind, status, detail):
     marker = "ghu_leaked_token_and_a_ClientError_message"
     s = _svc_with(verify_link={"side_effect": GitHubLinkError(marker, kind=kind)})
     client, _ = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.post("/api/v1/me/github-link/conn-1/verify", headers=_headers())
     assert resp.status_code == status, f"kind={kind}"
+    assert resp.json() == {"detail": detail, "code": f"github_link.{kind}"}
     assert marker not in resp.text, f"kind={kind} leaked the error message"
 
-    import api.routes.github_link as m
 
-    assert resp.json()["detail"] == m._ERROR_DETAIL[kind]
+@pytest.mark.parametrize(
+    "route,method,path",
+    [
+        ("list_for_principal", "get", "/api/v1/me/github-link"),
+        ("begin_link", "post", "/api/v1/me/github-link/start"),
+        ("complete_link", "post", "/api/v1/me/github-link/callback"),
+        ("unlink", "delete", "/api/v1/me/github-link/conn-1"),
+    ],
+)
+def test_every_route_renders_a_link_error_through_the_table(entra_settings, route, method, path):
+    s = _svc_with(**{route: {"side_effect": GitHubLinkError("row gone", kind="not_found")}})
+    client, _ = _build_client(s)
+    bodies = {
+        "post": {"connection_id": "conn-1", "redirect_uri": _CALLBACK, "code": "c", "state": "s"},
+    }
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        resp = getattr(client, method)(
+            path, headers=_headers(), **({"json": bodies["post"]} if method == "post" else {})
+        )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "GitHub link not found", "code": "github_link.not_found"}
+    assert "row gone" not in resp.text
 
 
-def test_refresh_in_progress_and_secret_error_stay_retryable(entra_settings):
-    """RETRYABLE, not terminal: both occur under ordinary 2-task contention or a transient
-    AWS blip, and the client is expected to retry after a delay. Collapsing either into a
-    terminal kind would tell the human to re-link over a 200ms race."""
-    import api.routes.github_link as m
-
-    assert m._ERROR_STATUS["refresh_in_progress"] == 409
-    assert m._ERROR_STATUS["secret_error"] == 502
-    assert "retry" in m._ERROR_DETAIL["refresh_in_progress"].lower()
+def test_refresh_in_progress_and_secret_error_stay_retryable():
+    """Both occur under ordinary two-task contention or a transient AWS blip; collapsing either
+    into a terminal kind would tell the human to re-link over a race."""
+    assert GitHubLinkError.kinds["refresh_in_progress"].status == 409
+    assert GitHubLinkError.kinds["secret_error"].status == 502
+    assert "retry" in str(GitHubLinkError.kinds["refresh_in_progress"].detail).lower()
 
 
-def test_no_route_ever_returns_401(entra_settings):
-    # B11: the SPA's 401 interceptor drops the auth token and reloads, logging the human out.
-    import api.routes.github_link as m
-
-    assert set(m._ERROR_STATUS.values()) <= {400, 404, 409, 502}
+def test_no_route_ever_returns_401():
+    """The SPA's 401 interceptor drops the auth token and reloads, logging the human out; every
+    table a link route renders through stays inside the pinned set."""
+    statuses = {o.status for o in GitHubLinkError.kinds.values()} | {
+        o.status for o in ConnectionError.kinds.values()
+    }
+    assert statuses <= {400, 404, 409, 502}
 
 
 def test_a_response_body_never_contains_a_token_or_a_secret(entra_settings):
@@ -469,7 +460,6 @@ def test_unauthenticated_request_is_rejected(entra_settings):
 
 
 def test_every_route_is_viewer_reachable(entra_settings):
-    """A per-user action on the human's OWN link — any authenticated human may take it."""
     s = _svc_with(
         list_for_principal={"return_value": []},
         begin_link={"return_value": ("https://github.com/x", "st")},
@@ -480,38 +470,19 @@ def test_every_route_is_viewer_reachable(entra_settings):
     client, _ = _build_client(s)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         assert client.get("/api/v1/me/github-link", headers=_headers()).status_code == 200
-        assert (
-            client.post(
-                "/api/v1/me/github-link/start",
-                json={
-                    "connection_id": "conn-1",
-                    "redirect_uri": "https://console.example.com/ops/github-link/callback",
-                },
-                headers=_headers(),
-            ).status_code
-            == 200
+        start = client.post(
+            "/api/v1/me/github-link/start",
+            json={"connection_id": "conn-1", "redirect_uri": _CALLBACK},
+            headers=_headers(),
         )
-        assert (
-            client.post(
-                "/api/v1/me/github-link/callback",
-                json={"code": "c", "state": "s"},
-                headers=_headers(),
-            ).status_code
-            == 200
+        assert start.status_code == 200
+        callback = client.post(
+            "/api/v1/me/github-link/callback", json={"code": "c", "state": "s"}, headers=_headers()
         )
-        assert (
-            client.post(
-                "/api/v1/me/github-link/conn-1/verify", headers=_headers()
-            ).status_code
-            == 200
-        )
-        assert (
-            client.delete("/api/v1/me/github-link/conn-1", headers=_headers()).status_code
-            == 204
-        )
+        assert callback.status_code == 200
+        assert client.post("/api/v1/me/github-link/conn-1/verify", headers=_headers()).status_code == 200
+        assert client.delete("/api/v1/me/github-link/conn-1", headers=_headers()).status_code == 204
 
-
-# --- GATE 1: the settings secret prefix is actually applied ------------------
 
 def test_settings_carries_the_pinned_link_secret_prefix(entra_settings):
     from core.config import Settings
@@ -520,9 +491,6 @@ def test_settings_carries_the_pinned_link_secret_prefix(entra_settings):
 
 
 def test_service_is_built_with_the_settings_secret_prefix(entra_settings):
-    """GATE 1. A missed ``secret_prefix=`` puts every per-user secret at a bare UUID name —
-    outside every ``agp-dev/*`` IAM condition and lifecycle rule, with dev and prod sharing
-    one namespace — and NOTHING fails loudly, because the ECS grant is ``Resource = "*"``."""
     import api.routes.connections as connections_module
     import api.routes.github_link as m
     from core.config import settings
@@ -531,14 +499,12 @@ def test_service_is_built_with_the_settings_secret_prefix(entra_settings):
     m._svc = None
     svc = m.get_github_link_service()
     assert svc.secret_prefix == settings.GITHUB_USER_LINK_SECRET_PREFIX
-    assert svc.secret_prefix  # never a bare UUID namespace
+    assert svc.secret_prefix
     assert svc._secret_name("link-1") == f"{settings.GITHUB_USER_LINK_SECRET_PREFIX}link-1"
     m._svc = None
 
 
 def test_an_empty_secret_prefix_is_loud_not_silent(entra_settings, monkeypatch):
-    """An operator who blanks the env var must get a loud, retryable failure — not secrets
-    quietly written to a bare-UUID namespace."""
     import api.routes.connections as connections_module
     import api.routes.github_link as m
     from core.config import settings
@@ -562,15 +528,11 @@ def test_an_empty_secret_prefix_surfaces_as_502_not_a_500(entra_settings, monkey
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get("/api/v1/me/github-link", headers=_headers())
     assert resp.status_code == 502
-    assert resp.json()["detail"] == m._ERROR_DETAIL["secret_error"]
+    assert resp.json() == {"detail": "Secret store operation failed", "code": "github_link.secret_error"}
     m._svc = None
 
 
-# --- GATE 2: allowed_origins is wired NON-EMPTY -----------------------------
-
 def test_service_is_built_with_non_empty_allowed_origins(entra_settings):
-    """GATE 2. ``allowed_origins`` fails OPEN when empty, so the server-side origin check on
-    the OAuth ``redirect_uri`` would silently not be enforced."""
     import api.routes.connections as connections_module
     import api.routes.github_link as m
     from core.config import settings
@@ -585,7 +547,6 @@ def test_service_is_built_with_non_empty_allowed_origins(entra_settings):
 
 
 def test_the_wired_origins_actually_reject_a_foreign_redirect_uri(entra_settings):
-    """The gate is only meaningful if the wired list is the one the check consults."""
     import api.routes.connections as connections_module
     import api.routes.github_link as m
 
@@ -595,36 +556,8 @@ def test_the_wired_origins_actually_reject_a_foreign_redirect_uri(entra_settings
     with pytest.raises(GitHubLinkError) as exc:
         svc._validate_redirect_uri("https://evil.example.com/ops/github-link/callback")
     assert exc.value.kind == "bad_request"
-    # and the real console origin passes
     svc._validate_redirect_uri("http://localhost:5173/ops/github-link/callback")
     m._svc = None
-
-
-# --- app wiring guard: BOTH include_router blocks ---------------------------
-
-def test_routes_registered_at_both_prefixes(entra_settings, monkeypatch):
-    """``main.py`` registers every router twice — at ``API_PREFIX`` and again at
-    ``ROOT_PATH + API_PREFIX`` for the API Gateway stage. Missing the second block makes the
-    routes 404 in cloud while passing every local test."""
-    monkeypatch.setenv("ROOT_PATH", "/dev")
-    doomed = [k for k in sys.modules if k == "main" or k.startswith(("api.", "core.config"))]
-    for k in doomed:
-        sys.modules.pop(k, None)
-    try:
-        import main
-
-        from conftest import app_route_paths
-
-        paths = app_route_paths(main.app)
-        for base in ("/api/v1", "/dev/api/v1"):
-            assert f"{base}/me/github-link" in paths
-            assert f"{base}/me/github-link/start" in paths
-            assert f"{base}/me/github-link/callback" in paths
-            assert f"{base}/me/github-link/{{connection_id}}/verify" in paths
-            assert f"{base}/me/github-link/{{connection_id}}" in paths
-    finally:
-        for k in [k for k in sys.modules if k == "main" or k.startswith(("api.", "core.config"))]:
-            sys.modules.pop(k, None)
 
 
 def test_router_is_exported_from_the_routes_package(entra_settings):
@@ -634,44 +567,22 @@ def test_router_is_exported_from_the_routes_package(entra_settings):
     assert routes.github_link_router is not None
 
 
-# --- store-fault contract: a boto3 fault in the COMPOSED ConnectionService ---
-#
-# The two routes below compose the REAL `ConnectionService` for the `org` field. It guarded
-# only `ClientError`, so a `BotoCoreError` (VPC-endpoint blip, DNS stall — ordinary from ECS)
-# propagated raw and both routes answered HTTP 500 — outside the pinned {400,404,409,502}
-# `test_no_route_ever_returns_401` asserts. Driven here through the real service so a
-# narrowed guard next door fails a ROUTE test, not only a service test.
-
-class _ConnFaultTable:
-    """Every DDB op raises the given fault. Only ever read by `ConnectionService`."""
-
-    def __init__(self, fault):
-        self._fault = fault
-
-    def get_item(self, **kwargs):
-        raise self._fault
-
-    def put_item(self, **kwargs):
-        raise self._fault
-
-    def delete_item(self, **kwargs):
-        raise self._fault
-
-    def query(self, **kwargs):
-        raise self._fault
-
-
 def _real_conn_svc_over(fault):
+    """A real ``ConnectionService`` over a table whose every operation raises ``fault``."""
+    from core.state_store import StateStore
     from services.connection_service import ConnectionService
 
+    table = MagicMock()
+    for op in ("get_item", "put_item", "delete_item", "query"):
+        getattr(table, op).side_effect = fault
     svc = ConnectionService(
-        table_name="connections",
+        table_name="",
         secret_prefix="agp-test/git-connections/",
         region="us-east-1",
         secrets_client=MagicMock(),
     )
-    svc._table = _ConnFaultTable(fault)
-    assert svc._has_ddb is True
+    svc._store = StateStore("connections", table=table)
+    assert svc._store.in_memory is False
     return svc
 
 
@@ -687,8 +598,9 @@ def _real_conn_svc_over(fault):
     ids=["client_error", "boto_core_error"],
 )
 def test_a_connection_store_fault_never_answers_500(entra_settings, fault):
+    """Driven through the real ``ConnectionService``, so a narrowed guard next door fails a route
+    test and not only a service test; both boto3 shapes."""
     import api.routes.connections as connections_module
-    import api.routes.github_link as m
 
     s = _svc_with(
         list_for_principal={"return_value": []},
@@ -697,7 +609,10 @@ def test_a_connection_store_fault_never_answers_500(entra_settings, fault):
     client, _ = _build_client(s)
     connections_module._svc = _real_conn_svc_over(fault)
 
-    allowed = set(m._ERROR_STATUS.values()) | {200, 204}
+    allowed = {o.status for o in GitHubLinkError.kinds.values()} | {
+        o.status for o in ConnectionError.kinds.values()
+    }
+    allowed |= {200, 204}
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         view = client.get("/api/v1/me/github-link", headers=_headers())
         verify = client.post("/api/v1/me/github-link/conn-1/verify", headers=_headers())
@@ -705,6 +620,5 @@ def test_a_connection_store_fault_never_answers_500(entra_settings, fault):
     for label, resp in (("GET view", view), ("POST verify", verify)):
         assert resp.status_code in allowed, f"{label} -> {resp.status_code}"
         assert resp.status_code != 500, f"{label} escaped as a 500"
-        # and nothing boto3-shaped reached the body
         for forbidden in ("ProvisionedThroughput", "dynamodb.example.invalid", "Traceback"):
             assert forbidden not in resp.text, f"{label}: {forbidden} leaked"

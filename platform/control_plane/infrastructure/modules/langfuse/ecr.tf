@@ -1,20 +1,20 @@
 # Bump these on a schedule — a stale pin is an exposed pin. See README.md §"Image
 # currency" for the check-and-bump routine and why "newest" is not the selection rule.
+# Base-OS packages are not the pin's job: the mirror applies them at build time
+# (patch-base.Dockerfile, patch-base.rpm.Dockerfile). The application's own dependencies
+# arrive only with a newer pin.
 variable "langfuse_version" {
   description = "Langfuse image version to pull and push (web + worker share it)"
   type        = string
-  default     = "3.225.0"
+  default     = "4.83.0"
 }
 
 variable "clickhouse_version" {
-  # STAY ON 25.8.x. It is the LTS line ClickHouse still ships security updates for
-  # (SECURITY.md: 25.8 supported; 25.9-25.12, 26.1, 26.2 and 26.4 are already EOL).
-  # Newest is NOT most-patched here: 26.7.2.59 carries an OLDER libssl3 than 25.8.28.1,
-  # because these images rebuild on Ubuntu 22.04 whenever upstream happens to. Moving to
-  # 26.x is a planned major upgrade of an EFS-backed store, not a CVE fix.
-  description = "ClickHouse image version to pull and push (stay on the 25.8 LTS line)"
+  # ClickHouse ships security updates only for the releases its SECURITY.md lists, and Langfuse v4
+  # needs 25.12 or newer. Pin an LTS line that file lists; a store cannot go back a release.
+  description = "ClickHouse image version to pull and push (an LTS line upstream still supports)"
   type        = string
-  default     = "25.8.28.1"
+  default     = "26.3.66.4"
 }
 
 locals {

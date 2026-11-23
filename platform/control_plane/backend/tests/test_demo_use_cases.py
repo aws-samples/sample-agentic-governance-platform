@@ -20,18 +20,15 @@ Coverage (design §8):
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import os
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Inject a mock boto3 module so the scripts import without a real boto3, and so we can
-# assert ZERO client construction on the dry-run path. The backend dir is put on
-# sys.path so `import scripts.<mod>` resolves (the scripts' own sys.path shim does this
-# too, but doing it here keeps the import order explicit). NO moto — research §10.
-# ---------------------------------------------------------------------------
 _mock_boto3 = MagicMock(name="boto3")
 _had_boto3 = "boto3" in sys.modules
 _original_boto3 = sys.modules.get("boto3")
@@ -41,25 +38,23 @@ _BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-import scripts.bootstrap_demo_use_cases as bootstrap  # noqa: E402 — after boto3 mock
-from scripts.create_example_gateway import (  # noqa: E402 — after boto3 mock
-    _DEMO_TOOL_SCHEMA,
-    build_create_target_kwargs,
-)
-from scripts.demo_use_cases import DEMO_USE_CASES  # noqa: E402 — after boto3 mock
+bootstrap = importlib.import_module("scripts.bootstrap_demo_use_cases")
+_create_example_gateway = importlib.import_module("scripts.create_example_gateway")
+_DEMO_TOOL_SCHEMA = _create_example_gateway._DEMO_TOOL_SCHEMA
+build_create_target_kwargs = _create_example_gateway.build_create_target_kwargs
+DEMO_USE_CASES = importlib.import_module("scripts.demo_use_cases").DEMO_USE_CASES
 
-# Restore original boto3 state for the rest of the suite (mirror test_script_properties).
 if _had_boto3:
+    assert _original_boto3 is not None
     sys.modules["boto3"] = _original_boto3
 else:
     del sys.modules["boto3"]
 
 
-# ---------------------------------------------------------------------------
-# A fake AgentCore client context: context.client_context.custom carries the namespaced
-# tool name "<targetName>___<toolName>" (the shared preamble splits on "___").
-# ---------------------------------------------------------------------------
 class _FakeClientContext:
+    """``context.client_context.custom`` carries the tool name namespaced as
+    ``<targetName>___<toolName>``; the shared handler preamble splits on ``___``."""
+
     def __init__(self, tool_name: str):
         self.custom = {"bedrockAgentCoreToolName": f"x___{tool_name}"}
 
@@ -69,16 +64,18 @@ class _FakeContext:
         self.client_context = _FakeClientContext(tool_name)
 
 
-def _load_handler(domain: dict):
-    """exec the domain's handler_src and return its `handler` callable (drives the mock
-    directly, design §8.1)."""
-    namespace: dict = {}
-    exec(domain["handler_src"], namespace)
-    return namespace["handler"]
+def _load_handler(domain: dict, tmp_path: Path):
+    """Write the domain's handler_src to a module file, import it the way the Lambda runtime
+    does, and return its `handler` callable."""
+    path = tmp_path / f"{domain['key']}_index.py"
+    path.write_text(domain["handler_src"])
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.handler
 
 
-# A sample event carrying every input id any tool reads — deterministic handlers only
-# .get() what they need, so a superset event is safe for all tools.
 _SAMPLE_EVENT = {
     "customer_id": "CUST-1",
     "policy_number": "POL-1",
@@ -108,9 +105,6 @@ _SAMPLE_EVENT = {
 }
 
 
-# ===========================================================================
-# §8.1 — registry integrity + handler invocation
-# ===========================================================================
 class TestRegistryIntegrity:
     def test_three_domains_with_unique_prefixes_and_keys(self):
         assert len(DEMO_USE_CASES) == 3
@@ -144,28 +138,33 @@ class TestRegistryIntegrity:
     def test_handler_parses_and_every_tool_has_a_branch(self, domain):
         """ast.parse succeeds and the bootstrap's drift guard passes (no schema/handler
         drift)."""
-        # _validate_handler_src raises ValueError on a syntax error or a missing branch.
         bootstrap._validate_handler_src(domain)
 
+    def test_use_case_resource_names_carry_no_demo(self):
+        """The use-case gateways are not the echo/add demo: no created resource name, the
+        gateway role's inline policy included, carries ``demo``."""
+        assert "demo" not in bootstrap._GATEWAY_INVOKE_POLICY_NAME
+        for domain in DEMO_USE_CASES:
+            for name in bootstrap._names(domain["prefix"]).values():
+                assert "demo" not in name, name
+
     @pytest.mark.parametrize("domain", DEMO_USE_CASES, ids=lambda d: d["key"])
-    def test_every_tool_returns_a_dict(self, domain):
-        """Invoking the handler for each tool (via a fake context) returns a dict."""
-        handler = _load_handler(domain)
+    def test_every_tool_returns_a_dict(self, domain, tmp_path):
+        """Invoking the handler for each tool (via a fake context) returns a dict. The sample
+        event is a superset of every input id any tool reads; handlers only ``.get()`` what
+        they need."""
+        handler = _load_handler(domain, tmp_path)
         for tool in domain["tool_schema"]:
             result = handler(dict(_SAMPLE_EVENT), _FakeContext(tool["name"]))
             assert isinstance(result, dict), f"{domain['key']}/{tool['name']} not a dict"
 
     @pytest.mark.parametrize("domain", DEMO_USE_CASES, ids=lambda d: d["key"])
-    def test_unknown_tool_raises_value_error(self, domain):
-        handler = _load_handler(domain)
+    def test_unknown_tool_raises_value_error(self, domain, tmp_path):
+        handler = _load_handler(domain, tmp_path)
         with pytest.raises(ValueError):
             handler({}, _FakeContext("definitely_not_a_real_tool"))
 
 
-# ===========================================================================
-# §8.2 — build_create_target_kwargs(tool_schema=...) carries the schema through;
-#         omitting it preserves _DEMO_TOOL_SCHEMA (backward-compat).
-# ===========================================================================
 class TestBuildTargetKwargsToolSchema:
     def test_passed_tool_schema_lands_in_inline_payload(self):
         domain = DEMO_USE_CASES[0]
@@ -188,17 +187,12 @@ class TestBuildTargetKwargsToolSchema:
         assert inline == _DEMO_TOOL_SCHEMA
 
 
-# ===========================================================================
-# §8.3 — dry-run makes ZERO boto3 calls + the drift guard raises on a bad entry.
-# ===========================================================================
 class TestDryRunZeroBoto3:
     def test_dry_run_makes_zero_boto3_calls(self, monkeypatch, capsys):
         """--dry-run must construct NO client. Inject a tripwire boto3 that fails if
         boto3.client is ever called, run main(["--dry-run"]), assert exit 0."""
         tripwire = MagicMock(name="boto3-tripwire")
-        tripwire.client.side_effect = AssertionError(
-            "boto3.client must NOT be called on the --dry-run path"
-        )
+        tripwire.client.side_effect = AssertionError("boto3.client must NOT be called on the --dry-run path")
         monkeypatch.setitem(sys.modules, "boto3", tripwire)
 
         rc = bootstrap.main(["--dry-run"])
@@ -206,7 +200,6 @@ class TestDryRunZeroBoto3:
         assert rc == 0
         tripwire.client.assert_not_called()
         out = capsys.readouterr().out
-        # All three domains printed.
         assert "agp-contact-center-mcp" in out
         assert "agp-fnol-mcp" in out
         assert "agp-insurance-support-mcp" in out
@@ -226,7 +219,6 @@ class TestDryRunZeroBoto3:
                     "inputSchema": {"type": "object", "properties": {}},
                 }
             ],
-            # Parses fine, but never branches on "tool_without_a_branch".
             "handler_src": "def handler(event, context):\n    return {}\n",
         }
         with pytest.raises(ValueError) as exc:
@@ -254,14 +246,8 @@ class TestDryRunZeroBoto3:
         assert rc == 1
 
 
-# ===========================================================================
-# §8.4 — continue-on-error: one domain raises, others still processed, summary marks the
-#         failure, exit code non-zero.
-# ===========================================================================
 class TestContinueOnError:
-    def test_one_domain_fails_others_succeed_and_exit_nonzero(
-        self, monkeypatch, capsys, tmp_path
-    ):
+    def test_one_domain_fails_others_succeed_and_exit_nonzero(self, monkeypatch, capsys, tmp_path):
         processed = []
 
         def fake_bootstrap_one(region, tenant_id, domain):
@@ -287,9 +273,7 @@ class TestContinueOnError:
 
         rc = bootstrap.main(["--output-file", str(out_file)])
 
-        # Non-zero exit because one domain failed.
         assert rc == 1
-        # ALL domains were attempted (the loop continued past the failure).
         assert processed == ["contact-center", "fnol", "insurance-support"]
 
         out = capsys.readouterr().out
@@ -298,7 +282,6 @@ class TestContinueOnError:
         assert "OK   contact-center" in out
         assert "OK   insurance-support" in out
 
-        # The output file lists ONLY the succeeded domains (not fnol).
         body = out_file.read_text(encoding="utf-8")
         assert "agp-contact-center-mcp" in body
         assert "agp-insurance-support-mcp" in body

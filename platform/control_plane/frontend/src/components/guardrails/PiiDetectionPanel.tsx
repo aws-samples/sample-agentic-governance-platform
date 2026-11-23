@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { PiiEntityConfig, GuardrailPiiAction } from '../../types';
+import type { PiiEntityConfigOutput, PiiAction, PiiEntityType } from '../../api/client';
 
 const PII_GROUPS = {
   Financial: [
@@ -29,20 +29,20 @@ const PII_GROUPS = {
     { type: 'AWS_ACCESS_KEY', label: 'AWS Access Key' },
     { type: 'AWS_SECRET_KEY', label: 'AWS Secret Key' },
   ],
-};
+} satisfies Record<string, { type: PiiEntityType; label: string }[]>;
 
 interface Props {
-  entities: PiiEntityConfig[];
-  onChange: (entities: PiiEntityConfig[]) => void;
+  entities: PiiEntityConfigOutput[];
+  onChange: (entities: PiiEntityConfigOutput[]) => void;
 }
 
 export default function PiiDetectionPanel({ entities, onChange }: Props) {
   const [expandedGroup, setExpandedGroup] = useState<string | null>('Financial');
 
   const isSelected = (type: string) => entities.some((e) => e.type === type);
-  const getAction = (type: string): GuardrailPiiAction => entities.find((e) => e.type === type)?.action || 'ANONYMIZE';
+  const getAction = (type: string): PiiAction => entities.find((e) => e.type === type)?.action || 'ANONYMIZE';
 
-  const toggleEntity = (type: string) => {
+  const toggleEntity = (type: PiiEntityType) => {
     if (isSelected(type)) {
       onChange(entities.filter((e) => e.type !== type));
     } else {
@@ -50,12 +50,12 @@ export default function PiiDetectionPanel({ entities, onChange }: Props) {
     }
   };
 
-  const setAction = (type: string, action: GuardrailPiiAction) => {
+  const setAction = (type: PiiEntityType, action: PiiAction) => {
     onChange(entities.map((e) => (e.type === type ? { ...e, action } : e)));
   };
 
   const selectAllInGroup = (group: string) => {
-    const types = PII_GROUPS[group as keyof typeof PII_GROUPS].map((e) => e.type);
+    const types: PiiEntityType[] = PII_GROUPS[group as keyof typeof PII_GROUPS].map((e) => e.type);
     const allSelected = types.every((t) => isSelected(t));
     if (allSelected) {
       onChange(entities.filter((e) => !types.includes(e.type)));
@@ -116,7 +116,7 @@ export default function PiiDetectionPanel({ entities, onChange }: Props) {
                     {isSelected(type) && (
                       <select
                         value={getAction(type)}
-                        onChange={(e) => setAction(type, e.target.value as GuardrailPiiAction)}
+                        onChange={(e) => setAction(type, e.target.value as PiiAction)}
                         className="text-xs px-2 py-1 rounded-lg border border-slate-200 bg-white text-slate-600"
                       >
                         <option value="ANONYMIZE">Anonymize</option>

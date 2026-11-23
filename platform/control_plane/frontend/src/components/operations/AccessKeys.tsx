@@ -1,20 +1,3 @@
-// Access Keys — the model-access request wizard (Epic 18, Task 10). The
-// supporting beat that proves parity with Maria's "Lounge": request model access,
-// pick an environment, and — for Exploration — get auto-approved INSTANTLY (her
-// proudest ticket-killing win, 500→250 access tickets/month). Use-case requests
-// route to a human approver and land in a `pending` state.
-//
-// There is no backend: the whole flow is a pure local interaction. `autoApproves`
-// is the one decision — Exploration approves on the spot, Use case pends. After a
-// brief "submitting…" beat (a ref-tracked setTimeout, cleaned on unmount, exactly
-// like the Experiments provisioning timer) we reveal one of two result panels.
-//
-// The seed data + shared store are Task 3; the page frame + emerald-on-glass tokens
-// are Task 1. This file is only the React composition on top of those.
-//
-// House style: emerald-on-glass Ops tokens (opsUi.ts), inline-SVG glyphs (no icon
-// lib), Tailwind v4 utility strings, 2-space indent — matching the other Ops pages.
-
 import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react';
 
 import { ComingSoonBanner } from '../shared/comingSoon';
@@ -22,29 +5,18 @@ import OpsPage from './OpsPage';
 import { OPS_CARD, OPS_BADGE, OPS_PRIMARY_BTN } from './opsUi';
 import { MODELS, TENANTS } from './demoData';
 
-// ───────────────────────────── constants ─────────────────────────────
-
 type Environment = 'Exploration' | 'Use case';
 
-// Reuse the exact business-unit + region strings the seed tenants use, so the
-// form selects reconcile with the rest of the demo world (no invented values) —
-// same source the Experiments form draws from.
 const BUSINESS_UNITS = Array.from(new Set(TENANTS.map((t) => t.businessUnit)));
 const REGIONS = Array.from(new Set(TENANTS.map((t) => t.region)));
 
-const SUBMIT_DELAY_MS = 700; // brief "submitting…" beat before the result panel
+const SUBMIT_DELAY_MS = 700;
 
-// Masked key revealed on auto-approval — illustrative only, never a real secret.
 const MASKED_KEY = 'sk-live-7Qx9••••••••••••••••••••••••3aF2';
 
-// ───────────────────────────── pure helper ─────────────────────────────
-
-/** Exploration access is auto-approved on the spot; use-case access pends a human. */
 function autoApproves(environment: Environment): boolean {
   return environment === 'Exploration';
 }
-
-// ───────────────────────────── inline glyphs (no icon lib) ─────────────────────────────
 
 function CheckGlyph({ className }: { className?: string }): JSX.Element {
   return (
@@ -72,20 +44,14 @@ function Spinner(): JSX.Element {
   );
 }
 
-// ───────────────────────────── the page ─────────────────────────────
-
 type Result = { environment: Environment };
 
 export default function AccessKeys(): JSX.Element {
-  // --- request form -------------------------------------------------------
   const [environment, setEnvironment] = useState<Environment>('Exploration');
   const [businessUnit, setBusinessUnit] = useState(BUSINESS_UNITS[0]);
   const [region, setRegion] = useState(REGIONS[0]);
   const [models, setModels] = useState<string[]>([MODELS[0].id]);
 
-  // --- submit beat --------------------------------------------------------
-  // `submitting` drives the brief "submitting…" delay; `result` is the issued
-  // grant (null until the beat resolves). A new submit clears the prior result.
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
 
@@ -96,7 +62,6 @@ export default function AccessKeys(): JSX.Element {
       timerRef.current = null;
     }
   };
-  // Cancel any in-flight submit timer on unmount.
   useEffect(() => clearTimer, []);
 
   const toggleModel = (id: string) => {
@@ -111,9 +76,6 @@ export default function AccessKeys(): JSX.Element {
     setResult(null);
     setSubmitting(true);
 
-    // Brief "submitting…" beat, then reveal the result. The timeout callback only
-    // flips local state (no side-effects, no store writes) so it's StrictMode-safe;
-    // the ref + unmount cleanup cancel it if the page goes away mid-beat.
     clearTimer();
     timerRef.current = setTimeout(() => {
       timerRef.current = null;
@@ -132,7 +94,6 @@ export default function AccessKeys(): JSX.Element {
     >
       <ComingSoonBanner />
 
-      {/* ── Request form ────────────────────────────────────────────────── */}
       <form onSubmit={onSubmit} className={`${OPS_CARD} p-5 mb-6`}>
         <Field label="Environment" htmlFor="ak-environment">
           <div className="flex flex-wrap gap-2">
@@ -225,13 +186,10 @@ export default function AccessKeys(): JSX.Element {
         </div>
       </form>
 
-      {/* ── Result panel ────────────────────────────────────────────────── */}
       {result && (autoApproves(result.environment) ? <ApprovedPanel /> : <PendingPanel />)}
     </OpsPage>
   );
 }
-
-// ───────────────────────────── sub-components ─────────────────────────────
 
 function Field({ label, htmlFor, children }: { label: string; htmlFor: string; children: ReactNode }): JSX.Element {
   return (

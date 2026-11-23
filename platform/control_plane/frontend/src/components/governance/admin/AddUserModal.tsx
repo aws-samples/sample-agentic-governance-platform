@@ -1,19 +1,6 @@
-// AddUserModal — the "add a platform user" dialog for the Users admin tab (Epic 16).
-//
-// Shell cloned from SubscribeModal (fixed-inset backdrop bg-slate-900/30
-// backdrop-blur-sm, role="dialog" aria-modal, mountedRef unmount guard,
-// Escape-to-close, footer Cancel/Confirm, inline actionError <p role="alert">).
-// Body swapped for an Entra directory picker: a debounced search <input> (the
-// 300ms-debounce idiom mirrored from PrincipalPicker → principalsApi.search),
-// a results list of filterNewPrincipals(hits, existingIds) rows (AgentAvatar +
-// display_name + mail; click selects), and a platform-role <select> over
-// PLATFORM_ROLES (default viewer). Confirm is disabled until a principal is
-// selected; on confirm it calls onSubmit({ principalId, role }) and the parent
-// closes the modal + refetches.
-
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { principalsApi } from '../../../api/client';
-import type { PlatformRole, PrincipalHit } from '../../../api/client';
+import type { RoleChange, PrincipalHit } from '../../../api/client';
 import { AgentAvatar } from '../agentUi';
 import { PLATFORM_ROLES, ROLE_BADGE, filterNewPrincipals } from './usersAdminForm';
 
@@ -26,28 +13,20 @@ export default function AddUserModal({
   onClose,
 }: {
   existingIds: Set<string>;
-  onSubmit: (opts: { principalId: string; role: PlatformRole }) => Promise<void>;
+  onSubmit: (opts: { principalId: string; role: RoleChange['role'] }) => Promise<void>;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState('');
-  const [hits, setHits] = useState<PrincipalHit[]>([]);
-  const [searching, setSearching] = useState(false);
-  // Whether a search has completed for the current query — gates the "No matches"
-  // empty state so it doesn't flash before the first fetch (PrincipalPicker idiom).
-  const [searched, setSearched] = useState(false);
-  // Surfaces a directory-search failure (Graph 502 / throttle) so it doesn't read
-  // as "no results" — mirrors PrincipalPicker's error handling.
-  const [searchError, setSearchError] = useState<string | null>(null);
+  const [settled, setSettled] = useState<{ query: string; hits: PrincipalHit[]; error: string | null } | null>(null);
 
   const [selected, setSelected] = useState<PrincipalHit | null>(null);
-  const [role, setRole] = useState<PlatformRole>('viewer');
+  const [role, setRole] = useState<RoleChange['role']>('viewer');
 
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Unmount guard — onSubmit resolves async and can land after the modal closes.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -56,12 +35,10 @@ export default function AddUserModal({
     };
   }, []);
 
-  // Focus the search box on open.
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
-  // Close on Escape (cloned from SubscribeModal).
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -73,42 +50,20 @@ export default function AddUserModal({
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
-  // Debounced Entra directory search (mirrors PrincipalPicker's 300ms debounce).
-  // A short query (< MIN_QUERY) clears results without hitting Graph; each
-  // keystroke cancels the prior in-flight debounce. Results are filtered to
-  // exclude principals who already hold a platform role.
+  // Decision: docs/adr/frontend-loading-state.md
   useEffect(() => {
     const q = query.trim();
-    if (q.length < MIN_QUERY) {
-      setHits([]);
-      setSearched(false);
-      setSearching(false);
-      setSearchError(null);
-      return;
-    }
+    if (q.length < MIN_QUERY) return;
     let cancelled = false;
-    setSearching(true);
-    setSearchError(null);
     const t = setTimeout(() => {
       principalsApi
         .search(q)
         .then((res) => {
-          if (!cancelled) {
-            setHits(filterNewPrincipals(res, existingIds));
-            setSearchError(null);
-          }
+          if (!cancelled) setSettled({ query: q, hits: filterNewPrincipals(res, existingIds), error: null });
         })
         .catch((err: unknown) => {
           if (!cancelled) {
-            setHits([]);
-            // The axios interceptor surfaces the backend `detail` as err.message.
-            setSearchError(err instanceof Error ? err.message : 'Search failed.');
-          }
-        })
-        .finally(() => {
-          if (!cancelled) {
-            setSearching(false);
-            setSearched(true);
+            setSettled({ query: q, hits: [], error: err instanceof Error ? err.message : 'Search failed.' });
           }
         });
     }, DEBOUNCE_MS);
@@ -118,6 +73,14 @@ export default function AddUserModal({
     };
   }, [query, existingIds]);
 
+  const trimmedQuery = query.trim();
+  const searchable = trimmedQuery.length >= MIN_QUERY;
+  const current = searchable && settled?.query === trimmedQuery ? settled : null;
+  const hits = current?.hits ?? [];
+  const searched = current !== null;
+  const searching = searchable && current === null;
+  const searchError = current?.error ?? null;
+
   const canSubmit = selected !== null;
 
   const handleSubmit = useCallback(async () => {
@@ -126,7 +89,6 @@ export default function AddUserModal({
     setActionError(null);
     try {
       await onSubmit({ principalId: selected.id, role });
-      // Parent closes the modal + refetches on success; nothing to do here.
     } catch (err: unknown) {
       if (mountedRef.current) {
         setActionError(err instanceof Error ? err.message : 'Failed to add user.');
@@ -143,12 +105,10 @@ export default function AddUserModal({
       aria-modal="true"
       aria-label="Add platform user"
       onMouseDown={(e) => {
-        // Click on the backdrop (not the panel) closes — unless mid-submit.
         if (e.target === e.currentTarget && !actionPending) onClose();
       }}
     >
       <div className="w-full max-w-lg bg-white rounded-2xl border border-slate-200 shadow-xl">
-        {/* Header. */}
         <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-slate-200/60">
           <div className="min-w-0">
             <h2 className="text-sm font-semibold text-slate-900 leading-tight">Add platform user</h2>
@@ -168,9 +128,7 @@ export default function AddUserModal({
           </button>
         </div>
 
-        {/* Body. */}
         <div className="px-5 py-4 space-y-4">
-          {/* Directory search. */}
           <div>
             <label
               htmlFor="add-user-search"
@@ -185,7 +143,6 @@ export default function AddUserModal({
               value={query}
               onChange={(e) => {
                 setQuery(e.target.value);
-                // Re-opening the search clears any prior pending selection.
                 setSelected(null);
               }}
               placeholder="Search the directory by name…"
@@ -193,7 +150,6 @@ export default function AddUserModal({
               autoComplete="off"
             />
 
-            {/* Results region. */}
             <div className="mt-3">
               {searchError && (
                 <p className="text-sm text-red-600" role="alert">
@@ -243,7 +199,6 @@ export default function AddUserModal({
             </div>
           </div>
 
-          {/* Role select — assigned on confirm. */}
           <div>
             <label
               htmlFor="add-user-role"
@@ -254,7 +209,7 @@ export default function AddUserModal({
             <select
               id="add-user-role"
               value={role}
-              onChange={(e) => setRole(e.target.value as PlatformRole)}
+              onChange={(e) => setRole(e.target.value as RoleChange['role'])}
               className="w-full px-3 py-1.5 text-sm rounded-lg border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/40"
             >
               {PLATFORM_ROLES.map((r) => (
@@ -272,7 +227,6 @@ export default function AddUserModal({
           )}
         </div>
 
-        {/* Footer actions. */}
         <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200/60">
           <button
             type="button"

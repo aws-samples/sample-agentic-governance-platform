@@ -1,47 +1,15 @@
-// TemplateModals — the upload + edit dialogs for the template catalog (E28/T9b).
-//
-// Moved here VERBATIM from `TemplatesAdmin.tsx`, which is now deleted. That file was the
-// Ops Admin console's "Templates" tab body; T8 removed the console, and T9 gave templates
-// their own left-nav page, so the tab body's only remaining job was housing these two
-// dialogs. Keeping it alive just to export them would have left the catalog reachable at
-// two paths with two different chromes — the defect T9 was written to close.
-//
-// `Templates.tsx` is the sole call site. These stay in their own module rather than moving
-// into the page because they are ~410 lines of form, and a 750-line page file is how the
-// original grew a tab body it could not test.
-//
-// Mechanics preserved exactly (they were live-tested): the `mountedRef` guard so a resolved
-// promise cannot setState on an unmounted dialog, `actionPending` single-flight, `canSubmit`,
-// the inline `<p role="alert">` error, and autofocus on open. The parent closes the dialog
-// and refetches on success — these never do.
-//
-// House style: the shared `ModalShell` (ConnectionsAdmin) + opsUi tokens, Tailwind v4
-// utility strings, 2-space indent.
-
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { TemplatePatch, TemplateView } from '../../api/client';
-// Explicit `.tsx`, load-bearing: with `allowImportingTsExtensions` on a case-insensitive
-// filesystem, an extensionless `./ConnectionsAdmin` can resolve to a sibling whose name
-// differs only in casing and import as `undefined` with no error (see
-// `githubLinkApi.test.ts:18-20`).
-import { ModalShell } from './ConnectionsAdmin.tsx';
-// The chip tints come from the card grid, not a local copy: these dialogs EDIT the very
-// chips the cards render, so a second `TAG_PILL` would let the editor and the card disagree.
-import { SERVICE_CHIP, TAG_PILL } from './TemplateCardGrid.tsx';
+import { ModalShell } from './ModalShell';
+import { SERVICE_CHIP, TAG_PILL } from './templateCardStyles.ts';
 
-// Templates are Strands agent scaffolds; the framework is fixed at upload time.
 const FRAMEWORK_DEFAULT = 'strands';
 
 const FIELD_LABEL = 'block text-[11px] uppercase tracking-wide text-slate-400 font-medium mb-1';
 const FIELD_INPUT =
   'w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/40';
 
-// --- Chip input -------------------------------------------------------------
-// A controlled string[] editor: type a value and press Enter or comma to commit
-// it as a removable chip; Backspace on an empty field removes the last chip.
-// Used for both aws_services and tags — the client encodes them (repeated form
-// fields on upload, JSON arrays on patch), so this only produces string[].
 function ChipInput({
   id,
   values,
@@ -63,7 +31,6 @@ function ChipInput({
     (raw: string) => {
       const token = raw.trim();
       if (!token) return;
-      // Dedupe case-insensitively; keep the first-seen casing.
       if (!values.some((v) => v.toLowerCase() === token.toLowerCase())) {
         onChange([...values, token]);
       }
@@ -123,12 +90,6 @@ function ChipInput({
   );
 }
 
-// --- Upload-template modal --------------------------------------------------
-// Collects the `.zip` + name + description + (read-only) framework + aws_services
-// + tags, then POSTs via githubTemplatesApi.upload. Mirrors AddConnectionModal
-// mechanics (mountedRef guard, actionPending, canSubmit, inline <p role="alert">).
-// Exported for the standalone Templates page (E28/T9) — one upload dialog, both call
-// sites. Unchanged otherwise.
 export function UploadTemplateModal({
   orgLabel,
   onSubmit,
@@ -178,7 +139,6 @@ export function UploadTemplateModal({
         aws_services: awsServices,
         tags,
       });
-      // Parent closes the modal + refetches on success.
     } catch (err: unknown) {
       if (mountedRef.current) {
         setActionError(err instanceof Error ? err.message : 'Upload failed.');
@@ -316,11 +276,6 @@ export function UploadTemplateModal({
   );
 }
 
-// --- Edit-template modal ----------------------------------------------------
-// Edits the mutable display metadata (description / aws_services / tags) via
-// githubTemplatesApi.patch. The name and framework are fixed at upload time, so
-// they're shown read-only. Same mechanics as UploadTemplateModal.
-// Exported for the standalone Templates page (E28/T9) — one edit dialog, both call sites.
 export function EditTemplateModal({
   template,
   onSubmit,
@@ -361,7 +316,6 @@ export function EditTemplateModal({
         aws_services: awsServices,
         tags,
       });
-      // Parent closes the modal + refetches on success.
     } catch (err: unknown) {
       if (mountedRef.current) {
         setActionError(err instanceof Error ? err.message : 'Failed to save template.');

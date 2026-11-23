@@ -1,4 +1,4 @@
-"""Route tests for the E26 observability read surface (contract C4, Task 6).
+"""Route tests for the observability read surface.
 
 Covers the tenant-scoped, VIEWER-GET observability routes:
   - ``GET /observability/settings`` (config echo — configured = bool(LANGFUSE_HOST)),
@@ -9,55 +9,26 @@ Covers the tenant-scoped, VIEWER-GET observability routes:
 Mirrors ``test_registry_tenant_scoping.py``'s harness: a minimal FastAPI app with ONLY
 the router under test, the REAL ``require_role`` + ``current_principal`` path against a
 mocked ``verify_entra_token``, a mocked ``AgentRegistryService`` (no AWS), a seeded
-tenant-resolver stub, and a MOCKED T5 metrics service (no live Langfuse). The 404 for a
+tenant-resolver stub, and a MOCKED metrics service (no live Langfuse). The 404 for a
 foreign/unknown agent must be BYTE-IDENTICAL to the truly-missing 404.
 """
 
 from datetime import date, datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-
-@pytest.fixture(autouse=True)
-def reset_modules():
-    """Drop cached auth/config/route modules so monkeypatched env is honored."""
-    import sys
-
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.agents",
-        "api.routes.observability",
-        "api.routes.users",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("DEBUG", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
-
-
-# --- fixtures ------------------------------------------------------------------
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
 
 def _make_agent(**overrides):
     from models.agent import Agent, LifecycleState, Origin
 
     now = datetime.now(timezone.utc)
-    base = dict(
+    base: dict[str, Any] = dict(
         id="rec-123",
         name="claims-triage-de",
         purpose="Triage claims",
@@ -73,7 +44,7 @@ def _make_agent(**overrides):
 
 
 def _metrics(traces=0, cost=0.0, tokens=0):
-    """Build a real AgentMetrics (the T5 DTO) for the mocked service to return."""
+    """Build a real AgentMetrics for the mocked service to return."""
     from services.langfuse_metrics_service import AgentMetrics, MetricTotals
 
     return AgentMetrics(
@@ -140,9 +111,11 @@ def _seed_resolver(ctx):
 
 
 def _build_observability_client(mock_svc, ctx, mock_metrics=None):
-    """Minimal app with ONLY the observability router + mocked registry/metrics/resolver."""
+    """Minimal app with ONLY the observability router, the ``AppError`` handler and mocked
+    registry/metrics/resolver."""
     import api.routes.agents as agents_module
     import api.routes.observability as obs_module
+    from core.errors import install_error_handlers
 
     agents_module._svc = mock_svc
     if mock_metrics is not None:
@@ -150,14 +123,17 @@ def _build_observability_client(mock_svc, ctx, mock_metrics=None):
     _seed_resolver(ctx)
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(obs_module.router, prefix="/api/v1")
     return TestClient(app), obs_module
 
 
 def _build_agents_client(mock_svc, ctx, mock_metrics=None):
-    """Minimal app with ONLY the agents router (for the per-agent metrics/traces routes)."""
+    """Minimal app with ONLY the agents router (for the per-agent metrics/traces routes) and the
+    ``AppError`` handler."""
     import api.routes.agents as agents_module
     import api.routes.observability as obs_module
+    from core.errors import install_error_handlers
 
     agents_module._svc = mock_svc
     if mock_metrics is not None:
@@ -165,6 +141,7 @@ def _build_agents_client(mock_svc, ctx, mock_metrics=None):
     _seed_resolver(ctx)
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(agents_module.router, prefix="/api/v1")
     return TestClient(app), agents_module
 
@@ -185,10 +162,6 @@ def _claims_for(role: str):
 def _headers():
     return {"Authorization": "Bearer fake-token"}
 
-
-# ===========================================================================
-# 1. /observability/settings — configured echo
-# ===========================================================================
 
 def test_settings_reports_configured(entra_settings, monkeypatch):
     monkeypatch.setenv("LANGFUSE_HOST", "https://langfuse.example.com")
@@ -215,10 +188,6 @@ def test_settings_reports_unconfigured(entra_settings, monkeypatch):
     assert resp.json() == {"langfuse_host": None, "configured": False}
 
 
-# ===========================================================================
-# 2. Per-agent metrics — foreign tenant 404 byte-identical to truly-missing
-# ===========================================================================
-
 def test_agent_metrics_foreign_tenant_404(entra_settings):
     mock_svc = MagicMock()
     mock_svc.get.side_effect = lambda agent_id: (
@@ -226,9 +195,7 @@ def test_agent_metrics_foreign_tenant_404(entra_settings):
     )
     mock_metrics = MagicMock()
     mock_metrics.get_agent_metrics = AsyncMock(return_value=_metrics())
-    client, _ = _build_agents_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-    )
+    client, _ = _build_agents_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         foreign_resp = client.get("/api/v1/agents/foreign/metrics", headers=_headers())
@@ -243,20 +210,12 @@ def test_agent_metrics_foreign_tenant_404(entra_settings):
     mock_metrics.get_agent_metrics.assert_not_called()
 
 
-# ===========================================================================
-# 3. Per-agent metrics — visible agent returns AgentMetrics
-# ===========================================================================
-
 def test_agent_metrics_ok(entra_settings):
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent(id="own", tenant_id="ten-1")
     mock_metrics = MagicMock()
-    mock_metrics.get_agent_metrics = AsyncMock(
-        return_value=_metrics(traces=7, cost=1.25, tokens=900)
-    )
-    client, _ = _build_agents_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-    )
+    mock_metrics.get_agent_metrics = AsyncMock(return_value=_metrics(traces=7, cost=1.25, tokens=900))
+    client, _ = _build_agents_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
         resp = client.get(
@@ -268,39 +227,43 @@ def test_agent_metrics_ok(entra_settings):
     body = resp.json()
     assert body["totals"] == {"traces": 7, "cost_usd": 1.25, "tokens": 900}
     assert body["daily"] == [] and body["by_model"] == []
-    # The route passed the resolved agent + parsed dates to the T5 service.
+    # The route passed the resolved agent + parsed dates to the metrics service.
     called_agent, d_from, d_to = mock_metrics.get_agent_metrics.call_args[0]
     assert called_agent.id == "own"
     assert d_from == date(2026, 7, 9) and d_to == date(2026, 7, 16)
 
 
 def test_agent_traces_ok(entra_settings):
+    from services.langfuse_metrics_service import TraceRow
+
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent(id="own", tenant_id="ten-1")
     mock_metrics = MagicMock()
-    mock_metrics.get_agent_traces = AsyncMock(
-        return_value={"data": [{"id": "t1", "cost_usd": 0.0}], "total": 1}
-    )
-    client, _ = _build_agents_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-    )
+    mock_metrics.get_agent_traces = AsyncMock(return_value={"data": [TraceRow(id="t1")], "total": 1})
+    client, _ = _build_agents_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        resp = client.get(
-            "/api/v1/agents/own/traces?page=2&limit=10", headers=_headers()
-        )
+        resp = client.get("/api/v1/agents/own/traces?page=2&limit=10", headers=_headers())
 
     assert resp.status_code == 200
-    assert resp.json() == {"data": [{"id": "t1", "cost_usd": 0.0}], "total": 1}
+    assert resp.json() == {
+        "data": [
+            {
+                "id": "t1",
+                "timestamp": None,
+                "name": None,
+                "user_id": None,
+                "latency_ms": None,
+                "cost_usd": 0.0,
+            }
+        ],
+        "total": 1,
+    }
     _, kwargs = mock_metrics.get_agent_traces.call_args
     called_agent = mock_metrics.get_agent_traces.call_args[0][0]
     assert called_agent.id == "own"
     assert kwargs.get("page") == 2 and kwargs.get("limit") == 10
 
-
-# ===========================================================================
-# 4. Scope metrics — scope=tenant lists totals + by_agent[] for visible agents
-# ===========================================================================
 
 def test_scope_metrics_tenant_lists_by_agent(entra_settings):
     mock_svc = MagicMock()
@@ -309,20 +272,12 @@ def test_scope_metrics_tenant_lists_by_agent(entra_settings):
         _make_agent(id="foreign", name="foreign-agent", tenant_id="ten-2"),
     ]
     mock_metrics = MagicMock()
-    mock_metrics.get_scope_metrics = AsyncMock(
-        return_value=_metrics(traces=5, cost=2.0, tokens=500)
-    )
-    mock_metrics.get_agent_metrics = AsyncMock(
-        return_value=_metrics(traces=5, cost=2.0, tokens=500)
-    )
-    client, _ = _build_observability_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-    )
+    mock_metrics.get_scope_metrics = AsyncMock(return_value=_metrics(traces=5, cost=2.0, tokens=500))
+    mock_metrics.get_agent_metrics = AsyncMock(return_value=_metrics(traces=5, cost=2.0, tokens=500))
+    client, _ = _build_observability_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        resp = client.get(
-            "/api/v1/observability/metrics?scope=tenant", headers=_headers()
-        )
+        resp = client.get("/api/v1/observability/metrics?scope=tenant", headers=_headers())
 
     assert resp.status_code == 200
     body = resp.json()
@@ -339,10 +294,6 @@ def test_scope_metrics_tenant_lists_by_agent(entra_settings):
     assert [a.id for a in scope_agents] == ["own"]
 
 
-# ===========================================================================
-# 4b. Scope=project — visibility-gated project read + foreign/missing collapse
-# ===========================================================================
-
 def test_scope_project_filters_foreign(entra_settings):
     """scope=project with a project in the caller's tenant returns ONLY the caller's
     visible agents in that project; a project in ANOTHER tenant (or nonexistent) yields
@@ -354,15 +305,9 @@ def test_scope_project_filters_foreign(entra_settings):
         _make_agent(id="foreign", name="foreign-agent", tenant_id="ten-2"),
     ]
     mock_metrics = MagicMock()
-    mock_metrics.get_scope_metrics = AsyncMock(
-        return_value=_metrics(traces=3, cost=1.0, tokens=300)
-    )
-    mock_metrics.get_agent_metrics = AsyncMock(
-        return_value=_metrics(traces=3, cost=1.0, tokens=300)
-    )
-    client, _ = _build_observability_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-    )
+    mock_metrics.get_scope_metrics = AsyncMock(return_value=_metrics(traces=3, cost=1.0, tokens=300))
+    mock_metrics.get_agent_metrics = AsyncMock(return_value=_metrics(traces=3, cost=1.0, tokens=300))
+    client, _ = _build_observability_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
 
     import api.routes.projects as projects_module
 
@@ -425,28 +370,39 @@ def test_scope_project_filters_foreign(entra_settings):
 
 
 def test_scope_project_missing_project_id_400(entra_settings):
-    """scope=project with NO project_id → 400 (locks the current guard)."""
     mock_svc = MagicMock()
     mock_svc.list.return_value = [_make_agent(id="own", tenant_id="ten-1")]
     mock_metrics = MagicMock()
     mock_metrics.get_scope_metrics = AsyncMock(return_value=_metrics())
     mock_metrics.get_agent_metrics = AsyncMock(return_value=_metrics())
-    client, _ = _build_observability_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-    )
+    client, _ = _build_observability_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        resp = client.get(
-            "/api/v1/observability/metrics?scope=project", headers=_headers()
-        )
+        resp = client.get("/api/v1/observability/metrics?scope=project", headers=_headers())
 
     assert resp.status_code == 400
-    assert resp.json()["detail"] == "project_id is required for scope=project"
+    assert resp.json() == {
+        "detail": "project_id is required for scope=project",
+        "code": "observability.project_required",
+    }
 
 
-# ===========================================================================
-# 4c. Scope=platform — non-admin restricted to own tenant; admin sees all
-# ===========================================================================
+def test_an_unknown_scope_is_fastapi_422(entra_settings):
+    mock_svc = MagicMock()
+    mock_metrics = MagicMock()
+    mock_metrics.get_scope_metrics = AsyncMock(return_value=_metrics())
+    client, _ = _build_observability_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        resp = client.get("/api/v1/observability/metrics?scope=galaxy", headers=_headers())
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert "code" not in body
+    assert [error["loc"] for error in body["detail"]] == [["query", "scope"]]
+    mock_svc.list.assert_not_called()
+    mock_metrics.get_scope_metrics.assert_not_called()
+
 
 def test_scope_platform_non_admin_restricted_to_tenant(entra_settings):
     """A NON-admin caller with scope=platform sees ONLY their tenant's agents in totals
@@ -458,21 +414,13 @@ def test_scope_platform_non_admin_restricted_to_tenant(entra_settings):
     mock_svc = MagicMock()
     mock_svc.list.return_value = agents
     mock_metrics = MagicMock()
-    mock_metrics.get_scope_metrics = AsyncMock(
-        return_value=_metrics(traces=9, cost=4.0, tokens=900)
-    )
-    mock_metrics.get_agent_metrics = AsyncMock(
-        return_value=_metrics(traces=9, cost=4.0, tokens=900)
-    )
+    mock_metrics.get_scope_metrics = AsyncMock(return_value=_metrics(traces=9, cost=4.0, tokens=900))
+    mock_metrics.get_agent_metrics = AsyncMock(return_value=_metrics(traces=9, cost=4.0, tokens=900))
 
     # Non-admin scoped to ten-1 — scope=platform must NOT leak the ten-2 agent.
-    client, _ = _build_observability_client(
-        mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-    )
+    client, _ = _build_observability_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        resp = client.get(
-            "/api/v1/observability/metrics?scope=platform", headers=_headers()
-        )
+        resp = client.get("/api/v1/observability/metrics?scope=platform", headers=_headers())
 
     assert resp.status_code == 200
     body = resp.json()
@@ -481,13 +429,9 @@ def test_scope_platform_non_admin_restricted_to_tenant(entra_settings):
     assert [a.id for a in scope_agents] == ["own"]
 
     # Global admin — scope=platform sees EVERY tenant's agents.
-    admin_client, _ = _build_observability_client(
-        mock_svc, _context(is_global=True), mock_metrics
-    )
+    admin_client, _ = _build_observability_client(mock_svc, _context(is_global=True), mock_metrics)
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
-        admin_resp = admin_client.get(
-            "/api/v1/observability/metrics?scope=platform", headers=_headers()
-        )
+        admin_resp = admin_client.get("/api/v1/observability/metrics?scope=platform", headers=_headers())
 
     assert admin_resp.status_code == 200
     admin_body = admin_resp.json()
@@ -495,10 +439,6 @@ def test_scope_platform_non_admin_restricted_to_tenant(entra_settings):
     admin_scope_agents = mock_metrics.get_scope_metrics.call_args[0][0]
     assert sorted(a.id for a in admin_scope_agents) == ["foreign", "own"]
 
-
-# ===========================================================================
-# 5. VIEWER is allowed on these GETs (not OPERATOR-gated)
-# ===========================================================================
 
 def test_viewer_can_get(entra_settings, monkeypatch):
     monkeypatch.setenv("LANGFUSE_HOST", "https://langfuse.example.com")
@@ -510,23 +450,103 @@ def test_viewer_can_get(entra_settings, monkeypatch):
     mock_metrics.get_scope_metrics = AsyncMock(return_value=_metrics(traces=1))
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
-        obs_client, _ = _build_observability_client(
-            mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-        )
-        settings_resp = obs_client.get(
-            "/api/v1/observability/settings", headers=_headers()
-        )
-        scope_resp = obs_client.get(
-            "/api/v1/observability/metrics?scope=tenant", headers=_headers()
-        )
+        obs_client, _ = _build_observability_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
+        settings_resp = obs_client.get("/api/v1/observability/settings", headers=_headers())
+        scope_resp = obs_client.get("/api/v1/observability/metrics?scope=tenant", headers=_headers())
 
-        agents_client, _ = _build_agents_client(
-            mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics
-        )
-        agent_metrics_resp = agents_client.get(
-            "/api/v1/agents/own/metrics", headers=_headers()
-        )
+        agents_client, _ = _build_agents_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
+        agent_metrics_resp = agents_client.get("/api/v1/agents/own/metrics", headers=_headers())
 
     assert settings_resp.status_code == 200
     assert scope_resp.status_code == 200
     assert agent_metrics_resp.status_code == 200
+
+
+def test_settings_body_is_the_recorded_shape(entra_settings, monkeypatch):
+    monkeypatch.setenv("LANGFUSE_HOST", "https://langfuse.example.com")
+    client, _ = _build_observability_client(MagicMock(), _context(tenant_ids=["ten-1"]))
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        body = client.get("/api/v1/observability/settings", headers=_headers()).json()
+
+    assert body == {"langfuse_host": "https://langfuse.example.com", "configured": True}
+
+
+def _scope_metrics_body(entra_settings):
+    mock_svc = MagicMock()
+    mock_svc.list.return_value = [_make_agent(id="own", name="own-agent", tenant_id="ten-1")]
+    mock_metrics = MagicMock()
+    mock_metrics.get_scope_metrics = AsyncMock(return_value=_metrics(traces=5, cost=2.0, tokens=500))
+    mock_metrics.get_agent_metrics = AsyncMock(return_value=_metrics(traces=5, cost=2.0, tokens=500))
+    client, _ = _build_observability_client(mock_svc, _context(tenant_ids=["ten-1"]), mock_metrics)
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        return client.get("/api/v1/observability/metrics?scope=tenant", headers=_headers()).json()
+
+
+RECORDED_SCOPE_METRICS_BODY = {
+    "totals": {"traces": 5, "cost_usd": 2.0, "tokens": 500},
+    "daily": [],
+    "by_model": [],
+    "by_user": [],
+    "by_agent": [
+        {
+            "agent_id": "own",
+            "agent_name": "own-agent",
+            "tenant_id": "ten-1",
+            "totals": {"traces": 5, "cost_usd": 2.0, "tokens": 500},
+        }
+    ],
+}
+
+
+def test_scope_metrics_body_is_the_recorded_shape(entra_settings):
+    assert _scope_metrics_body(entra_settings) == RECORDED_SCOPE_METRICS_BODY
+
+
+def _declared_response_model(router, path: str):
+    (route,) = [r for r in router.routes if getattr(r, "path", None) == path]
+    return route.response_model
+
+
+def test_settings_validates_through_its_model(entra_settings, monkeypatch):
+    from models.observability import ObservabilitySettings
+
+    monkeypatch.setenv("LANGFUSE_HOST", "https://langfuse.example.com")
+    client, obs_module = _build_observability_client(MagicMock(), _context(tenant_ids=["ten-1"]))
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        body = client.get("/api/v1/observability/settings", headers=_headers()).json()
+
+    assert _declared_response_model(obs_module.router, "/observability/settings") is ObservabilitySettings
+    assert ObservabilitySettings.model_validate(body).model_dump() == body
+    assert set(ObservabilitySettings.model_fields) == {"langfuse_host", "configured"}
+
+
+def test_settings_unconfigured_validates_through_its_model(entra_settings, monkeypatch):
+    from models.observability import ObservabilitySettings
+
+    monkeypatch.delenv("LANGFUSE_HOST", raising=False)
+    client, _ = _build_observability_client(MagicMock(), _context(tenant_ids=["ten-1"]))
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        body = client.get("/api/v1/observability/settings", headers=_headers()).json()
+
+    assert body == {"langfuse_host": None, "configured": False}
+    assert ObservabilitySettings.model_validate(body).model_dump() == body
+
+
+def test_scope_metrics_validates_through_its_model(entra_settings):
+    from services.langfuse_metrics_service import AgentMetrics, AgentScopeRow, MetricTotals, ScopeMetrics
+
+    body = _scope_metrics_body(entra_settings)
+
+    import api.routes.observability as obs_module
+
+    assert _declared_response_model(obs_module.router, "/observability/metrics") is ScopeMetrics
+    assert body == RECORDED_SCOPE_METRICS_BODY
+    assert ScopeMetrics.model_validate(body).model_dump() == body
+    assert issubclass(ScopeMetrics, AgentMetrics)
+    assert set(ScopeMetrics.model_fields) == set(AgentMetrics.model_fields) | {"by_agent"}
+    assert set(AgentScopeRow.model_fields) == {"agent_id", "agent_name", "tenant_id", "totals"}
+    assert AgentScopeRow.model_fields["totals"].annotation is MetricTotals

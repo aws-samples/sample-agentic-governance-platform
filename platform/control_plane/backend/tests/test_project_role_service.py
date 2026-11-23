@@ -1,11 +1,16 @@
-# tests/test_project_role_service.py — table_name="" (local fallback), injected clock. No moto.
+"""ProjectRoleService over the state store's memory double with an injected clock; the fault paths
+inject a raising table through the store. No moto, no live AWS."""
+
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 from botocore.exceptions import ClientError
+from seed import seed
 
+from core.state_store import StateStore
 from models.project_role import ProjectRole, ProjectRoleCreate, role_name
 from services.project_role_service import ProjectRoleError, ProjectRoleService
 
@@ -13,16 +18,41 @@ FIXED_TS = "2026-07-27T00:00:00+00:00"
 
 
 def _svc() -> ProjectRoleService:
-    return ProjectRoleService(table_name="", now=lambda: __import__("datetime").datetime.fromisoformat(FIXED_TS))
+    return ProjectRoleService(table_name="", now=lambda: datetime.fromisoformat(FIXED_TS))
 
 
 def _create(principal_id: str = "oid-1", role: str = "owner", ptype: str = "user") -> ProjectRoleCreate:
-    return ProjectRoleCreate(principal_id=principal_id, principal_type=ptype, principal_display="Alex", role=role)
+    return ProjectRoleCreate(
+        principal_id=principal_id, principal_type=ptype, principal_display="Alex", role=role
+    )
 
 
 def test_role_ordering_is_meaningful():
     assert ProjectRole.OWNER > ProjectRole.MAINTAINER > ProjectRole.VIEWER
     assert role_name(ProjectRole.OWNER) == "owner"
+
+
+@pytest.mark.parametrize(
+    "kind,status,detail",
+    [
+        ("not_found", 404, "project role not found"),
+        ("validation", 400, "invalid project role"),
+        ("last_owner", 409, "project must keep at least one owner"),
+        ("ownership_unverified", 503, "could not verify project ownership"),
+        ("changed", 409, "Project role changed while this request ran; reload and retry"),
+    ],
+)
+def test_each_kind_renders_its_fixed_detail_and_keeps_the_message_for_the_log(kind, status, detail):
+    err = ProjectRoleError("arn:aws:dynamodb:secret-table", kind)
+
+    assert (err.status_code, err.detail, err.code) == (status, detail, f"project_role.{kind}")
+    assert err.body() == {"detail": detail, "code": f"project_role.{kind}"}
+    assert err.message == "arn:aws:dynamodb:secret-table" and err.kind == kind
+
+
+def test_an_unknown_kind_is_refused_at_construction():
+    with pytest.raises(TypeError, match="unknown kind 'nope'"):
+        ProjectRoleError("boom", "nope")
 
 
 def test_grant_then_list_for_project():
@@ -81,7 +111,7 @@ def test_revoking_last_owner_is_blocked():
     with pytest.raises(ProjectRoleError) as ei:
         svc.revoke("proj-1", "oid-1")
     assert ei.value.kind == "last_owner"
-    assert svc.owner_count("proj-1") == 1  # nothing persisted on failure
+    assert svc.owner_count("proj-1") == 1
 
 
 def test_revoking_a_non_last_owner_is_allowed():
@@ -92,24 +122,16 @@ def test_revoking_a_non_last_owner_is_allowed():
     assert svc.owner_count("proj-1") == 1
 
 
-# --------------------------------------------------------------------------- #
-# the last-owner guard covers the UPSERT verb too — a downgrade of the only owner
-# is the same zero-owner lockout as revoking them, reachable via PUT instead of
-# DELETE. Only an owner→lesser change on the LAST owner may be refused.
-# --------------------------------------------------------------------------- #
-
-
 def test_downgrading_the_only_owner_is_blocked():
+    """The upsert verb can strand a project with zero owners exactly like a revoke can, so the guard
+    covers it and persists nothing on the refused path."""
     svc = _svc()
     svc.grant("proj-1", _create("oid-1", role="owner"), granted_by="a")
     with pytest.raises(ProjectRoleError) as ei:
         svc.grant("proj-1", _create("oid-1", role="viewer"), granted_by="a")
     assert ei.value.kind == "last_owner"
-    # nothing persisted on the blocked path — the owner still holds the role
     assert svc.owner_count("proj-1") == 1
-    assert [(r.principal_id, r.role) for r in svc.list_for_project("proj-1")] == [
-        ("oid-1", "owner")
-    ]
+    assert [(r.principal_id, r.role) for r in svc.list_for_project("proj-1")] == [("oid-1", "owner")]
 
 
 def test_downgrading_one_of_two_owners_is_allowed():
@@ -121,8 +143,8 @@ def test_downgrading_one_of_two_owners_is_allowed():
 
 
 def test_re_granting_the_only_owner_as_owner_is_allowed():
-    """An idempotent re-grant never lowers the owner count, so the guard must not fire —
-    otherwise the sole owner could not even refresh their own display name."""
+    """An idempotent re-grant never lowers the owner count, so the guard must not fire; otherwise the
+    sole owner could not even refresh their own display name."""
     svc = _svc()
     svc.grant("proj-1", _create("oid-1", role="owner"), granted_by="a")
     rec = svc.grant("proj-1", _create("oid-1", role="owner"), granted_by="b")
@@ -131,8 +153,8 @@ def test_re_granting_the_only_owner_as_owner_is_allowed():
 
 
 def test_granting_a_new_non_owner_beside_an_owner_is_allowed():
-    """The guard keys on the EXISTING row's role, not the incoming one — a brand-new
-    viewer/maintainer leaves the owner count untouched."""
+    """The guard keys on the existing row's role, not the incoming one: a brand-new viewer or
+    maintainer leaves the owner count untouched."""
     svc = _svc()
     svc.grant("proj-1", _create("oid-1", role="owner"), granted_by="a")
     svc.grant("proj-1", _create("oid-2", role="viewer"), granted_by="a")
@@ -143,8 +165,8 @@ def test_granting_a_new_non_owner_beside_an_owner_is_allowed():
 
 @pytest.mark.parametrize("role", ["viewer", "maintainer", "owner"])
 def test_the_first_grant_on_an_empty_project_is_always_allowed(role):
-    """Zero owners is the SEED state, not a lockout — refusing here would make a fresh
-    project impossible to govern at all."""
+    """Zero owners is the seed state, not a lockout; refusing here would make a fresh project
+    impossible to govern at all."""
     svc = _svc()
     rec = svc.grant("proj-new", _create("oid-1", role=role), granted_by="a")
     assert rec.role == role
@@ -155,13 +177,6 @@ def test_revoke_unknown_principal_is_not_found():
     with pytest.raises(ProjectRoleError) as ei:
         svc.revoke("proj-1", "ghost")
     assert ei.value.kind == "not_found"
-
-
-# --------------------------------------------------------------------------- #
-# composite-key injectivity — a '#' in either key half would alias two grants
-# onto ONE sk (("a","b#c") and ("a#b","c") both encode to "a#b#c"), silently
-# overwriting a grant. Rejected at every entry point that takes the ids.
-# --------------------------------------------------------------------------- #
 
 
 def test_separator_in_principal_id_rejected():
@@ -179,8 +194,8 @@ def test_separator_in_project_id_rejected():
 
 
 def test_aliasing_grants_cannot_collide():
-    """The pair that used to collapse onto "a#b#c": the second grant overwrote the first,
-    list_all() returned 1 row, and the survivor reported project_id="a#b"."""
+    """``("a", "b#c")`` and ``("a#b", "c")`` both encode to the sort key ``a#b#c``; without the
+    separator check the second grant overwrote the first and the survivor read back the wrong project."""
     svc = _svc()
     for project_id, principal_id in (("a", "b#c"), ("a#b", "c")):
         with pytest.raises(ProjectRoleError):
@@ -204,156 +219,102 @@ def test_every_entry_point_rejects_the_separator(call):
     assert ei.value.kind == "validation"
 
 
-# --------------------------------------------------------------------------- #
-# DDB mode — the composite-sk begins_with range read, _to_item/_from_item, and
-# the read-degrades / write-propagates split. Fake table, no moto, no live AWS
-# (mirrors test_project_service.py's _FakeTable idiom).
-# --------------------------------------------------------------------------- #
+def test_an_empty_table_name_selects_the_in_memory_store():
+    assert _svc()._store.in_memory is True
 
 
-class _FakeTable:
-    """A minimal DDB Table double keyed on ("pk","sk"). ``query`` interprets the REAL
-    boto3 condition the service builds — ``Key("pk").eq(...)`` alone, or ANDed with
-    ``Key("sk").begins_with(...)`` — so prefix semantics are exercised, not simulated."""
-
-    def __init__(self, items=None):
-        self.items = list(items or [])
-        self.queries = []  # every KeyConditionExpression the service issued
-
-    # -- boto3 surface ------------------------------------------------------
-    def query(self, **kwargs):
-        expr = kwargs["KeyConditionExpression"]
-        self.queries.append(expr)
-        pk, prefix = _condition_parts(expr)
-        rows = [i for i in self.items if i.get("pk") == pk]
-        if prefix is not None:
-            rows = [i for i in rows if str(i.get("sk", "")).startswith(prefix)]
-        return {"Items": rows}
-
-    def get_item(self, Key):  # noqa: N803 — boto3 param name
-        for i in self.items:
-            if i.get("pk") == Key["pk"] and i.get("sk") == Key["sk"]:
-                return {"Item": i}
-        return {}
-
-    def put_item(self, Item):  # noqa: N803 — boto3 param name
-        self.items = [
-            i
-            for i in self.items
-            if not (i.get("pk") == Item["pk"] and i.get("sk") == Item["sk"])
-        ]
-        self.items.append(dict(Item))
-
-    def delete_item(self, Key):  # noqa: N803 — boto3 param name
-        self.items = [
-            i
-            for i in self.items
-            if not (i.get("pk") == Key["pk"] and i.get("sk") == Key["sk"])
-        ]
-
-
-def _condition_parts(expr):
-    """Unpack the service's KeyConditionExpression → (pk value, sk prefix or None)."""
-    if expr.expression_operator == "AND":
-        pk_cond, sk_cond = expr._values
-        assert sk_cond.expression_operator == "begins_with"
-        return pk_cond._values[1], sk_cond._values[1]
-    return expr._values[1], None
-
-
-def _ddb_svc(items=None):
-    """Flip a service into DDB mode with a fake table (non-empty table_name + swapped table)."""
+def _svc_over(table: MagicMock) -> ProjectRoleService:
     svc = _svc()
-    svc.table_name = "projects"
-    svc._table = _FakeTable(items)
-    assert svc._has_ddb is True
+    svc._store = StateStore("projects", table=table)
+    assert svc._store.in_memory is False
     return svc
 
 
-def test_ddb_grant_stores_partition_and_composite_sk():
-    svc = _ddb_svc()
+def _unreadable_table() -> MagicMock:
+    table = MagicMock()
+    table.query.side_effect = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException"}}, "Query"
+    )
+    return table
+
+
+def _rows(svc: ProjectRoleService) -> list[dict]:
+    return svc._store.query("project_role")
+
+
+def test_grant_stores_partition_and_composite_sk():
+    svc = _svc()
     svc.grant("proj-1", _create("oid-1"), granted_by="admin-oid")
-    keys = [(i["pk"], i["sk"]) for i in svc._table.items]
-    assert keys == [("project_role", "proj-1#oid-1")]
+    assert [(i["pk"], i["sk"]) for i in _rows(svc)] == [("project_role", "proj-1#oid-1")]
 
 
-def test_ddb_item_round_trips_through_to_item_and_from_item():
-    svc = _ddb_svc()
+def test_item_round_trips_through_to_item_and_from_item():
+    """``pk`` and ``sk`` are key plumbing and never reach the model."""
+    svc = _svc()
     rec = svc.grant("proj-1", _create("oid-1", role="maintainer"), granted_by="admin-oid")
 
-    item = svc._table.items[0]
+    item = _rows(svc)[0]
     assert svc._from_item(item) == rec
-    # pk/sk are key-only plumbing — they never leak into the model.
     dumped = svc._from_item(item).model_dump()
     assert "pk" not in dumped and "sk" not in dumped
     assert set(dumped) == set(rec.model_dump())
 
 
-def test_ddb_list_for_project_issues_a_begins_with_range_read():
-    svc = _ddb_svc()
-    svc.grant("proj-1", _create("oid-1"), granted_by="a")
-    svc._table.queries.clear()
+def test_list_for_project_issues_a_begins_with_range_read():
+    table = MagicMock()
+    table.query.return_value = {"Items": []}
+    svc = _svc_over(table)
 
     svc.list_for_project("proj-1")
 
-    pk, prefix = _condition_parts(svc._table.queries[-1])
-    assert pk == "project_role"
-    assert prefix == "proj-1#"  # the separator is PART of the prefix — see next test
+    condition = table.query.call_args.kwargs["KeyConditionExpression"].get_expression()
+    assert condition["operator"] == "AND"
+    pk_cond, sk_cond = (part.get_expression() for part in condition["values"])
+    assert (pk_cond["operator"], pk_cond["values"][1]) == ("=", "project_role")
+    assert (sk_cond["operator"], sk_cond["values"][1]) == ("begins_with", "proj-1#")
 
 
-def test_ddb_list_for_project_does_not_bleed_across_a_prefix():
-    svc = _ddb_svc()
+def test_list_for_project_does_not_bleed_across_a_prefix():
+    """The separator is part of the prefix, so ``proj-1`` never reads ``proj-1-extra``'s rows."""
+    svc = _svc()
     svc.grant("proj-1", _create("oid-1"), granted_by="a")
     svc.grant("proj-1-extra", _create("oid-2"), granted_by="a")
 
     assert [r.principal_id for r in svc.list_for_project("proj-1")] == ["oid-1"]
     assert [r.principal_id for r in svc.list_for_project("proj-1-extra")] == ["oid-2"]
-    assert len(svc.list_all()) == 2  # list_all keeps the bare-pk whole-partition query
+    assert len(svc.list_all()) == 2
 
 
-def test_ddb_reads_degrade_on_client_error():
-    svc = _ddb_svc()
-    boom = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "Query")
-    svc._table = MagicMock()
-    svc._table.query.side_effect = boom
-    svc._table.get_item.side_effect = boom
+def test_reads_degrade_on_client_error():
+    table = _unreadable_table()
+    table.get_item.side_effect = table.query.side_effect
+    svc = _svc_over(table)
 
     assert svc.list_for_project("proj-1") == []
     assert svc.list_all() == []
     assert svc._get("proj-1", "oid-1") is None
-    # owner_count is a READ too — the routes depend on it degrading rather than raising.
     assert svc.owner_count("proj-1") == 0
 
 
-def test_ddb_writes_propagate_client_error():
-    svc = _ddb_svc([_ROW_OWNER_1, _ROW_OWNER_2])
+def test_writes_propagate_client_error():
     boom = ClientError({"Error": {"Code": "AccessDeniedException"}}, "PutItem")
     table = MagicMock()
     table.put_item.side_effect = boom
     table.delete_item.side_effect = boom
+    table.get_item.return_value = {}
     table.query.side_effect = lambda **kw: {"Items": [_ROW_OWNER_1, _ROW_OWNER_2]}
-    svc._table = table
+    svc = _svc_over(table)
 
     with pytest.raises(ClientError):
         svc.grant("proj-1", _create("oid-1"), granted_by="a")
     with pytest.raises(ClientError):
-        svc.revoke("proj-1", "oid-1")  # two owners, so the guard passes → delete raises
-
-
-# --------------------------------------------------------------------------- #
-# The public STRICT reads (E27/T4). ``has_role_rows`` / ``list_all_strict`` answer an
-# AUTHORIZATION question, not a data one: "the partition is empty" and "the partition is
-# unreadable" are the same value to a degrading read but OPPOSITE answers to "is this
-# project governed?" — "ungoverned" hands out the design-§3 MAINTAINER fallback. So these
-# two do NOT degrade, while their ``list_for_project`` / ``list_all`` siblings still must.
-# --------------------------------------------------------------------------- #
+        svc.revoke("proj-1", "oid-1")
 
 
 def test_strict_reads_propagate_as_ownership_unverified():
-    svc = _ddb_svc()
-    boom = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "Query")
-    svc._table = MagicMock()
-    svc._table.query.side_effect = boom
+    """``has_role_rows`` and ``list_all_strict`` answer an authorization question, so an unreadable
+    partition must not read as "ungoverned"; their degrading siblings still return ``[]``."""
+    svc = _svc_over(_unreadable_table())
 
     with pytest.raises(ProjectRoleError) as ei:
         svc.has_role_rows("proj-1")
@@ -361,44 +322,37 @@ def test_strict_reads_propagate_as_ownership_unverified():
     with pytest.raises(ProjectRoleError) as ei:
         svc.list_all_strict()
     assert ei.value.kind == "ownership_unverified"
-    # ...while the DEGRADING siblings the read routes + the resolver depend on are unchanged.
     assert svc.list_for_project("proj-1") == []
     assert svc.list_all() == []
     assert svc.owner_count("proj-1") == 0
 
 
 def test_strict_reads_answer_normally_when_the_partition_is_readable():
-    """A readable-and-EMPTY partition is a real answer: ungoverned, not unverifiable."""
-    svc = _ddb_svc()
+    """A readable and empty partition is a real answer: ungoverned, not unverifiable."""
+    svc = _svc()
     assert svc.has_role_rows("proj-1") is False
     assert svc.list_all_strict() == []
 
     svc.grant("proj-1", _create("oid-1"), granted_by="a")
     assert svc.has_role_rows("proj-1") is True
-    assert svc.has_role_rows("proj-2") is False  # scoped per project, not partition-wide
+    assert svc.has_role_rows("proj-2") is False
     assert [r.project_id for r in svc.list_all_strict()] == ["proj-1"]
 
 
 def test_list_for_project_strict_propagates_as_ownership_unverified():
-    """E27/T11 — the ROSTER read has the same hazard one layer up: the console turns the
-    list's EMPTINESS into a decision (``existingIds`` is what makes its Grant an ADD rather
-    than an upsert-downgrade), so a swallowed ``ClientError`` would let "grant Viewer"
-    silently demote a principal already holding Owner. Strict here, degrading sibling kept."""
-    svc = _ddb_svc()
-    boom = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "Query")
-    svc._table = MagicMock()
-    svc._table.query.side_effect = boom
+    """The roster read: the console turns the list's emptiness into a decision, so a swallowed store
+    fault would let a Viewer grant demote a principal already holding Owner. Strict here, the
+    degrading sibling kept for the resolver and the migration inventory."""
+    svc = _svc_over(_unreadable_table())
 
     with pytest.raises(ProjectRoleError) as ei:
         svc.list_for_project_strict("proj-1")
     assert ei.value.kind == "ownership_unverified"
-    # The degrading sibling is untouched — the resolver + the migration inventory want it.
     assert svc.list_for_project("proj-1") == []
 
 
 def test_list_for_project_strict_answers_normally_when_readable():
-    """A readable-and-EMPTY roster is a real answer, and a populated one round-trips."""
-    svc = _ddb_svc()
+    svc = _svc()
     assert svc.list_for_project_strict("proj-1") == []
 
     svc.grant("proj-1", _create("oid-1"), granted_by="a")
@@ -414,8 +368,6 @@ def test_list_for_project_strict_rejects_a_separator_bearing_id():
 
 
 def test_has_role_rows_rejects_a_separator_bearing_id():
-    """Same validation as every other entry point — a '#' makes the composite sk
-    non-injective, so the store cannot answer for that id at all."""
     with pytest.raises(ProjectRoleError) as ei:
         _svc().has_role_rows("proj#1")
     assert ei.value.kind == "validation"
@@ -439,89 +391,148 @@ _ROW_OWNER_1 = _row("oid-1")
 _ROW_OWNER_2 = _row("oid-2")
 
 
-class _PagedFakeTable(_FakeTable):
-    """``query`` hands back one page at a time with a ``LastEvaluatedKey`` until the last —
-    the real DDB continuation shape a >1MB partition produces."""
-
-    def __init__(self, pages):
-        super().__init__()
-        self._pages = list(pages)
-
-    def query(self, **kwargs):
-        self.queries.append(kwargs)
-        page = self._pages.pop(0)
-        resp = {"Items": page}
-        if self._pages:
-            resp["LastEvaluatedKey"] = {"pk": page[-1]["pk"], "sk": page[-1]["sk"]}
-        return resp
-
-
-# --------------------------------------------------------------------------- #
-# the last-owner guard is a WRITE decision, so its read must FAIL CLOSED. Reads
-# elsewhere degrade to []/0, and [] is also the legitimate FIRST-grant state — so a
-# swallowed ClientError would read as "no owners to protect" and let the very
-# downgrade the guard exists to refuse through, stranding the project at zero owners.
-# --------------------------------------------------------------------------- #
-
-
 def test_an_unreadable_partition_refuses_a_sole_owner_downgrade():
-    svc = _ddb_svc()
-    boom = ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "Query")
-    table = MagicMock()
-    table.query.side_effect = boom
-    svc._table = table
+    """The last-owner guard is a write decision, so its read fails closed: ``[]`` is also the legitimate
+    first-grant state, and a swallowed fault would read as "no owners to protect"."""
+    table = _unreadable_table()
+    svc = _svc_over(table)
 
     with pytest.raises(ProjectRoleError) as ei:
         svc.grant("proj-1", _create("oid-1", role="viewer"), granted_by="a")
     assert ei.value.kind == "ownership_unverified"
-    # persists NOTHING — the whole point: a read blip must not authorize a demotion.
     table.put_item.assert_not_called()
 
 
 def test_a_genuinely_empty_partition_still_allows_the_first_grant():
-    """The strict read must only fail closed on a FAILURE — a real empty partition is the
-    seed state and the first grant (any role) still has to land."""
-    svc = _ddb_svc()  # empty _FakeTable: the query succeeds and returns no rows
+    svc = _svc()
     rec = svc.grant("proj-new", _create("oid-1", role="viewer"), granted_by="a")
     assert rec.role == "viewer"
-    assert [(i["pk"], i["sk"]) for i in svc._table.items] == [
-        ("project_role", "proj-new#oid-1")
-    ]
+    assert [(i["pk"], i["sk"]) for i in _rows(svc)] == [("project_role", "proj-new#oid-1")]
 
 
 def test_an_unreadable_partition_does_not_block_an_owner_grant():
-    """The guard early-exits on ``role == owner`` BEFORE it reads, so a store blip cannot
-    block the one write that can never lower the owner count."""
-    svc = _ddb_svc()
-    svc._table = MagicMock()
-    svc._table.query.side_effect = ClientError({"Error": {"Code": "Throttled"}}, "Query")
+    """The guard exits on ``role == owner`` before it reads, so a store fault cannot block the one
+    write that can never lower the owner count."""
+    table = MagicMock()
+    table.query.side_effect = ClientError({"Error": {"Code": "Throttled"}}, "Query")
+    table.get_item.return_value = {}
+    svc = _svc_over(table)
 
     rec = svc.grant("proj-1", _create("oid-1", role="owner"), granted_by="a")
     assert rec.role == "owner"
-    svc._table.put_item.assert_called_once()
+    table.put_item.assert_called_once()
 
 
-def test_ddb_scan_partition_follows_the_last_evaluated_key():
-    """A paginated partition must yield BOTH pages. Dropping the continuation would
-    silently UNDER-count rows — an owner could read back as absent (owner_count 0 →
-    the last-owner guard passes) or as unprivileged in the resolver's role map."""
-    svc = _ddb_svc()
-    svc._table = _PagedFakeTable([[_ROW_OWNER_1], [_ROW_OWNER_2]])
+_CHANGED = {
+    "detail": "Project role changed while this request ran; reload and retry",
+    "code": "project_role.changed",
+}
+
+
+def _after_the_read(monkeypatch, svc: ProjectRoleService, competitor) -> None:
+    read = svc._store.get
+
+    def read_then_compete(key, **kwargs):
+        row = read(key, **kwargs)
+        monkeypatch.setattr(svc._store, "get", read)
+        competitor()
+        return row
+
+    monkeypatch.setattr(svc._store, "get", read_then_compete)
+
+
+def test_a_first_grant_writes_version_one_and_each_re_grant_the_next():
+    svc = _svc()
+    svc.grant("proj-1", _create("oid-1"), granted_by="a")
+    assert _rows(svc)[0]["row_version"] == 1
+
+    svc.grant("proj-1", _create("oid-1"), granted_by="b")
+
+    assert _rows(svc)[0]["row_version"] == 2
+
+
+def test_two_re_grants_that_read_the_same_row_cannot_both_land(monkeypatch):
+    svc = _svc()
+    svc.grant("proj-1", _create("oid-1"), granted_by="a")
+    svc.grant("proj-1", _create("oid-2", role="viewer"), granted_by="a")
+    _after_the_read(
+        monkeypatch, svc, lambda: svc.grant("proj-1", _create("oid-2", role="maintainer"), granted_by="b")
+    )
+
+    with pytest.raises(ProjectRoleError) as ei:
+        svc.grant("proj-1", _create("oid-2", role="owner"), granted_by="c")
+
+    assert (ei.value.kind, ei.value.status_code, ei.value.body()) == ("changed", 409, _CHANGED)
+    assert [(r.role, r.granted_by) for r in svc.list_for_project("proj-1") if r.principal_id == "oid-2"] == [
+        ("maintainer", "b")
+    ]
+
+
+def test_two_first_grants_for_one_principal_cannot_both_land(monkeypatch):
+    svc = _svc()
+    _after_the_read(monkeypatch, svc, lambda: svc.grant("proj-1", _create("oid-1"), granted_by="b"))
+
+    with pytest.raises(ProjectRoleError) as ei:
+        svc.grant("proj-1", _create("oid-1", role="maintainer"), granted_by="c")
+
+    assert (ei.value.kind, ei.value.status_code, ei.value.body()) == ("changed", 409, _CHANGED)
+    assert [(r.role, r.granted_by) for r in svc.list_for_project("proj-1")] == [("owner", "b")]
+
+
+def test_a_re_grant_that_raced_a_revoke_answers_changed_and_does_not_resurrect_the_row(monkeypatch):
+    svc = _svc()
+    svc.grant("proj-1", _create("oid-1"), granted_by="a")
+    svc.grant("proj-1", _create("oid-2", role="viewer"), granted_by="a")
+    _after_the_read(monkeypatch, svc, lambda: svc.revoke("proj-1", "oid-2"))
+
+    with pytest.raises(ProjectRoleError) as ei:
+        svc.grant("proj-1", _create("oid-2", role="maintainer"), granted_by="c")
+
+    assert (ei.value.kind, ei.value.status_code, ei.value.body()) == ("changed", 409, _CHANGED)
+    assert [r.principal_id for r in svc.list_for_project("proj-1")] == ["oid-1"]
+
+
+def test_a_re_grant_reads_its_row_strongly_consistent():
+    svc = _svc()
+    svc.grant("proj-1", _create("oid-1"), granted_by="a")
+    table = MagicMock(wraps=svc._store._table)
+    svc._store = StateStore("projects", table=table)
+
+    svc.grant("proj-1", _create("oid-1"), granted_by="b")
+
+    assert [c.kwargs["ConsistentRead"] for c in table.get_item.call_args_list] == [True]
+
+
+def test_a_role_row_written_before_versioning_takes_one_versioned_re_grant():
+    svc = _svc()
+    seed(svc._store, _row("oid-1", role="viewer"))
+
+    svc.grant("proj-1", _create("oid-1", role="maintainer"), granted_by="b")
+    assert _rows(svc)[0]["row_version"] == 1
+    svc.grant("proj-1", _create("oid-1"), granted_by="c")
+
+    row = _rows(svc)[0]
+    assert (row["row_version"], row["role"]) == (2, "owner")
+
+
+def test_list_all_follows_the_last_evaluated_key():
+    """Dropping the continuation would under-count rows: an owner could read back as absent and pass
+    the last-owner guard, or as unprivileged in the resolver's role map."""
+    table = MagicMock()
+    table.query.side_effect = [
+        {"Items": [_ROW_OWNER_1], "LastEvaluatedKey": {"pk": "project_role", "sk": "proj-1#oid-1"}},
+        {"Items": [_ROW_OWNER_2]},
+    ]
+    svc = _svc_over(table)
 
     assert [r.principal_id for r in svc.list_all()] == ["oid-1", "oid-2"]
-    assert svc._table.queries[1]["ExclusiveStartKey"] == {
+    assert table.query.call_args_list[1].kwargs["ExclusiveStartKey"] == {
         "pk": "project_role",
         "sk": "proj-1#oid-1",
     }
 
 
-# --------------------------------------------------------------------------- #
-# revoke_all — the project-deletion counterpart (E27 fix pass, review I1)
-# --------------------------------------------------------------------------- #
-
-
 def test_revoke_all_deletes_every_row_on_the_project_only():
-    """Scoped: a project delete must not touch another project's governance."""
     svc = _svc()
     svc.grant("proj-1", _create("oid-1", role="owner"), granted_by="a")
     svc.grant("proj-1", _create("oid-2", role="viewer"), granted_by="a")
@@ -533,44 +544,40 @@ def test_revoke_all_deletes_every_row_on_the_project_only():
 
 
 def test_revoke_all_ignores_the_last_owner_guard():
-    """It MUST bypass it — the guard protects a LIVE project from becoming unadministerable,
-    but the project is gone, and applying it here would make the final owner row undeletable."""
+    """The guard protects a live project from becoming unadministerable; the project is gone, and
+    applying it here would make the final owner row undeletable."""
     svc = _svc()
     svc.grant("proj-1", _create("oid-1", role="owner"), granted_by="a")
-    assert svc.owner_count("proj-1") == 1  # the guard would refuse a plain revoke here
+    assert svc.owner_count("proj-1") == 1
     assert svc.revoke_all("proj-1") == 1
     assert svc.list_for_project("proj-1") == []
 
 
 def test_revoke_all_is_idempotent_and_already_gone_is_success():
-    """E23 cascade idiom — a retried or partially-completed delete must be safe to re-run."""
     svc = _svc()
     svc.grant("proj-1", _create("oid-1"), granted_by="a")
     assert svc.revoke_all("proj-1") == 1
-    assert svc.revoke_all("proj-1") == 0        # already gone
+    assert svc.revoke_all("proj-1") == 0
     assert svc.revoke_all("never-existed") == 0
 
 
-def test_revoke_all_deletes_the_ddb_items():
-    svc = _ddb_svc()
+def test_revoke_all_deletes_the_stored_rows():
+    svc = _svc()
     svc.grant("proj-1", _create("oid-1"), granted_by="a")
     svc.grant("proj-1", _create("oid-2"), granted_by="a")
     assert svc.revoke_all("proj-1") == 2
-    assert svc._table.items == []
+    assert _rows(svc) == []
 
 
 def test_revoke_all_propagates_an_unreadable_partition():
-    """Strict: deleting nothing because the partition was briefly unreadable is exactly the
-    silent orphaning this method exists to prevent. The route logs and continues."""
-    svc = _ddb_svc()
-    svc._table = MagicMock()
-    svc._table.query.side_effect = ClientError(
-        {"Error": {"Code": "ProvisionedThroughputExceededException"}}, "Query"
-    )
+    """Deleting nothing because the partition was briefly unreadable is the silent orphaning this
+    method exists to prevent; the route logs and continues."""
+    table = _unreadable_table()
+    svc = _svc_over(table)
     with pytest.raises(ProjectRoleError) as ei:
         svc.revoke_all("proj-1")
     assert ei.value.kind == "ownership_unverified"
-    svc._table.delete_item.assert_not_called()
+    table.delete_item.assert_not_called()
 
 
 def test_revoke_all_rejects_a_separator_bearing_id():

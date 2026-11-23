@@ -15,3 +15,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "ephemeral" {
+  description = "Delete the secret immediately on destroy instead of scheduling it for the 30-day recovery window"
+  type        = bool
+  default     = false
+}

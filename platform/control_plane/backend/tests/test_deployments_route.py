@@ -1,17 +1,13 @@
-"""Tests for ``GET /agents/{agent_id}/deployments`` (E28/T11, contract C2 + D7).
+"""Tests for ``GET /agents/{agent_id}/deployments``, the read over the append-only deployment store
+(``ProjectService.append_deployment`` and ``list_deployments``).
 
-WHY THIS ROUTE EXISTS AT ALL. T3 built the append-only store
-(``ProjectService.append_deployment`` / ``list_deployments``) and T4 built the appends, but
-no task ever mounted the read. C2 pins the route, and the frontend client call T11 adds
-would otherwise have been a call to a 404.
-
-The load-bearing invariants, and why each is here rather than assumed:
+The invariants, and why each is here rather than assumed:
 
 1. **The gate is BYTE-IDENTICAL to ``/runtime``'s.** Two sibling reads on the same resource
-   must not carry different guards — whichever is looser becomes the bypass (D3). So a
+   must not carry different guards, because whichever is looser becomes the bypass. So a
    foreign tenant's agent and a truly-missing id both produce the same "Agent not found",
    and the store is never touched before the gate has run.
-2. **``stage`` is FREE-FORM (D8).** A tenant's stage set is open, so the route must forward
+2. **``stage`` is FREE-FORM.** A tenant's stage set is open, so the route must forward
    ``uat`` (or a region name) to the store unvalidated. A dev/prod allowlist here would be
    exactly the hardcode the design forbids.
 3. **An agent with no repository returns ``[]``, not a 500.** The store is keyed by
@@ -39,42 +35,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
 AGENT_ID = "own"
 REPO_ID = "repo-1"
 
 
-@pytest.fixture(autouse=True)
-def reset_modules():
-    """Drop cached auth/config/route modules so monkeypatched env is honored."""
-    import sys
-
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.agents",
-        "api.routes.users",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("DEBUG", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
-
-
 def _make_agent(*, agent_id: str = AGENT_ID, tenant_id: str = "ten-1"):
-    from models.agent import Agent, AuthType, LifecycleState, Platform
+    from models.agent import Agent, AgentAuthType, LifecycleState, Platform
 
     now = datetime.now(timezone.utc)
     return Agent(
@@ -83,7 +54,7 @@ def _make_agent(*, agent_id: str = AGENT_ID, tenant_id: str = "ten-1"):
         purpose="Triage inbound motor claims",
         lifecycle_state=LifecycleState.APPROVED,
         platform=Platform.AWS_BEDROCK,
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         tenant_id=tenant_id,
         created_at=now,
         updated_at=now,
@@ -141,11 +112,13 @@ def _build_client(mock_svc, ctx):
     """Minimal app with ONLY the agents router + mocked registry/resolver."""
     import api.routes.agents as agents_module
     import api.routes.users as users_module
+    from core.errors import install_error_handlers
 
     agents_module._svc = mock_svc
     users_module._tenant_resolver = _FakeResolver(ctx)
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(agents_module.router, prefix="/api/v1")
     return TestClient(app)
 
@@ -176,24 +149,19 @@ def _project_svc(*, repo=None, rows=None):
 
 
 def _get(client, project_svc, url):
-    with patch(
-        "core.security_entra.verify_entra_token", return_value=_claims_for("viewer")
-    ), patch("api.routes.projects.get_project_service", return_value=project_svc):
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")),
+        patch("api.routes.projects.get_project_service", return_value=project_svc),
+    ):
         return client.get(url, headers=_headers())
 
-
-# ---------------------------------------------------------------------------
-# The gate — byte-identical to /runtime's
-# ---------------------------------------------------------------------------
 
 def test_foreign_tenant_404_is_byte_identical_to_missing(entra_settings):
     """A foreign tenant's agent must look ABSENT, never leak a 403 that confirms it exists —
     and the deployment store must not be read before the gate has run."""
     foreign = _make_agent(agent_id="foreign", tenant_id="ten-2")
     mock_svc = MagicMock()
-    mock_svc.get.side_effect = lambda agent_id: (
-        foreign if agent_id == "foreign" else None
-    )
+    mock_svc.get.side_effect = lambda agent_id: foreign if agent_id == "foreign" else None
     client = _build_client(mock_svc, _context(tenant_ids=["ten-1"]))
     project_svc = _project_svc(repo=_repo())
 
@@ -209,30 +177,27 @@ def test_foreign_tenant_404_is_byte_identical_to_missing(entra_settings):
 
 
 def test_gate_matches_the_runtime_route_exactly(entra_settings):
-    """Mechanical, not by eye: the two handlers' RBAC dependencies must be the same objects
-    in the same order. A guard that differs between two sibling reads on one resource means
-    the looser one is a bypass (D3), and a hand-copied gate is exactly how that happens."""
+    """Mechanical, not by eye: the two handlers' RBAC dependencies must be the same objects in the same
+    order. A guard that differs between two sibling reads on one resource means the looser one is a
+    bypass, and a hand-copied gate is exactly how that happens. The ``/runtime`` gate is checked first so
+    the comparison cannot pass vacuously: it really carries both halves, and the role half really
+    captured VIEWER."""
     import api.routes.agents as agents_module
 
     def deps(suffix: str):
-        route = next(
-            r
-            for r in agents_module.router.routes
-            if getattr(r, "path", "").endswith(suffix)
-        )
-        # The gate, in DECLARATION ORDER (order matters — the tenant context must resolve
-        # before the role check). ``require_role`` returns a fresh closure per call, so the
-        # callables are never identical objects; the comparable identity is the qualified name
-        # plus the captured ``min_role``, which is exactly what makes two gates the same gate.
+        """The gate in declaration order (the tenant context must resolve before the role check).
+        ``require_role`` returns a fresh closure per call, so the callables are never identical objects;
+        the comparable identity is the qualified name plus the captured ``min_role``."""
+        route = next(r for r in agents_module.router.routes if getattr(r, "path", "").endswith(suffix))
+        assert isinstance(route, APIRoute)
         out = []
         for d in route.dependant.dependencies:
+            assert d.call is not None
             captured = tuple(c.cell_contents for c in (d.call.__closure__ or ()))
             out.append((d.name, d.call.__qualname__, captured))
         return out
 
     runtime_gate = deps("/{agent_id}/runtime")
-    # Guards this assertion against a vacuous pass: /runtime really does carry both halves of
-    # the gate, and the role half really did capture VIEWER.
     from core.rbac import Role
 
     assert len(runtime_gate) == 2
@@ -272,25 +237,22 @@ def test_viewer_suffices(entra_settings):
     assert resp.status_code == 200
 
 
-# ---------------------------------------------------------------------------
-# The read
-# ---------------------------------------------------------------------------
-
 def test_agent_with_no_repository_is_empty(entra_settings):
-    """The store is keyed by ``repo_id``; the caller supplies an ``agent_id``. An agent that
-    owns no repository has NO deployment history, which is a state and not an error."""
+    """The store is keyed by ``repo_id``; the caller supplies an ``agent_id``. An agent that owns no
+    repository has no deployment history, which is a state and not an error, and the route does not fall
+    through to an unscoped read, which would return another repo's rows."""
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent()
     client = _build_client(mock_svc, _context(tenant_ids=["ten-1"]))
-    project_svc = _project_svc(repo=None, rows=[_deployment(
-        stage="uat", image_tag="own-tree001", started_at="2026-07-30T10:00:00+00:00"
-    )])
+    project_svc = _project_svc(
+        repo=None,
+        rows=[_deployment(stage="uat", image_tag="own-tree001", started_at="2026-07-30T10:00:00+00:00")],
+    )
 
     resp = _get(client, project_svc, f"/api/v1/agents/{AGENT_ID}/deployments")
 
     assert resp.status_code == 200
     assert resp.json() == []
-    # And it did NOT fall through to an unscoped read — that would return another repo's rows.
     project_svc.list_deployments.assert_not_called()
 
 
@@ -315,14 +277,12 @@ def test_repo_id_is_resolved_server_side_from_the_agent(entra_settings):
 
 
 def test_a_uat_stage_passes_through_unvalidated(entra_settings):
-    """``stage`` is FREE-FORM (D8). A tenant's stage set is open, so validating against a
+    """``stage`` is FREE-FORM. A tenant's stage set is open, so validating against a
     dev/prod literal here would refuse a legitimate tenant's only stage."""
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent()
     client = _build_client(mock_svc, _context(tenant_ids=["ten-1"]))
-    row = _deployment(
-        stage="uat", image_tag="own-tree001", started_at="2026-07-30T10:00:00+00:00"
-    )
+    row = _deployment(stage="uat", image_tag="own-tree001", started_at="2026-07-30T10:00:00+00:00")
     project_svc = _project_svc(repo=_repo(), rows=[row])
 
     resp = _get(client, project_svc, f"/api/v1/agents/{AGENT_ID}/deployments?stage=uat")
@@ -339,9 +299,7 @@ def test_an_arbitrary_stage_name_is_not_refused(entra_settings):
     client = _build_client(mock_svc, _context(tenant_ids=["ten-1"]))
     project_svc = _project_svc(repo=_repo(), rows=[])
 
-    resp = _get(
-        client, project_svc, f"/api/v1/agents/{AGENT_ID}/deployments?stage=eu-central-1"
-    )
+    resp = _get(client, project_svc, f"/api/v1/agents/{AGENT_ID}/deployments?stage=eu-central-1")
 
     assert resp.status_code == 200
     assert project_svc.list_deployments.call_args.kwargs["stage"] == "eu-central-1"
@@ -369,15 +327,21 @@ def test_newest_first_ordering_survives_the_route(entra_settings):
     client = _build_client(mock_svc, _context(tenant_ids=["ten-1"]))
     rows = [
         _deployment(
-            stage="uat", image_tag="own-newest", started_at="2026-07-31T10:00:00+00:00",
+            stage="uat",
+            image_tag="own-newest",
+            started_at="2026-07-31T10:00:00+00:00",
             id="dep-11111111",
         ),
         _deployment(
-            stage="uat", image_tag="own-middle", started_at="2026-07-30T10:00:00+00:00",
+            stage="uat",
+            image_tag="own-middle",
+            started_at="2026-07-30T10:00:00+00:00",
             id="dep-22222222",
         ),
         _deployment(
-            stage="uat", image_tag="own-oldest", started_at="2026-07-29T10:00:00+00:00",
+            stage="uat",
+            image_tag="own-oldest",
+            started_at="2026-07-29T10:00:00+00:00",
             id="dep-33333333",
         ),
     ]
@@ -386,29 +350,39 @@ def test_newest_first_ordering_survives_the_route(entra_settings):
     resp = _get(client, project_svc, f"/api/v1/agents/{AGENT_ID}/deployments")
 
     assert [r["image_tag"] for r in resp.json()] == [
-        "own-newest", "own-middle", "own-oldest",
+        "own-newest",
+        "own-middle",
+        "own-oldest",
     ]
 
 
 def test_actor_kind_round_trips(entra_settings):
-    """A GitHub login and an Entra oid are two different currencies and must never be
-    rendered as one (E27A §6) — so the discriminator has to survive the wire."""
+    """A GitHub login and an Entra oid are two different currencies and must never be rendered as one, so
+    the discriminator has to survive the wire; a build-written terminal row carries no actor at all."""
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent()
     client = _build_client(mock_svc, _context(tenant_ids=["ten-1"]))
     rows = [
         _deployment(
-            stage="uat", image_tag="own-a", started_at="2026-07-31T10:00:00+00:00",
-            actor="jorge", actor_kind="github", id="dep-aaaaaaaa",
+            stage="uat",
+            image_tag="own-a",
+            started_at="2026-07-31T10:00:00+00:00",
+            actor="jorge",
+            actor_kind="github",
+            id="dep-aaaaaaaa",
         ),
         _deployment(
-            stage="uat", image_tag="own-b", started_at="2026-07-30T10:00:00+00:00",
-            actor="00000000-0000-0000-0000-000000000009", actor_kind="entra",
+            stage="uat",
+            image_tag="own-b",
+            started_at="2026-07-30T10:00:00+00:00",
+            actor="00000000-0000-0000-0000-000000000009",
+            actor_kind="entra",
             id="dep-bbbbbbbb",
         ),
-        # A build-written terminal row carries NO actor at all, by design (C1).
         _deployment(
-            stage="uat", image_tag="own-c", started_at="2026-07-29T10:00:00+00:00",
+            stage="uat",
+            image_tag="own-c",
+            started_at="2026-07-29T10:00:00+00:00",
             id="dep-cccccccc",
         ),
     ]
@@ -418,13 +392,11 @@ def test_actor_kind_round_trips(entra_settings):
 
     assert [r["actor_kind"] for r in body] == ["github", "entra", None]
     assert [r["actor"] for r in body] == [
-        "jorge", "00000000-0000-0000-0000-000000000009", None,
+        "jorge",
+        "00000000-0000-0000-0000-000000000009",
+        None,
     ]
 
-
-# ---------------------------------------------------------------------------
-# limit
-# ---------------------------------------------------------------------------
 
 def test_limit_defaults_to_50(entra_settings):
     mock_svc = MagicMock()
@@ -463,14 +435,9 @@ def test_limit_is_forwarded(entra_settings):
     assert project_svc.list_deployments.call_args.kwargs["limit"] == 7
 
 
-# ---------------------------------------------------------------------------
-# Degradation
-# ---------------------------------------------------------------------------
-
 def test_an_unreachable_store_is_an_empty_history_not_a_5xx(entra_settings):
-    """``list_deployments`` degrades to ``[]`` and NEVER raises (T3/T2, hardened over three
-    rounds). The route must not add error mapping that turns that into a 5xx — a 500 here
-    would blank a repo page over a DynamoDB throttle."""
+    """``list_deployments`` degrades to ``[]`` and never raises. The route must not add error mapping that
+    turns that into a 5xx: a 500 here would blank a repo page over a DynamoDB throttle."""
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent()
     client = _build_client(mock_svc, _context(tenant_ids=["ten-1"]))
@@ -483,24 +450,25 @@ def test_an_unreachable_store_is_an_empty_history_not_a_5xx(entra_settings):
 
 
 def test_response_carries_no_account_id(entra_settings):
-    """A hard project rule: no AWS account id anywhere. Nothing on a Deployment row should
-    ever carry one, and this pins that the route does not enrich the row with one."""
+    """A hard project rule: no AWS account id anywhere. Nothing on a Deployment row should ever carry one,
+    and this pins that the route does not enrich the row with one. The 200 is asserted first: a 404 body
+    would satisfy every "not in" below and the test would pass vacuously."""
     mock_svc = MagicMock()
     mock_svc.get.return_value = _make_agent()
     client = _build_client(mock_svc, _context(tenant_ids=["ten-1"]))
     rows = [
         _deployment(
-            stage="uat", image_tag="own-a", started_at="2026-07-31T10:00:00+00:00",
-            source_sha="3f9a1c2b" * 5, build_id="agp-runtime:abc-123",
+            stage="uat",
+            image_tag="own-a",
+            started_at="2026-07-31T10:00:00+00:00",
+            source_sha="3f9a1c2b" * 5,
+            build_id="agp-runtime:abc-123",
         )
     ]
     project_svc = _project_svc(repo=_repo(), rows=rows)
 
     resp = _get(client, project_svc, f"/api/v1/agents/{AGENT_ID}/deployments")
 
-    # Assert the 200 FIRST. Without it a 404 body ("Agent not found") satisfies every
-    # "not in" below and the test passes vacuously — the exact class of guard this epic
-    # got burned by twice.
     assert resp.status_code == 200
     assert len(resp.json()) == 1
     raw = resp.text

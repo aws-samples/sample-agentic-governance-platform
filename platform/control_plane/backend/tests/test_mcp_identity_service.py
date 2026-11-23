@@ -1,17 +1,11 @@
-"""Tests for ``services.mcp_identity_service`` — the E7 MCP provisioning orchestrator.
+"""Tests for ``services.mcp_identity_service``, the MCP identity provisioning orchestrator.
 
-A CLONE of ``test_agent_identity_service`` in idiom, with the E7 deltas baked into
-the assertions (the CRITIC callouts that distinguish this from the agent clone):
-  - CRITIC-C2: provision NEVER calls obo-consent (the agent→MCP delegated consent
-    moves to GRANT time, not provision time) + a NEW pre-lockdown tool-scan precedes
-    app creation, so create is not step 1.
-  - CRITIC-I1: the pre-lockdown scan is best-effort — a ``McpScanError`` does NOT fail
-    provisioning, and a transient empty/error scan never wipes E5-seeded tools.
-  - CRITIC-I3: ``persist_identity`` writes the ``mcp.server`` descriptor, NOT a CUSTOM
-    one (covered in test_mcp_server_service.py).
-  - CRITIC-I4: all five Entra ids are set after create.
-  - CRITIC-M3: the gateway/runtime authorizer feeds BOTH audience forms (URI + GUID).
-  - E6 CRITIQUE-FIX-A: the ids persist IMMEDIATELY after create, before authorizer config.
+The deltas from the agent-side orchestrator are baked into the assertions: provision never calls
+the consent grant (that happens at grant time) and a pre-lockdown tool scan precedes app creation,
+so create is not step one; the scan is best-effort (a ``McpScanError`` never fails provisioning and
+an empty or failed discovery never wipes seeded tools); all five Entra ids are set after create and
+persisted immediately, before the authorizer is configured; the gateway and runtime authorizers
+feed both audience forms (URI and GUID).
 
 ALL external collaborators are mocked — there are NO live AWS / Graph / MCP calls:
   - ``GraphService`` → an ``AsyncMock`` double (``create_mcp_app`` returns the 6-key
@@ -47,25 +41,16 @@ from services.mcp_identity_service import (
 )
 from services.mcp_tool_scanner import McpScanError
 
-# ---------------------------------------------------------------------------
-# Fixtures / builders
-# ---------------------------------------------------------------------------
 TENANT_ID = "00000000-0000-0000-0000-000000000001"
 LOGIN_BASE = "https://login.microsoftonline.com"
 REGION = "us-east-1"
 
-# A realistic AgentCore gateway ARN; the gatewayId is the last "/"-segment.
 GATEWAY_ID = "demo-claims-gw-aBcDeFgHiJ"
-GATEWAY_ARN = (
-    f"arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{GATEWAY_ID}"
-)
+GATEWAY_ARN = f"arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{GATEWAY_ID}"
 GATEWAY_URL = f"https://{GATEWAY_ID}.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
 
-# A realistic AgentCore runtime ARN (the runtime-MCP path); RID is the last segment.
 RUNTIME_RID = "mcp_runtime_test-wdOmsREOEj"
-RUNTIME_ARN = (
-    f"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/{RUNTIME_RID}"
-)
+RUNTIME_ARN = f"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/{RUNTIME_RID}"
 
 
 def _make_mcp(
@@ -77,7 +62,7 @@ def _make_mcp(
     runtime_arn: str | None = None,
     entra_sp_id: str | None = None,
     entra_app_audience: str | None = None,
-    identity_status: str = "none",
+    identity_status: IdentityStatus = IdentityStatus.NONE,
     available_tools: list[McpTool] | None = None,
 ) -> McpServer:
     now = datetime.now(timezone.utc)
@@ -119,9 +104,7 @@ def _graph_double(mcp_id: str = "mcp-rec-123") -> AsyncMock:
     return graph
 
 
-def _gateway_control_client(
-    statuses: list[str] | None = None, *, authorizer_type: str = "NONE"
-) -> MagicMock:
+def _gateway_control_client(statuses: list[str] | None = None, *, authorizer_type: str = "NONE") -> MagicMock:
     """A MagicMock boto3 control client for the GATEWAY path.
 
     ``get_gateway`` returns a dict carrying the replay fields (name/roleArn/
@@ -144,19 +127,14 @@ def _gateway_control_client(
     if statuses is None:
         control.get_gateway.return_value = {**base, "status": "READY"}
     else:
-        control.get_gateway.side_effect = [
-            {**base, "status": s} for s in statuses
-        ]
+        control.get_gateway.side_effect = [{**base, "status": s} for s in statuses]
     control.update_gateway.return_value = {"status": "UPDATING"}
-    # Native tool-read (T-NATIVE-TOOLSCAN): default to NO targets so the existing
-    # open-gateway tests still exercise the wire-scan fallback. Tests that exercise the
-    # native path override list_gateway_targets / get_gateway_target explicitly.
     control.list_gateway_targets.return_value = {"items": []}
     return control
 
 
 def _runtime_control_client(statuses: list[str] | None = None) -> MagicMock:
-    """A MagicMock boto3 control client for the RUNTIME-MCP path (E6 verbatim)."""
+    """A MagicMock boto3 control client for the RUNTIME-MCP path."""
     control = MagicMock(name="bedrock-agentcore-control")
     artifact = {"containerConfiguration": {"containerUri": "123.dkr.ecr/mcp:latest"}}
     role_arn = "arn:aws:iam::123456789012:role/mcp-runtime-role"
@@ -233,37 +211,20 @@ def patch_scan(monkeypatch):
     return scanner
 
 
-# ===========================================================================
-# Gate
-# ===========================================================================
 def test_should_provision_gate():
-    # Gateway + arn → True.
     assert should_provision_mcp(_make_mcp(kind=Kind.GATEWAY, gateway_arn=GATEWAY_ARN)) is True
-    # Runtime + runtime_arn → True.
     assert (
-        should_provision_mcp(
-            _make_mcp(kind=Kind.RUNTIME, gateway_arn=None, runtime_arn=RUNTIME_ARN)
-        )
-        is True
+        should_provision_mcp(_make_mcp(kind=Kind.RUNTIME, gateway_arn=None, runtime_arn=RUNTIME_ARN)) is True
     )
 
-    # Standard → False (metadata-only, no identity).
     assert should_provision_mcp(_make_mcp(kind=Kind.STANDARD, gateway_arn=None)) is False
     assert should_provision_mcp(_make_mcp(kind=Kind.STANDARD, gateway_arn=GATEWAY_ARN)) is False
 
-    # Gateway WITHOUT a handle → False (no arn to configure).
     assert should_provision_mcp(_make_mcp(kind=Kind.GATEWAY, gateway_arn=None)) is False
     assert should_provision_mcp(_make_mcp(kind=Kind.GATEWAY, gateway_arn="")) is False
-    # Runtime WITHOUT a handle → False.
-    assert (
-        should_provision_mcp(_make_mcp(kind=Kind.RUNTIME, gateway_arn=None, runtime_arn=None))
-        is False
-    )
+    assert should_provision_mcp(_make_mcp(kind=Kind.RUNTIME, gateway_arn=None, runtime_arn=None)) is False
 
 
-# ===========================================================================
-# Happy path — order + ids + status (gateway)
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_gateway_happy_path(patch_scan):
     mcp = _make_mcp()
@@ -271,7 +232,6 @@ async def test_provision_gateway_happy_path(patch_scan):
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="NONE")
 
-    # A shared manager records the relative order of the collaborator calls.
     manager = MagicMock()
     manager.attach_mock(control.get_gateway, "get_gateway")
     manager.attach_mock(patch_scan, "scan_mcp_tools")
@@ -283,24 +243,16 @@ async def test_provision_gateway_happy_path(patch_scan):
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # The canonical E7 order (CRITIC-C2): GetGateway → persist(pending) →
-    # scan(bearer=None) → create_mcp_app → persist(pending) → set_assignment_required
-    # → update_gateway(CUSTOM_JWT) [→ poll READY via get_gateway] → persist(provisioned).
     order = [c[0] for c in manager.mock_calls]
-    # Filter out the poll-to-READY get_gateway reads after update so the spine is clear:
-    # the load-bearing relative order is GetGateway-first, scan before create_mcp_app,
-    # create before update_gateway, with persist(pending) landing after create.
     assert order[0] == "get_gateway"
     assert "scan_mcp_tools" in order
     assert order.index("scan_mcp_tools") < order.index("create_mcp_app")
     assert order.index("create_mcp_app") < order.index("set_assignment_required")
     assert order.index("set_assignment_required") < order.index("update_gateway")
-    # A persist landed between create and set_assignment_required (the immediate persist).
     create_idx = order.index("create_mcp_app")
     sar_idx = order.index("set_assignment_required")
     assert "persist_identity" in order[create_idx:sar_idx]
 
-    # Final status + gateway_url captured verbatim + all five ids set.
     assert result.identity_status == "provisioned"
     assert result.gateway_url == GATEWAY_URL
     assert result.gateway_id == GATEWAY_ID
@@ -310,21 +262,11 @@ async def test_provision_gateway_happy_path(patch_scan):
     assert result.admin_role_id == f"admin-{mcp.id}"
     assert result.entra_app_audience == f"api://agp-mcp-{mcp.id}"
 
-    # create_mcp_app was called with (mcp.id, mcp.name).
     graph.create_mcp_app.assert_awaited_once_with(mcp.id, mcp.name)
 
-    # E7 (research §2.4/§2.5): the MCP SP is set assignment-required=FALSE — the
-    # delegated/OBO user is gated by the agent→MCP consent grant, never by an app-role
-    # assignment (which Entra would enforce against the USER in an OBO flow → AADSTS50105).
-    # SPECIFIC to False: this fails if the call reverts to the hardcoded True default.
-    graph.set_assignment_required.assert_awaited_once_with(
-        f"sp-obj-id-{mcp.id}", required=False
-    )
+    graph.set_assignment_required.assert_awaited_once_with(f"sp-obj-id-{mcp.id}", required=False)
 
 
-# ===========================================================================
-# The writers assign IdentityStatus MEMBERS (Epic 36/T20) — no serializer warnings
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provisioned_mcp_serializes_without_pydantic_serializer_warnings(patch_scan):
     """PINNED (agent-side twin: test_agent_identity_service.py): the MCP provisioning
@@ -345,21 +287,15 @@ async def test_provisioned_mcp_serializes_without_pydantic_serializer_warnings(p
     )
     result = await svc.provision(mcp)
 
-    # the MEMBER — an `==` check alone would pass on a bare string too (str-Enum).
     assert result.identity_status is IdentityStatus.PROVISIONED
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         result.model_dump()
-        jsonable_encoder(result)  # the FastAPI response path
-    assert [
-        str(w.message) for w in caught if "Pydantic serializer warnings" in str(w.message)
-    ] == []
+        jsonable_encoder(result)
+    assert [str(w.message) for w in caught if "Pydantic serializer warnings" in str(w.message)] == []
 
 
-# ===========================================================================
-# CRITIC-C2 — provision NEVER calls obo-consent (that's grant-time)
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_never_calls_obo_consent(patch_scan):
     mcp = _make_mcp()
@@ -370,14 +306,10 @@ async def test_provision_never_calls_obo_consent(patch_scan):
     svc = _make_service(graph=graph, registry=registry, control=control)
     await svc.provision(mcp)
 
-    # The agent→MCP delegated consent fires at GRANT time, never during provision.
     graph.grant_agent_obo_consent.assert_not_awaited()
     graph.grant_agent_obo_consent.assert_not_called()
 
 
-# ===========================================================================
-# CRITIC-M3 — both audience forms, no allowedClients/customClaims, replay name/role/protocol
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_configures_gateway_authorizer_both_audience_forms(patch_scan):
     mcp = _make_mcp()
@@ -385,7 +317,6 @@ async def test_provision_configures_gateway_authorizer_both_audience_forms(patch
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="NONE")
 
-    # Capture the GetGateway read so we can compare the replayed fields.
     read = control.get_gateway.return_value
 
     svc = _make_service(graph=graph, registry=registry, control=control)
@@ -394,32 +325,77 @@ async def test_provision_configures_gateway_authorizer_both_audience_forms(patch
     _, kwargs = control.update_gateway.call_args
     jwt = kwargs["authorizerConfiguration"]["customJWTAuthorizer"]
 
-    # Both forms, order = (URI, GUID).
     assert jwt["allowedAudience"] == [mcp.entra_app_audience, mcp.entra_app_id]
-    # Audience ONLY — no allowedClients / customClaims / allowedScopes.
     assert "allowedClients" not in jwt
     assert "customClaims" not in jwt
     assert "allowedScopes" not in jwt
-    # discoveryUrl is the Entra v2 well-known, per-tenant.
-    assert jwt["discoveryUrl"] == (
-        f"{LOGIN_BASE}/{TENANT_ID}/v2.0/.well-known/openid-configuration"
-    )
-    # authorizerType flipped to CUSTOM_JWT.
+    assert jwt["discoveryUrl"] == (f"{LOGIN_BASE}/{TENANT_ID}/v2.0/.well-known/openid-configuration")
     assert kwargs["authorizerType"] == "CUSTOM_JWT"
-    # The required fields are replayed from the GET (full-replace PUT).
     assert kwargs["name"] == read["name"]
     assert kwargs["roleArn"] == read["roleArn"]
     assert kwargs["protocolType"] == read["protocolType"]
-    # The optional protocolConfiguration (carries searchType=SEMANTIC) is replayed.
     assert kwargs["protocolConfiguration"] == read["protocolConfiguration"]
-    # gatewayIdentifier is the short id, NOT the ARN.
     assert kwargs["gatewayIdentifier"] == GATEWAY_ID
     assert kwargs["gatewayIdentifier"] != GATEWAY_ARN
 
 
-# ===========================================================================
-# Runtime-MCP path → UpdateAgentRuntime, NOT update_gateway
-# ===========================================================================
+def _gateway_with_jwt_authorizer(discovery_url: str) -> MagicMock:
+    control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
+    control.get_gateway.return_value = {
+        **control.get_gateway.return_value,
+        "authorizerConfiguration": {
+            "customJWTAuthorizer": {
+                "discoveryUrl": discovery_url,
+                "allowedAudience": ["api://stale"],
+                "allowedScopes": ["Invoke"],
+                "allowedClients": ["client-guid"],
+                "customClaims": [{"inboundTokenClaimName": "tid"}],
+            }
+        },
+    }
+    return control
+
+
+@pytest.mark.asyncio
+async def test_authorizer_replay_keeps_scopes_and_clients_under_the_same_entra_issuer(patch_scan):
+    """A Terraform-built gateway is born with ``allowedScopes=["Invoke"]`` (the gate
+    that 403s app-only tokens) under AGP's Entra issuer. The re-config owns only discoveryUrl +
+    allowedAudience; the other customJWTAuthorizer fields are carried through, never forced."""
+    mcp = _make_mcp()
+    entra = f"{LOGIN_BASE}/{TENANT_ID}/v2.0/.well-known/openid-configuration"
+    control = _gateway_with_jwt_authorizer(entra)
+
+    svc = _make_service(graph=_graph_double(mcp.id), registry=_registry_double(), control=control)
+    await svc.provision(mcp)
+
+    _, kwargs = control.update_gateway.call_args
+    jwt = kwargs["authorizerConfiguration"]["customJWTAuthorizer"]
+    assert jwt["allowedScopes"] == ["Invoke"]
+    assert jwt["allowedClients"] == ["client-guid"]
+    assert jwt["customClaims"] == [{"inboundTokenClaimName": "tid"}]
+    assert jwt["allowedAudience"] == [mcp.entra_app_audience, mcp.entra_app_id]
+    assert jwt["discoveryUrl"] == entra
+
+
+@pytest.mark.asyncio
+async def test_authorizer_from_another_issuer_is_rebuilt_fresh(patch_scan):
+    """A gateway previously locked to a different IdP must not keep that IdP's clients/scopes
+    under the Entra issuer — the authorizer is built fresh ."""
+    mcp = _make_mcp()
+    control = _gateway_with_jwt_authorizer("https://other-idp.example/.well-known/openid-configuration")
+
+    svc = _make_service(graph=_graph_double(mcp.id), registry=_registry_double(), control=control)
+    await svc.provision(mcp)
+
+    _, kwargs = control.update_gateway.call_args
+    assert kwargs["authorizerConfiguration"] == {
+        "customJWTAuthorizer": {
+            "discoveryUrl": f"{LOGIN_BASE}/{TENANT_ID}/v2.0/.well-known/openid-configuration",
+            "allowedAudience": [mcp.entra_app_audience, mcp.entra_app_id],
+        }
+    }
+
+
 @pytest.mark.asyncio
 async def test_provision_runtime_uses_update_agent_runtime(patch_scan):
     mcp = _make_mcp(kind=Kind.RUNTIME, gateway_arn=None, runtime_arn=RUNTIME_ARN)
@@ -430,23 +406,17 @@ async def test_provision_runtime_uses_update_agent_runtime(patch_scan):
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # The runtime path: UpdateAgentRuntime, NOT update_gateway.
     control.update_agent_runtime.assert_called_once()
     control.update_gateway.assert_not_called()
 
-    # allowedAudience still carries both forms (CRITIC-M3).
     _, kwargs = control.update_agent_runtime.call_args
     jwt = kwargs["authorizerConfiguration"]["customJWTAuthorizer"]
     assert jwt["allowedAudience"] == [mcp.entra_app_audience, mcp.entra_app_id]
-    # agentRuntimeId is the RID, not the ARN.
     assert kwargs["agentRuntimeId"] == RUNTIME_RID
     assert kwargs["agentRuntimeId"] != RUNTIME_ARN
     assert result.identity_status == "provisioned"
 
 
-# ===========================================================================
-# CRITIC-I1 / pre-lockdown scan — scan called with bearer=None when authorizer is NONE
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_prelockdown_scan_no_bearer(patch_scan):
     mcp = _make_mcp()
@@ -457,76 +427,56 @@ async def test_provision_prelockdown_scan_no_bearer(patch_scan):
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # The scan ran against the verbatim gatewayUrl with bearer=None (no token —
-    # the gateway is not yet locked down).
     patch_scan.assert_awaited_once()
     call = patch_scan.await_args
-    # endpoint_url is the gateway_url (positional or kw).
     endpoint = call.args[0] if call.args else call.kwargs.get("endpoint_url")
     assert endpoint == GATEWAY_URL
-    # bearer is None (positional second arg or kw).
     bearer = call.args[1] if len(call.args) > 1 else call.kwargs.get("bearer")
     assert bearer is None
-    # The scanned tools landed on the record.
     assert [t.name for t in result.available_tools] == ["get_claim"]
 
 
-# ===========================================================================
-# Skip the scan when the gateway is already CUSTOM_JWT (re-provision)
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_skips_scan_when_already_custom_jwt(patch_scan):
-    seeded = [McpTool(name="seeded_tool", description="from E5", input_schema={})]
+    seeded = [McpTool(name="seeded_tool", description="seeded", input_schema={})]
     mcp = _make_mcp(available_tools=seeded)
     graph = _graph_double(mcp.id)
     registry = _registry_double()
-    # The gateway is ALREADY locked down (re-provision case).
     control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
 
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # No scan when the gateway is already CUSTOM_JWT (scanning would need a token).
     patch_scan.assert_not_awaited()
-    # Existing/seeded tools are kept.
     assert [t.name for t in result.available_tools] == ["seeded_tool"]
 
 
-# ===========================================================================
-# CRITIC-I1 — a scan failure does NOT fail provisioning, seeded tools NOT wiped
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_scan_failure_does_not_fail_provisioning(patch_scan):
-    seeded = [McpTool(name="seeded_tool", description="from E5", input_schema={})]
+    seeded = [McpTool(name="seeded_tool", description="seeded", input_schema={})]
     mcp = _make_mcp(available_tools=seeded)
     graph = _graph_double(mcp.id)
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="NONE")
 
-    # The pre-lockdown scan blows up (a flaky endpoint).
     patch_scan.side_effect = McpScanError("MCP server returned HTTP 503")
 
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # Provisioning CONTINUED past the swallowed scan error and reached 'provisioned'.
     assert result.identity_status == "provisioned"
-    # The authorizer was still configured.
     control.update_gateway.assert_called_once()
-    # The E5-seeded tools were NOT wiped by the failed scan.
     assert [t.name for t in result.available_tools] == ["seeded_tool"]
 
 
 @pytest.mark.asyncio
 async def test_provision_empty_scan_does_not_wipe_seeded_tools(patch_scan):
-    # CRITIC-I1: OVERWRITE available_tools ONLY on a successful NON-EMPTY scan.
-    seeded = [McpTool(name="seeded_tool", description="from E5", input_schema={})]
+    seeded = [McpTool(name="seeded_tool", description="seeded", input_schema={})]
     mcp = _make_mcp(available_tools=seeded)
     graph = _graph_double(mcp.id)
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="NONE")
 
-    # The scan succeeds but returns NO tools — must not wipe the seed.
     patch_scan.return_value = []
 
     svc = _make_service(graph=graph, registry=registry, control=control)
@@ -536,9 +486,6 @@ async def test_provision_empty_scan_does_not_wipe_seeded_tools(patch_scan):
     assert [t.name for t in result.available_tools] == ["seeded_tool"]
 
 
-# ===========================================================================
-# CRITIC-I4 — all five Entra ids set after create
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_sets_all_five_entra_ids(patch_scan):
     mcp = _make_mcp()
@@ -556,9 +503,6 @@ async def test_provision_sets_all_five_entra_ids(patch_scan):
     assert result.admin_role_id == f"admin-{mcp.id}"
 
 
-# ===========================================================================
-# E6 CRITIQUE-FIX-A — persist ids IMMEDIATELY after create, before authorizer config
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_persists_ids_immediately_after_create(patch_scan):
     mcp = _make_mcp()
@@ -566,9 +510,6 @@ async def test_provision_persists_ids_immediately_after_create(patch_scan):
     registry = _registry_double()
     control = _gateway_control_client()
 
-    # Record the mcp's identity_status + ids AT THE MOMENT set_assignment_required is
-    # invoked. If the immediate persist happened first, the snapshot must show the ids
-    # set + status 'pending' + a persist already counted.
     snapshot: dict = {}
 
     async def _capture_on_set_assignment(sp_id, required=True):
@@ -592,20 +533,15 @@ async def test_provision_persists_ids_immediately_after_create(patch_scan):
     assert snapshot["invoker_role_id"] == f"invoker-{mcp.id}"
     assert snapshot["admin_role_id"] == f"admin-{mcp.id}"
     assert snapshot["entra_app_audience"] == f"api://agp-mcp-{mcp.id}"
-    # At least one persist (the immediate one after create) had landed by step (4).
     assert snapshot["persist_count_at_step"] >= 1
 
 
-# ===========================================================================
-# Idempotency — skip create when entra_sp_id already set (re-provision)
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_idempotent_skips_create_when_sp_exists(patch_scan):
-    # The MCP already carries its identity ids (a re-provision).
     mcp = _make_mcp(
         entra_sp_id="sp-existing",
         entra_app_audience="api://agp-mcp-mcp-rec-123",
-        identity_status="failed",
+        identity_status=IdentityStatus.FAILED,
     )
     mcp.entra_app_id = "app-existing"
     mcp.invoker_role_id = "invoker-existing"
@@ -617,21 +553,12 @@ async def test_provision_idempotent_skips_create_when_sp_exists(patch_scan):
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # create_mcp_app NOT called (sp already known).
     graph.create_mcp_app.assert_not_awaited()
-    # Authorizer still re-configured (the point of re-provision).
     control.update_gateway.assert_called_once()
-    # set_assignment_required still runs (idempotent), on the existing sp, and EXPLICITLY
-    # with required=False so a re-provision of an SP currently set TRUE (e.g. one a human
-    # flipped, or any prior-true record) CONVERGES to False — idempotent + self-healing
-    # (research §2.4/§2.5: the agent→MCP consent grant is the OBO gate, not assignment).
     graph.set_assignment_required.assert_awaited_once_with("sp-existing", required=False)
     assert result.identity_status == "provisioned"
 
 
-# ===========================================================================
-# Failure → identity_status='failed' + McpProvisioningError
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_failure_sets_failed_and_raises(patch_scan):
     mcp = _make_mcp()
@@ -639,7 +566,6 @@ async def test_provision_failure_sets_failed_and_raises(patch_scan):
     registry = _registry_double()
     control = _gateway_control_client()
 
-    # The authorizer config step raises.
     control.update_gateway.side_effect = RuntimeError("ValidationException")
 
     svc = _make_service(graph=graph, registry=registry, control=control)
@@ -647,10 +573,7 @@ async def test_provision_failure_sets_failed_and_raises(patch_scan):
         await svc.provision(mcp)
 
     assert mcp.identity_status == "failed"
-    # The failed status was persisted.
-    persisted_statuses = [
-        c.args[0].identity_status for c in registry.persist_identity.call_args_list
-    ]
+    persisted_statuses = [c.args[0].identity_status for c in registry.persist_identity.call_args_list]
     assert "failed" in persisted_statuses
 
 
@@ -659,7 +582,6 @@ async def test_provision_runtime_update_failed_status_raises(patch_scan):
     mcp = _make_mcp(kind=Kind.RUNTIME, gateway_arn=None, runtime_arn=RUNTIME_ARN)
     graph = _graph_double(mcp.id)
     registry = _registry_double()
-    # Initial read READY, then the poll sees UPDATE_FAILED → must raise.
     control = _runtime_control_client(statuses=["READY", "UPDATE_FAILED"])
 
     svc = _make_service(graph=graph, registry=registry, control=control)
@@ -669,12 +591,6 @@ async def test_provision_runtime_update_failed_status_raises(patch_scan):
     assert mcp.identity_status == "failed"
 
 
-# ===========================================================================
-# T-OBSERVABILITY — a NON-Graph (unexpected) provisioning failure logs the full
-# traceback (logger.exception → ERROR record with exc_info), so the next silent
-# 502 is diagnosable from logs. The 'failed' persist + McpProvisioningError
-# contract is unchanged.
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_failure_logs_traceback_for_unexpected_error(patch_scan, caplog):
     mcp = _make_mcp()
@@ -682,7 +598,6 @@ async def test_provision_failure_logs_traceback_for_unexpected_error(patch_scan,
     registry = _registry_double()
     control = _gateway_control_client()
 
-    # The very first control call (the step-1 GetGateway) raises a NON-Graph error.
     control.get_gateway.side_effect = RuntimeError("boom — unexpected control-plane error")
 
     svc = _make_service(graph=graph, registry=registry, control=control)
@@ -690,7 +605,6 @@ async def test_provision_failure_logs_traceback_for_unexpected_error(patch_scan,
         with pytest.raises(McpProvisioningError):
             await svc.provision(mcp)
 
-    # logger.exception fired: an ERROR-level record carrying a traceback (exc_info).
     failure_records = [
         r
         for r in caplog.records
@@ -701,17 +615,11 @@ async def test_provision_failure_logs_traceback_for_unexpected_error(patch_scan,
     ]
     assert failure_records, "expected an ERROR record with a traceback for the unexpected failure"
 
-    # Existing behavior unchanged: 'failed' persisted + McpProvisioningError raised.
     assert mcp.identity_status == "failed"
-    persisted_statuses = [
-        c.args[0].identity_status for c in registry.persist_identity.call_args_list
-    ]
+    persisted_statuses = [c.args[0].identity_status for c in registry.persist_identity.call_args_list]
     assert "failed" in persisted_statuses
 
 
-# ===========================================================================
-# CRITIQUE-FIX-B — the blocking authorizer config runs OFF the event loop
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_configure_gateway_dispatched_off_loop(patch_scan, monkeypatch):
     mcp = _make_mcp()
@@ -721,9 +629,6 @@ async def test_configure_gateway_dispatched_off_loop(patch_scan, monkeypatch):
 
     import services.mcp_identity_service as mod
 
-    # Patch anyio.to_thread.run_sync with an AsyncMock that actually runs the target
-    # (so the rest of provision still works) but records that it was awaited with the
-    # blocking method + its args.
     real_run_sync = mod.anyio.to_thread.run_sync
     recorder = AsyncMock(side_effect=real_run_sync)
     monkeypatch.setattr(mod.anyio.to_thread, "run_sync", recorder)
@@ -731,56 +636,35 @@ async def test_configure_gateway_dispatched_off_loop(patch_scan, monkeypatch):
     svc = _make_service(graph=graph, registry=registry, control=control)
     await svc.provision(mcp)
 
-    # run_sync was awaited with the bound _configure_gateway_authorizer + (gateway_id, mcp).
-    # NOTE: run_sync is now awaited MORE than once — the native tool read
-    # (_read_gateway_tools_native) is ALSO dispatched off-loop (T-NATIVE-TOOLSCAN) — so we
-    # assert the authorizer-config dispatch is PRESENT among the off-loop calls, not that
-    # it is the only one.
     authorizer_calls = [
-        c
-        for c in recorder.await_args_list
-        if c.args and c.args[0] == svc._configure_gateway_authorizer
+        c for c in recorder.await_args_list if c.args and c.args[0] == svc._configure_gateway_authorizer
     ]
     assert len(authorizer_calls) == 1
     awaited_args = authorizer_calls[0].args
     assert awaited_args[1] == GATEWAY_ID
     assert awaited_args[2] is mcp
-    # The native tool read was ALSO dispatched off the loop (never blocks the uvicorn loop).
     native_calls = [
-        c
-        for c in recorder.await_args_list
-        if c.args and c.args[0] == svc._read_gateway_tools_native
+        c for c in recorder.await_args_list if c.args and c.args[0] == svc._read_gateway_tools_native
     ]
     assert len(native_calls) == 1
 
 
-# ===========================================================================
-# Poll to READY — the gateway poll waits before flipping to 'provisioned'
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_polls_gateway_to_ready(patch_scan):
     mcp = _make_mcp()
     graph = _graph_double(mcp.id)
     registry = _registry_double()
-    # First get_gateway read (for replay) + poll reads: UPDATING, UPDATING, READY.
     control = _gateway_control_client(statuses=["READY", "UPDATING", "UPDATING", "READY"])
 
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
     assert result.identity_status == "provisioned"
-    # get_gateway called more than once (initial replay read + ≥1 poll until READY).
     assert control.get_gateway.call_count >= 2
 
 
-# ===========================================================================
-# Fix #1 — runtime optional fields are replayed into UpdateAgentRuntime
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_runtime_replays_optional_fields(patch_scan):
-    # Seed environmentVariables + protocolConfiguration on the get_agent_runtime mock.
-    # Both are optional fields UpdateAgentRuntime accepts; without the fix they would be
-    # silently dropped — the runtime comes back READY but mis-configured.
     mcp = _make_mcp(kind=Kind.RUNTIME, gateway_arn=None, runtime_arn=RUNTIME_ARN)
     graph = _graph_double(mcp.id)
     registry = _registry_double()
@@ -798,29 +682,22 @@ async def test_provision_runtime_replays_optional_fields(patch_scan):
     await svc.provision(mcp)
 
     _, kwargs = control.update_agent_runtime.call_args
-    # The optional fields from the GET are forwarded into the Update kwargs.
     assert kwargs["environmentVariables"] == env_vars
     assert kwargs["protocolConfiguration"] == proto_cfg
-    # Required fields still present.
     assert "agentRuntimeArtifact" in kwargs
     assert "roleArn" in kwargs
     assert "networkConfiguration" in kwargs
     assert "authorizerConfiguration" in kwargs
 
 
-# ===========================================================================
-# Fix #2 — empty allowedAudience raises before the Update (fail-loud guard)
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_provision_empty_audience_raises_before_update_gateway(patch_scan):
-    # Both entra_app_audience and entra_app_id are None → _allowed_audience returns [].
-    # The guard must raise McpProvisioningError and must NOT call update_gateway.
     mcp = _make_mcp(
-        entra_sp_id="sp-existing",        # skip create so we reach the authorizer step
+        entra_sp_id="sp-existing",
         entra_app_audience=None,
-        identity_status="failed",
+        identity_status=IdentityStatus.FAILED,
     )
-    mcp.entra_app_id = None               # both forms absent
+    mcp.entra_app_id = None
     graph = _graph_double(mcp.id)
     registry = _registry_double()
     control = _gateway_control_client()
@@ -829,29 +706,17 @@ async def test_provision_empty_audience_raises_before_update_gateway(patch_scan)
     with pytest.raises(McpProvisioningError):
         await svc.provision(mcp)
 
-    # The guard fired before the Update — no authorizer was configured.
     control.update_gateway.assert_not_called()
-    # Failure path: identity_status persisted as 'failed'.
     assert mcp.identity_status == "failed"
 
 
-# ===========================================================================
-# T-NATIVE-TOOLSCAN — native control-plane tool read (no token; works on a
-# born-CUSTOM_JWT gateway) via ListGatewayTargets → GetGatewayTarget.
-# ===========================================================================
 def _lambda_target_config(*, tools: list[dict]) -> dict:
     """A GetGatewayTarget targetConfiguration for a LAMBDA target with an inline toolSchema."""
-    return {
-        "targetConfiguration": {
-            "mcp": {"lambda": {"toolSchema": {"inlinePayload": tools}}}
-        }
-    }
+    return {"targetConfiguration": {"mcp": {"lambda": {"toolSchema": {"inlinePayload": tools}}}}}
 
 
 @pytest.mark.asyncio
 async def test_provision_reads_native_lambda_tools_on_custom_jwt_gateway(patch_scan):
-    # The gateway is born CUSTOM_JWT (immutable post-create), so the wire-scan is never
-    # eligible. The native control-plane read must populate tools regardless.
     mcp = _make_mcp()
     graph = _graph_double(mcp.id)
     registry = _registry_double()
@@ -873,16 +738,10 @@ async def test_provision_reads_native_lambda_tools_on_custom_jwt_gateway(patch_s
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # Native read used the prefixed <targetName>___<toolName> names, verbatim.
     assert sorted(t.name for t in result.available_tools) == ["claims___add", "claims___echo"]
-    # The wire-scan was NOT used (native path served a locked CUSTOM_JWT gateway).
     patch_scan.assert_not_awaited()
-    # Native read targeted the gateway by id.
     control.list_gateway_targets.assert_called()
-    control.get_gateway_target.assert_called_once_with(
-        gatewayIdentifier=GATEWAY_ID, targetId="tgt-1"
-    )
-    # Provisioning still completed.
+    control.get_gateway_target.assert_called_once_with(gatewayIdentifier=GATEWAY_ID, targetId="tgt-1")
     assert result.identity_status == "provisioned"
 
 
@@ -893,7 +752,6 @@ async def test_native_tool_read_paginates_targets(patch_scan):
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
 
-    # Two pages of targets (nextToken on the first, none on the second).
     control.list_gateway_targets.side_effect = [
         {"items": [{"targetId": "tgt-1", "name": "alpha"}], "nextToken": "PAGE2"},
         {"items": [{"targetId": "tgt-2", "name": "beta"}]},
@@ -907,7 +765,6 @@ async def test_native_tool_read_paginates_targets(patch_scan):
     result = await svc.provision(mcp)
 
     assert sorted(t.name for t in result.available_tools) == ["alpha___a_tool", "beta___b_tool"]
-    # The second page was requested with the nextToken.
     second_call = control.list_gateway_targets.call_args_list[1]
     assert second_call.kwargs.get("nextToken") == "PAGE2"
     assert result.identity_status == "provisioned"
@@ -926,8 +783,6 @@ async def test_native_tool_read_skips_non_lambda_targets(patch_scan):
             {"targetId": "tgt-lambda", "name": "local"},
         ]
     }
-    # First target is an mcpServer (no inline lambda schema) → skipped, no crash.
-    # Second target is a lambda → its tools still come through.
     control.get_gateway_target.side_effect = [
         {"name": "remote", "targetConfiguration": {"mcp": {"mcpServer": {"endpoint": "https://x"}}}},
         {"name": "local", **_lambda_target_config(tools=[{"name": "do_it", "inputSchema": {}}])},
@@ -942,9 +797,7 @@ async def test_native_tool_read_skips_non_lambda_targets(patch_scan):
 
 @pytest.mark.asyncio
 async def test_native_tool_read_best_effort_does_not_fail_provisioning(patch_scan):
-    # ListGatewayTargets raises — provisioning must continue (best-effort) and must NOT
-    # wipe pre-seeded tools.
-    seeded = [McpTool(name="seeded_tool", description="from E5", input_schema={})]
+    seeded = [McpTool(name="seeded_tool", description="seeded", input_schema={})]
     mcp = _make_mcp(available_tools=seeded)
     graph = _graph_double(mcp.id)
     registry = _registry_double()
@@ -957,20 +810,16 @@ async def test_native_tool_read_best_effort_does_not_fail_provisioning(patch_sca
 
     assert result.identity_status == "provisioned"
     control.update_gateway.assert_called_once()
-    # Seeded tools NOT wiped by the failed native read.
     assert [t.name for t in result.available_tools] == ["seeded_tool"]
 
 
 @pytest.mark.asyncio
 async def test_provision_falls_back_to_wire_scan_when_open_and_native_empty(patch_scan):
-    # An OPEN (NONE) gateway whose native read finds NO targets must fall back to the
-    # token-less wire-scan (which still works while the gateway is open).
     mcp = _make_mcp()
     graph = _graph_double(mcp.id)
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="NONE")
 
-    # Native read returns no targets (default helper already returns {"items": []}).
     patch_scan.return_value = [
         McpTool(name="wire_tool", description="from wire", input_schema={"type": "object"})
     ]
@@ -978,7 +827,6 @@ async def test_provision_falls_back_to_wire_scan_when_open_and_native_empty(patc
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # The wire-scan fallback ran with bearer=None and its tool landed.
     patch_scan.assert_awaited_once()
     call = patch_scan.await_args
     bearer = call.args[1] if len(call.args) > 1 else call.kwargs.get("bearer")
@@ -989,8 +837,6 @@ async def test_provision_falls_back_to_wire_scan_when_open_and_native_empty(patc
 
 @pytest.mark.asyncio
 async def test_native_tool_read_per_target_error_is_isolated(patch_scan):
-    # A get_gateway_target error on the FIRST target must be isolated: the second
-    # target's tools still land. Proves the per-target try/except guarantee.
     mcp = _make_mcp()
     graph = _graph_double(mcp.id)
     registry = _registry_double()
@@ -1002,7 +848,6 @@ async def test_native_tool_read_per_target_error_is_isolated(patch_scan):
             {"targetId": "tgt-good", "name": "good"},
         ]
     }
-    # First call raises; second call returns a valid lambda target.
     control.get_gateway_target.side_effect = [
         RuntimeError("boom"),
         {
@@ -1014,16 +859,12 @@ async def test_native_tool_read_per_target_error_is_isolated(patch_scan):
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.provision(mcp)
 
-    # The bad target was skipped; the good target's tool still populated.
     assert [t.name for t in result.available_tools] == ["good___ok_tool"]
     assert result.identity_status == "provisioned"
 
 
 @pytest.mark.asyncio
 async def test_native_tool_read_pagination_is_bounded(patch_scan):
-    # list_gateway_targets ALWAYS returns a nextToken (never self-terminates).
-    # The loop must stop at _MAX_TARGET_PAGES and provisioning must still complete
-    # (no infinite loop). Locks in the bound against future edits.
     from services.mcp_identity_service import _MAX_TARGET_PAGES
 
     mcp = _make_mcp()
@@ -1031,7 +872,6 @@ async def test_native_tool_read_pagination_is_bounded(patch_scan):
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
 
-    # Every page returns a nextToken — the loop must self-stop at _MAX_TARGET_PAGES.
     control.list_gateway_targets.return_value = {"items": [], "nextToken": "forever"}
 
     svc = _make_service(graph=graph, registry=registry, control=control)
@@ -1041,20 +881,12 @@ async def test_native_tool_read_pagination_is_bounded(patch_scan):
     assert result.identity_status == "provisioned"
 
 
-# ===========================================================================
-# T-REFRESH-TOOLS-BE — refresh_tools: synchronous, tools-ONLY native re-read.
-# Re-reads a gateway's tools natively + persists, WITHOUT touching the
-# authorizer / identity. Best-effort + overwrite-only-on-non-empty (CRITIC-I1).
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_refresh_tools_reads_native_and_persists():
-    # A locked CUSTOM_JWT gateway whose native read returns 2 tools — available_tools
-    # is overwritten to those 2 + persist_identity is called. The authorizer / identity
-    # are left untouched (update_gateway NOT called; create_mcp_app NOT called).
     mcp = _make_mcp(
         entra_sp_id="sp-existing",
         entra_app_audience="api://agp-mcp-mcp-rec-123",
-        identity_status="provisioned",
+        identity_status=IdentityStatus.PROVISIONED,
         available_tools=[McpTool(name="old___stale", description="stale", input_schema={})],
     )
     mcp.gateway_id = GATEWAY_ID
@@ -1062,9 +894,7 @@ async def test_refresh_tools_reads_native_and_persists():
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
 
-    control.list_gateway_targets.return_value = {
-        "items": [{"targetId": "tgt-1", "name": "claims"}]
-    }
+    control.list_gateway_targets.return_value = {"items": [{"targetId": "tgt-1", "name": "claims"}]}
     control.get_gateway_target.return_value = {
         "name": "claims",
         **_lambda_target_config(
@@ -1078,11 +908,8 @@ async def test_refresh_tools_reads_native_and_persists():
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.refresh_tools(mcp)
 
-    # The fresh native tools replaced the stale ones.
     assert sorted(t.name for t in result.available_tools) == ["claims___add", "claims___echo"]
-    # Persisted exactly once (only when we got tools).
     registry.persist_identity.assert_called_once()
-    # Tools-only: NO authorizer reconfigure / identity create / status change.
     control.update_gateway.assert_not_called()
     graph.create_mcp_app.assert_not_awaited()
     graph.set_assignment_required.assert_not_awaited()
@@ -1092,16 +919,13 @@ async def test_refresh_tools_reads_native_and_persists():
 
 @pytest.mark.asyncio
 async def test_refresh_tools_derives_gateway_id_from_arn_when_absent():
-    # No gateway_id on the record, but a gateway_arn is present → it must be derived.
-    mcp = _make_mcp(identity_status="provisioned")  # gateway_arn set, gateway_id None
+    mcp = _make_mcp(identity_status=IdentityStatus.PROVISIONED)
     assert mcp.gateway_id is None
     graph = _graph_double(mcp.id)
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
 
-    control.list_gateway_targets.return_value = {
-        "items": [{"targetId": "tgt-1", "name": "claims"}]
-    }
+    control.list_gateway_targets.return_value = {"items": [{"targetId": "tgt-1", "name": "claims"}]}
     control.get_gateway_target.return_value = {
         "name": "claims",
         **_lambda_target_config(tools=[{"name": "echo", "inputSchema": {}}]),
@@ -1110,7 +934,6 @@ async def test_refresh_tools_derives_gateway_id_from_arn_when_absent():
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.refresh_tools(mcp)
 
-    # The native read was targeted by the gatewayId derived from the ARN.
     control.list_gateway_targets.assert_called()
     assert control.list_gateway_targets.call_args.kwargs["gatewayIdentifier"] == GATEWAY_ID
     assert [t.name for t in result.available_tools] == ["claims___echo"]
@@ -1118,19 +941,16 @@ async def test_refresh_tools_derives_gateway_id_from_arn_when_absent():
 
 @pytest.mark.asyncio
 async def test_refresh_tools_empty_keeps_existing():
-    # CRITIC-I1: an empty native read must NOT wipe existing tools + must NOT persist.
     seeded = [McpTool(name="seeded___tool", description="from before", input_schema={})]
-    mcp = _make_mcp(identity_status="provisioned", available_tools=seeded)
+    mcp = _make_mcp(identity_status=IdentityStatus.PROVISIONED, available_tools=seeded)
     mcp.gateway_id = GATEWAY_ID
     graph = _graph_double(mcp.id)
     registry = _registry_double()
     control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
 
-    # Native read finds nothing (default helper returns {"items": []}).
     svc = _make_service(graph=graph, registry=registry, control=control)
     result = await svc.refresh_tools(mcp)
 
-    # Existing tools kept, nothing persisted (no needless write / UPDATING-race).
     assert [t.name for t in result.available_tools] == ["seeded___tool"]
     registry.persist_identity.assert_not_called()
     control.update_gateway.assert_not_called()
@@ -1138,10 +958,8 @@ async def test_refresh_tools_empty_keeps_existing():
 
 @pytest.mark.asyncio
 async def test_refresh_tools_error_is_best_effort():
-    # CRITIC-I1: a native-read error is swallowed — returns the mcp unchanged, no raise,
-    # no wipe, no persist. (A flaky read must never 500 the refresh button.)
     seeded = [McpTool(name="seeded___tool", description="from before", input_schema={})]
-    mcp = _make_mcp(identity_status="provisioned", available_tools=seeded)
+    mcp = _make_mcp(identity_status=IdentityStatus.PROVISIONED, available_tools=seeded)
     mcp.gateway_id = GATEWAY_ID
     graph = _graph_double(mcp.id)
     registry = _registry_double()
@@ -1150,7 +968,7 @@ async def test_refresh_tools_error_is_best_effort():
     control.list_gateway_targets.side_effect = RuntimeError("AccessDeniedException")
 
     svc = _make_service(graph=graph, registry=registry, control=control)
-    result = await svc.refresh_tools(mcp)  # must NOT raise
+    result = await svc.refresh_tools(mcp)
 
     assert [t.name for t in result.available_tools] == ["seeded___tool"]
     registry.persist_identity.assert_not_called()
@@ -1159,9 +977,8 @@ async def test_refresh_tools_error_is_best_effort():
 
 @pytest.mark.asyncio
 async def test_refresh_tools_no_gateway_handle_returns_unchanged():
-    # Defensive: no gateway_id AND no gateway_arn → return unchanged, no read, no persist.
     seeded = [McpTool(name="seeded___tool", description="from before", input_schema={})]
-    mcp = _make_mcp(gateway_arn=None, identity_status="provisioned", available_tools=seeded)
+    mcp = _make_mcp(gateway_arn=None, identity_status=IdentityStatus.PROVISIONED, available_tools=seeded)
     assert mcp.gateway_id is None and mcp.gateway_arn is None
     graph = _graph_double(mcp.id)
     registry = _registry_double()
@@ -1173,3 +990,264 @@ async def test_refresh_tools_no_gateway_handle_returns_unchanged():
     assert [t.name for t in result.available_tools] == ["seeded___tool"]
     registry.persist_identity.assert_not_called()
     control.list_gateway_targets.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_tools_identical_read_does_not_write():
+    current = [McpTool(name="claims___echo", description="echo back", input_schema={})]
+    mcp = _make_mcp(identity_status=IdentityStatus.PROVISIONED, available_tools=current)
+    mcp.gateway_id = GATEWAY_ID
+    registry = _registry_double()
+    control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
+    control.list_gateway_targets.return_value = {"items": [{"targetId": "tgt-1", "name": "claims"}]}
+    control.get_gateway_target.return_value = {
+        "name": "claims",
+        **_lambda_target_config(tools=[{"name": "echo", "description": "echo back", "inputSchema": {}}]),
+    }
+
+    svc = _make_service(graph=_graph_double(mcp.id), registry=registry, control=control)
+    result = await svc.refresh_tools(mcp)
+
+    assert [t.name for t in result.available_tools] == ["claims___echo"]
+    registry.persist_identity.assert_not_called()
+
+
+def test_mint_app_creates_app_and_persists_once_without_touching_a_gateway():
+    mcp = _make_mcp(gateway_arn=None)
+    graph = _graph_double(mcp.id)
+    registry = _registry_double()
+    control = _gateway_control_client()
+
+    svc = _make_service(graph=graph, registry=registry, control=control)
+    result = svc.mint_app(mcp)
+
+    graph.create_mcp_app.assert_awaited_once_with(mcp.id, mcp.name)
+    graph.set_assignment_required.assert_awaited_once_with(f"sp-obj-id-{mcp.id}", required=False)
+    assert result.entra_app_id == f"app-client-guid-{mcp.id}"
+    assert result.entra_sp_id == f"sp-obj-id-{mcp.id}"
+    assert result.entra_app_audience == f"api://agp-mcp-{mcp.id}"
+    assert result.invoker_role_id == f"invoker-{mcp.id}"
+    assert result.admin_role_id == f"admin-{mcp.id}"
+    assert result.identity_status == IdentityStatus.PENDING
+    registry.persist_identity.assert_called_once()
+    assert control.method_calls == []
+
+
+def test_mint_app_is_idempotent_when_the_sp_already_exists():
+    mcp = _make_mcp(gateway_arn=None, entra_sp_id="sp-existing")
+    graph = _graph_double(mcp.id)
+    registry = _registry_double()
+    control = _gateway_control_client()
+
+    svc = _make_service(graph=graph, registry=registry, control=control)
+    result = svc.mint_app(mcp)
+
+    assert result is mcp
+    graph.create_mcp_app.assert_not_awaited()
+    registry.persist_identity.assert_not_called()
+    assert control.method_calls == []
+
+
+def test_mint_app_without_sp_id_raises():
+    mcp = _make_mcp(gateway_arn=None)
+    graph = _graph_double(mcp.id)
+    graph.create_mcp_app.return_value = {**graph.create_mcp_app.return_value, "sp_id": None}
+    registry = _registry_double()
+
+    svc = _make_service(graph=graph, registry=registry, control=_gateway_control_client())
+    with pytest.raises(McpProvisioningError):
+        svc.mint_app(mcp)
+    graph.set_assignment_required.assert_not_awaited()
+
+
+def _adopt_control() -> MagicMock:
+    control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
+    control.list_gateway_targets.return_value = {"items": [{"targetId": "tgt-1", "name": "api"}]}
+    control.get_gateway_target.return_value = {
+        "name": "api",
+        **_lambda_target_config(tools=[{"name": "getClaim", "inputSchema": {}}]),
+    }
+    return control
+
+
+def _minted_mcp() -> McpServer:
+    mcp = _make_mcp(
+        gateway_arn=None,
+        entra_sp_id="sp-existing",
+        entra_app_audience="api://agp-mcp-mcp-rec-123",
+        identity_status=IdentityStatus.PENDING,
+    )
+    return mcp
+
+
+def test_adopt_built_gateway_writes_once_then_noops_on_identical_input():
+    mcp = _minted_mcp()
+    registry = _registry_double()
+    control = _adopt_control()
+    svc = _make_service(graph=_graph_double(mcp.id), registry=registry, control=control)
+
+    result = svc.adopt_built_gateway(
+        mcp, gateway_arn=GATEWAY_ARN, gateway_id=GATEWAY_ID, gateway_url=GATEWAY_URL
+    )
+
+    control.get_gateway.assert_called_once_with(gatewayIdentifier=GATEWAY_ID)
+    assert result.gateway_arn == GATEWAY_ARN
+    assert result.gateway_id == GATEWAY_ID
+    assert result.gateway_url == GATEWAY_URL
+    assert [t.name for t in result.available_tools] == ["api___getClaim"]
+    assert result.identity_status == IdentityStatus.PROVISIONED
+    registry.persist_identity.assert_called_once()
+
+    svc.adopt_built_gateway(result, gateway_arn=GATEWAY_ARN, gateway_id=GATEWAY_ID, gateway_url=GATEWAY_URL)
+    registry.persist_identity.assert_called_once()
+
+
+def test_adopt_built_gateway_never_updates_the_gateway():
+    mcp = _minted_mcp()
+    control = _adopt_control()
+    svc = _make_service(graph=_graph_double(mcp.id), registry=_registry_double(), control=control)
+
+    svc.adopt_built_gateway(mcp, gateway_arn=GATEWAY_ARN, gateway_id=GATEWAY_ID, gateway_url=GATEWAY_URL)
+
+    control.update_gateway.assert_not_called()
+
+
+def test_adopt_built_gateway_raises_when_the_gateway_is_missing():
+    mcp = _minted_mcp()
+    registry = _registry_double()
+    control = _adopt_control()
+    control.get_gateway.side_effect = RuntimeError("ResourceNotFoundException")
+    svc = _make_service(graph=_graph_double(mcp.id), registry=registry, control=control)
+
+    with pytest.raises(McpProvisioningError):
+        svc.adopt_built_gateway(mcp, gateway_arn=GATEWAY_ARN, gateway_id=GATEWAY_ID, gateway_url=GATEWAY_URL)
+    registry.persist_identity.assert_not_called()
+
+
+def test_adopt_built_gateway_keeps_existing_tools_when_discovery_is_empty():
+    seeded = [McpTool(name="api___getClaim", description="", input_schema={})]
+    mcp = _minted_mcp()
+    mcp.available_tools = seeded
+    registry = _registry_double()
+    control = _adopt_control()
+    control.list_gateway_targets.side_effect = RuntimeError("AccessDeniedException")
+    svc = _make_service(graph=_graph_double(mcp.id), registry=registry, control=control)
+
+    result = svc.adopt_built_gateway(
+        mcp, gateway_arn=GATEWAY_ARN, gateway_id=GATEWAY_ID, gateway_url=GATEWAY_URL
+    )
+
+    assert [t.name for t in result.available_tools] == ["api___getClaim"]
+    assert result.identity_status == IdentityStatus.PROVISIONED
+    registry.persist_identity.assert_called_once()
+
+
+def test_registry_create_stamps_project_and_repo_ownership(mcp_service, mcp_mock_registry_clients):
+    import json
+
+    from models.mcp_server import McpServerCreate
+
+    ctl, _ = mcp_mock_registry_clients
+    req = McpServerCreate(name="claims-api", kind=Kind.GATEWAY, tenant_id="default")
+
+    mcp = mcp_service.create(req, project_id="proj-1", repo_id="repo-1")
+
+    gov = json.loads(ctl.create_registry_record.call_args.kwargs["descriptors"]["mcpServer"]["data"])[
+        "_meta"
+    ]["com.agp/governance"]
+    assert (gov["project_id"], gov["repo_id"]) == ("proj-1", "repo-1")
+    assert mcp.is_repo_owned
+    assert not mcp_service.create(
+        McpServerCreate(name="byo-gw", kind=Kind.GATEWAY, tenant_id="default")
+    ).is_repo_owned
+
+
+def test_adopt_built_gateway_reordered_discovery_is_no_change():
+    a = McpTool(name="api___a", description="", input_schema={})
+    b = McpTool(name="api___b", description="", input_schema={})
+    mcp = _minted_mcp()
+    mcp.gateway_arn, mcp.gateway_id, mcp.gateway_url = GATEWAY_ARN, GATEWAY_ID, GATEWAY_URL
+    mcp.identity_status = IdentityStatus.PROVISIONED
+    mcp.available_tools = [b, a]
+    registry = _registry_double()
+    control = _adopt_control()
+    control.get_gateway_target.return_value = {
+        "name": "api",
+        **_lambda_target_config(tools=[{"name": "a"}, {"name": "b"}]),
+    }
+    svc = _make_service(graph=_graph_double(mcp.id), registry=registry, control=control)
+
+    svc.adopt_built_gateway(mcp, gateway_arn=GATEWAY_ARN, gateway_id=GATEWAY_ID, gateway_url=GATEWAY_URL)
+
+    registry.persist_identity.assert_not_called()
+
+
+def _alias_bomb(levels: int) -> str:
+    s = "openapi: '3'\npaths: {}\na0: &a0 [lol,lol,lol,lol,lol,lol,lol,lol,lol,lol]\n"
+    for i in range(1, levels):
+        s += f"a{i}: &a{i} [" + ",".join([f"*a{i - 1}"] * 10) + "]\n"
+    return s
+
+
+def test_parse_openapi_refuses_a_yaml_alias_bomb():
+    import time
+
+    from services.mcp_identity_service import _parse_openapi
+
+    started = time.monotonic()
+    assert _parse_openapi(_alias_bomb(9)) is None
+    assert time.monotonic() - started < 1
+
+
+def test_parse_openapi_refuses_any_alias_but_keeps_plain_yaml():
+    from services.mcp_identity_service import _parse_openapi
+
+    assert _parse_openapi("openapi: '3'\nx: &a 1\ny: *a\n") is None
+    assert _parse_openapi("openapi: '3'\npaths: {}\ninfo: {version: 2026-10-05}\n") == {
+        "openapi": "3",
+        "paths": {},
+        "info": {"version": "2026-10-05"},
+    }
+
+
+def test_parse_openapi_keeps_base60_scalars_as_strings_and_is_fast():
+    import time
+
+    from services.mcp_identity_service import _parse_openapi
+
+    value = "1" + ":5" * 99_000
+    quoted = f"openapi: '3'\npaths: {{}}\nx: '{value}'\ny: '{value}.5'\n"
+    unquoted = f"openapi: '3'\npaths: {{}}\nx: {value}\ny: {value}.5\n"
+    started = time.monotonic()
+    baseline = _parse_openapi(quoted)
+    quoted_seconds = time.monotonic() - started
+    started = time.monotonic()
+    spec = _parse_openapi(unquoted)
+    unquoted_seconds = time.monotonic() - started
+    assert unquoted_seconds < 5 * quoted_seconds, (quoted_seconds, unquoted_seconds)
+    assert spec == baseline
+    assert spec is not None
+    assert spec["x"] == value and spec["y"] == value + ".5"
+    assert _parse_openapi("openapi: '3'\na: 1:30\nb: 12\nc: 1.5\n") == {
+        "openapi": "3",
+        "a": "1:30",
+        "b": 12,
+        "c": 1.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_native_tool_read_isolates_a_spec_that_crashes_the_parser(patch_scan):
+    mcp = _make_mcp()
+    control = _gateway_control_client(authorizer_type="CUSTOM_JWT")
+    control.list_gateway_targets.return_value = {
+        "items": [{"targetId": "tgt-bad", "name": "bad"}, {"targetId": "tgt-good", "name": "good"}]
+    }
+    deep = '{"openapi":"3","paths":' + "[" * 200_000 + "]" * 200_000 + "}"
+    control.get_gateway_target.side_effect = [
+        {"name": "bad", "targetConfiguration": {"mcp": {"openApiSchema": {"inlinePayload": deep}}}},
+        {"name": "good", **_lambda_target_config(tools=[{"name": "ok_tool", "inputSchema": {}}])},
+    ]
+    svc = _make_service(graph=_graph_double(mcp.id), registry=_registry_double(), control=control)
+    result = await svc.provision(mcp)
+    assert [t.name for t in result.available_tools] == ["good___ok_tool"]

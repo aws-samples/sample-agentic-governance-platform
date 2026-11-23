@@ -1,16 +1,17 @@
-"""Unit tests for the MCP Server models + envelope/server.json round-trip (Epic 5, Task 1).
+"""Unit tests for the MCP Server models and the envelope / server.json round-trip.
 
-Spec: the Epic 5 MCP-server-catalog plan (Task 1) and the MCP server registry-records
-      research notes (§2 payload, §3 + §3.1 server.json + envelope, §4 kind, §5 lifecycle)
-      — design artifacts kept outside this repository.
-
-These are pure-python tests: no boto3, no FastAPI, no AWS. The lifecycle machinery
-is reused verbatim from models.agent (research §5: it is identical to E4).
+Pure-python tests: no boto3, no FastAPI, no AWS. The lifecycle machinery is reused verbatim from
+``models.agent``. Every service-written block (the Entra identity and gateway fields, the Cedar
+policy-engine fields, the tenant fields, the marketplace publication, the repo-ownership pair) is
+pinned the same way: it rides ``to_envelope`` / ``from_record``, a pre-existing envelope without its
+keys hydrates to the defaults so ``ENVELOPE_SCHEMA_VERSION`` stays 1, and it is absent from
+``McpServerCreate`` and ``McpServerUpdate``.
 """
 
 import json
 import logging
 from datetime import datetime
+from typing import Any
 
 import pytest
 
@@ -27,10 +28,6 @@ from models.mcp_server import (
     McpTool,
 )
 
-
-# ---------------------------------------------------------------------------
-# Builders
-# ---------------------------------------------------------------------------
 
 def _make_mcp_server() -> McpServer:
     return McpServer(
@@ -66,32 +63,24 @@ def _make_mcp_server() -> McpServer:
 
 
 def _native_record(status: str = "DRAFT") -> dict:
-    """A native record with NO ``displayName`` — deliberately the pre-E32 shape, so every
-    test built on it also proves the ``displayName`` -> ``name`` fall-back still hydrates
-    records written before the migration."""
+    """A native record with NO ``displayName``, deliberately the older shape, so every test built on
+    it also proves the ``displayName`` -> ``name`` fall-back still hydrates records written before
+    the migration."""
     return {
         "recordId": "mcp-7f3a1b2c9d",
         "name": "internal-claims-mcp",
         "description": "native description (ignored — server.json is authoritative)",
         "status": status,
-        "recordType": "MCP",  # E32: recordType replaces the removed descriptorType
+        "recordType": "MCP",
         "createdAt": datetime(2026, 6, 2),
         "updatedAt": datetime(2026, 6, 2),
     }
 
 
-# ---------------------------------------------------------------------------
-# Kind enum
-# ---------------------------------------------------------------------------
-
 def test_kind_enum_values():
     assert Kind.GATEWAY == "gateway"
     assert Kind.STANDARD == "standard"
 
-
-# ---------------------------------------------------------------------------
-# to_envelope
-# ---------------------------------------------------------------------------
 
 def test_to_envelope_includes_governance_fields():
     env = _make_mcp_server().to_envelope()
@@ -131,10 +120,6 @@ def test_to_envelope_enums_are_json_safe_strings():
     assert isinstance(reparsed["data_classification"], str)
 
 
-# ---------------------------------------------------------------------------
-# to_server_json
-# ---------------------------------------------------------------------------
-
 def test_to_server_json_namespaces_name():
     sj = _make_mcp_server().to_server_json()
     assert sj["name"] == "agp/internal-claims-mcp"
@@ -157,21 +142,11 @@ def test_to_server_json_remotes_from_endpoint_url():
     assert "remotes" not in sj2
 
 
-# ---------------------------------------------------------------------------
-# tools_as_mcp
-# ---------------------------------------------------------------------------
-
 def test_tools_as_mcp_maps_input_schema_key():
     mcp = _make_mcp_server()
     mcp.available_tools = [McpTool(name="get_claim", input_schema={"type": "object"})]
-    assert mcp.tools_as_mcp() == [
-        {"name": "get_claim", "description": "", "inputSchema": {"type": "object"}}
-    ]
+    assert mcp.tools_as_mcp() == [{"name": "get_claim", "description": "", "inputSchema": {"type": "object"}}]
 
-
-# ---------------------------------------------------------------------------
-# from_record
-# ---------------------------------------------------------------------------
 
 def test_from_record_maps_native_fields_and_status():
     server_json = _make_mcp_server().to_server_json()
@@ -184,7 +159,7 @@ def test_from_record_maps_native_fields_and_status():
 
 
 def test_from_record_prefers_display_name_over_name():
-    """Native displayName WINS over the record's name (E32).
+    """Native displayName WINS over the record's name.
 
     The two values must DIFFER or the test is a tautology. ``name`` is the registry's
     unique dedup key; ``displayName`` is the human-facing label the registry now shows and
@@ -197,7 +172,7 @@ def test_from_record_prefers_display_name_over_name():
 
 
 def test_from_record_falls_back_to_name_without_display_name():
-    """A pre-E32 record has no displayName at all and must still hydrate, not KeyError."""
+    """A record written before displayName existed must still hydrate, not KeyError."""
     server_json = _make_mcp_server().to_server_json()
     record = _native_record()
     assert "displayName" not in record
@@ -271,9 +246,7 @@ def test_from_record_rejects_invalid_data_classification():
         "name": "agp/x",
         "description": "",
         "version": "1.0.0",
-        "_meta": {
-            "com.agp/governance": {"schema_version": 1, "data_classification": "bogus"}
-        },
+        "_meta": {"com.agp/governance": {"schema_version": 1, "data_classification": "bogus"}},
     }
     with pytest.raises(ValidationError):
         McpServer.from_record(_native_record(), server_json, [])
@@ -291,7 +264,6 @@ def test_round_trip_preserves_governance_and_tools():
     server_json = original.to_server_json()
     tools = original.tools_as_mcp()
     rebuilt = McpServer.from_record(_native_record(status="APPROVED"), server_json, tools)
-    # governance
     assert rebuilt.kind == original.kind
     assert rebuilt.owner_oid == original.owner_oid
     assert rebuilt.owner_email == original.owner_email
@@ -299,19 +271,13 @@ def test_round_trip_preserves_governance_and_tools():
     assert rebuilt.region == original.region
     assert rebuilt.data_classification == original.data_classification
     assert rebuilt.created_by == original.created_by
-    # server.json-sourced
     assert rebuilt.description == original.description
     assert rebuilt.version == original.version
     assert rebuilt.endpoint_url == original.endpoint_url
-    # tools
     assert len(rebuilt.available_tools) == 1
     assert rebuilt.available_tools[0].name == original.available_tools[0].name
     assert rebuilt.available_tools[0].input_schema == original.available_tools[0].input_schema
 
-
-# ---------------------------------------------------------------------------
-# Model split / defaults
-# ---------------------------------------------------------------------------
 
 def test_mcp_server_create_minimal_only_name():
     c = McpServerCreate(name="x", tenant_id="default")
@@ -328,22 +294,22 @@ def test_mcp_server_update_all_optional_exclude_none():
 def test_mcp_server_update_runtime_arn_patchable():
     """runtime_arn is user-suppliable (parallel to gateway_arn) so it must appear on
     McpServerUpdate — confirming a PATCH can set it via model_dump(exclude_none=True)."""
-    assert McpServerUpdate(
-        runtime_arn="arn:aws:bedrock-agentcore:eu-central-1:123:runtime/x"
-    ).model_dump(exclude_none=True) == {
-        "runtime_arn": "arn:aws:bedrock-agentcore:eu-central-1:123:runtime/x"
-    }
+    assert McpServerUpdate(runtime_arn="arn:aws:bedrock-agentcore:eu-central-1:123:runtime/x").model_dump(
+        exclude_none=True
+    ) == {"runtime_arn": "arn:aws:bedrock-agentcore:eu-central-1:123:runtime/x"}
 
 
 def test_mcp_server_id_has_no_default():
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        McpServer(
-            name="x",
-            lifecycle_state=LifecycleState.PROPOSED,
-            created_at=datetime(2026, 6, 2),
-            updated_at=datetime(2026, 6, 2),
+        McpServer.model_validate(
+            {
+                "name": "x",
+                "lifecycle_state": LifecycleState.PROPOSED,
+                "created_at": datetime(2026, 6, 2),
+                "updated_at": datetime(2026, 6, 2),
+            }
         )  # missing required id
 
 
@@ -351,19 +317,10 @@ def test_lifecycle_reused_from_agent_module():
     assert LifecycleState is agent_module.LifecycleState
 
 
-# ---------------------------------------------------------------------------
-# Entra identity + gateway/runtime fields (Epic 7, Task T-MODEL): mirrors the
-# E6 pattern E6 added to Agent, field-for-field. Service-written (like the
-# existing entra_app_id) -> on the McpServer read model + envelope only, NOT
-# Base/Create/Update. The new Kind.RUNTIME member + the Base-level runtime_arn
-# (user-suppliable at registration, parallel to gateway_arn) round-trip too.
-# Research §6.1 / §6.2. Additive + backward-compatible: ENVELOPE_SCHEMA_VERSION
-# stays 1.
-# ---------------------------------------------------------------------------
-
 def _make_mcp_server_with_identity() -> McpServer:
-    """An McpServer with all 7 E7 identity/gateway fields + runtime_arn set to
-    distinct sentinel values."""
+    """An McpServer with all 7 identity/gateway fields + runtime_arn set to distinct sentinel
+    values. The identity block mirrors the agent's field for field; ``runtime_arn`` is the one
+    user-suppliable member (on Base, parallel to ``gateway_arn``)."""
     mcp = _make_mcp_server()
     mcp.runtime_arn = "arn:aws:bedrock-agentcore:eu-central-1:123:runtime/mcp-rt-9"
     mcp.entra_sp_id = "sp-1111"
@@ -372,7 +329,7 @@ def _make_mcp_server_with_identity() -> McpServer:
     mcp.admin_role_id = "role-admin-3333"
     mcp.gateway_id = "gw-abc123"
     mcp.gateway_url = "https://gw-abc123.gateway.bedrock-agentcore.eu-central-1.amazonaws.com/mcp"
-    mcp.identity_status = "provisioned"
+    mcp.identity_status = IdentityStatus.PROVISIONED
     return mcp
 
 
@@ -388,12 +345,8 @@ def test_to_envelope_includes_identity_and_gateway_fields():
     assert env["invoker_role_id"] == "role-invoker-2222"
     assert env["admin_role_id"] == "role-admin-3333"
     assert env["gateway_id"] == "gw-abc123"
-    assert (
-        env["gateway_url"]
-        == "https://gw-abc123.gateway.bedrock-agentcore.eu-central-1.amazonaws.com/mcp"
-    )
+    assert env["gateway_url"] == "https://gw-abc123.gateway.bedrock-agentcore.eu-central-1.amazonaws.com/mcp"
     assert env["identity_status"] == "provisioned"
-    # still JSON-safe end-to-end (plain strings)
     reparsed = json.loads(json.dumps(env))
     assert reparsed["entra_sp_id"] == "sp-1111"
     assert reparsed["identity_status"] == "provisioned"
@@ -429,13 +382,13 @@ def test_from_record_reads_identity_and_gateway_fields():
 
 
 def test_from_record_defaults_identity_status_none_when_missing():
-    """A pre-E7 envelope lacks the identity keys -> identity_status defaults to 'none',
-    the other 6 fields default to None (backward-compatible hydration)."""
+    """An envelope without the identity keys hydrates identity_status to 'none' and the other six
+    fields to None."""
     server_json = {
         "name": "agp/x",
         "description": "",
         "version": "1.0.0",
-        "_meta": {"com.agp/governance": {"schema_version": 1}},  # pre-E7
+        "_meta": {"com.agp/governance": {"schema_version": 1}},
     }
     mcp = McpServer.from_record(_native_record(status="APPROVED"), server_json, [])
     assert mcp.identity_status == "none"
@@ -451,9 +404,7 @@ def test_round_trip_preserves_new_fields():
     """All 7 new fields (plus runtime_arn) survive a to_envelope -> from_record round-trip."""
     original = _make_mcp_server_with_identity()
     server_json = original.to_server_json()
-    rebuilt = McpServer.from_record(
-        _native_record(status="APPROVED"), server_json, original.tools_as_mcp()
-    )
+    rebuilt = McpServer.from_record(_native_record(status="APPROVED"), server_json, original.tools_as_mcp())
     assert rebuilt.entra_sp_id == original.entra_sp_id
     assert rebuilt.entra_app_audience == original.entra_app_audience
     assert rebuilt.invoker_role_id == original.invoker_role_id
@@ -470,10 +421,7 @@ def test_runtime_arn_on_base_round_trips():
     original.runtime_arn = "arn:aws:bedrock-agentcore:eu-central-1:123:runtime/mcp-rt-9"
     server_json = original.to_server_json()
     rebuilt = McpServer.from_record(_native_record(status="APPROVED"), server_json, [])
-    assert (
-        rebuilt.runtime_arn
-        == "arn:aws:bedrock-agentcore:eu-central-1:123:runtime/mcp-rt-9"
-    )
+    assert rebuilt.runtime_arn == "arn:aws:bedrock-agentcore:eu-central-1:123:runtime/mcp-rt-9"
 
 
 def test_create_does_not_require_identity_fields():
@@ -481,35 +429,26 @@ def test_create_does_not_require_identity_fields():
     validate with them absent, and (pydantic v2 default extra='ignore') silently drop an
     unexpected one rather than raise -- we must NOT add extra='forbid' (the workspace
     shares one .env and forbids it). runtime_arn IS user-suppliable (on Base)."""
-    c = McpServerCreate(name="x", tenant_id="default")  # identity fields absent -> valid
+    c = McpServerCreate(name="x", tenant_id="default")
     assert c.name == "x"
     assert c.runtime_arn is None
-    # an unexpected service-written field is silently dropped, not raised
-    assert "entra_sp_id" not in McpServerCreate(name="x", tenant_id="default", entra_sp_id="y").model_dump()
+    extra = McpServerCreate.model_validate({"name": "x", "tenant_id": "default", "entra_sp_id": "y"})
+    assert "entra_sp_id" not in extra.model_dump()
 
 
 def test_envelope_schema_version_still_1():
-    """T-MODEL is additive + backward-compatible -> the envelope schema version stays 1."""
+    """The identity block is additive and backward-compatible: the envelope schema version stays 1."""
     assert ENVELOPE_SCHEMA_VERSION == 1
     assert _make_mcp_server_with_identity().to_envelope()["schema_version"] == 1
 
 
-# ---------------------------------------------------------------------------
-# Cedar policy-engine fields (Epic 8, Task T1): three SERVICE-WRITTEN fields on
-# McpServer only (NOT Base/Create/Update — like the E7 identity block). They ride
-# the proven to_envelope/from_record round-trip, tolerant of pre-E8 envelopes
-# (cedar_enforcement_mode defaults to "none", like identity_status). Additive +
-# backward-compatible: ENVELOPE_SCHEMA_VERSION stays 1.
-# ---------------------------------------------------------------------------
-
 _CEDAR_ENGINE_ARN = (
-    "arn:aws:bedrock-agentcore:us-east-1:111122223333:"
-    "policy-engine/agp-cedar-mcp-1-aaaaaaaaaa"
+    "arn:aws:bedrock-agentcore:us-east-1:111122223333:policy-engine/agp-cedar-mcp-1-aaaaaaaaaa"
 )
 
 
 def _make_mcp_server_with_cedar_engine() -> McpServer:
-    """An McpServer with the three E8 Cedar policy-engine fields set."""
+    """An McpServer with the three Cedar policy-engine fields set."""
     mcp = _make_mcp_server()
     mcp.cedar_policy_engine_id = "pe-abc"
     mcp.cedar_policy_engine_arn = _CEDAR_ENGINE_ARN
@@ -547,13 +486,13 @@ def test_from_record_reads_cedar_engine_fields():
 
 
 def test_from_record_defaults_cedar_enforcement_mode_none_when_missing():
-    """A pre-E8 envelope lacks the Cedar keys -> the ids default to None and
-    cedar_enforcement_mode defaults to 'none' (backward-compatible hydration)."""
+    """An envelope without the Cedar keys hydrates the ids to None and cedar_enforcement_mode to
+    'none'."""
     server_json = {
         "name": "agp/x",
         "description": "",
         "version": "1.0.0",
-        "_meta": {"com.agp/governance": {"schema_version": 1}},  # pre-E8
+        "_meta": {"com.agp/governance": {"schema_version": 1}},
     }
     mcp = McpServer.from_record(_native_record(status="APPROVED"), server_json, [])
     assert mcp.cedar_policy_engine_id is None
@@ -565,9 +504,7 @@ def test_round_trip_preserves_cedar_engine_fields():
     """The three new fields survive a to_server_json -> from_record round-trip."""
     original = _make_mcp_server_with_cedar_engine()
     server_json = original.to_server_json()
-    rebuilt = McpServer.from_record(
-        _native_record(status="APPROVED"), server_json, original.tools_as_mcp()
-    )
+    rebuilt = McpServer.from_record(_native_record(status="APPROVED"), server_json, original.tools_as_mcp())
     assert rebuilt.cedar_policy_engine_id == original.cedar_policy_engine_id
     assert rebuilt.cedar_policy_engine_arn == original.cedar_policy_engine_arn
     assert rebuilt.cedar_enforcement_mode == original.cedar_enforcement_mode
@@ -583,13 +520,9 @@ def test_cedar_fields_not_on_create():
 
 
 def test_envelope_schema_version_still_1_with_cedar_engine():
-    """T1 is additive + backward-compatible -> the envelope schema version stays 1."""
+    """The Cedar block is additive and backward-compatible: the envelope schema version stays 1."""
     assert _make_mcp_server_with_cedar_engine().to_envelope()["schema_version"] == 1
 
-
-# ---------------------------------------------------------------------------
-# Tenant fields (Epic 24, Task 4) — tenant_id / published / shared
-# ---------------------------------------------------------------------------
 
 def _make_mcp_server_with_tenant() -> McpServer:
     mcp = _make_mcp_server()
@@ -610,22 +543,19 @@ def test_tenant_fields_round_trip_through_envelope():
     assert env["shared"] is True
 
     server_json = original.to_server_json()
-    rebuilt = McpServer.from_record(
-        _native_record(status="APPROVED"), server_json, original.tools_as_mcp()
-    )
+    rebuilt = McpServer.from_record(_native_record(status="APPROVED"), server_json, original.tools_as_mcp())
     assert rebuilt.tenant_id == "ten-claims"
     assert rebuilt.published is True
     assert rebuilt.shared is True
 
 
-def test_from_record_tolerates_pre_e23_envelope_without_tenant_fields():
-    """A pre-E24 envelope lacking the tenant keys hydrates to None/False/False
-    (migration tolerance — ENVELOPE_SCHEMA_VERSION stays 1)."""
+def test_from_record_tolerates_an_envelope_without_tenant_fields():
+    """An envelope lacking the tenant keys hydrates to None/False/False."""
     server_json = {
         "name": "agp/x",
         "description": "",
         "version": "1.0.0",
-        "_meta": {"com.agp/governance": {"schema_version": 1}},  # pre-E24
+        "_meta": {"com.agp/governance": {"schema_version": 1}},
     }
     mcp = McpServer.from_record(_native_record(status="APPROVED"), server_json, [])
     assert mcp.tenant_id is None
@@ -634,22 +564,17 @@ def test_from_record_tolerates_pre_e23_envelope_without_tenant_fields():
 
 
 def test_envelope_schema_version_still_1_with_tenant_fields():
-    """E24 is additive + backward-compatible -> the envelope schema version stays 1."""
+    """The tenant fields are additive and backward-compatible: the envelope schema version stays 1."""
     assert _make_mcp_server_with_tenant().to_envelope()["schema_version"] == 1
     assert ENVELOPE_SCHEMA_VERSION == 1
 
-
-# ---------------------------------------------------------------------------
-# Marketplace publication (Epic 33 Amendment 1, contract C8) — the mirror of the
-# agent-side C2 block: publish is the ONE door for both product types, so the MCP
-# envelope carries the SAME MarketplacePublication model.
-# ---------------------------------------------------------------------------
 
 DECLARED_AT = datetime(2026, 8, 11, 12, 0, 0)
 
 
 def _publication(published: bool = True):
-    """A MarketplacePublication with a fully-populated declared datasheet."""
+    """A MarketplacePublication with a fully-populated declared datasheet: publish is the one door
+    for both product types, so the MCP envelope carries the same model the agent envelope does."""
     from models.marketplace import Datasheet, MarketplacePublication
 
     return MarketplacePublication(
@@ -706,22 +631,19 @@ def test_marketplace_unpublished_block_round_trips():
     """An unpublish KEEPS the block with ``published=False`` (declared history retained),
     so the false value must survive the round-trip rather than reading back as absent."""
     original = _make_mcp_server_with_marketplace(published=False)
-    rebuilt = McpServer.from_record(
-        _native_record(status="APPROVED"), original.to_server_json(), []
-    )
+    rebuilt = McpServer.from_record(_native_record(status="APPROVED"), original.to_server_json(), [])
     assert rebuilt.marketplace is not None
     assert rebuilt.marketplace.published is False
     assert rebuilt.marketplace.datasheet.owner_team == "Platform Engineering"
 
 
-def test_from_record_tolerates_pre_e33_envelope_without_marketplace():
-    """A pre-E33 envelope lacking the key hydrates to None (migration tolerance —
-    ENVELOPE_SCHEMA_VERSION stays 1). An explicit stored ``null`` is tolerated too."""
+def test_from_record_tolerates_an_envelope_without_marketplace():
+    """An envelope lacking the key hydrates to None; an explicit stored ``null`` is tolerated too."""
     base = {
         "name": "agp/x",
         "description": "",
         "version": "1.0.0",
-        "_meta": {"com.agp/governance": {"schema_version": 1}},  # pre-E33
+        "_meta": {"com.agp/governance": {"schema_version": 1}},
     }
     assert McpServer.from_record(_native_record(), base, []).marketplace is None
 
@@ -743,7 +665,6 @@ def test_from_record_raises_validation_error_on_malformed_marketplace_block():
         "name": "agp/x",
         "description": "",
         "version": "1.0.0",
-        # ``published`` alone is not a publication: datasheet/declared_by/declared_at are required.
         "_meta": {"com.agp/governance": {"schema_version": 1, "marketplace": {"published": True}}},
     }
     with pytest.raises(ValidationError):
@@ -766,7 +687,7 @@ def test_marketplace_is_not_settable_by_a_request_body():
 
 
 def test_envelope_schema_version_still_1_with_marketplace():
-    """C8 is additive + backward-compatible -> the envelope schema version stays 1."""
+    """The marketplace block is additive and backward-compatible: the envelope schema version stays 1."""
     assert _make_mcp_server_with_marketplace().to_envelope()["schema_version"] == 1
     assert ENVELOPE_SCHEMA_VERSION == 1
 
@@ -779,13 +700,6 @@ def test_marketplace_key_always_present_in_envelope():
     assert "marketplace" in env
     assert env["marketplace"] is None
 
-
-# ---------------------------------------------------------------------------
-# IdentityStatus is a pinned str-Enum (Epic 36/T20, verification item 16)
-#
-# ONE definition, reused — the enum lives in `models.agent` and is re-exported here,
-# exactly like the lifecycle machinery above (research §5: the MCP side is identical).
-# ---------------------------------------------------------------------------
 
 def test_identity_status_reused_from_agent_module():
     """The MCP side must not redefine the enum: a second class would compare unequal
@@ -806,17 +720,16 @@ def test_mcp_to_envelope_stores_the_plain_value_never_the_enum_repr():
     assert env["identity_status"] == "none"
     assert type(env["identity_status"]) is str
     assert "IdentityStatus" not in json.dumps(env)
-    # and through the real server.json serializer the MCP side actually persists
     assert "IdentityStatus" not in json.dumps(_make_mcp_server().to_server_json())
 
 
-def test_mcp_to_envelope_tolerates_a_service_assigned_raw_string():
+def test_mcp_to_envelope_tolerates_a_service_assigned_raw_string(monkeypatch):
     """`services/mcp_identity_service.py:351` assigns `IdentityStatus.FAILED`
     post-construction, but pydantic does not validate assignment, so nothing STOPS a
     future writer from assigning a raw string — the serializer must pass one through
     rather than fail on `.value`."""
     mcp = _make_mcp_server()
-    mcp.identity_status = "failed"
+    monkeypatch.setattr(mcp, "identity_status", "failed")
     assert mcp.to_envelope()["identity_status"] == "failed"
 
 
@@ -847,16 +760,11 @@ def test_mcp_from_record_coerces_unknown_identity_status_to_none_and_warns(caplo
     assert "provisionned" in caplog.text
 
 
-# ---------------------------------------------------------------------------
-# Dropped debris (E36/T22): the E5-reserved `cedar_policy_set_id` (superseded by
-# `cedar_policy_engine_id`, which is what the E8 Cedar path actually uses) and the
-# hardcoded write-only `"origin": "Registered"` envelope literal (never hydrated;
-# the FE reads `origin` off the AGENT model, which keeps its field).
-# ---------------------------------------------------------------------------
-
 def test_to_envelope_omits_dropped_debris_keys():
-    """Neither key is written any more, and the field is off every model — so a future
-    edit cannot reintroduce either one silently."""
+    """The reserved `cedar_policy_set_id` (superseded by `cedar_policy_engine_id`) and the write-only
+    `"origin": "Registered"` literal (never hydrated; the frontend reads `origin` off the agent model)
+    are gone: neither key is written and the field is off every model, so a future edit cannot
+    reintroduce either one silently."""
     env = _make_mcp_server().to_envelope()
     assert "cedar_policy_set_id" not in env
     assert "origin" not in env
@@ -878,8 +786,8 @@ def test_from_record_ignores_legacy_debris_keys():
                 "kind": "standard",
                 "owner_email": "maria.bauer@example.com",
                 "cedar_policy_set_id": "legacy-policy-set",  # the dropped field
-                "origin": "Registered",                      # the write-only literal
-                "cedar_policy_engine_id": "pe-abc",          # what superseded it
+                "origin": "Registered",  # the write-only literal
+                "cedar_policy_engine_id": "pe-abc",  # what superseded it
             }
         },
     }
@@ -891,3 +799,91 @@ def test_from_record_ignores_legacy_debris_keys():
     rewritten = mcp.to_envelope()
     assert "cedar_policy_set_id" not in rewritten
     assert "origin" not in rewritten
+
+
+def test_create_rejects_description_over_100_chars_naming_the_field():
+    """server.json caps `description` at 100 chars; the write models validate it on the way in."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc:
+        McpServerCreate(name="x", tenant_id="default", description="d" * 101)
+    assert exc.value.errors()[0]["loc"] == ("description",)
+
+
+def test_create_accepts_description_of_exactly_100_chars():
+    created = McpServerCreate(name="x", tenant_id="default", description="d" * 100)
+    assert created.description is not None
+    assert len(created.description) == 100
+
+
+def test_update_rejects_description_over_100_chars_naming_the_field():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc:
+        McpServerUpdate(description="d" * 101)
+    assert exc.value.errors()[0]["loc"] == ("description",)
+
+
+def test_read_side_still_hydrates_a_longer_stored_description():
+    """The cap guards writes only — a record that already holds a longer description
+    must still list, not fail hydration."""
+    mcp = McpServer(
+        id="r1",
+        name="x",
+        description="d" * 300,
+        lifecycle_state=LifecycleState.PROPOSED,
+        created_at=datetime(2026, 6, 2),
+        updated_at=datetime(2026, 6, 2),
+    )
+    assert mcp.description is not None
+    assert len(mcp.description) == 300
+
+
+def test_project_and_repo_id_round_trip_through_envelope():
+    """The repo-ownership pair is service-written like the marketplace block: stamped by
+    ProjectService when a repo materializes the record."""
+    mcp = _make_mcp_server()
+    mcp.project_id = "p1"
+    mcp.repo_id = "r1"
+    env = mcp.to_envelope()
+    assert env["project_id"] == "p1"
+    assert env["repo_id"] == "r1"
+    rebuilt = McpServer.from_record(_native_record(), mcp.to_server_json(), [])
+    assert (rebuilt.project_id, rebuilt.repo_id) == ("p1", "r1")
+    assert rebuilt.is_repo_owned is True
+
+
+def test_ownership_keys_always_present_in_envelope_and_default_none():
+    """Written as explicit nulls (envelope discipline — see the marketplace key above)."""
+    env = _make_mcp_server().to_envelope()
+    assert env["project_id"] is None
+    assert env["repo_id"] is None
+
+
+def test_from_record_tolerates_an_envelope_without_ownership():
+    mcp = McpServer.from_record(_native_record(), _make_mcp_server().to_server_json(), [])
+    assert mcp.project_id is None
+    assert mcp.repo_id is None
+    assert mcp.is_repo_owned is False
+
+
+def test_is_repo_owned_is_a_read_only_property_not_a_wire_field():
+    mcp = _make_mcp_server()
+    untyped: Any = mcp
+    with pytest.raises(AttributeError):
+        untyped.is_repo_owned = True
+    assert "is_repo_owned" not in mcp.model_dump()
+
+
+def test_ownership_is_not_settable_by_a_request_body():
+    for field in ("project_id", "repo_id"):
+        assert field not in McpServerCreate.model_fields
+        assert field not in McpServerUpdate.model_fields
+    created = McpServerCreate.model_validate(
+        {"name": "x", "tenant_id": "default", "project_id": "p1", "repo_id": "r1"}
+    )
+    assert not hasattr(created, "project_id")
+    assert not hasattr(created, "repo_id")
+    updated = McpServerUpdate.model_validate({"project_id": "p1", "repo_id": "r1"})
+    assert "project_id" not in updated.model_dump(exclude_none=True)
+    assert "repo_id" not in updated.model_dump(exclude_none=True)

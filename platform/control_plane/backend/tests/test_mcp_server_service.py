@@ -1,39 +1,34 @@
-"""Tests for McpServerRegistryService (Epic 5, Task 3).
+"""Tests for McpServerRegistryService.
 
-Strategy (research §10): no moto — inject ``unittest.mock.MagicMock`` boto3
-clients via the service constructor. Fixtures live in ``conftest.py``. This is a
-structural clone of ``test_agent_registry_service.py`` with the MCP payload, the
-``kind`` client-side filter, the new ``McpValidationError`` (schema-validation
-→ 422), and the poll-to-DRAFT (research §6.2).
+No moto: ``unittest.mock.MagicMock`` boto3 clients are injected through the service constructor;
+the fixtures live in ``conftest.py``. A structural twin of ``test_agent_registry_service.py`` with
+the MCP payload, the ``kind`` client-side filter, ``McpValidationError`` for a schema rejection and
+the poll-to-DRAFT.
 """
 
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timezone
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import MCP_RECORD_ID, REGISTRY_ID
 
+from models.agent import IdentityStatus
 from models.marketplace import Datasheet, MarketplacePublication
-from models.mcp_server import Kind, McpServerCreate, McpServerUpdate, McpTool, LifecycleState
+from models.mcp_server import Kind, LifecycleState, McpServer, McpServerCreate, McpServerUpdate, McpTool
 from services.mcp_server_service import (
     IllegalTransitionError,
     MalformedMcpRecordError,
     McpServerNotFoundError,
-    McpServerRegistryService,
     McpValidationError,
     NameTakenError,
 )
 
-from conftest import REGISTRY_ID, MCP_RECORD_ID
-
 
 def _not_found(op: str = "GetRegistryRecord") -> ClientError:
-    return ClientError(
-        {"Error": {"Code": "ResourceNotFoundException", "Message": "x"}}, op
-    )
+    return ClientError({"Error": {"Code": "ResourceNotFoundException", "Message": "x"}}, op)
 
 
 def _schema_validation(op: str) -> ClientError:
@@ -50,8 +45,6 @@ def _schema_validation(op: str) -> ClientError:
         op,
     )
 
-
-# --- create ----------------------------------------------------------------
 
 def test_create_calls_create_registry_record_with_mcp_descriptor(mcp_service, mcp_mock_registry_clients):
     ctl, _ = mcp_mock_registry_clients
@@ -85,7 +78,7 @@ def test_create_calls_create_registry_record_with_mcp_descriptor(mcp_service, mc
     assert gov["schema_version"] == 1
 
     assert mcp.id == MCP_RECORD_ID
-    assert mcp.lifecycle_state == LifecycleState.PROPOSED  # DRAFT after poll
+    assert mcp.lifecycle_state == LifecycleState.PROPOSED
     assert mcp.created_by == "lars.svensson@example.com"
 
 
@@ -93,8 +86,6 @@ def test_create_omits_tools_branch_when_no_tools(mcp_service, mcp_mock_registry_
     ctl, _ = mcp_mock_registry_clients
     mcp_service.create(McpServerCreate(name="server-only-mcp", tenant_id="default", available_tools=[]))
     kwargs = ctl.create_registry_record.call_args.kwargs
-    # E32: tools live under mcpServer.additionalData.tools, so a server-only record omits
-    # the whole additionalData branch.
     assert "additionalData" not in kwargs["descriptors"]["mcpServer"]
 
 
@@ -104,9 +95,7 @@ def test_create_includes_tools_branch_when_present(mcp_service, mcp_mock_registr
         McpServerCreate(
             name="claims-mcp",
             tenant_id="default",
-            available_tools=[
-                McpTool(name="get_claim", description="Fetch", input_schema={"type": "object"})
-            ],
+            available_tools=[McpTool(name="get_claim", description="Fetch", input_schema={"type": "object"})],
         )
     )
     kwargs = ctl.create_registry_record.call_args.kwargs
@@ -117,11 +106,21 @@ def test_create_includes_tools_branch_when_present(mcp_service, mcp_mock_registr
     assert payload["tools"][0]["inputSchema"] == {"type": "object"}
 
 
-def test_create_polls_record_to_draft(mcp_service, mcp_mock_registry_clients, mcp_sample_record, monkeypatch):
+@pytest.fixture
+def writer_clock(monkeypatch):
+    """Drive the registry writer's clock: sleeps advance time instantly."""
+    import services.registry_writer as mod
+
+    t = {"now": 0.0}
+    monkeypatch.setattr(mod, "_monotonic", lambda: t["now"])
+    monkeypatch.setattr(mod, "_sleep", lambda s: t.__setitem__("now", t["now"] + s))
+    return t
+
+
+def test_create_polls_record_to_draft(
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, writer_clock
+):
     ctl, _ = mcp_mock_registry_clients
-    # Don't actually sleep between the CREATING and DRAFT polls.
-    monkeypatch.setattr(time, "sleep", lambda *_: None)
-    # create returns CREATING (fixture default); poll sees CREATING then DRAFT.
     ctl.get_registry_record.side_effect = [
         mcp_sample_record(status="CREATING"),
         mcp_sample_record(status="DRAFT"),
@@ -131,33 +130,31 @@ def test_create_polls_record_to_draft(mcp_service, mcp_mock_registry_clients, mc
     assert ctl.get_registry_record.call_count >= 2
 
 
-def test_poll_conflict_during_creating_keeps_polling(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
+def test_poll_conflict_during_creating_keeps_polling(
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, writer_clock
+):
     ctl, _ = mcp_mock_registry_clients
-    # A ConflictException while the record is still CREATING is expected — keep polling.
     conflict = ClientError(
         {"Error": {"Code": "ConflictException", "Message": "record is CREATING"}},
         "GetRegistryRecord",
     )
     ctl.get_registry_record.side_effect = [conflict, mcp_sample_record(status="DRAFT")]
-    status = mcp_service._poll_record_to_draft(MCP_RECORD_ID, attempts=3, delay=0)
-    assert status == "DRAFT"
+    mcp = mcp_service.create(McpServerCreate(name="claims-mcp", tenant_id="default"))
+    assert mcp.lifecycle_state == LifecycleState.PROPOSED
     assert ctl.get_registry_record.call_count == 2
 
 
-def test_poll_times_out_raises(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
+def test_poll_times_out_raises(mcp_service, mcp_mock_registry_clients, mcp_sample_record, writer_clock):
     ctl, _ = mcp_mock_registry_clients
-    # Never reaches DRAFT -> bounded loop exhausts and raises.
     ctl.get_registry_record.return_value = mcp_sample_record(status="CREATING")
     with pytest.raises(RuntimeError):
-        mcp_service._poll_record_to_draft(MCP_RECORD_ID, attempts=2, delay=0)
+        mcp_service.create(McpServerCreate(name="claims-mcp", tenant_id="default"))
 
 
 def test_create_name_precheck_raises_name_taken(mcp_service, mcp_mock_registry_clients):
     ctl, _ = mcp_mock_registry_clients
     ctl.list_registry_records.return_value = {
-        "registryRecords": [
-            {"recordId": "mcp-existing", "name": "claims-mcp", "status": "DRAFT"}
-        ],
+        "registryRecords": [{"recordId": "mcp-existing", "name": "claims-mcp", "status": "DRAFT"}],
         "nextToken": None,
     }
     with pytest.raises(NameTakenError):
@@ -170,12 +167,11 @@ def test_create_schema_validation_raises_mcp_validation_error(mcp_service, mcp_m
     ctl.create_registry_record.side_effect = _schema_validation("CreateRegistryRecord")
     with pytest.raises(McpValidationError) as exc:
         mcp_service.create(McpServerCreate(name="bad-mcp", tenant_id="default"))
-    # A schema-validation rejection on create must NOT be mapped to the transition error.
     assert not isinstance(exc.value, IllegalTransitionError)
 
 
 def test_create_name_precheck_queries_by_name_and_mcp_type(mcp_service, mcp_mock_registry_clients):
-    """E32: the discrete name/descriptorType query params became one structured filters list."""
+    """The name pre-check sends the structured filters list, not discrete query params."""
     ctl, _ = mcp_mock_registry_clients
     mcp_service.create(McpServerCreate(name="fraud-mcp", tenant_id="default"))
     precheck = ctl.list_registry_records.call_args_list[0]
@@ -186,8 +182,6 @@ def test_create_name_precheck_queries_by_name_and_mcp_type(mcp_service, mcp_mock
     assert "descriptorType" not in precheck.kwargs
     assert "name" not in precheck.kwargs
 
-
-# --- get -------------------------------------------------------------------
 
 def test_get_parses_server_json_and_maps_status(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
     ctl, _ = mcp_mock_registry_clients
@@ -229,9 +223,9 @@ def test_get_reraises_non_not_found_client_error(mcp_service, mcp_mock_registry_
         mcp_service.get(MCP_RECORD_ID)
 
 
-# --- list ------------------------------------------------------------------
-
-def test_list_fans_out_and_filters_by_kind(mcp_service, mcp_mock_registry_clients, mcp_sample_record, mcp_sample_envelope):
+def test_list_fans_out_and_filters_by_kind(
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, mcp_sample_envelope
+):
     ctl, _ = mcp_mock_registry_clients
     ctl.list_registry_records.return_value = {
         "registryRecords": [
@@ -256,7 +250,9 @@ def test_list_fans_out_and_filters_by_kind(mcp_service, mcp_mock_registry_client
     assert [m.id for m in gateways] == ["mcp-1"]
 
 
-def test_list_filters_by_business_unit(mcp_service, mcp_mock_registry_clients, mcp_sample_record, mcp_sample_envelope):
+def test_list_filters_by_business_unit(
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, mcp_sample_envelope
+):
     ctl, _ = mcp_mock_registry_clients
     ctl.list_registry_records.return_value = {
         "registryRecords": [
@@ -269,7 +265,9 @@ def test_list_filters_by_business_unit(mcp_service, mcp_mock_registry_clients, m
     def _get(registryId, recordId):
         if recordId == "mcp-1":
             return mcp_sample_record(recordId="mcp-1", _envelope=mcp_sample_envelope(business_unit="Claims"))
-        return mcp_sample_record(recordId="mcp-2", _envelope=mcp_sample_envelope(business_unit="Underwriting"))
+        return mcp_sample_record(
+            recordId="mcp-2", _envelope=mcp_sample_envelope(business_unit="Underwriting")
+        )
 
     ctl.get_registry_record.side_effect = _get
 
@@ -278,7 +276,7 @@ def test_list_filters_by_business_unit(mcp_service, mcp_mock_registry_clients, m
 
 
 def test_list_passes_descriptor_type_mcp(mcp_service, mcp_mock_registry_clients):
-    """E32: the record-type filter moved into the structured filters list."""
+    """The record-type filter travels in the structured filters list."""
     ctl, _ = mcp_mock_registry_clients
     mcp_service.list()
     kwargs = ctl.list_registry_records.call_args.kwargs
@@ -301,8 +299,6 @@ def test_list_proposed_is_client_side_not_server_filtered(mcp_service, mcp_mock_
     ctl, _ = mcp_mock_registry_clients
     mcp_service.list(lifecycle_state=LifecycleState.PROPOSED)
     kwargs = ctl.list_registry_records.call_args.kwargs
-    # No status leg in the filters list — PROPOSED maps from several native states, so it
-    # is filtered client-side.
     assert kwargs["filters"] == [{"name": "recordType", "values": ["MCP"]}]
     assert "status" not in kwargs
 
@@ -343,8 +339,6 @@ def test_list_paginates_across_pages(mcp_service, mcp_mock_registry_clients, mcp
     assert ctl.list_registry_records.call_count == 2
 
 
-# --- update ----------------------------------------------------------------
-
 def test_update_read_modify_write(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
     ctl, _ = mcp_mock_registry_clients
     ctl.get_registry_record.return_value = mcp_sample_record(status="DRAFT")
@@ -355,15 +349,14 @@ def test_update_read_modify_write(mcp_service, mcp_mock_registry_clients, mcp_sa
     assert updated.description == "New description"
     assert ctl.update_registry_record.called
     kwargs = ctl.update_registry_record.call_args.kwargs
-    # UpdateRegistryRecord is a PATCH API: descriptors are wrapped in the optionalValue
-    # envelope at every level, and E32 made every LEAF its own wrapper too — so the server
-    # blob sits three optionalValues deep. See test_registry_update_param_shape.
     server_descriptor = kwargs["descriptors"]["optionalValue"]["mcpServer"]["optionalValue"]
     server_json = json.loads(server_descriptor["data"]["optionalValue"])
     assert server_json["description"] == "New description"
 
 
-def test_update_schema_validation_raises_mcp_validation_error(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
+def test_update_schema_validation_raises_mcp_validation_error(
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record
+):
     ctl, _ = mcp_mock_registry_clients
     ctl.get_registry_record.return_value = mcp_sample_record(status="DRAFT")
     ctl.update_registry_record.side_effect = _schema_validation("UpdateRegistryRecord")
@@ -376,8 +369,6 @@ def test_update_returns_none_when_missing(mcp_service, mcp_mock_registry_clients
     ctl.get_registry_record.side_effect = _not_found()
     assert mcp_service.update("mcp-missing", McpServerUpdate(description="x")) is None
 
-
-# --- delete ----------------------------------------------------------------
 
 def test_delete_returns_prior(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
     ctl, _ = mcp_mock_registry_clients
@@ -394,15 +385,11 @@ def test_delete_returns_none_when_missing(mcp_service, mcp_mock_registry_clients
     ctl.delete_registry_record.assert_not_called()
 
 
-# --- submit_for_approval ----------------------------------------------------
-
 def test_submit_for_approval_calls_submit(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
     ctl, _ = mcp_mock_registry_clients
     ctl.get_registry_record.return_value = mcp_sample_record(status="PENDING_APPROVAL")
     mcp = mcp_service.submit_for_approval(MCP_RECORD_ID)
-    ctl.submit_registry_record_for_approval.assert_called_with(
-        registryId=REGISTRY_ID, recordId=MCP_RECORD_ID
-    )
+    ctl.submit_registry_record_for_approval.assert_called_with(registryId=REGISTRY_ID, recordId=MCP_RECORD_ID)
     assert mcp is not None
     assert mcp.lifecycle_state == LifecycleState.PENDING_APPROVAL
 
@@ -412,8 +399,6 @@ def test_submit_for_approval_returns_none_when_missing(mcp_service, mcp_mock_reg
     ctl.submit_registry_record_for_approval.side_effect = _not_found("SubmitRegistryRecordForApproval")
     assert mcp_service.submit_for_approval("mcp-missing") is None
 
-
-# --- transition -------------------------------------------------------------
 
 def test_transition_approve_calls_update_status(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
     ctl, _ = mcp_mock_registry_clients
@@ -467,27 +452,23 @@ def test_transition_reraises_other_client_errors(mcp_service, mcp_mock_registry_
         mcp_service.transition("mcp-1", "approve", "ok")
 
 
-# --- persist_identity (Epic 7, T-IDENTITY) ----------------------------------
-
-
-def _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record) -> "object":
+def _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record) -> McpServer:
     """Hydrate a real McpServer via get() so persist_identity has an in-hand record."""
     ctl, _ = mcp_mock_registry_clients
     ctl.get_registry_record.return_value = mcp_sample_record(status="DRAFT")
-    return mcp_service.get(MCP_RECORD_ID)
+    mcp = mcp_service.get(MCP_RECORD_ID)
+    assert mcp is not None
+    return mcp
 
 
 def test_persist_identity_writes_mcp_server_descriptor_not_custom(
     mcp_service, mcp_mock_registry_clients, mcp_sample_record
 ):
-    # CRITIC-I3 (clone trap): persist_identity MUST mirror update()'s mcpServer
-    # descriptor rebuild — NOT the agent CUSTOM helper. The written descriptor must
-    # carry the `mcpServer` branch (PATCH optionalValue shape), never a `custom` branch.
     ctl, _ = mcp_mock_registry_clients
     mcp = _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record)
 
     mcp.entra_sp_id = "sp-obj-id-xyz"
-    mcp.identity_status = "provisioned"
+    mcp.identity_status = IdentityStatus.PROVISIONED
 
     returned = mcp_service.persist_identity(mcp)
 
@@ -495,23 +476,18 @@ def test_persist_identity_writes_mcp_server_descriptor_not_custom(
     assert ctl.update_registry_record.called
     kwargs = ctl.update_registry_record.call_args.kwargs
     descriptors = kwargs["descriptors"]
-    # The PATCH envelope wraps the mcpServer branch (NOT custom).
     assert "optionalValue" in descriptors
     inner = descriptors["optionalValue"]
     assert "mcpServer" in inner
     assert "custom" not in inner
-    # And it is the same mcpServer PATCH shape that update() produces.
     server_descriptor = inner["mcpServer"]["optionalValue"]
     assert "data" in server_descriptor
-    # name is a plain string (not wrapped) — matches update().
     assert kwargs["name"] == mcp.name
 
 
 def test_persist_identity_round_trips_identity_fields(
     mcp_service, mcp_mock_registry_clients, mcp_sample_record
 ):
-    # The identity fields ride in the governance envelope inside server.json (via
-    # to_server_json → to_envelope), so the T-MODEL round-trip carries them.
     ctl, _ = mcp_mock_registry_clients
     mcp = _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record)
 
@@ -522,7 +498,7 @@ def test_persist_identity_round_trips_identity_fields(
     mcp.admin_role_id = "admin-xyz"
     mcp.gateway_id = "demo-gw-aBcDeFgHiJ"
     mcp.gateway_url = "https://demo-gw.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
-    mcp.identity_status = "provisioned"
+    mcp.identity_status = IdentityStatus.PROVISIONED
 
     mcp_service.persist_identity(mcp)
 
@@ -541,14 +517,10 @@ def test_persist_identity_round_trips_identity_fields(
     assert gov["identity_status"] == "provisioned"
 
 
-def test_persist_identity_preserves_tools_branch(
-    mcp_service, mcp_mock_registry_clients, mcp_sample_record
-):
-    # The sample record carries tools; persist_identity rebuilds the descriptor via
-    # tools_as_mcp() exactly like update(), so the tools branch survives the write.
+def test_persist_identity_preserves_tools_branch(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
     ctl, _ = mcp_mock_registry_clients
     mcp = _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record)
-    mcp.identity_status = "provisioned"
+    mcp.identity_status = IdentityStatus.PROVISIONED
 
     mcp_service.persist_identity(mcp)
 
@@ -559,19 +531,14 @@ def test_persist_identity_preserves_tools_branch(
     assert tools_payload["tools"][0]["name"] == "get_claim"
 
 
-# --- persist_identity ConflictException retry (T-PERSIST-RETRY) -------------
-
-
 def _conflict(op: str = "UpdateRegistryRecord") -> ClientError:
     """A ConflictException — the record is briefly UPDATING after a prior write/create
-    (the E6 live seam: "Registry record cannot be modified while in UPDATING state")."""
+    (the live seam: "Registry record cannot be modified while in UPDATING state")."""
     return ClientError(
         {
             "Error": {
                 "Code": "ConflictException",
-                "Message": (
-                    "Registry record cannot be modified while in UPDATING state."
-                ),
+                "Message": ("Registry record cannot be modified while in UPDATING state."),
             }
         },
         op,
@@ -579,17 +546,11 @@ def _conflict(op: str = "UpdateRegistryRecord") -> ClientError:
 
 
 def test_persist_identity_retries_on_conflict_then_succeeds(
-    mcp_service, mcp_mock_registry_clients, mcp_sample_record, monkeypatch
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, writer_clock
 ):
-    # The UpdateRegistryRecord write races a prior write's UPDATING transition: it
-    # ConflictExceptions twice, then succeeds. persist_identity must retry and return
-    # normally. Patch time.sleep so the test is instant.
-    import services.mcp_server_service as mod
-
-    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
     ctl, _ = mcp_mock_registry_clients
     mcp = _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record)
-    mcp.identity_status = "provisioned"
+    mcp.identity_status = IdentityStatus.PROVISIONED
 
     ctl.update_registry_record.side_effect = [
         _conflict(),
@@ -604,84 +565,62 @@ def test_persist_identity_retries_on_conflict_then_succeeds(
 
 
 def test_persist_identity_reraises_non_conflict_error(
-    mcp_service, mcp_mock_registry_clients, mcp_sample_record, monkeypatch
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, writer_clock
 ):
-    # A NON-Conflict ClientError (e.g. ValidationException) must propagate immediately,
-    # NOT be retried — the retry only swallows ConflictException.
-    import services.mcp_server_service as mod
-
-    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
     ctl, _ = mcp_mock_registry_clients
     mcp = _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record)
-    mcp.identity_status = "provisioned"
+    mcp.identity_status = IdentityStatus.PROVISIONED
 
     ctl.update_registry_record.side_effect = _schema_validation("UpdateRegistryRecord")
 
     with pytest.raises(ClientError) as exc:
         mcp_service.persist_identity(mcp)
     assert exc.value.response["Error"]["Code"] == "ValidationException"
-    # Not retried — surfaced on the first attempt.
     assert ctl.update_registry_record.call_count == 1
 
 
 def test_persist_identity_raises_after_exhausting_conflict_retries(
-    mcp_service, mcp_mock_registry_clients, mcp_sample_record, monkeypatch
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, writer_clock
 ):
-    # The record never leaves UPDATING: after `attempts` ConflictExceptions the bounded
-    # retry exhausts and surfaces the last ConflictException.
-    import services.mcp_server_service as mod
+    from services.registry_writer import REAPPROVAL_BUDGET_S
 
-    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
     ctl, _ = mcp_mock_registry_clients
     mcp = _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record)
-    mcp.identity_status = "provisioned"
+    mcp.identity_status = IdentityStatus.PROVISIONED
 
     ctl.update_registry_record.side_effect = _conflict()
 
-    # Use a tiny attempts budget via the helper to keep the test quick.
     with pytest.raises(ClientError) as exc:
-        mcp_service._update_registry_record_with_retry(
-            recordId=mcp.id,
-            name=mcp.name,
-            displayName={"optionalValue": mcp.name},
-            description={"optionalValue": mcp.description or ""},
-            descriptors={"optionalValue": {"mcpServer": {"optionalValue": {}}}},
-            recordVersion="1.0.0",
-            attempts=3,
-            delay=0,
-        )
+        mcp_service.persist_identity(mcp)
     assert exc.value.response["Error"]["Code"] == "ConflictException"
-    assert ctl.update_registry_record.call_count == 3
+    assert ctl.update_registry_record.call_count > 1
+    assert writer_clock["now"] <= REAPPROVAL_BUDGET_S
 
 
-def test_update_still_maps_validation_through_retry_helper(
-    mcp_service, mcp_mock_registry_clients, mcp_sample_record, monkeypatch
+def test_update_still_maps_validation_through_the_writer(
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, writer_clock
 ):
-    # update() routes its write through the same retry helper; a ValidationException
-    # must still map to McpValidationError (its 422 behavior), NOT be retried.
-    import services.mcp_server_service as mod
-
-    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
     ctl, _ = mcp_mock_registry_clients
     ctl.get_registry_record.return_value = mcp_sample_record(status="DRAFT")
     ctl.update_registry_record.side_effect = _schema_validation("UpdateRegistryRecord")
 
     with pytest.raises(McpValidationError):
         mcp_service.update(MCP_RECORD_ID, McpServerUpdate(description="bad"))
-    # Not retried — the validation error surfaced on the first attempt.
     assert ctl.update_registry_record.call_count == 1
 
 
-# ---------------------------------------------------------------------------
-# E32 — agent-registry namespace + mcpServer descriptor migration
-# ---------------------------------------------------------------------------
-
 def test_create_sends_new_mcp_descriptor_shape(mcp_service, mcp_mock_registry_clients):
-    """descriptors.mcpServer.data replaces descriptors.mcp.server (E32)."""
+    """The create sends descriptors.mcpServer.data, not the older descriptors.mcp.server."""
     ctl, _ = mcp_mock_registry_clients
-    mcp_service.create(McpServerCreate(name="m1", description="d", kind="standard",
-                                       endpoint_url="https://example.invalid/mcp",
-                                       tenant_id="default"))
+    mcp_service.create(
+        McpServerCreate(
+            name="m1",
+            description="d",
+            kind=Kind.STANDARD,
+            endpoint_url="https://example.invalid/mcp",
+            tenant_id="default",
+        )
+    )
 
     kwargs = ctl.create_registry_record.call_args.kwargs
     assert kwargs["recordType"] == "MCP"
@@ -693,12 +632,18 @@ def test_create_sends_new_mcp_descriptor_shape(mcp_service, mcp_mock_registry_cl
 
 
 def test_create_nests_tools_under_additional_data(mcp_service, mcp_mock_registry_clients):
-    """tools move to mcpServer.additionalData.tools with dataSchemaVersion (E32)."""
+    """Tools travel under mcpServer.additionalData.tools with a dataSchemaVersion."""
     ctl, _ = mcp_mock_registry_clients
-    mcp_service.create(McpServerCreate(name="m2", description="d", kind="standard",
-                                       endpoint_url="https://example.invalid/mcp",
-                                       tenant_id="default",
-                                       available_tools=[McpTool(name="t1", description="dt")]))
+    mcp_service.create(
+        McpServerCreate(
+            name="m2",
+            description="d",
+            kind=Kind.STANDARD,
+            endpoint_url="https://example.invalid/mcp",
+            tenant_id="default",
+            available_tools=[McpTool(name="t1", description="dt")],
+        )
+    )
 
     server = ctl.create_registry_record.call_args.kwargs["descriptors"]["mcpServer"]
     tools = server["additionalData"]["tools"]
@@ -731,7 +676,7 @@ def test_create_falls_back_to_name_when_description_blank(mcp_service, mcp_mock_
 
 
 def test_update_sends_display_name(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
-    """A rename must patch displayName too, or reads silently resolve the stale one (E32).
+    """A rename must patch displayName too, or reads silently resolve the stale one.
 
     Regression guard: reads prefer displayName, so updating `name` alone makes a rename
     revert on the next read.
@@ -742,15 +687,12 @@ def test_update_sends_display_name(mcp_service, mcp_mock_registry_clients, mcp_s
     mcp_service.update(MCP_RECORD_ID, McpServerUpdate(name="new-name"))
 
     kwargs = ctl.update_registry_record.call_args.kwargs
-    # name stays a PLAIN string; displayName takes the one-level PATCH envelope.
     assert kwargs["name"] == "new-name"
     assert kwargs["displayName"] == {"optionalValue": "new-name"}
 
 
-def test_persist_identity_sends_display_name(
-    mcp_service, mcp_mock_registry_clients, mcp_sample_record
-):
-    """persist_identity envelope-writes the whole server, so it owns displayName too (E32)."""
+def test_persist_identity_sends_display_name(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
+    """persist_identity envelope-writes the whole server, so it owns displayName too."""
     ctl, _ = mcp_mock_registry_clients
     mcp = _hydrated_mcp(mcp_service, mcp_mock_registry_clients, mcp_sample_record)
 
@@ -762,7 +704,7 @@ def test_persist_identity_sends_display_name(
 
 
 def test_get_reads_display_name(mcp_service, mcp_mock_registry_clients, mcp_sample_record):
-    """Native displayName WINS over the record's name (E32).
+    """Native displayName WINS over the record's name.
 
     The two values must DIFFER here or the test is a tautology: the shared conftest record
     sets ``name == displayName``, so an assertion against that fixture passes whether
@@ -772,16 +714,10 @@ def test_get_reads_display_name(mcp_service, mcp_mock_registry_clients, mcp_samp
     ``name``) is covered by ``test_mcp_server_model``'s ``_native_record``.
     """
     ctl, _ = mcp_mock_registry_clients
-    ctl.get_registry_record.return_value = mcp_sample_record(
-        name="dedup-key", displayName="Human Label"
-    )
+    ctl.get_registry_record.return_value = mcp_sample_record(name="dedup-key", displayName="Human Label")
 
     assert mcp_service.get(MCP_RECORD_ID).name == "Human Label"
 
-
-# ---------------------------------------------------------------------------
-# E33 Amendment 1 — marketplace publication block (contract C8)
-# ---------------------------------------------------------------------------
 
 DECLARED_AT = datetime(2026, 8, 11, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -816,7 +752,9 @@ def _envelope_from_update(ctl) -> dict:
     return server_json["_meta"]["com.agp/governance"]
 
 
-def test_update_preserves_marketplace_block(mcp_service, mcp_mock_registry_clients, mcp_sample_record, mcp_sample_envelope):
+def test_update_preserves_marketplace_block(
+    mcp_service, mcp_mock_registry_clients, mcp_sample_record, mcp_sample_envelope
+):
     """The silently-destroyed-key trap: an ordinary ``update()`` on an UNRELATED field
     rebuilds server.json wholesale, so the marketplace key must survive it. A key absent
     from ``to_envelope()`` would be discarded here with no error at all."""
@@ -846,14 +784,12 @@ def test_persist_marketplace_writes_block_through_patch_envelope(
 
     assert result.marketplace is not None and result.marketplace.published is True
     kwargs = ctl.update_registry_record.call_args.kwargs
-    # name stays a PLAIN string; displayName + description take the one-level wrap.
     assert kwargs["name"] == "internal-claims-mcp"
     assert kwargs["displayName"] == {"optionalValue": "internal-claims-mcp"}
     assert "custom" not in kwargs["descriptors"]["optionalValue"]
     envelope = _envelope_from_update(ctl)
     assert envelope["marketplace"]["published"] is True
     assert envelope["marketplace"]["datasheet"]["support_contact"] == "mcp-platform@acme.com"
-    # Untouched governance fields survive the regenerated envelope.
     assert envelope["owner_oid"] == "maria-oid"
     assert envelope["region"] == "DE"
 
@@ -868,7 +804,9 @@ def test_persist_marketplace_preserves_tools_branch(
 
     mcp_service.persist_marketplace(MCP_RECORD_ID, _publication())
 
-    server_branch = ctl.update_registry_record.call_args.kwargs["descriptors"]["optionalValue"]["mcpServer"]["optionalValue"]
+    server_branch = ctl.update_registry_record.call_args.kwargs["descriptors"]["optionalValue"]["mcpServer"][
+        "optionalValue"
+    ]
     tools_branch = server_branch["additionalData"]["optionalValue"]["tools"]
     tools_payload = json.loads(tools_branch["optionalValue"]["data"]["optionalValue"])
     assert tools_payload["tools"][0]["name"] == "get_claim"
@@ -934,7 +872,7 @@ def test_persist_marketplace_bumps_updated_at(mcp_service, mcp_mock_registry_cli
 def test_list_skips_record_with_malformed_marketplace_block(
     mcp_service, mcp_mock_registry_clients, mcp_sample_record, mcp_sample_envelope
 ):
-    """The I2 containment, mirrored on the MCP hydrate seam: a well-formed server.json can
+    """The malformed-record containment, mirrored on the MCP hydrate seam: a well-formed server.json can
     still hold a structurally invalid ``marketplace`` block, which ``from_record`` parses
     with ``MarketplacePublication.model_validate``. That pydantic ``ValidationError`` must
     reach ``list()`` as ``MalformedMcpRecordError`` — otherwise ONE bad record 500s the whole
@@ -951,7 +889,6 @@ def test_list_skips_record_with_malformed_marketplace_block(
 
     def _get(registryId, recordId):
         if recordId == "mcp-bad":
-            # server.json parses as JSON; the marketplace block does not validate.
             return mcp_sample_record(
                 recordId="mcp-bad",
                 _envelope=mcp_sample_envelope(marketplace={"published": True}),
@@ -976,10 +913,6 @@ def test_get_raises_malformed_on_invalid_marketplace_block(
         mcp_service.get(MCP_RECORD_ID)
 
 
-# ---------------------------------------------------------------------------
-# E33 Amendment 2 — deprecate ⇒ unlist (contract C12)
-# ---------------------------------------------------------------------------
-
 def _method_call_names(ctl) -> list[str]:
     """The ordered method names called on the control client (for ordering pins)."""
     return [call[0] for call in ctl.method_calls]
@@ -988,7 +921,7 @@ def _method_call_names(ctl) -> list[str]:
 def test_transition_deprecate_unlists_a_published_marketplace_product(
     mcp_service, mcp_mock_registry_clients, mcp_sample_record, mcp_sample_envelope
 ):
-    """C12: deprecating a PUBLISHED product unlists it — one write per concern, lifecycle
+    """Deprecating a PUBLISHED product unlists it — one write per concern, lifecycle
     status FIRST and the unlist SECOND, with the declared datasheet kept as history."""
     ctl, _ = mcp_mock_registry_clients
     env = mcp_sample_envelope(marketplace=json.loads(_publication().model_dump_json()))
@@ -1002,20 +935,17 @@ def test_transition_deprecate_unlists_a_published_marketplace_product(
         status="DEPRECATED",
         statusReason="superseded by v2",
     )
-    # Ordering pin: the lifecycle write lands BEFORE the unlist envelope write.
     names = _method_call_names(ctl)
     assert names.index("update_registry_record_status") < names.index("update_registry_record")
 
     envelope = _envelope_from_update(ctl)
     assert envelope["marketplace"]["published"] is False
-    # The declared datasheet is HISTORY: the block is kept, never cleared to None.
     assert envelope["marketplace"]["datasheet"]["owner_team"] == "Platform Engineering"
     assert envelope["marketplace"]["datasheet"]["support_contact"] == "mcp-platform@acme.com"
     assert envelope["marketplace"]["datasheet"]["compliance"] == ["GDPR", "BaFin"]
     assert envelope["marketplace"]["declared_by"] == "admin@acme.com"
     assert envelope["marketplace"]["declared_at"] is not None
 
-    # The returned record reflects the unlist (the route hands this straight back).
     assert mcp is not None
     assert mcp.lifecycle_state == LifecycleState.DEPRECATED
     assert mcp.marketplace is not None and mcp.marketplace.published is False
@@ -1041,9 +971,7 @@ def test_transition_deprecate_already_unpublished_writes_no_marketplace_block(
 ):
     """Already ``published=False`` → idempotent no-op: the unlist is skipped entirely."""
     ctl, _ = mcp_mock_registry_clients
-    env = mcp_sample_envelope(
-        marketplace=json.loads(_publication(published=False).model_dump_json())
-    )
+    env = mcp_sample_envelope(marketplace=json.loads(_publication(published=False).model_dump_json()))
     ctl.get_registry_record.return_value = mcp_sample_record(status="DEPRECATED", _envelope=env)
 
     mcp = mcp_service.transition(MCP_RECORD_ID, "deprecate", reason="eol")
@@ -1061,9 +989,7 @@ def test_transition_approve_and_reject_never_touch_the_marketplace_block(
     later lifecycle re-approve must NOT re-list the product — only a fresh publish
     request can."""
     ctl, _ = mcp_mock_registry_clients
-    env = mcp_sample_envelope(
-        marketplace=json.loads(_publication(published=False).model_dump_json())
-    )
+    env = mcp_sample_envelope(marketplace=json.loads(_publication(published=False).model_dump_json()))
     ctl.get_registry_record.return_value = mcp_sample_record(status=status, _envelope=env)
 
     mcp = mcp_service.transition(MCP_RECORD_ID, action, reason="ok")
@@ -1095,11 +1021,9 @@ def test_transition_deprecate_raises_when_the_unlist_write_fails(
     ctl.update_registry_record.assert_called_once()
 
 
-def test_transition_deprecate_returns_none_when_the_record_vanished(
-    mcp_service, mcp_mock_registry_clients
-):
-    """The status write succeeded but the re-read 404s: still ``None`` (the pre-C12
-    contract), and no unlist is attempted on a record we could not hydrate."""
+def test_transition_deprecate_returns_none_when_the_record_vanished(mcp_service, mcp_mock_registry_clients):
+    """The status write succeeded but the re-read 404s: still ``None``, and no unlist is
+    attempted on a record we could not hydrate."""
     ctl, _ = mcp_mock_registry_clients
     ctl.get_registry_record.side_effect = _not_found()
 

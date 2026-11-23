@@ -1,14 +1,3 @@
-// Projects — the API-backed list of project CONTAINERS (Epic 20 / Task 16). A
-// Project is an empty container scoped to one org (connection); the repos it
-// holds are materialized from ops-templates on the detail page. Rows come from
-// projectsApi.list(); the Org column resolves connection_id → provider·org via
-// connectionsApi.list(). A row navigates to /ops/projects/:id; "New project"
-// opens a small create modal (name + connection + optional description).
-//
-// House style: emerald-on-glass Ops tokens (opsUi.ts), the OpsPage frame,
-// Tailwind v4 utility strings, 2-space indent — mirroring the Deployments.tsx /
-// Tenants.tsx table idiom and the ConnectionsAdmin ModalShell form idiom.
-
 import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from 'react';
 import { useNavigate } from 'react-router-dom';
 
@@ -18,10 +7,11 @@ import {
   type Connection,
   type Project,
 } from '../../api/client';
-import { useUser } from '../../contexts/UserContext';
+import { useLoad } from '../../api/useLoad';
+import { useUser } from '../../contexts/useUser';
 import { tenantSelectOptions } from '../governance/tenantUi';
 import { useTenantDirectory } from '../governance/useTenantDirectory';
-import { ModalShell } from './ConnectionsAdmin';
+import { ModalShell } from './ModalShell';
 import OpsPage from './OpsPage';
 import { orgLabel } from './opsLabels';
 import { OPS_CARD, OPS_PRIMARY_BTN, OPS_TABLE_DIVIDE, OPS_TABLE_HEAD } from './opsUi';
@@ -32,20 +22,12 @@ const FIELD_INPUT =
 const FIELD_SELECT =
   'w-full px-3 py-2 text-sm rounded-lg border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500/40 disabled:opacity-40';
 
-// Human date for created_at; falls back to the raw string when unparseable.
 function formatDate(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
-// Resolve a connection_id → "Provider · org"; falls back to the raw id when the connection
-// is missing (deleted, or not visible to this caller).
-//
-// E28/T10: the label itself now comes from the shared `opsLabels.orgLabel`. This copy
-// rendered the RAW wire enum (`github · acme`) while `TemplatesAdmin` rendered the brand
-// casing (`GitHub · acme`) — one fact, one surface, two spellings, visible when an operator
-// moves between the two pages. Only the Map lookup stays local; the formatting is pinned.
 function connectionLabel(connections: Map<string, Connection>, connectionId: string): string {
   return orgLabel(connections.get(connectionId), connectionId);
 }
@@ -53,51 +35,26 @@ function connectionLabel(connections: Map<string, Connection>, connectionId: str
 export default function Projects(): JSX.Element {
   const navigate = useNavigate();
 
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [connections, setConnections] = useState<Connection[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [reloadNonce, setReloadNonce] = useState(0);
-
   const [showCreate, setShowCreate] = useState(false);
 
-  // Load projects (primary — its failure is the error state), then resolve connections
-  // best-effort (they feed the cosmetic Org column + the create-modal picker). A
-  // connections failure — e.g. a 403 for a true OPERATOR — must NOT blank the projects
-  // list; the Org column just falls back to the raw connection_id. Mirrors ProjectDetail.
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    projectsApi
-      .list()
-      .then(async (projectRows) => {
-        if (cancelled) return;
-        setProjects(projectRows);
-        setError(null);
-        try {
-          const connectionRows = await connectionsApi.list();
-          if (!cancelled) setConnections(connectionRows);
-        } catch {
-          if (!cancelled) setConnections([]);
-        }
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Failed to load projects.');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [reloadNonce]);
-
-  const refetch = useCallback(() => setReloadNonce((n) => n + 1), []);
+  const { state, reload } = useLoad(
+    () =>
+      projectsApi.list().then(async (projects) => ({
+        projects,
+        connections: await connectionsApi.list().catch(() => [] as Connection[]),
+      })),
+    [],
+    'Failed to load projects.',
+  );
+  const loading = state.kind === 'loading';
+  const error = state.kind === 'error' ? state.message : null;
+  const data = state.kind === 'ready' ? state.data : null;
+  const projects = data?.projects ?? [];
+  const connections = data?.connections ?? [];
 
   const connectionsById = useMemo(
-    () => new Map(connections.map((c) => [c.id, c])),
-    [connections],
+    () => new Map((data?.connections ?? []).map((c) => [c.id, c])),
+    [data],
   );
 
   return (
@@ -106,7 +63,12 @@ export default function Projects(): JSX.Element {
       title="Projects"
       subtitle="Projects group related agents and repositories under a single owner for provisioning and governance."
       action={
-        <button type="button" onClick={() => setShowCreate(true)} className={OPS_PRIMARY_BTN}>
+        <button
+          type="button"
+          onClick={() => setShowCreate(true)}
+          className={OPS_PRIMARY_BTN}
+          data-testid="project-new"
+        >
           New project
         </button>
       }
@@ -117,7 +79,7 @@ export default function Projects(): JSX.Element {
           <p className="text-sm text-slate-600 mt-1">{error}</p>
           <button
             type="button"
-            onClick={refetch}
+            onClick={reload}
             className="mt-3 px-3 py-1.5 rounded-lg bg-white border border-slate-300 text-slate-700 text-xs font-medium hover:bg-slate-50 transition-colors"
           >
             Retry
@@ -147,6 +109,15 @@ export default function Projects(): JSX.Element {
                   <tr
                     key={p.id}
                     onClick={() => navigate(`/ops/projects/${p.id}`)}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Open ${p.name}`}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        navigate(`/ops/projects/${p.id}`);
+                      }
+                    }}
                     className="hover:bg-emerald-50/40 transition-colors cursor-pointer"
                   >
                     <td className="px-4 py-3">
@@ -184,7 +155,7 @@ export default function Projects(): JSX.Element {
           onClose={() => setShowCreate(false)}
           onCreated={() => {
             setShowCreate(false);
-            refetch();
+            reload();
           }}
         />
       )}
@@ -192,22 +163,15 @@ export default function Projects(): JSX.Element {
   );
 }
 
-// --- Create-project modal ---------------------------------------------------
-// Reuses the shared ModalShell (ConnectionsAdmin) + the AddConnectionModal
-// mechanics (mountedRef guard, actionPending, canSubmit, inline <p role="alert">).
-// Fields: name, connection (from the passed-in list), optional description →
-// projectsApi.create. The parent closes + refetches on success.
-function CreateProjectModal({
+export function CreateProjectModal({
   connections,
   onClose,
   onCreated,
 }: {
   connections: Connection[];
   onClose: () => void;
-  onCreated: () => void;
+  onCreated: (project: Project) => void;
 }) {
-  // Tenant select source (E24/T6): the caller's memberships, or the full admin
-  // directory for role_level >= 2 (degrades to memberships while it loads).
   const { user } = useUser();
   const isAdmin = (user?.role_level ?? 0) >= 2;
   const tenantDirectory = useTenantDirectory(isAdmin);
@@ -223,7 +187,6 @@ function CreateProjectModal({
 
   const nameRef = useRef<HTMLInputElement>(null);
 
-  // Unmount guard — create resolves async and can land after the modal closes.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -244,13 +207,13 @@ function CreateProjectModal({
     setActionPending(true);
     setActionError(null);
     try {
-      await projectsApi.create({
+      const project = await projectsApi.create({
         name: name.trim(),
         connection_id: connectionId,
         tenant_id: tenantId,
         description: description.trim() || undefined,
       });
-      onCreated();
+      onCreated(project);
     } catch (err: unknown) {
       if (mountedRef.current) {
         setActionError(err instanceof Error ? err.message : 'Failed to create the project.');
@@ -282,13 +245,13 @@ function CreateProjectModal({
             onClick={handleSubmit}
             disabled={!canSubmit}
             className={`${OPS_PRIMARY_BTN} disabled:opacity-40`}
+            data-testid="project-create"
           >
             {actionPending ? 'Creating…' : 'Create project'}
           </button>
         </>
       }
     >
-      {/* Project name. */}
       <div>
         <label htmlFor="new-proj-name" className={FIELD_LABEL}>
           Project name
@@ -306,7 +269,6 @@ function CreateProjectModal({
         />
       </div>
 
-      {/* Connection (org). */}
       <div>
         <label htmlFor="new-proj-connection" className={FIELD_LABEL}>
           Org connection
@@ -332,8 +294,6 @@ function CreateProjectModal({
         )}
       </div>
 
-      {/* Tenant (required, E24/T6) — options from the caller's memberships, or
-          the full directory for admins. */}
       <div>
         <label htmlFor="new-proj-tenant" className={FIELD_LABEL}>
           Tenant
@@ -359,7 +319,6 @@ function CreateProjectModal({
         )}
       </div>
 
-      {/* Description (optional). */}
       <div>
         <label htmlFor="new-proj-description" className={FIELD_LABEL}>
           Description <span className="text-slate-300 normal-case">(optional)</span>

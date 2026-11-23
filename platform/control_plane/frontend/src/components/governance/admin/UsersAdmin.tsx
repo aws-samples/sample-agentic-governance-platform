@@ -1,78 +1,31 @@
-// UsersAdmin — the platform-users admin panel (Epic 16), rendered as the "Users"
-// tab inside AdminConsole.
-//
-// Admin-gated (role_level >= 2). Unlike MarketplaceAdmin, the non-admin path
-// returns null: the AdminConsole already shows the not-authorized panel, so this
-// tab body never renders for non-admins (and duplicating the panel would be
-// wrong). Skeleton cloned from MarketplaceAdmin: the cancelled-guard loader keyed
-// on [isAdmin, reloadNonce] calling usersAdminApi.list(), the refetch nonce-bump,
-// the shared runAction(id, fn) mutation helper, the glass-CARD table, inline
-// loading/error/empty states, the per-row disabled/… spinner idiom, and the
-// top-level actionError <p role="alert">.
-// Layout:
-//   • a header row — a short description <p> + an "Add user" primary button;
-//   • the glass-CARD table of usersAdminApi.list() rows. Each row shows the
-//     principal (avatar + display name), a slate principal-type pill, an inline
-//     role <select> (changeRole on change), and a rose Remove action (mirrors
-//     MarketplaceAdmin's Revoke button), with the click wrapped so it doesn't
-//     interfere with the row.
-//   • Add-user opens AddUserModal; on submit it adds the user then closes +
-//     refetches.
-
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { usersAdminApi } from '../../../api/client';
-import type { PlatformRole, PlatformUser } from '../../../api/client';
-import { useUser } from '../../../contexts/UserContext';
+import type { RoleChange, PlatformUser } from '../../../api/client';
+import { useLoad } from '../../../api/useLoad';
+import { useUser } from '../../../contexts/useUser';
 import { AgentAvatar } from '../agentUi';
 import { PLATFORM_ROLES, ROLE_BADGE } from './usersAdminForm';
 import AddUserModal from './AddUserModal';
 
+const NO_USERS: PlatformUser[] = [];
 const CARD = 'bg-white/70 backdrop-blur rounded-xl border border-slate-200/60 shadow-sm';
 
 export default function UsersAdmin() {
   const { user } = useUser();
   const isAdmin = (user?.role_level ?? 0) >= 2;
 
-  const [users, setUsers] = useState<PlatformUser[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [reloadNonce, setReloadNonce] = useState(0);
+  const { state, reload: refetch } = useLoad(
+    () => (isAdmin ? usersAdminApi.list() : Promise.resolve(NO_USERS)),
+    [isAdmin],
+    'Failed to load users.',
+  );
+  const users = state.data ?? NO_USERS;
+  const loading = state.kind === 'loading';
 
-  // Per-row action state.
   const [actionPendingId, setActionPendingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const [showAdd, setShowAdd] = useState(false);
-
-  // Load the platform users. Skipped entirely for non-admins (this tab body never
-  // renders for them — the AdminConsole short-circuits to the not-authorized panel).
-  useEffect(() => {
-    if (!isAdmin) {
-      setLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    usersAdminApi
-      .list()
-      .then((rows) => {
-        if (cancelled) return;
-        setUsers(rows);
-        setError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Failed to load users.');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isAdmin, reloadNonce]);
-
-  const refetch = useCallback(() => setReloadNonce((n) => n + 1), []);
 
   const runAction = useCallback(
     async (id: string, fn: () => Promise<unknown>) => {
@@ -92,7 +45,7 @@ export default function UsersAdmin() {
   );
 
   const handleChangeRole = useCallback(
-    (id: string, role: PlatformRole) => {
+    (id: string, role: RoleChange['role']) => {
       void runAction(id, () => usersAdminApi.changeRole(id, role));
     },
     [runAction],
@@ -107,18 +60,12 @@ export default function UsersAdmin() {
     [runAction],
   );
 
-  // Memoized so its identity is stable across unrelated re-renders — it's a dep of
-  // AddUserModal's debounced search effect. Declared before the early return to keep
-  // hook order unconditional (Rules of Hooks).
   const existingIds = useMemo(() => new Set(users.map((u) => u.principal_id)), [users]);
 
-  // The non-admin path returns null — the AdminConsole already renders the
-  // not-authorized panel, so there is nothing to show here.
   if (!isAdmin) return null;
 
   return (
     <div className="space-y-3">
-      {/* Header row: description + Add user. */}
       <div className="flex items-start justify-between gap-3">
         <p className="text-xs text-slate-500">
           Manage who can access the platform and at what role. Roles are granted as Entra app-role
@@ -139,11 +86,10 @@ export default function UsersAdmin() {
         </p>
       )}
 
-      {/* Table. */}
-      {error ? (
+      {state.kind === 'error' ? (
         <div className="bg-white/70 backdrop-blur rounded-xl border border-red-200/70 shadow-sm p-6">
           <h3 className="text-sm font-semibold text-red-700">Couldn’t load users</h3>
-          <p className="text-sm text-slate-600 mt-1">{error}</p>
+          <p className="text-sm text-slate-600 mt-1">{state.message}</p>
           <button
             onClick={refetch}
             className="mt-3 px-3 py-1.5 rounded-lg bg-white border border-slate-300 text-slate-700 text-xs font-medium hover:bg-slate-50 transition-colors"
@@ -174,10 +120,6 @@ export default function UsersAdmin() {
               {!loading &&
                 users.map((u) => {
                   const rowPending = actionPendingId === u.principal_id;
-                  // While ANY row's action is in flight, disable every row's controls:
-                  // runAction is single-flight (it drops a second concurrent call), so an
-                  // enabled select on another row would silently discard the change and
-                  // show an unpersisted value until the next refetch snaps it back.
                   const anyPending = actionPendingId !== null;
                   return (
                     <tr key={u.principal_id} className="hover:bg-blue-50/40 transition-colors">
@@ -201,7 +143,7 @@ export default function UsersAdmin() {
                           value={u.role}
                           disabled={rowPending || anyPending}
                           onChange={(e) =>
-                            handleChangeRole(u.principal_id, e.target.value as PlatformRole)
+                            handleChangeRole(u.principal_id, e.target.value as RoleChange['role'])
                           }
                         >
                           {PLATFORM_ROLES.map((r) => (
@@ -245,8 +187,6 @@ export default function UsersAdmin() {
           onClose={() => setShowAdd(false)}
           onSubmit={async ({ principalId, role }) => {
             await usersAdminApi.add({ principal_id: principalId, role });
-            // Add doesn't go through runAction, so clear any stale banner from a
-            // prior failed Remove/changeRole before closing + refetching.
             setActionError(null);
             setShowAdd(false);
             refetch();

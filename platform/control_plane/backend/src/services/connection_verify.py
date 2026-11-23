@@ -1,14 +1,11 @@
-"""Provider verification for Git org Connections (E19).
+"""Provider verification for Git org connections over an injectable ``httpx.Client``.
 
-Pure-ish token + org-access verification over an injectable ``httpx.Client``.
-The caller supplies the client (tests inject one backed by ``httpx.MockTransport``;
-the connection service builds a real one). This module owns the GitHub/GitLab
-endpoint sequence and the identity/org-access outcome mapping (spec §4).
-
-Two probes per provider: an identity check, then an org/group visibility check.
-``Authorization: Bearer {token}`` is set on EACH request here — the caller's
-client carries no pre-set auth. The response body is NEVER folded into
-``reason`` (it can echo attacker-controlled or sensitive content).
+Two probes per provider: an identity check, then an org or group visibility check; success
+requires both to answer 200. A GitHub App installation token has no user identity, so it is
+checked with the single ``GET /installation/repositories`` liveness probe instead.
+``Authorization: Bearer {token}`` is set on each request here; the caller's client carries no
+auth. Transport failures and the documented HTTP outcomes map to fixed reason strings, and a
+response body is never folded into a reason.
 """
 
 from dataclasses import dataclass
@@ -30,60 +27,35 @@ class VerifyResult:
     reason: Optional[str]
 
 
-def verify_connection(
-    provider: Provider,
-    org: str,
-    base_url: Optional[str],
-    token: str,
-    *,
-    client: httpx.Client,
-    is_app: bool = False,
-) -> VerifyResult:
-    """Verify a credential authenticates AND can see ``org`` on ``provider``.
-
-    ``is_app`` selects the GitHub probe: a PAT (``is_app=False``) is checked with the
-    user-identity endpoint (``GET /user``); a GitHub App **installation token**
-    (``is_app=True``) has NO user identity — ``GET /user`` returns 403 "Resource not
-    accessible by integration" — so it is checked with ``GET /installation/repositories``,
-    the canonical liveness probe for an installation token (200 ⇒ the token is valid and the
-    App is installed). The installation↔org binding is already established upstream (the
-    installation id was resolved by matching the org, or pasted by the operator, and the
-    token was minted for exactly that installation), so the App path uses the single probe.
-
-    Returns a ``VerifyResult``; transport failures and the documented HTTP outcomes are
-    mapped to fixed reason strings (no response body ever leaks).
-    """
+def _api_base(provider: Provider, base_url: Optional[str]) -> str:
     if base_url:
-        base = base_url.rstrip("/")
-    elif provider == Provider.GITLAB:
-        base = GITLAB_DEFAULT_BASE
-    else:
-        base = GITHUB_DEFAULT_BASE
+        return base_url.rstrip("/")
+    if provider == Provider.GITLAB:
+        return GITLAB_DEFAULT_BASE
+    return GITHUB_DEFAULT_BASE
 
-    headers = {"Authorization": f"Bearer {token}"}
-    unreachable_reason = f"could not reach {provider.value} ('{base}')"
 
-    # GitHub App installation token: single liveness probe (see docstring).
-    if is_app:
-        url = f"{base}/installation/repositories"
-        try:
-            resp = client.get(url, headers=headers)
-        except httpx.HTTPError:
-            return VerifyResult(ok=False, account_login=None, reason=unreachable_reason)
-        if resp.status_code == 401:
-            return VerifyResult(
-                ok=False, account_login=None, reason="installation token did not authenticate"
-            )
-        if resp.status_code != 200:
-            # 403/404/5xx: the App isn't installed, lost access, or GitHub is unreachable.
-            return VerifyResult(
-                ok=False,
-                account_login=None,
-                reason=f"App installation is not active for org '{org}'",
-            )
-        # account_login = the org the App is installed on (the "account" for an App token).
-        return VerifyResult(ok=True, account_login=org, reason=None)
+def _verify_app_installation(
+    base: str, org: str, headers: dict, *, client: httpx.Client, unreachable_reason: str
+) -> VerifyResult:
+    try:
+        resp = client.get(f"{base}/installation/repositories", headers=headers)
+    except (httpx.HTTPError, httpx.InvalidURL, UnicodeError):
+        return VerifyResult(ok=False, account_login=None, reason=unreachable_reason)
+    if resp.status_code == 401:
+        return VerifyResult(ok=False, account_login=None, reason="installation token did not authenticate")
+    if resp.status_code != 200:
+        return VerifyResult(
+            ok=False,
+            account_login=None,
+            reason=f"App installation is not active for org '{org}'",
+        )
+    return VerifyResult(ok=True, account_login=org, reason=None)
 
+
+def _verify_identity_and_org(
+    provider: Provider, base: str, org: str, headers: dict, *, client: httpx.Client, unreachable_reason: str
+) -> VerifyResult:
     if provider == Provider.GITLAB:
         identity_url = f"{base}/api/v4/user"
         org_url = f"{base}/api/v4/groups/{quote(org, safe='')}"
@@ -97,13 +69,9 @@ def verify_connection(
         identity_resp = client.get(identity_url, headers=headers)
         if identity_resp.status_code == 401:
             return VerifyResult(ok=False, account_login=None, reason="token did not authenticate")
-        # Spec §4: success requires BOTH calls to return 200. Any other identity
-        # status (403/429/5xx/...) is the network/other bucket, not success.
         if identity_resp.status_code != 200:
             return VerifyResult(ok=False, account_login=None, reason=unreachable_reason)
 
-        # A malformed/non-JSON or non-object body (e.g. a 5xx HTML page slipping
-        # through as 200) must NOT crash the caller and must NEVER leak into reason.
         try:
             identity_body = identity_resp.json()
         except ValueError:
@@ -123,9 +91,33 @@ def verify_connection(
             return VerifyResult(ok=False, account_login=account_login, reason=unreachable_reason)
 
         return VerifyResult(ok=True, account_login=account_login, reason=None)
-    except httpx.HTTPError:
-        return VerifyResult(
-            ok=False,
-            account_login=None,
-            reason=unreachable_reason,
+    except (httpx.HTTPError, httpx.InvalidURL, UnicodeError):
+        return VerifyResult(ok=False, account_login=None, reason=unreachable_reason)
+
+
+def verify_connection(
+    provider: Provider,
+    org: str,
+    base_url: Optional[str],
+    token: str,
+    *,
+    client: httpx.Client,
+    is_app: bool = False,
+) -> VerifyResult:
+    """Verify that a credential authenticates and can see ``org`` on ``provider``.
+
+    ``is_app`` selects the GitHub App installation-token probe (``GET /installation/repositories``,
+    200 means the token is valid and the App is installed) instead of the PAT probes
+    (``GET /user`` then the org or group lookup).
+    """
+    base = _api_base(provider, base_url)
+    headers = {"Authorization": f"Bearer {token}"}
+    unreachable_reason = f"could not reach {provider.value} ('{base}')"
+
+    if is_app:
+        return _verify_app_installation(
+            base, org, headers, client=client, unreachable_reason=unreachable_reason
         )
+    return _verify_identity_and_org(
+        provider, base, org, headers, client=client, unreachable_reason=unreachable_reason
+    )

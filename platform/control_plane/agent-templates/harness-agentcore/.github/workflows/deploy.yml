@@ -1,0 +1,125 @@
+name: deploy
+
+# Deploy-only CI for a CONFIG-DRIVEN agent (E30 — AgentCore harness, preview).
+#
+# There is nothing to build. The agent is `harness.yaml`, so this workflow's whole job is to
+# tell the platform that a new revision of that file exists: mint a GitHub OIDC token and
+# `POST /builds/runtime`. AGP then runs the harness Terraform module against the commit this
+# run names. No docker, no ECR, no image — deliberately, and not an omission to "restore":
+# the container template's build/push legs have no config-build counterpart, and the platform
+# refuses to record a deploy for an artifact it cannot name (here the artifact is a commit).
+#
+# ONE branch, ONE path, same as the container template:
+#   - push to the repo's trunk → `POST /builds/runtime` (dev deploy)
+#   - any other branch         → nothing runs; open a PR into the trunk
+# The `push` list is narrow for the same reason it is there: exactly ONE dev harness exists per
+# agent, so if every feature branch deployed, N branches would race to overwrite it,
+# last-push-wins. `main` here is THIS repository's own default, not a platform constant — a repo
+# whose trunk is named otherwise edits that one line and nothing else.
+#
+# CI has no prod path at all. A prod deploy is an AGP action: a project OWNER approves a
+# recorded revision and AGP applies it in the prod account. The platform refuses a prod deploy
+# asked for over the GitHub OIDC audience.
+#
+# `concurrency` is load-bearing, not hygiene. The platform build runs `terraform apply` against
+# ONE state per agent (`agentcore-harness/{agent_id}/{stage}`), and two pushes seconds apart
+# would race that state lock — leaving the loser failed while the winner applied stale config,
+# with AGP's own record claiming success. Keying on the ref queues a second WORKFLOW RUN, but
+# that alone is NOT the fix (LIVEFIX, E30 dev deploy): this workflow has one job, so the run is
+# "done" the instant its `fetch` returns, seconds after AGP answers 202 — long before CodeBuild's
+# async `terraform apply` actually finishes. So the next queued push's trigger could still fire
+# while the previous apply was running, which is exactly what happened live. The real
+# serialization is AGP's: `POST /builds/runtime` now answers 409 while a build for this
+# agent+stage is in flight, and the script below polls on that 409 until it clears (or the job's
+# own timeout). `concurrency` still matters — it stops two trigger jobs for the same ref from
+# both polling at once — but it is not what makes the applies serialize; the 409 retry loop is.
+# `cancel-in-progress: false` because an apply already in flight must be allowed to FINISH:
+# killing it halfway abandons the lock and half-applies the harness.
+#
+# `environment: dev` is a DEPLOYMENT LABEL, not where the vars come from. `AGP_API_URL` /
+# `AGENT_ID` / `CONNECTION_ID` are REPOSITORY-level variables written by AGP at materialize
+# time, and they resolve here because a lookup checks the environment first and FALLS BACK to
+# the repository set. A config build gets no ECR vars at all — that is the platform skipping
+# them on purpose, not a materialize step that failed.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  # Per-ref: two pushes to the trunk serialize rather than racing this agent's single
+  # terraform state lock. Never cancel — see the header.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    name: Trigger platform harness deploy (dev)
+    # A push NEVER deploys production — stage is always dev, in the dev tenant account.
+    environment: dev
+    runs-on: ubuntu-latest
+    permissions:
+      # `id-token: write` is the only credential this workflow needs: it mints the GitHub OIDC
+      # token AGP verifies. No AWS role is assumed here — there is no registry to push to, and
+      # the platform (not the repo) holds the deploy credential.
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mint OIDC token and POST to AGP build-trigger
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Same body shape as the container template's — one contract, two build kinds.
+            // The COMMIT SHA takes the `image_tag` slot: for a config build it is the
+            // deployment version, the thing AGP records and a later promotion attests to,
+            // exactly as an image tag is for a container build. `image_digest` and `ecr_repo`
+            // are empty because no image exists; the platform resolves the build kind and the
+            // IaC type from the agent's template chain and never from this body.
+            const body = {
+              agent_id: '${{ vars.AGENT_ID }}',
+              image_tag: '${{ github.sha }}',
+              image_digest: '',
+              ecr_repo: '',
+              connection_id: '${{ vars.CONNECTION_ID }}',
+              stage: 'dev',
+            };
+            // LIVEFIX (E30 dev deploy): AGP answers 409 (not 202) while a build for this
+            // agent+stage is already running — see builds.py's start_runtime_build route. Poll
+            // on that 409 instead of failing the job, so a second push genuinely WAITS for the
+            // first apply to finish rather than racing its terraform state lock. Bounded so a
+            // stuck prior build fails this job eventually instead of hanging forever.
+            const maxWaitMs = 20 * 60 * 1000;
+            const pollMs = 20 * 1000;
+            const started = Date.now();
+            let resp;
+            let text;
+            while (true) {
+              // Minted INSIDE the loop, not once before it: OIDC tokens expire ~5 min in,
+              // the backend checks expiry with 60s leeway (security_github_oidc.py), and
+              // this poll can legitimately run up to maxWaitMs (20 min) — a token fetched
+              // before the loop would be stale and 401 on any wait past ~4 min.
+              const token = await core.getIDToken('agp-runtime-build');
+              resp = await fetch('${{ vars.AGP_API_URL }}/builds/runtime', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
+              });
+              text = await resp.text();
+              if (resp.status !== 409) break;
+              if (Date.now() - started > maxWaitMs) {
+                core.setFailed(`AGP still reports a build in progress for this agent+stage after ${maxWaitMs / 1000}s: ${text}`);
+                return;
+              }
+              core.info(`AGP reports a build already in progress for this agent+stage (409) — waiting ${pollMs / 1000}s and retrying...`);
+              await new Promise((r) => setTimeout(r, pollMs));
+            }
+            core.info(`AGP responded ${resp.status}: ${text}`);
+            if (!resp.ok) {
+              core.setFailed(`AGP deploy-trigger failed (${resp.status}): ${text}`);
+            }

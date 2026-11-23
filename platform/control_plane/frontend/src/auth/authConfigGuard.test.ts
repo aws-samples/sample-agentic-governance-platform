@@ -1,26 +1,3 @@
-// authConfigGuard.test.ts — the UNCONDITIONAL Entra fail-fast (E36/T19, research item 9).
-//
-// WHY THIS FILE IS THE CONTRACT. The defect was not that the guard was missing — it was that
-// the guard was GATED on `VITE_AUTH_PROVIDER`, a variable typed OPTIONAL
-// (`vite-env.d.ts:5`) and written by exactly one build path. Every other path
-// (`deploy-frontend.sh`, a bare `npm run build`, CI) could produce a bundle whose
-// `.env.production` lacks the key, which made the throw inert and shipped `clientId: ''`
-// against the `/common` multi-tenant authority — a sign-in that cannot work, with no
-// diagnostic. So the two things worth pinning are exactly the two the old code got wrong:
-//
-//   • the throw does NOT depend on `VITE_AUTH_PROVIDER` in ANY of its states (absent,
-//     empty, 'entra', or something else). It is asserted key-by-key against a matrix of
-//     provider values, because "the guard is unconditional" is a claim about a variable that
-//     is no longer read at all;
-//   • there is NO fallback. `clientId: ''` and the `/common` authority are the values the
-//     old module produced when the throw was skipped, so both are asserted UNREACHABLE
-//     rather than merely absent from the source.
-//
-// The unusable-value predicate is pinned against its TWIN in
-// `infrastructure/scripts/deploy-full.sh:86-91` (`frontend_var_unusable`). Two spellings of
-// one rule is the drift this epic exists to remove: a value the deploy preflight refuses must
-// be a value the bundle refuses, and vice versa.
-
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -29,19 +6,13 @@ import {
   resolveAuthConfig,
 } from './authConfigGuard';
 
-/** A tenant/client pair that is genuinely usable — real GUIDs, shaped like `frontend/.env`. */
 const GOOD = {
-  [AUTH_ENV_KEYS.tenantId]: 'c244fa39-b8de-4f97-9f36-d053103d65c4',
-  [AUTH_ENV_KEYS.clientId]: '1e335d0e-0af8-4699-acd4-d78d04acb585',
+  [AUTH_ENV_KEYS.tenantId]: '11111111-2222-3333-4444-555555555555',
+  [AUTH_ENV_KEYS.clientId]: '66666666-7777-8888-9999-aaaaaaaaaaaa',
 } as const;
 
-// Every state `VITE_AUTH_PROVIDER` can be in. The var is typed `?: 'entra'`, so `undefined`
-// and `'entra'` are the declared ones; the other two are what a hand-written or
-// pre-E34/T11-generated `.env.production` actually contains.
 const PROVIDER_STATES: (string | undefined)[] = [undefined, '', 'entra', 'something-else'];
 
-// The unusable forms, one per clause of `frontend_var_unusable`. Kept as (label, value) pairs
-// so a failure names WHICH clause regressed.
 const UNUSABLE_VALUES: [string, string | undefined][] = [
   ['absent', undefined],
   ['empty', ''],
@@ -55,7 +26,7 @@ const UNUSABLE_VALUES: [string, string | undefined][] = [
   ['an all-zero GUID with padding', '  00000000-0000-0000-0000-000000000009  '],
 ];
 
-describe('isUnusableAuthValue — the twin of deploy-full.sh:86-91', () => {
+describe('isUnusableAuthValue — the twin of unusable() in scripts/ci/deploy-frontend.sh', () => {
   it.each(UNUSABLE_VALUES)('rejects %s', (_label, value) => {
     expect(isUnusableAuthValue(value)).toBe(true);
   });
@@ -69,10 +40,7 @@ describe('isUnusableAuthValue — the twin of deploy-full.sh:86-91', () => {
     expect(isUnusableAuthValue(`  ${GOOD[AUTH_ENV_KEYS.clientId]}\n`)).toBe(false);
   });
 
-  it('does NOT reject a GUID that merely starts with a zero group', () => {
-    // The `deploy-full.sh` clause is the full four-group all-zero prefix, not "starts with
-    // 0". A tenant whose real GUID opens with `00000000-` must not be refused; narrowing
-    // this predicate to be "safer" would refuse a valid deployment.
+  it('does not reject a GUID that merely opens with a zero group: the clause is the full four-group prefix', () => {
     expect(isUnusableAuthValue('00000000-1111-2222-3333-444444444444')).toBe(false);
   });
 });
@@ -96,9 +64,7 @@ describe('resolveAuthConfig — the happy path', () => {
     );
   });
 
-  it('ignores every other key it is handed', () => {
-    // It is handed the whole of `import.meta.env`. Reading only its two keys is what makes
-    // the "regardless of VITE_AUTH_PROVIDER" property structural rather than asserted.
+  it('ignores every other key it is handed, VITE_AUTH_PROVIDER included', () => {
     expect(
       resolveAuthConfig({
         ...GOOD,
@@ -112,10 +78,7 @@ describe('resolveAuthConfig — the happy path', () => {
   });
 });
 
-describe('resolveAuthConfig — throws REGARDLESS of VITE_AUTH_PROVIDER', () => {
-  // The regression net for the actual defect. Each unusable value is asserted against every
-  // provider state: the old module threw only in the `'entra'` column and returned a broken
-  // config in the other three.
+describe('resolveAuthConfig — throws regardless of VITE_AUTH_PROVIDER', () => {
   for (const provider of PROVIDER_STATES) {
     describe(`with VITE_AUTH_PROVIDER=${JSON.stringify(provider)}`, () => {
       it.each(UNUSABLE_VALUES)('throws on an %s tenant id', (_label, value) => {
@@ -169,9 +132,6 @@ describe('resolveAuthConfig — the message names what to fix', () => {
   });
 
   it('says a placeholder is as broken as an absent value, and points at a file', () => {
-    // `cp .env.example .env` and forget is the common way sign-in dies, and the value LOOKS
-    // filled in — so the message must say "or still a placeholder", exactly as the deploy
-    // preflight does, or the operator stares at a populated file.
     let message = '';
     try {
       resolveAuthConfig({ ...GOOD, [AUTH_ENV_KEYS.tenantId]: '00000000-0000-0000-0000-000000000001' });
@@ -183,9 +143,7 @@ describe('resolveAuthConfig — the message names what to fix', () => {
     expect(message).toContain('docs/entra-setup.md');
   });
 
-  it('does NOT tell the reader to set VITE_AUTH_PROVIDER', () => {
-    // The old message was "VITE_AUTH_PROVIDER=entra requires …", which pointed the reader at
-    // the variable that no longer participates. Setting it would now fix nothing.
+  it('does not tell the reader to set VITE_AUTH_PROVIDER, which no longer participates', () => {
     let message = '';
     try {
       resolveAuthConfig({});
@@ -198,8 +156,6 @@ describe('resolveAuthConfig — the message names what to fix', () => {
 
 describe('resolveAuthConfig — the deleted fallbacks are unreachable', () => {
   it('never returns an empty client id', () => {
-    // `clientId: clientId || ''` (old `msalConfig.ts:22`). An empty client id is the value
-    // MSAL happily builds a request URL from, which is how this shipped unnoticed.
     for (const value of UNUSABLE_VALUES) {
       expect(() =>
         resolveAuthConfig({ ...GOOD, [AUTH_ENV_KEYS.clientId]: value[1] }),
@@ -207,16 +163,12 @@ describe('resolveAuthConfig — the deleted fallbacks are unreachable', () => {
     }
   });
 
-  it('never returns the /common multi-tenant authority', () => {
-    // Old `msalConfig.ts:23-25`. This is the harmful half: `/common` is a WORKING authority
-    // pointing at the wrong directory, so sign-in proceeds and every API call 401s on issuer.
+  it('never returns the /common multi-tenant authority, the old silent default', () => {
     for (const value of UNUSABLE_VALUES) {
       expect(() =>
         resolveAuthConfig({ ...GOOD, [AUTH_ENV_KEYS.tenantId]: value[1] }),
       ).toThrow();
     }
-    // And no usable tenant can produce it either, short of literally being named `common`
-    // (a deliberate act, refused by the backend's issuer check — see the module comment).
     expect(resolveAuthConfig({ ...GOOD }).authority).not.toContain('/common');
   });
 });

@@ -1,15 +1,14 @@
 #!/usr/bin/env python
-"""Purge the leftover per-build scratch clone-token secrets from Secrets Manager (E36/T9).
+"""Purge the leftover per-build scratch clone-token secrets from Secrets Manager.
 
 Why this script exists
 ----------------------
 `services/runtime_build_service.py::_write_scratch_token` writes ONE Secrets Manager secret per
 runtime build — `<RUNTIME_BUILD_TOKEN_PREFIX><image_tag>`, body `{"token": <ready bearer token>}`,
-tagged `managed_by=agp` + `purpose=runtime-build-token`. Until E36/T9 nothing ever deleted them, so
-they accumulated one per build, forever, each billing monthly and each still holding a live git
-credential (a verbatim PAT, or a ~1h GitHub App installation token).
+tagged `managed_by=agp` + `purpose=runtime-build-token`. Each holds a live git credential (a
+verbatim PAT, or a ~1h GitHub App installation token) and bills monthly for as long as it exists.
 
-T9 closed the leak going forward with two code legs:
+Two code legs delete them going forward:
 
   1. the buildspec's `post_build` force-deletes `$GIT_SECRET_ARN` (covers every build that STARTED,
      on success and on failure alike);
@@ -17,14 +16,15 @@ T9 closed the leak going forward with two code legs:
      secret is written BEFORE StartBuild, so a StartBuild that faults leaves a secret behind with
      no build to run post_build.
 
-This script is the third leg: a one-off, operator-run reclaim of the ALREADY-ACCUMULATED backlog,
-and the backstop for anything the other two miss (a build killed before post_build ran, a WARNed
-delete). It is safe to re-run — deleting an already-deleted secret is a no-op here.
+This script is the third leg: a one-off, operator-run reclaim of an accumulated backlog, and the
+backstop for anything the other two miss (a build killed before post_build ran, a WARNed delete).
+It is safe to re-run — a secret already scheduled for deletion is skipped.
 
 How a secret is selected (two independent criteria, OR-ed)
 ---------------------------------------------------------
   * **tags** — `managed_by=agp` AND `purpose=runtime-build-token`, both, exactly;
-  * **name prefix** — `RUNTIME_BUILD_TOKEN_PREFIX` (`--prefix`).
+  * **name prefix** — `RUNTIME_BUILD_TOKEN_PREFIX` (`--prefix`). `DEFAULT_PREFIX` mirrors the
+    default in `src/core/config.py` as a literal; a change to one must be made to the other.
 
 The name-prefix leg is NOT redundant. `_write_scratch_token` tags only on the `create_secret` path;
 when the name already exists (a retry of the same image tag) it falls back to `put_secret_value`,
@@ -41,7 +41,9 @@ operator one-off pays a few extra `ListSecrets` pages for that.
 flight would delete the token that build has not cloned with yet, failing a live deploy. 24 h is
 comfortably longer than any build.
 
-DRY RUN IS THE DEFAULT. Nothing is deleted unless `--delete` is passed.
+DRY RUN IS THE DEFAULT. Nothing is deleted unless `--delete` is passed. Deletes are forced
+(`ForceDeleteWithoutRecovery`): the default 30-day recovery window would leave the git token
+readable, and billing, for that whole window, which is not a reclaim.
 
 Usage (from the backend dir):
 
@@ -61,16 +63,15 @@ import os
 import sys
 from datetime import datetime, timezone
 
+_SRC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 logger = logging.getLogger("sweep_runtime_build_tokens")
 
 DEFAULT_REGION = "us-east-1"
-# Mirrors the default of `RUNTIME_BUILD_TOKEN_PREFIX` (src/core/config.py) — duplicated as a
-# literal rather than imported so this script needs no PYTHONPATH=src and constructs no Settings
-# object (which would demand the backend's whole environment just to read one default).
 DEFAULT_PREFIX = "agp-dev/runtime-build-token/"
 DEFAULT_MIN_AGE_HOURS = 24.0
-
-# Both required, exactly — the tag pair `_write_scratch_token` applies on the create path.
 REQUIRED_TAGS = {"managed_by": "agp", "purpose": "runtime-build-token"}
 
 
@@ -88,7 +89,6 @@ def match_reason(secret: dict, prefix: str) -> str:
     reasons = []
     if all(_tags_of(secret).get(k) == v for k, v in REQUIRED_TAGS.items()):
         reasons.append("tags")
-    # The tag-less half: `put_secret_value` (the same-image-tag retry path) does not re-tag.
     if prefix and secret.get("Name", "").startswith(prefix):
         reasons.append("name prefix")
     return " + ".join(reasons)
@@ -113,7 +113,6 @@ def list_scratch_secrets(sm, *, prefix: str) -> list:
     out = []
     for page in sm.get_paginator("list_secrets").paginate():
         for secret in page.get("SecretList", []):
-            # Already scheduled for deletion by an earlier sweep — nothing left to reclaim.
             if secret.get("DeletedDate"):
                 continue
             reason = match_reason(secret, prefix)
@@ -124,6 +123,8 @@ def list_scratch_secrets(sm, *, prefix: str) -> list:
 
 def run(*, sm, prefix: str, min_age_hours: float, delete: bool, now=None) -> int:
     """Plan (and optionally perform) the sweep. Returns the process exit status."""
+    from botocore.exceptions import BotoCoreError, ClientError
+
     now = now or datetime.now(timezone.utc)
     candidates = list_scratch_secrets(sm, prefix=prefix)
 
@@ -141,10 +142,8 @@ def run(*, sm, prefix: str, min_age_hours: float, delete: bool, now=None) -> int
         name, arn = secret["Name"], secret["ARN"]
         age = age_hours(secret, now)
         if age < min_age_hours:
-            # Never race a live build (see the module docstring).
             logger.info(
-                "  [skip] %s — last written %.1fh ago, under the %.1fh floor (a build may still "
-                "be using it)",
+                "  [skip] %s — last written %.1fh ago, under the %.1fh floor (a build may still be using it)",
                 name,
                 age,
                 min_age_hours,
@@ -155,10 +154,8 @@ def run(*, sm, prefix: str, min_age_hours: float, delete: bool, now=None) -> int
             logger.info("  [dry-run] would delete %s (%.1fh old, matched by %s)", name, age, reason)
             continue
         try:
-            # Force delete: the default 30-day recovery window would leave the git token readable
-            # (and billing) for that whole window, which is not a reclaim.
             sm.delete_secret(SecretId=arn, ForceDeleteWithoutRecovery=True)
-        except Exception as exc:  # noqa: BLE001 — one bad secret must not abort the sweep
+        except (BotoCoreError, ClientError) as exc:
             logger.error("  [FAILED] %s — %s", name, exc)
             failures += 1
             continue
@@ -250,18 +247,18 @@ def main(argv=None) -> int:
         return 2
 
     region = args.region or os.environ.get("AWS_REGION") or DEFAULT_REGION
-    try:
-        import boto3  # imported lazily so importing this module never touches AWS setup
+    from core.aws_clients import client
 
-        sm = boto3.client("secretsmanager", region_name=region)
+    try:
+        sm = client("secretsmanager", region=region)
         return run(
             sm=sm,
             prefix=args.prefix,
             min_age_hours=args.min_age_hours,
             delete=args.delete,
         )
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        logger.error("Sweep failed in region %s: %s", region, exc)
+    except Exception as exc:
+        logger.exception("Sweep failed in region %s: %s", region, exc)
         logger.error(
             "Check that (1) AWS credentials for the CONTROL-PLANE account are configured, "
             "(2) they carry secretsmanager:ListSecrets (and secretsmanager:DeleteSecret with "

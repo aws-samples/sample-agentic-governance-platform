@@ -46,7 +46,6 @@ export default function Guardrails({ initialTab }: { initialTab?: Tab }) {
   return (
     <div className="min-h-[calc(100vh-4rem)] relative">
       <div className="relative max-w-7xl mx-auto px-6 py-10">
-        {/* Header */}
         <div className="mb-8 animate-fade-in">
           <Link to="/" className="text-sm text-slate-400 hover:text-slate-600 transition-colors font-medium">
             &larr; Back to Home
@@ -57,7 +56,6 @@ export default function Guardrails({ initialTab }: { initialTab?: Tab }) {
           </p>
         </div>
 
-        {/* Tab Navigation */}
         <div className="flex items-center gap-1 mb-8 p-1 bg-slate-100/80 rounded-xl w-fit animate-fade-in stagger-1">
           {tabs.map((tab) => (
             <button
@@ -75,7 +73,6 @@ export default function Guardrails({ initialTab }: { initialTab?: Tab }) {
           ))}
         </div>
 
-        {/* Tab Content */}
         <div className="animate-fade-in stagger-2">
           {activeTab === 'templates' && <GuardrailTemplateList onCreateNew={() => navigate('/secure/guardrails/create')} />}
           {activeTab === 'builder' && <GuardrailBuilder onComplete={() => navigate('/secure/guardrails')} />}

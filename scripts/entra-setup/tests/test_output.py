@@ -19,6 +19,12 @@ merely nearly right:
   breaks sign-in when it is skipped;
 - what the run did for the person who ran it, so an operator who is not sure
   whether they can sign in does not have to go and look.
+
+The key names, the two frontend values that exist only after the first deploy, and the two file paths
+the blocks are pasted into are transcribed here from the documentation rather than read off the
+module: two independent copies of a contract make a rename in either place visible instead of
+self-consistent, and a heading that names the right file in the wrong directory would send the
+operator to create a second ``secrets.auto.tfvars`` that Terraform never reads.
 """
 
 from __future__ import annotations
@@ -29,17 +35,10 @@ from pathlib import Path
 
 import pytest
 
-# The script is a standalone single file, not an installed package: put its
-# directory on the import path so the tests run the same way regardless of the
-# working directory pytest was invoked from.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import setup_entra  # noqa: E402  (import follows the sys.path bootstrap above)
+import setup_entra
 
-
-# The five Terraform variable names, transcribed from `docs/entra-setup.md`'s backend table
-# rather than referenced from the module: two independent copies of a contract are
-# what make a rename in either place visible instead of self-consistent.
 TFVARS_KEYS = (
     "entra_tenant_id",
     "entra_audience",
@@ -48,9 +47,6 @@ TFVARS_KEYS = (
     "entra_spa_client_id",
 )
 
-# The five frontend keys, from the same doc's frontend table. The other two the SPA declares —
-# `VITE_API_URL` and `VITE_ENTRA_SPA_REDIRECT_URI` — do not exist until after the
-# first deploy and are deliberately NOT printed as values.
 VITE_KEYS = (
     "VITE_AUTH_PROVIDER",
     "VITE_ENTRA_TENANT_ID",
@@ -59,10 +55,6 @@ VITE_KEYS = (
     "VITE_ENTRA_SPA_SCOPE",
 )
 
-# The two files the two blocks are pasted into, transcribed whole rather than by
-# their basenames: a heading that names the right file in the wrong directory sends
-# the operator to create a second `secrets.auto.tfvars` that Terraform never reads,
-# and every value in it then looks unset for reasons nothing explains.
 TFVARS_PATH = "platform/control_plane/infrastructure/secrets.auto.tfvars"
 FRONTEND_ENV_PATH = "platform/control_plane/frontend/.env"
 
@@ -108,9 +100,6 @@ def env_line(key: str, value: str) -> re.Pattern[str]:
     return re.compile(rf"^{re.escape(key)}={re.escape(value)}$", re.MULTILINE)
 
 
-# ===========================================================================
-# The two config blocks
-# ===========================================================================
 def test_every_terraform_key_is_present_and_quoted() -> None:
     """All five, spelled as `variables.tf` declares them, with the values a paste
     into `secrets.auto.tfvars` needs."""
@@ -150,9 +139,7 @@ def test_the_scope_is_the_audience_joined_to_the_scope_name() -> None:
     `401 Invalid audience` on every API call when its halves disagree."""
     rendered = render(audience="api://agp-test")
 
-    assert env_line(
-        "VITE_ENTRA_SPA_SCOPE", f"api://agp-test/{setup_entra.SCOPE_NAME}"
-    ).search(rendered)
+    assert env_line("VITE_ENTRA_SPA_SCOPE", f"api://agp-test/{setup_entra.SCOPE_NAME}").search(rendered)
 
 
 def test_both_config_files_are_named_so_the_values_have_somewhere_to_go() -> None:
@@ -168,9 +155,6 @@ def test_both_config_files_are_named_so_the_values_have_somewhere_to_go() -> Non
     assert FRONTEND_ENV_PATH in rendered
 
 
-# ===========================================================================
-# The secret
-# ===========================================================================
 def test_the_secret_is_printed_once_and_flagged_as_un_recoverable() -> None:
     """Exactly once, on purpose.
 
@@ -192,9 +176,7 @@ def test_a_reused_registration_says_the_existing_secret_cannot_be_read_back() ->
     `secrets.auto.tfvars` is still the right one and must be left alone."""
     rendered = render(secret=None, secret_outcome="existing")
 
-    assert assignment(
-        "entra_backend_client_secret", "<existing secret — cannot be re-read>"
-    ).search(rendered)
+    assert assignment("entra_backend_client_secret", "<existing secret — cannot be re-read>").search(rendered)
     assert SECRET not in rendered
     assert "--rotate-secret" in rendered
 
@@ -211,9 +193,7 @@ def test_a_dry_run_against_an_existing_backend_predicts_that_no_secret_is_coming
     """
     rendered = render(secret=None, secret_outcome="existing", dry_run=True)
 
-    assert assignment(
-        "entra_backend_client_secret", "<existing secret — cannot be re-read>"
-    ).search(rendered)
+    assert assignment("entra_backend_client_secret", "<existing secret — cannot be re-read>").search(rendered)
     assert "<created-on-real-run>" not in rendered
     assert "will NOT" in rendered
     assert "--rotate-secret" in rendered
@@ -225,9 +205,7 @@ def test_a_dry_run_with_rotation_predicts_a_second_secret() -> None:
     valid alongside the first, which is what makes a rotation deployable."""
     rendered = render(secret=None, secret_outcome="rotated", dry_run=True)
 
-    assert assignment("entra_backend_client_secret", "<created-on-real-run>").search(
-        rendered
-    )
+    assert assignment("entra_backend_client_secret", "<created-on-real-run>").search(rendered)
     lowered = rendered.lower()
     assert "--rotate-secret" in rendered
     assert "second secret" in lowered
@@ -248,17 +226,11 @@ def test_a_dry_run_marks_the_values_it_cannot_know() -> None:
 
     assert assignment("entra_backend_client_id", "<created-on-real-run>").search(rendered)
     assert assignment("entra_spa_client_id", "<created-on-real-run>").search(rendered)
-    assert assignment("entra_backend_client_secret", "<created-on-real-run>").search(
-        rendered
-    )
-    # The tenant-level values ARE known in a dry run, and are printed for real.
+    assert assignment("entra_backend_client_secret", "<created-on-real-run>").search(rendered)
     assert assignment("entra_tenant_id", TENANT_ID).search(rendered)
     assert env_line("VITE_ENTRA_TENANT_DOMAIN", TENANT_DOMAIN).search(rendered)
 
 
-# ===========================================================================
-# The after-you-deploy note
-# ===========================================================================
 def test_the_note_names_both_post_deploy_values_and_their_source() -> None:
     """Neither exists until the first apply, so neither is printed as a value — but
     an operator who is not told they are missing reads the block as complete."""
@@ -286,9 +258,6 @@ def test_the_note_demands_the_redirect_uri_be_registered_in_entra_too() -> None:
     assert "register" in lowered
 
 
-# ===========================================================================
-# What the run did for the runner
-# ===========================================================================
 def test_the_block_reports_the_role_assignment_for_the_runner() -> None:
     """Named account, named role: it is the difference between an operator who can
     sign in and one who gets a token with no roles claim and no explanation."""
@@ -308,9 +277,6 @@ def test_an_unassigned_runner_is_reported_as_unassigned() -> None:
     assert "not assigned" in rendered.lower()
 
 
-# ===========================================================================
-# Order
-# ===========================================================================
 def test_the_five_parts_appear_in_the_documented_order() -> None:
     """Paste-ready first, caveats after: an operator works top to bottom, and the
     two blocks they have to copy are the reason they ran the script."""

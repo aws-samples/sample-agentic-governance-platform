@@ -1,12 +1,8 @@
-"""Tests for services/github_app_auth.py — App JWT signing + installation-token mint.
+"""The App JWT and the installation-token mint, offline: a throwaway RSA keypair per test and an
+``httpx.MockTransport`` for the mint; ``now_epoch`` is passed explicitly."""
 
-Offline: a throwaway RSA keypair is generated per test via ``cryptography`` (no fixed
-key material committed), and the token-mint POST is served by an ``httpx.MockTransport``
-(NO live GitHub). Determinism: ``now_epoch`` is passed explicitly — no wall clock.
-"""
-
-import jwt
 import httpx
+import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -18,7 +14,7 @@ from services.github_app_auth import (
     mint_installation_token,
 )
 
-FIXED_EPOCH = 1_700_000_000  # arbitrary fixed instant — determinism, not "now"
+FIXED_EPOCH = 1_700_000_000
 
 
 def _rsa_pem():
@@ -37,16 +33,27 @@ def test_build_app_jwt_is_decodable_rs256_with_right_claims():
 
     token = build_app_jwt("123456", private_pem, now_epoch=FIXED_EPOCH)
 
-    # Verifies the RS256 signature against the public key (skip exp so the fixed
-    # epoch doesn't trip expiry) and asserts the clock-skew-safe iss/iat/exp claims.
-    claims = jwt.decode(
-        token, public_key, algorithms=["RS256"], options={"verify_exp": False}
-    )
+    claims = jwt.decode(token, public_key, algorithms=["RS256"], options={"verify_exp": False})
     assert claims["iss"] == "123456"
     assert claims["iat"] == FIXED_EPOCH - 60
     assert claims["exp"] == FIXED_EPOCH + 540
-    # exp window is ≤ 10 minutes (GitHub's hard cap).
+
+
+def test_build_app_jwt_stays_inside_githubs_ten_minute_cap():
+    private_pem, public_key = _rsa_pem()
+
+    token = build_app_jwt("123456", private_pem, now_epoch=FIXED_EPOCH)
+
+    claims = jwt.decode(token, public_key, algorithms=["RS256"], options={"verify_exp": False})
     assert claims["exp"] - claims["iat"] <= 600
+
+
+def test_build_app_jwt_wraps_an_unparseable_private_key_in_the_documented_error():
+    with pytest.raises(GitHubAppAuthError) as ei:
+        build_app_jwt("123456", "not-a-pem", now_epoch=FIXED_EPOCH)
+
+    assert str(ei.value) == "the App private key could not be parsed"
+    assert ei.value.__cause__ is None
 
 
 def test_mint_installation_token_posts_to_right_url_and_returns_token():
@@ -84,8 +91,12 @@ def test_mint_uses_custom_base_url_for_ghe():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     try:
         token = mint_installation_token(
-            "1", "2", private_pem,
-            client=client, base_url="https://ghe.example.com/api/v3/", now_epoch=FIXED_EPOCH,
+            "1",
+            "2",
+            private_pem,
+            client=client,
+            base_url="https://ghe.example.com/api/v3/",
+            now_epoch=FIXED_EPOCH,
         )
     finally:
         client.close()
@@ -95,10 +106,10 @@ def test_mint_uses_custom_base_url_for_ghe():
 
 
 def test_mint_non_201_raises_safe_error():
+    """A body that echoes key material never reaches the message; only the status does."""
     private_pem, _ = _rsa_pem()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        # A body that echoes secret-looking content — must NEVER leak into the message.
         return httpx.Response(404, json={"message": "Not Found", "secret_leak": private_pem})
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -113,7 +124,7 @@ def test_mint_non_201_raises_safe_error():
     msg = str(ei.value)
     assert "404" in msg
     assert private_pem not in msg
-    assert "BEGIN" not in msg  # no PEM material
+    assert "BEGIN" not in msg
 
 
 def test_mint_transport_error_raises_safe_error():

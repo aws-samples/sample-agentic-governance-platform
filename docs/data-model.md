@@ -59,9 +59,13 @@ Everything governance-related rides in that payload: sponsor, business unit, reg
 classification, platform, framework, model id, tenant, marketplace block, the runtime ARNs (`agent_arn`
 scalar + `agent_arns` stage map for AgentCore; `runtime_handle`, `runtime_kind`, `binding_mode`,
 `databricks_sp_id`, `databricks_sp_secret_arn`, `oauth2_app_client_id` for Databricks, `models/agent.py:189-239`),
-the directory identity handles, and the observability project join. What does *not* ride in it is the
-lifecycle state — that is derived from the registry's native record status on every read and never
-stored (`models/agent.py:145-183`). The registry also has **no tenant concept**, so tenant filtering
+the directory identity handles, and the observability project join. Two additive keys joined it in E38, both
+absent ⇒ legacy so neither is a migration: `bound_stage`, the resolved stage key a Databricks agent's
+provisioning pins so a multi-workspace tenant stays invocable for new agents, and `trace_delivery`
+(`"auto"`/`"manual"`, absent ⇒ auto) which says whether AGP injects the tracing env or leaves it to
+self-serve wiring (`models/agent.py:476`, `:353`, round-tripped at `:616-619`, `:719-723`). What does *not*
+ride in it is the lifecycle state — that is derived from the registry's native record status on every read and
+never stored (`models/agent.py:145-183`). The registry also has **no tenant concept**, so tenant filtering
 is a post-filter in Python after the list returns (`api/routes/agents.py:483-485`).
 
 For the write timeline — what is created when, and in what order —
@@ -207,8 +211,13 @@ ids whose membership defines tenant membership (at least one required), and a `s
 entry per deployment stage, each naming a target AWS account and the roles used to reach it. That
 map is the cross-account seam: an empty deploy role means deploy-in-place.
 
+It also carries the connect-time **probe results** — a `capabilities` map of flat boolean flags (AWS writes
+one `can_deploy_reach:<stage>` / `can_push_reach:<stage>` per probed role; Databricks writes its own) and,
+for Databricks, a `binding_mode` string. Those are the *only* stored half of the readiness story: the other
+half is declared in code, and what a tenant page shows is the two intersected at read time (§4.4).
+
 Read by every tenant-scoped route and by the build path; written only by the tenant admin routes
-and the seed script.
+(including the re-probe verb), and the seed script.
 
 > **Known limitation — a stage cannot be deleted through the update route.** The tenant update
 > route merges the `stages` map at *stage* granularity (`services/tenant_service.py:158`): a stage
@@ -395,7 +404,31 @@ either: a consent with no record entry simply means nothing wires the endpoint i
 Granting therefore writes the directory first and the record second, and a failure between the two
 raises an explicit split-state error rather than reporting success.
 
-### 4.4 Pull requests are not cached
+### 4.4 Per-verb readiness is derived; the support matrix lives in code
+
+What a tenant page shows for each verb — discover, invoke, mirror, deploy, publish, guardrails, MCP delivery,
+observability — is computed on the way out, never stored. It is the intersection of two things that live in
+different places (E38). The **declared** half is a per-platform fact — who owns the access door, whether group
+grants exist, whether AGP can auto-deliver traces, whether an ops lane exists, whether records are
+publishable, and how each verb relates to the platform — and it lives in code, as an exhaustive table in
+`services/platform_registry.py`, so the support matrix is rendered from a declaration rather than maintained
+as prose. The **probed** half is the tenant's own grant state (`capabilities`, `binding_mode`, [§2.3](#23-tenants)),
+which is stored. `tenant_readiness(tenant)` is the one place the two meet, and it persists nothing, so there
+is no migration and no stored badge that can disagree with the record it describes. An unknown platform is a
+loud `platform_unsupported` refusal, never a default row.
+
+### 4.5 A record's teardown artifacts are enumerated, not stored
+
+Deleting a governed agent does not read a stored list of things to clean up. The platform asks the record what
+it *names* — `adapter.named_artifacts(agent)` — and acts on each artifact by its policy (blocking, best-effort
+or never-touch), so the artifacts a delete touches are derived from the same fields already on the record (the
+runtime ARNs, the Databricks federation audience, the per-agent secret, the directory identity) rather than
+kept as a separate teardown manifest that could drift from them. The AgentCore runtime is still torn down
+through the repository cascade, keyed on the repository ([§2.1](#21-projects--five-partitions-in-one-table));
+nothing is keyed on a stored artifact inventory. How the delete executes those classes is in
+[registration](agentcore-registration.md).
+
+### 4.6 Pull requests are not cached
 
 The Git provider is authoritative; the platform reads them live and projects them into a view model
 carrying no provider body and no token (`models/repository.py:309-320`). Their author is a Git

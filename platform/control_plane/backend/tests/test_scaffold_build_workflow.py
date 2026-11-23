@@ -1,11 +1,9 @@
-"""Contract tests for the agent scaffold's GitHub Actions workflow (E27A/T3, E28B/T5).
+"""Contract tests for the agent scaffold's GitHub Actions workflow.
 
 The scaffold's `build.yml` is the *only* place the trigger shape, the concurrency guard and
 the image-digest handover live — the backend never reads ECR (the ECS task role holds only
 `sts:GetCallerIdentity`), so the workflow is what guarantees the platform is handed a digest
-at all. That makes these assertions the sole offline guard on E28B's load-bearing mechanic.
-
-E28B/T5 replaces E27A's two-path shape. What is pinned here now:
+at all. That makes these assertions the sole offline guard on the digest mechanic. Pinned here:
   - ONE path: quality -> build -> push image -> resolve digest -> POST to AGP. No `candidate`
     job, no `github.ref` branch gate, no tree-sha existence probe / conditional rebuild.
   - `concurrency:` keyed on the ref with `cancel-in-progress: false`. A live test saw two
@@ -14,11 +12,10 @@ E28B/T5 replaces E27A's two-path shape. What is pinned here now:
     fix, and NOT cancelling is half of it — a killed apply abandons the lock half-applied.
   - The handover is an image DIGEST, not just a mutable tag, and the build FAILS rather than
     reporting a deploy for an image it could not name.
-  - HARD invariant from E27/T9, unchanged: no job may ever post `stage: 'prod'`. The backend
-    refuses it with a 403; production is reachable only through AGP's promote route.
+  - HARD invariant: no job may ever post `stage: 'prod'`. The backend refuses it with a 403;
+    production is reachable only through AGP's promote route.
 
-A note on method, carried from E28/E28A where it cost three fix rounds and six defeated
-guards: every assertion below reads the PARSED document (`yaml.safe_load`), and every
+A note on method: every assertion below reads the PARSED document (`yaml.safe_load`), and every
 assertion about a shell body reads that body with `#` comment lines STRIPPED. The workflow's
 header comment legitimately names `workflow_dispatch`, `describe-images`, `[skip ci]` and
 `sha256:` while explaining why each is handled the way it is — a whole-text substring check
@@ -35,21 +32,21 @@ import pytest
 import yaml
 
 WORKFLOW = (
-    Path(__file__).resolve().parents[2]
-    / "agent-templates/strands-agentcore/.github/workflows/build.yml"
+    Path(__file__).resolve().parents[2] / "agent-templates/strands-agentcore/.github/workflows/build.yml"
 )
 
 TEXT = WORKFLOW.read_text()
 DOC = yaml.safe_load(TEXT)
-# PyYAML follows YAML 1.1, where the bare key `on` resolves to the boolean True.
+# PyYAML follows YAML 1.1, where the bare key `on` resolves to the boolean True
+# (https://yaml.org/type/bool.html).
 TRIGGERS = DOC.get("on", DOC.get(True))
 JOBS = DOC["jobs"]
 
 
 def _job_text(name: str) -> str:
-    """The job's full YAML block as text — the shell/JS bodies live in scalars, so
-    string assertions on them are the honest way to pin the wiring."""
-    # width=10**6 so long shell lines are not re-wrapped mid-token by the dumper.
+    """The job's full YAML block as text — the shell/JS bodies live in scalars, so string
+    assertions on them are the honest way to pin the wiring. The width keeps long shell lines
+    from being re-wrapped mid-token by the dumper."""
     return yaml.safe_dump(JOBS[name], width=10**6)
 
 
@@ -69,24 +66,19 @@ def _step(job: str, step_id: str) -> dict:
 def test_the_comment_strip_is_not_vacuous():
     """Non-vacuity for every `_strip_comments` assertion below.
 
-    Six guards across E28+E28A were defeated by a comment quoting the very string the guard
-    searched for, and this workflow's digest step deliberately explains `describe-images` in
+    Guards have been defeated before by a comment quoting the very string the guard searched
+    for, and this workflow's digest step deliberately explains `describe-images` in
     prose. So the strip is load-bearing: if it ever stopped removing comment lines, the
     assertions that rely on it would silently start passing on prose.
     """
     fixture = "# aws ecr describe-images --repository-name r\nDIGEST=real\n  // js comment\n"
     assert _strip_comments(fixture) == "DIGEST=real"
-    # …and the workflow really DOES carry that literal in prose, so the strip is doing work
-    # here and not merely on a synthetic fixture.
     assert "describe-images" in TEXT
     assert "describe-images" not in _strip_comments(TEXT)
 
 
-# --- triggers: one path -----------------------------------------------------------
-
-
 def test_push_triggers_exactly_one_branch():
-    """E28B: a repo has ONE branch. Two deploying branches would race the single dev runtime
+    """A repo has ONE branch. Two deploying branches would race the single dev runtime
     (last-push-wins) AND the single terraform state lock behind it."""
     assert TRIGGERS["push"]["branches"] == ["main"], TRIGGERS["push"]
 
@@ -130,9 +122,6 @@ def test_skip_ci_is_not_defeated_by_a_message_blind_trigger():
     assert message_blind.isdisjoint(set(TRIGGERS)), TRIGGERS
 
 
-# --- concurrency: the direct fix for the raced state lock -------------------------
-
-
 def test_the_workflow_declares_a_concurrency_group():
     """The defect, observed live: two builds 11 seconds apart raced one terraform state lock.
     The loser failed; the winner deployed a stale image while the repo record claimed success.
@@ -155,9 +144,6 @@ def test_in_flight_builds_are_never_cancelled():
     assert DOC["concurrency"]["cancel-in-progress"] is False, DOC["concurrency"]
 
 
-# --- quality job (must stay unchanged) ------------------------------------------
-
-
 def test_quality_job_is_untouched():
     quality = JOBS["quality"]
     assert quality["name"] == "Lint, test, audit"
@@ -172,11 +158,8 @@ def test_quality_job_is_untouched():
     ]
 
 
-# --- the deleted candidate path --------------------------------------------------
-
-
 def test_the_candidate_job_is_gone():
-    """E28B deletes it: promotion is a recorded digest, so there is nothing for a branch-
+    """Promotion is a recorded digest, so there is nothing for a branch-
     triggered 'register a candidate' job to do. Asserted on the parsed job map — a `candidate`
     job reintroduced under any `if:` would reinstate the second writer this epic removes."""
     assert "candidate" not in JOBS, sorted(JOBS)
@@ -188,14 +171,13 @@ def test_nothing_posts_to_the_prod_candidate_route():
 
 
 def test_the_tree_sha_existence_probe_and_conditional_rebuild_are_gone():
-    """E27A inferred "same tree ⇒ same image" from an ECR existence probe, then rebuilt when
+    """An earlier workflow inferred "same tree ⇒ same image" from an ECR existence probe, then rebuilt when
     the probe said absent. A digest makes the identity true by construction, so the probe,
     its three-way fail-closed branching and the conditional rebuild all go — and with them the
     only path in this workflow that could push a DIFFERENT image under an existing tag."""
     code = _strip_comments(TEXT)
     assert "batch-get-image" not in code
     assert "ImageNotFound" not in code
-    # Exactly one build+push remains: the unconditional one.
     assert code.count("docker buildx build") == 1, code
 
 
@@ -209,9 +191,6 @@ def test_no_ecr_read_call_the_push_role_lacks():
     assert "list-images" not in code
 
 
-# --- the digest handover ---------------------------------------------------------
-
-
 def test_the_build_exports_the_digest_as_a_job_output():
     """The `trigger` job is a separate job, so the digest can only reach it as an output."""
     assert "image_digest" in JOBS["build"]["outputs"]
@@ -221,15 +200,13 @@ def test_the_digest_comes_from_the_push_itself():
     """Taken from buildx's `--metadata-file`, which names the exact bytes THIS run uploaded.
     A read-back of the tag can already have been overwritten by a concurrent push — the very
     class of bug the digest exists to close."""
-    pushed = next(
-        s for s in JOBS["build"]["steps"] if "docker buildx build" in str(s.get("run", ""))
-    )
+    pushed = next(s for s in JOBS["build"]["steps"] if "docker buildx build" in str(s.get("run", "")))
     assert "--metadata-file" in pushed["run"]
     assert "containerimage.digest" in _strip_comments(_step("build", "digest")["run"])
 
 
 def test_the_digest_step_refuses_anything_that_is_not_a_sha256_reference():
-    """"Never report success for an image you could not name" (the E28A/T1b idiom). Both the
+    """ "Never report success for an image you could not name" (the digest idiom). Both the
     empty and the malformed case must hard-exit, announced as a workflow error."""
     code = _strip_comments(_step("build", "digest")["run"])
     assert "sha256:*)" in code, code
@@ -255,9 +232,7 @@ def test_the_trigger_validates_the_digest_before_posting_it():
 def test_the_digest_reaches_github_script_through_env_not_string_interpolation():
     """`${{ }}` inside a `script:` body splices the value into the JS SOURCE; an `env:` var
     read via `process.env` cannot break out of a string. The tag already used this shape."""
-    step = next(
-        s for s in JOBS["trigger"]["steps"] if s.get("uses", "").startswith("actions/github-script")
-    )
+    step = next(s for s in JOBS["trigger"]["steps"] if s.get("uses", "").startswith("actions/github-script"))
     assert set(step["env"]) >= {"IMAGE_TAG", "IMAGE_DIGEST"}, step["env"]
     assert "process.env.IMAGE_DIGEST" in step["with"]["script"]
 
@@ -289,10 +264,7 @@ def test_the_digest_guard_actually_fires(tmp_path, metadata, expect_exit):
     (tmp_path / "metadata.json").write_text(metadata)
     out_file = tmp_path / "gh_output"
     script = (
-        f"cd {tmp_path}\n"
-        f'GITHUB_OUTPUT="{out_file}"\n'
-        f"{_step('build', 'digest')['run']}\n"
-        "echo REACHED_POST\n"
+        f'cd {tmp_path}\nGITHUB_OUTPUT="{out_file}"\n{_step("build", "digest")["run"]}\necho REACHED_POST\n'
     )
     out = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60)
     assert out.returncode == expect_exit, f"stdout={out.stdout!r} stderr={out.stderr!r}"
@@ -305,15 +277,11 @@ def test_the_digest_guard_actually_fires(tmp_path, metadata, expect_exit):
         assert f"digest=sha256:{'ab' * 32}" in out_file.read_text()
 
 
-# --- invariants that outlive the rewrite ----------------------------------------
-
-
 def test_no_job_ever_posts_stage_prod():
-    """E27/T9 invariant: CI cannot deploy production. The backend 403s `stage=prod` on the
+    """CI cannot deploy production. The backend 403s `stage=prod` on the
     OIDC path; production is reachable only through AGP's promote route."""
     code = _strip_comments(TEXT)
     assert re.search(r"stage\s*[:=]\s*['\"]?prod", code, re.IGNORECASE) is None
-    # Non-vacuous: the pattern DOES catch the dev stage the trigger job really sends.
     assert re.search(r"stage\s*[:=]\s*['\"]?dev", code) is not None
 
 
@@ -338,9 +306,6 @@ def test_nothing_hardcodes_an_aws_account_or_region():
     assert not re.search(r"\b\d{12}\b", code), "no hardcoded AWS account id"
     assert "${{ vars.AWS_REGION }}" in code
     assert "${{ vars.ECR_REPOSITORY }}" in code
-
-
-# --- environments (what makes vars.* resolve at all) ----------------------------
 
 
 def test_both_ecr_jobs_declare_the_dev_environment():

@@ -5,9 +5,32 @@ variable "aws_region" {
 }
 
 variable "environment" {
-  description = "Environment name (dev, staging, prod)"
+  description = "Environment name (dev, staging, prod, pr-<iid>); passed as -var by the CI scripts, never from a tfvars file"
   type        = string
-  default     = "dev"
+}
+
+variable "naming_environment" {
+  description = "Token used in resource names where the stack predates named environments; defaults to environment"
+  type        = string
+  default     = null
+}
+
+variable "create_langfuse" {
+  description = "Create the Langfuse observability module; false leaves LANGFUSE_HOST empty on the backend"
+  type        = bool
+  default     = true
+}
+
+variable "ephemeral" {
+  description = "Mark the stack destroyable: S3 force_destroy, no DynamoDB deletion protection, no secret recovery window"
+  type        = bool
+  default     = false
+}
+
+variable "create_shared_resources" {
+  description = "Create the account-wide resources shared by every stack (the branch-image ECR repository); true on dev only"
+  type        = bool
+  default     = false
 }
 
 variable "app_name" {
@@ -47,12 +70,6 @@ variable "private_subnet_ids" {
   default     = []
 }
 
-variable "create_vpc" {
-  description = "Whether to create a new VPC (false if using existing)"
-  type        = bool
-  default     = true
-}
-
 variable "vpc_cidr" {
   description = "CIDR block for VPC (only used if creating new VPC)"
   type        = string
@@ -80,7 +97,8 @@ variable "agp_api_url" {
     repos; the scaffold build.yml `trigger` job POSTs to `$${AGP_API_URL}/builds/runtime`.
     Supplied as a root var (not module.api_gateway.api_endpoint) because api_gateway
     already depends on module.ecs — wiring the endpoint back would create a cycle.
-    Empty ⇒ the repo var is omitted (the runtime-build trigger cannot reach the platform).
+    Empty ⇒ materializing an agent repo FAILS at "Set repository CI variables" with an error
+    naming this variable (before 2026-10-14 the repo var was silently omitted instead).
   EOT
   type        = string
   default     = ""
@@ -124,9 +142,9 @@ variable "ecs_max_capacity" {
 }
 
 variable "container_image" {
-  description = "Docker container image URL (ECR)"
+  description = "Backend image reference for this run in digest form (<repo>@sha256:<digest>); empty reads the SSM parameter /agp/<environment>/backend-image."
   type        = string
-  default     = "" # Will be set to ECR URL after first build
+  default     = ""
 }
 
 # S3 Configuration
@@ -232,6 +250,24 @@ variable "entra_spa_client_id" {
   default     = ""
 }
 
+variable "entra_tenant_domain" {
+  description = "Entra tenant domain the SPA signs in against (VITE_ENTRA_TENANT_DOMAIN). Supplied per environment via tfvars."
+  type        = string
+  default     = ""
+}
+
+variable "entra_spa_scope" {
+  description = "Full API scope the SPA requests (VITE_ENTRA_SPA_SCOPE). Its URI half must equal entra_audience. Supplied per environment via tfvars."
+  type        = string
+  default     = ""
+}
+
+variable "product_mode" {
+  description = "Frontend product mode baked in at build time (VITE_PRODUCT_MODE)."
+  type        = string
+  default     = "governance"
+}
+
 # ============================================================================
 # Agent Registry (E4; Terraform-owned since E32)
 # Wired into the ECS task definition so the backend can talk to AWS Agent Registry.
@@ -293,6 +329,12 @@ variable "mcp_registry_region" {
 # these in a gitignored tfvars / -var. The password feeds the headless
 # LANGFUSE_INIT_USER_PASSWORD + the Lambda@Edge auto-login the provisioner uses.
 
+variable "clickhouse_version" {
+  description = "ClickHouse image version for the Langfuse module (an LTS line upstream still supports). Without this root declaration a tfvars pin is silently ignored and the module default wins. KEEP IN STEP with modules/langfuse/ecr.tf: this default overrides the module's, so a bump there that is not mirrored here silently re-pins every root apply to the older image (seen 2026-10-13: the module moved to 25.8.33.6, the root still said 25.8.28.1, and the ClickHouse task definition pointed at a tag no ECR mirror held)."
+  type        = string
+  default     = "26.3.66.4"
+}
+
 variable "langfuse_admin_email" {
   description = "Email for the seed Langfuse admin user (LANGFUSE_INIT_USER_EMAIL). Operator-supplied at apply time; do not commit a value."
   type        = string
@@ -304,4 +346,31 @@ variable "langfuse_admin_password" {
   type        = string
   sensitive   = true
   default     = ""
+}
+
+# ============================================================================
+# CloudWatch Transaction Search (E42 evaluations / Ops Observability traces)
+# ============================================================================
+# Agent runtimes export spans to X-Ray, but X-Ray only writes them to the CloudWatch Logs
+# group `aws/spans` — the source for the Ops Observability traces list and the E42 eval
+# judges — when the account's trace-segment destination is CloudWatchLogs, i.e. when
+# Transaction Search is on. It is OFF in a fresh account and the failure is silent (empty
+# traces list, judges score nothing). module "observability" turns it on; see the
+# Transaction Search section in modules/observability/main.tf for the full reasoning.
+
+variable "enable_transaction_search" {
+  description = "Enable CloudWatch Transaction Search for the account in aws_region (switches the X-Ray trace-segment destination to CloudWatch Logs so agent spans land in the `aws/spans` log group that the Ops Observability traces list and the E42 eval judges read). ACCOUNT-WIDE SETTING (per region), not scoped to this stack: it affects every X-Ray producer in the account. COST: every ingested span is billed as CloudWatch Logs ingestion. Set to false if the account manages this elsewhere or must not pay for it — then container-agent traces and evaluations stay empty. Note the provider's delete is a no-op: destroying the stack or flipping this to false later does NOT turn the setting off (`aws xray update-trace-segment-destination --destination XRay` does)."
+  type        = bool
+  default     = true
+}
+
+variable "transaction_search_indexing_percentage" {
+  description = "Share (0-100) of ingested spans X-Ray INDEXES for Transaction Search queries, applied to the account's `Default` indexing rule. Does not change what lands in `aws/spans` (always 100%), so the platform reads the same data at any value. 1 (AWS's default) is free; anything above is billed per indexed span. Ignored when enable_transaction_search is false."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.transaction_search_indexing_percentage >= 0 && var.transaction_search_indexing_percentage <= 100
+    error_message = "transaction_search_indexing_percentage must be between 0 and 100."
+  }
 }

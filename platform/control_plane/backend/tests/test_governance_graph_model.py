@@ -1,10 +1,8 @@
-"""Tests for the governance-graph Pydantic read-models (Epic 11, Task 3).
+"""Tests for the governance-graph Pydantic read-models: construction and wire keys, literal
+validation, defaults, and mutable-default isolation (pydantic v2 deep-copies defaults per instance).
 
-Spec: the Epic 11 governance-graph plan (Task 3 + Cross-task contracts -> Pydantic
-      models / Backend wire contract) — a design artifact kept outside this repository.
-
-These are pure-python read-DTO models: no envelope, no boto3, no FastAPI. They
-back the read-only GET /governance-graph aggregation endpoint.
+Pure-python read-DTO models: no envelope, no boto3, no FastAPI. They back the read-only
+GET /governance-graph aggregation endpoint.
 """
 
 import pytest
@@ -17,10 +15,6 @@ from models.governance_graph import (
     PrincipalDetail,
 )
 
-
-# ---------------------------------------------------------------------------
-# Construction + model_dump key coverage (matches the wire contract)
-# ---------------------------------------------------------------------------
 
 def test_graph_node_constructs_and_dumps_wire_keys():
     node = GraphNode(
@@ -111,28 +105,22 @@ def test_principal_detail_constructs_and_dumps_wire_keys():
     assert dumped["group_names"] == ["Contoso-Claims-Officers"]
 
 
-# ---------------------------------------------------------------------------
-# Literal validation: bad type / kind values raise ValidationError
-# ---------------------------------------------------------------------------
-
 def test_graph_node_rejects_bad_type_literal():
     with pytest.raises(ValidationError):
-        GraphNode(type="robot", id="robot:x", label="X", ref_id="x")
+        GraphNode.model_validate({"type": "robot", "id": "robot:x", "label": "X", "ref_id": "x"})
 
 
 def test_graph_edge_rejects_bad_type_literal():
     with pytest.raises(ValidationError):
-        GraphEdge(id="e1", source="a", target="b", type="invokes", role="Invoker")
+        GraphEdge.model_validate(
+            {"id": "e1", "source": "a", "target": "b", "type": "invokes", "role": "Invoker"}
+        )
 
 
 def test_principal_detail_rejects_bad_kind_literal():
     with pytest.raises(ValidationError):
-        PrincipalDetail(id="oid-1", display_name="X", kind="service_principal")
+        PrincipalDetail.model_validate({"id": "oid-1", "display_name": "X", "kind": "service_principal"})
 
-
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
 
 def test_graph_edge_has_policy_defaults_false():
     edge = GraphEdge(
@@ -158,17 +146,12 @@ def test_principal_detail_optional_defaults():
     assert detail.group_names == []
 
 
-# ---------------------------------------------------------------------------
-# Mutable-default isolation: two instances must NOT share the same default object
-# (guards the default-factory question — Pydantic v2 deep-copies defaults).
-# ---------------------------------------------------------------------------
-
 def test_graph_node_metadata_default_not_shared_between_instances():
     a = GraphNode(type="user", id="user:a", label="A", ref_id="a")
     b = GraphNode(type="user", id="user:b", label="B", ref_id="b")
     a.metadata["mutated"] = True
     assert a.metadata == {"mutated": True}
-    assert b.metadata == {}  # unaffected
+    assert b.metadata == {}
     assert a.metadata is not b.metadata
 
 
@@ -177,5 +160,5 @@ def test_principal_detail_group_names_default_not_shared_between_instances():
     b = PrincipalDetail(id="b", display_name="B", kind="user")
     a.group_names.append("grp-1")
     assert a.group_names == ["grp-1"]
-    assert b.group_names == []  # unaffected
+    assert b.group_names == []
     assert a.group_names is not b.group_names

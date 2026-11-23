@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import type { DatabricksStageConfig, PrincipalHit } from '../../../api/client';
+import type { DatabricksStageConfigInput, PrincipalHit } from '../../../api/client';
+import type {
+  DatabricksStageConfigOutput,
+  TenantView,
+} from '../../../api/openapi';
 import {
+  BINDING_MODE_HINT,
   EMPTY_TENANT_DRAFT,
   type DatabricksStageDraft,
   type TenantDraft,
@@ -15,6 +20,7 @@ import {
   bindingModeLabel,
   capabilityBadges,
   databricksStageDraftFromConfig,
+  draftDatabricksStages,
   draftFromTenant,
   draftPlatform,
   hasBeenProbed,
@@ -24,7 +30,53 @@ import {
   isValidWorkspaceId,
   isValidWorkspaceUrl,
   platformLabel,
+  draftStageKeys,
+  addStage,
+  removeStage,
+  nextSuggestedStageKey,
+  compactBindingModeLabel,
+  PRIVILEGE_STATEMENT,
+  compareStageKeys,
+  unionStageKeys,
 } from './tenantsAdminForm';
+import { principalHit, tenantStageConfig } from '../../../test/wire';
+
+const FAKE_WORKSPACE = 'https://dbc-test.cloud.databricks.com';
+
+function databricksStageConfigOutput(
+  overrides: Partial<DatabricksStageConfigOutput> = {},
+): DatabricksStageConfigOutput {
+  return {
+    workspace_url: FAKE_WORKSPACE,
+    workspace_id: '0',
+    cloud: 'aws',
+    region: '',
+    account_id: '',
+    sp_client_id: '',
+    sp_client_secret_arn: '',
+    ...overrides,
+  };
+}
+
+function tenantView(overrides: Partial<TenantView> = {}): TenantView {
+  return {
+    id: 'tenant-1',
+    name: 'Retail Claims',
+    line_of_business: 'Claims',
+    description: '',
+    platform: 'aws',
+    stages: { dev: tenantStageConfig() },
+    entra_group_ids: [],
+    capabilities: {},
+    binding_mode: '',
+    readiness: {},
+    account_admin_secret_arn: '',
+    created_by: 'oid-admin',
+    created_at: '2026-08-10T00:00:00Z',
+    updated_at: '2026-08-10T00:00:00Z',
+    ...overrides,
+  };
+}
 
 const VALID_DRAFT: TenantDraft = {
   name: 'Retail Claims',
@@ -51,9 +103,9 @@ const VALID_DRAFT: TenantDraft = {
 
 describe('tenantsAdminForm', () => {
   describe('EMPTY_TENANT_DRAFT', () => {
-    it('defaults both stage regions and starts with no groups', () => {
+    it('seeds a single dev stage with a default region and no groups: prod is the suggested add, not a forced second column', () => {
+      expect(draftStageKeys(EMPTY_TENANT_DRAFT)).toEqual(['dev']);
       expect(EMPTY_TENANT_DRAFT.stages.dev.region).toBe('us-east-1');
-      expect(EMPTY_TENANT_DRAFT.stages.prod.region).toBe('us-east-1');
       expect(EMPTY_TENANT_DRAFT.stages.dev.account_id).toBe('');
       expect(EMPTY_TENANT_DRAFT.groups).toEqual([]);
       expect(EMPTY_TENANT_DRAFT.name).toBe('');
@@ -204,14 +256,14 @@ describe('tenantsAdminForm', () => {
   });
 
   describe('addGroup', () => {
-    const hit: PrincipalHit = { id: 'g2', display_name: 'Claims Leads', type: 'group' };
+    const hit: PrincipalHit = principalHit({ id: 'g2', display_name: 'Claims Leads', type: 'group' });
     it('appends a new group', () => {
       const out = addGroup(VALID_DRAFT.groups, hit);
       expect(out.map((g) => g.id)).toEqual(['g1', 'g2']);
       expect(out[1].display_name).toBe('Claims Leads');
     });
     it('dedupes by id (no double-add)', () => {
-      const dup: PrincipalHit = { id: 'g1', display_name: 'Claims Ops', type: 'group' };
+      const dup: PrincipalHit = principalHit({ id: 'g1', display_name: 'Claims Ops', type: 'group' });
       const out = addGroup(VALID_DRAFT.groups, dup);
       expect(out).toEqual(VALID_DRAFT.groups);
     });
@@ -245,25 +297,16 @@ describe('tenantsAdminForm', () => {
   });
 
   describe('filterGroupHits', () => {
-    it('keeps only groups and drops already-selected ids', () => {
+    it('keeps only groups and drops already-selected ids: the directory search has no kind filter, so groups-only is decided here', () => {
       const hits: PrincipalHit[] = [
-        { id: 'u1', display_name: 'Ana', type: 'user' },
-        { id: 'g1', display_name: 'Claims Ops', type: 'group' },
-        { id: 'g2', display_name: 'Claims Leads', type: 'group' },
-        { id: 'a1', display_name: 'Bot', type: 'agent' },
+        principalHit({ id: 'u1', display_name: 'Ana', type: 'user' }),
+        principalHit({ id: 'g1', display_name: 'Claims Ops', type: 'group' }),
+        principalHit({ id: 'g2', display_name: 'Claims Leads', type: 'group' }),
       ];
       const out = filterGroupHits(hits, VALID_DRAFT.groups);
       expect(out.map((h) => h.id)).toEqual(['g2']);
     });
   });
-
-  // -------------------------------------------------------------------------
-  // E29 — the Databricks branch. The AWS assertions above are the FENCE: they are
-  // unmodified, and everything below must leave them passing.
-  // -------------------------------------------------------------------------
-
-  // A fake workspace, matching the plan's designated test fake. Not a real host.
-  const FAKE_WORKSPACE = 'https://dbc-test.cloud.databricks.com';
 
   const VALID_DB_STAGE: DatabricksStageDraft = {
     workspace_url: FAKE_WORKSPACE,
@@ -277,7 +320,6 @@ describe('tenantsAdminForm', () => {
     has_sp_secret: false,
   };
 
-  // A stage as it comes back from a read: a stored secret pointer, no plaintext secret.
   const STORED_ARN = 'arn:aws:secretsmanager:::secret:agp/databricks/dev-AbCdEf';
   const EDITED_DB_STAGE: DatabricksStageDraft = {
     ...VALID_DB_STAGE,
@@ -286,10 +328,6 @@ describe('tenantsAdminForm', () => {
     has_sp_secret: true,
   };
 
-  // A COMPLETE Databricks draft — and since T14 that includes the account-admin credential:
-  // federation is the model, not a mode, so a draft without one is incomplete by definition
-  // (§3B / tenet 4). Tests that need the credential ABSENT spell the blanks out locally, so
-  // "still requires name/LoB/group" keeps failing for its own reason rather than for this one.
   const VALID_DB_DRAFT: TenantDraft = {
     name: 'Retail Claims',
     line_of_business: 'Claims',
@@ -302,8 +340,6 @@ describe('tenantsAdminForm', () => {
     groups: [{ id: 'g1', display_name: 'Claims Ops' }],
   };
 
-  // The same draft with no account-admin credential typed and none stored — a CREATE that
-  // cannot federate.
   const NO_ADMIN_DB_DRAFT: TenantDraft = {
     ...VALID_DB_DRAFT,
     account_admin_client_id: '',
@@ -311,7 +347,7 @@ describe('tenantsAdminForm', () => {
   };
 
   describe('draftPlatform', () => {
-    it('defaults an absent platform to aws (the pre-E29 hydration rule)', () => {
+    it('defaults an absent platform to aws for both the empty draft and a draft that never set one', () => {
       expect(draftPlatform(VALID_DRAFT)).toBe('aws');
       expect(draftPlatform(EMPTY_TENANT_DRAFT)).toBe('aws');
     });
@@ -327,9 +363,7 @@ describe('tenantsAdminForm', () => {
     });
   });
 
-  // The security boundary. Every case below is EXECUTED against the real regex — the
-  // point is not that the pattern looks right but that these specific inputs are refused.
-  describe('isValidWorkspaceUrl', () => {
+  describe('isValidWorkspaceUrl — the security boundary, every hostile input executed against the real pattern', () => {
     it('accepts a plain https workspace origin', () => {
       expect(isValidWorkspaceUrl(FAKE_WORKSPACE)).toBe(true);
       expect(isValidWorkspaceUrl('https://adb-123.4.azuredatabricks.net')).toBe(true);
@@ -337,7 +371,6 @@ describe('tenantsAdminForm', () => {
 
     it('rejects a javascript: scheme', () => {
       expect(isValidWorkspaceUrl('javascript:alert(1)')).toBe(false);
-      // Prefixed so the substring "https://" appears but the value does not START https.
       expect(isValidWorkspaceUrl('javascript:https://dbc-test.cloud.databricks.com')).toBe(false);
     });
 
@@ -355,10 +388,7 @@ describe('tenantsAdminForm', () => {
       expect(isValidWorkspaceUrl(` ${FAKE_WORKSPACE}`)).toBe(false);
     });
 
-    // The one JS `$` genuinely does NOT protect against in every engine/flag combination,
-    // and the exact hole the backend's WORKSPACE_URL_RE comment warns about. A smuggled
-    // second line must not ride along on a valid first one.
-    it('rejects a trailing newline and anything smuggled after it', () => {
+    it('rejects a trailing newline and anything smuggled after it (the case a multiline flag on the pattern would let through)', () => {
       expect(isValidWorkspaceUrl(`${FAKE_WORKSPACE}\n`)).toBe(false);
       expect(isValidWorkspaceUrl(`${FAKE_WORKSPACE}\njavascript:alert(1)`)).toBe(false);
       expect(isValidWorkspaceUrl(`${FAKE_WORKSPACE}\r\n`)).toBe(false);
@@ -424,9 +454,7 @@ describe('tenantsAdminForm', () => {
     });
   });
 
-  describe('isAccountAdminCredentialUsable', () => {
-    // Shape-only, deliberately: this predicate answers "is what was typed coherent", not
-    // "is a credential present". `canSubmit` is where presence is required (T14).
+  describe('isAccountAdminCredentialUsable — shape only: is what was typed coherent, not is a credential present', () => {
     it('accepts the credential being absent entirely', () => {
       expect(isAccountAdminCredentialUsable(NO_ADMIN_DB_DRAFT)).toBe(true);
     });
@@ -494,21 +522,11 @@ describe('tenantsAdminForm', () => {
       expect(canSubmit({ ...VALID_DB_DRAFT, account_admin_secret: '' })).toBe(false);
     });
 
-    // T14 / §3B, the inversion: the account-admin credential used to be optional here, on the
-    // reasoning that a credential-less tenant was "a perfectly valid sp_secret-mode tenant".
-    // sp_secret is no longer an outcome the connect flow can produce, so a Databricks CREATE
-    // without an account-admin credential is an incomplete form, not a lesser mode.
-    it('REQUIRES an account-admin credential on create (federation is the model, not a mode)', () => {
+    it('requires an account-admin credential on create and never on edit: without one the tenant cannot invoke, and an existing one must stay administrable', () => {
       expect(canSubmit(NO_ADMIN_DB_DRAFT)).toBe(false);
-      // ...and on CREATE only. The gate's honest job is to stop AGP creating an un-federatable
-      // tenant silently, not to make an existing one un-administrable (§3B).
       expect(canSubmit(NO_ADMIN_DB_DRAFT, true)).toBe(true);
     });
 
-    // ...but never forces re-entry of a secret that is already stored. The record's
-    // `account_admin_secret_arn` is the only "one is stored" signal a client gets (the same
-    // pointer-as-boolean idiom as `has_sp_secret`), and an edit that leaves both boxes blank
-    // means "keep the stored one".
     it('accepts blank boxes on an EDIT when a credential is already stored', () => {
       expect(canSubmit({ ...NO_ADMIN_DB_DRAFT, has_account_admin_credential: true })).toBe(true);
     });
@@ -523,14 +541,10 @@ describe('tenantsAdminForm', () => {
       ).toBe(false);
     });
 
-    // The fence for the fence: requiring the credential must not leak onto the AWS branch,
-    // which has no account-admin concept at all.
     it('never requires an account-admin credential for an aws draft', () => {
       expect(canSubmit(VALID_DRAFT)).toBe(true);
       expect(canSubmit({ ...VALID_DRAFT, account_admin_client_id: '', account_admin_secret: '' })).toBe(true);
     });
-    // The fence, stated as a test: a valid AWS draft does not depend on any E29 field, and
-    // 12-digit account ids are NOT applied to the Databricks branch.
     it('ignores the databricks half entirely for an aws draft', () => {
       expect(
         canSubmit({
@@ -551,11 +565,10 @@ describe('tenantsAdminForm', () => {
         },
       });
       expect(payload.platform).toBe('databricks');
-      const dev = payload.stages.dev as DatabricksStageConfig & { sp_client_secret?: string };
+      const dev = payload.stages.dev as DatabricksStageConfigInput;
       expect(dev.workspace_url).toBe(FAKE_WORKSPACE);
       expect(dev.sp_client_id).toBe('spid');
       expect(dev.sp_client_secret).toBe('typed-secret');
-      // The ARN is the backend's to write, never the client's to assert.
       expect(dev.sp_client_secret_arn).toBe('');
     });
 
@@ -567,22 +580,17 @@ describe('tenantsAdminForm', () => {
           prod: { ...VALID_DB_STAGE, sp_client_secret: '', has_sp_secret: true },
         },
       });
-      const dev = payload.stages.dev as DatabricksStageConfig & { sp_client_secret?: string };
+      const dev = payload.stages.dev as DatabricksStageConfigInput;
       expect('sp_client_secret' in dev).toBe(false);
     });
 
-    // FIX ROUND 1 — the regression this pins is data LOSS, not a cosmetic omission. The
-    // update path replaces the whole stage object server-side, so emitting an empty ARN
-    // destroys the pointer to the stored secret; reproduced against the landed backend,
-    // where a no-op edit turned a real ARN into "".
-    it('preserves the stored secret ARN verbatim when the secret box is left blank', () => {
+    it('preserves the stored secret ARN verbatim when the secret box is left blank: the update replaces the whole stage object, so an empty ARN would destroy the stored secret', () => {
       const payload = buildCreatePayload({
         ...VALID_DB_DRAFT,
         databricks: { dev: EDITED_DB_STAGE, prod: EDITED_DB_STAGE },
       });
-      const dev = payload.stages.dev as DatabricksStageConfig & { sp_client_secret?: string };
+      const dev = payload.stages.dev as DatabricksStageConfigInput;
       expect(dev.sp_client_secret_arn).toBe(STORED_ARN);
-      // And still no plaintext key — "blank means keep" needs BOTH halves to hold.
       expect('sp_client_secret' in dev).toBe(false);
     });
 
@@ -594,14 +602,14 @@ describe('tenantsAdminForm', () => {
           prod: EDITED_DB_STAGE,
         },
       });
-      const dev = payload.stages.dev as DatabricksStageConfig & { sp_client_secret?: string };
+      const dev = payload.stages.dev as DatabricksStageConfigInput;
       expect(dev.sp_client_secret_arn).toBe(STORED_ARN);
       expect(dev.sp_client_secret).toBe('rotated-secret');
     });
 
     it('emits an empty ARN on create, where there is genuinely nothing to preserve', () => {
       const payload = buildCreatePayload(VALID_DB_DRAFT);
-      const dev = payload.stages.dev as DatabricksStageConfig & { sp_client_secret?: string };
+      const dev = payload.stages.dev as DatabricksStageConfigInput;
       expect(dev.sp_client_secret_arn).toBe('');
       expect(dev.sp_client_secret).toBe('typed-secret');
     });
@@ -611,7 +619,7 @@ describe('tenantsAdminForm', () => {
         ...VALID_DB_DRAFT,
         databricks: { dev: EDITED_DB_STAGE, prod: EDITED_DB_STAGE },
       });
-      const dev = payload.stages.dev as DatabricksStageConfig & { sp_client_secret?: string };
+      const dev = payload.stages?.dev as DatabricksStageConfigInput;
       expect(dev.sp_client_secret_arn).toBe(STORED_ARN);
     });
 
@@ -623,7 +631,7 @@ describe('tenantsAdminForm', () => {
           prod: VALID_DB_STAGE,
         },
       });
-      const dev = payload.stages.dev as DatabricksStageConfig & { sp_client_secret?: string };
+      const dev = payload.stages.dev as DatabricksStageConfigInput;
       expect(dev.sp_client_secret).toBe(' padded ');
     });
 
@@ -638,16 +646,11 @@ describe('tenantsAdminForm', () => {
       expect(withAdmin.account_admin_secret).toBe('admin-secret');
     });
 
-    // §3B, stated as a test: the form cannot produce an sp_secret outcome. It never asserts a
-    // binding mode (the probe is the only writer), and the ONE input that decides the tenant's
-    // mode — the account-admin credential — is now mandatory, so no submittable Databricks
-    // draft exists whose payload lacks it.
     it('cannot produce an sp_secret outcome: no mode is asserted, and admin creds always travel', () => {
       const payload = buildCreatePayload(VALID_DB_DRAFT) as unknown as Record<string, unknown>;
       expect('binding_mode' in payload).toBe(false);
       expect(JSON.stringify(payload)).not.toContain('sp_secret');
       expect(payload.account_admin_client_id).toBe('admin-client-id');
-      // And the only draft whose payload would omit them is one `canSubmit` refuses.
       expect(canSubmit(NO_ADMIN_DB_DRAFT)).toBe(false);
     });
 
@@ -658,8 +661,6 @@ describe('tenantsAdminForm', () => {
       expect('federation_audience' in payload).toBe(false);
     });
 
-    // The fence: an AWS draft's payload carries NO platform key, so the wire shape is
-    // byte-identical to pre-E29 (the backend defaults an absent platform to aws).
     it('omits platform entirely for an aws draft', () => {
       const payload = buildCreatePayload(VALID_DRAFT) as unknown as Record<string, unknown>;
       expect('platform' in payload).toBe(false);
@@ -670,27 +671,39 @@ describe('tenantsAdminForm', () => {
     it('strips platform — a tenant can never be re-typed', () => {
       const payload = buildUpdatePayload(VALID_DB_DRAFT) as unknown as Record<string, unknown>;
       expect('platform' in payload).toBe(false);
-      // Everything else still travels.
       expect(payload.name).toBe('Retail Claims');
       expect(payload.stages).toBeDefined();
     });
   });
 
-  describe('bindingModeLabel (C-6 copy, verbatim)', () => {
+  describe('bindingModeLabel — the badge copy, verbatim, shared with the agent-detail badge and the onboarding doc', () => {
     it('reads exactly "Federation" and "SP secret"', () => {
       expect(bindingModeLabel('federation')).toBe('Federation');
       expect(bindingModeLabel('sp_secret')).toBe('SP secret');
     });
-    // T14: the third mode a tenant can now be in. The label says what is REFUSED and what
-    // fixes it, in the badge itself — the operator should not have to hover to learn that
-    // invoke does not work.
-    it('reads exactly "Invoke unavailable — federation required" for invoke_unavailable', () => {
+    it('reads exactly "Invoke unavailable — federation required" for invoke_unavailable: the badge itself says what is refused and what fixes it', () => {
       expect(bindingModeLabel('invoke_unavailable')).toBe('Invoke unavailable — federation required');
     });
-    it('is null for an aws tenant, an unknown value and an absent one', () => {
+    it('is null for an aws tenant, an unknown value and an absent one: a badge never renders a raw wire value', () => {
       expect(bindingModeLabel('')).toBeNull();
       expect(bindingModeLabel(undefined)).toBeNull();
       expect(bindingModeLabel('something_new')).toBeNull();
+    });
+  });
+
+  describe('BINDING_MODE_HINT — what each mode means for the caller, in the badge title', () => {
+    it('invoke_unavailable names what is refused, what still works, and the two things federation needs', () => {
+      expect(BINDING_MODE_HINT.invoke_unavailable).toContain('Invoke is refused');
+      expect(BINDING_MODE_HINT.invoke_unavailable).toContain('discovery, registration and observability still work');
+      expect(BINDING_MODE_HINT.invoke_unavailable).toContain('account-admin credential');
+      expect(BINDING_MODE_HINT.invoke_unavailable).toContain('user sync from Entra to Databricks');
+    });
+    it('sp_secret, a mode no connect flow produces any more, still states attribution to the service principal for the records that carry it', () => {
+      expect(BINDING_MODE_HINT.sp_secret).toContain('service principal');
+      expect(BINDING_MODE_HINT.sp_secret).toContain('not the individual caller');
+    });
+    it('federation states that the real caller is seen', () => {
+      expect(BINDING_MODE_HINT.federation).toContain('see the real caller');
     });
   });
 
@@ -730,32 +743,15 @@ describe('tenantsAdminForm', () => {
     it('narrows on workspace_url', () => {
       expect(isDatabricksStage(undefined)).toBe(false);
       expect(isDatabricksStage(VALID_DRAFT.stages.dev)).toBe(false);
-      expect(
-        isDatabricksStage({
-          workspace_url: FAKE_WORKSPACE,
-          workspace_id: '0',
-          cloud: 'aws',
-          region: '',
-          account_id: '',
-          sp_client_id: '',
-          sp_client_secret_arn: '',
-        }),
-      ).toBe(true);
+      expect(isDatabricksStage(databricksStageConfigOutput({ workspace_url: FAKE_WORKSPACE }))).toBe(true);
     });
 
-    it('answers false for null WITHOUT throwing (E29/T11 fix round 1)', () => {
-      // The signature said `… | undefined` and the body tested `!== undefined`, so a `null` stage
-      // config reached the property read and threw `TypeError: Cannot read properties of null`.
-      // That is not a hypothetical shape: `stages` arrives as JSON off `/users/me`, where a key
-      // with a null value is ordinary — and the crash blanked an entire page for every platform.
-      // The parameter is now `unknown` and the guard is truthiness.
+    it('answers false for null without throwing: a null stage value off /users/me once blanked the page for every platform', () => {
       expect(() => isDatabricksStage(null)).not.toThrow();
       expect(isDatabricksStage(null)).toBe(false);
     });
 
     it('answers false for primitives rather than throwing', () => {
-      // `unknown` means callers may hand this anything. A property read is safe on every
-      // non-nullish value, so these fall through the `typeof` to false.
       for (const v of ['', 'x', 0, 7, true, false, NaN]) {
         expect(isDatabricksStage(v), String(v)).toBe(false);
       }
@@ -764,63 +760,45 @@ describe('tenantsAdminForm', () => {
 
   describe('databricksStageDraftFromConfig', () => {
     it('derives has_sp_secret from the stored ARN and NEVER seeds a secret', () => {
-      const draft = databricksStageDraftFromConfig({
-        workspace_url: FAKE_WORKSPACE,
-        workspace_id: '99',
-        cloud: 'azure',
-        region: 'westeurope',
-        account_id: 'acct-uuid',
-        sp_client_id: 'spid',
-        sp_client_secret_arn: 'arn:aws:secretsmanager:::secret:x',
-      });
+      const draft = databricksStageDraftFromConfig(
+        databricksStageConfigOutput({
+          workspace_id: '99',
+          cloud: 'azure',
+          sp_client_secret_arn: 'arn:aws:secretsmanager:::secret:x',
+        }),
+      );
       expect(draft.has_sp_secret).toBe(true);
       expect(draft.sp_client_secret).toBe('');
-      // The pointer is carried, not just the derived boolean — that omission is what let an
-      // edit wipe the stored secret (fix round 1).
       expect(draft.sp_client_secret_arn).toBe('arn:aws:secretsmanager:::secret:x');
       expect(draft.workspace_id).toBe('99');
       expect(draft.cloud).toBe('azure');
     });
     it('has_sp_secret is false when no ARN is stored', () => {
-      const draft = databricksStageDraftFromConfig({
-        workspace_url: FAKE_WORKSPACE,
-        workspace_id: '0',
-        cloud: 'aws',
-        region: '',
-        account_id: '',
-        sp_client_id: '',
-        sp_client_secret_arn: '',
-      });
+      const draft = databricksStageDraftFromConfig(databricksStageConfigOutput({ sp_client_secret_arn: '' }));
       expect(draft.has_sp_secret).toBe(false);
     });
-    it('yields a blank draft for an absent config', () => {
+    it('yields a blank draft for an absent config: workspace id "0", cloud aws, region blank (a Databricks region is not an AWS region, so none is guessed)', () => {
       const draft = databricksStageDraftFromConfig(undefined);
       expect(draft.workspace_url).toBe('');
       expect(draft.workspace_id).toBe('0');
+      expect(draft.cloud).toBe('aws');
+      expect(draft.region).toBe('');
       expect(draft.has_sp_secret).toBe(false);
     });
   });
 
   describe('draftFromTenant', () => {
-    const DB_STAGE: DatabricksStageConfig = {
+    const DB_STAGE = databricksStageConfigOutput({
       workspace_url: FAKE_WORKSPACE,
-      workspace_id: '77',
-      cloud: 'aws',
-      region: 'us-east-1',
       account_id: 'acct-uuid',
       sp_client_id: 'spid',
       sp_client_secret_arn: 'arn:aws:secretsmanager:::secret:x',
-    };
+    });
 
     it('seeds a databricks tenant into the databricks half, with has-secret state', () => {
-      const draft = draftFromTenant({
-        name: 'DB Tenant',
-        line_of_business: 'Claims',
-        description: 'd',
-        platform: 'databricks',
-        stages: { dev: DB_STAGE, prod: DB_STAGE },
-        entra_group_ids: ['g1'],
-      });
+      const draft = draftFromTenant(
+        tenantView({ platform: 'databricks', stages: { dev: DB_STAGE, prod: DB_STAGE }, entra_group_ids: ['g1'] }),
+      );
       expect(draft.platform).toBe('databricks');
       expect(draft.databricks?.dev.workspace_url).toBe(FAKE_WORKSPACE);
       expect(draft.databricks?.dev.has_sp_secret).toBe(true);
@@ -829,137 +807,284 @@ describe('tenantsAdminForm', () => {
     });
 
     it('never seeds the write-only account-admin credential', () => {
-      const draft = draftFromTenant({
-        name: 'DB Tenant',
-        line_of_business: 'Claims',
-        description: 'd',
-        platform: 'databricks',
-        stages: { dev: DB_STAGE, prod: DB_STAGE },
-        entra_group_ids: [],
-      });
+      const draft = draftFromTenant(tenantView({ platform: 'databricks', stages: { dev: DB_STAGE, prod: DB_STAGE } }));
       expect(draft.account_admin_client_id).toBe('');
       expect(draft.account_admin_secret).toBe('');
     });
 
-    // T14: blank boxes plus "one is stored" is what lets an edit submit without re-typing a
-    // secret. The stored-ness comes from the record's Secrets Manager POINTER — the same
-    // pointer-as-boolean signal `has_sp_secret` is derived from — never from the secret itself.
     it('records that an account-admin credential is STORED, from the ARN pointer alone', () => {
-      const base = {
-        name: 'DB Tenant',
-        line_of_business: 'Claims',
-        description: 'd',
-        platform: 'databricks' as const,
-        stages: { dev: DB_STAGE, prod: DB_STAGE },
-        entra_group_ids: [],
-      };
+      const base: Partial<TenantView> = { platform: 'databricks', stages: { dev: DB_STAGE, prod: DB_STAGE } };
       expect(
-        draftFromTenant({ ...base, account_admin_secret_arn: 'arn:aws:secretsmanager:::secret:admin' })
+        draftFromTenant(tenantView({ ...base, account_admin_secret_arn: 'arn:aws:secretsmanager:::secret:admin' }))
           .has_account_admin_credential,
       ).toBe(true);
-      expect(draftFromTenant({ ...base, account_admin_secret_arn: '' }).has_account_admin_credential).toBe(false);
-      // Absent on the wire (a pre-E29 record, or a build before the field was projected) is
-      // "none stored" — never an assumed one.
-      expect(draftFromTenant(base).has_account_admin_credential).toBe(false);
+      expect(
+        draftFromTenant(tenantView({ ...base, account_admin_secret_arn: '' })).has_account_admin_credential,
+      ).toBe(false);
     });
 
-    it('hydrates a record with no platform as aws (zero migration)', () => {
-      const draft = draftFromTenant({
-        name: 'Legacy',
-        line_of_business: 'Claims',
-        description: '',
-        stages: { dev: { account_id: '111122223333', region: 'us-east-1' } },
-        entra_group_ids: [],
-      });
-      expect(draft.platform).toBe('aws');
+    it('seeds exactly the stages the record carries — a single-stage tenant stays single', () => {
+      const draft = draftFromTenant(
+        tenantView({ stages: { dev: tenantStageConfig({ account_id: '111122223333' }) } }),
+      );
+      expect(draftStageKeys(draft)).toEqual(['dev']);
       expect(draft.stages.dev.account_id).toBe('111122223333');
+      expect(draft.stages.prod).toBeUndefined();
     });
 
-    // The crash the client.ts OPEN SEAM note describes: a single-stage tenant used to throw
-    // here on `undefined.account_id`. A blank stage is the honest reading, never a guess.
-    it('yields a blank stage rather than throwing on a single-stage tenant', () => {
-      const draft = draftFromTenant({
-        name: 'One stage',
-        line_of_business: 'Claims',
-        description: '',
-        platform: 'aws',
-        stages: { dev: { account_id: '111122223333', region: 'us-east-1' } },
-        entra_group_ids: [],
-      });
-      expect(draft.stages.prod.account_id).toBe('');
-      expect(draft.stages.prod.region).toBe('us-east-1');
+    it('seeds the dev stage for a record that carries no stages at all, so the draft is not an unsubmittable empty one', () => {
+      const draft = draftFromTenant(tenantView({ stages: {} }));
+      expect(draftStageKeys(draft)).toEqual(['dev']);
+      expect(draft.stages.dev.account_id).toBe('');
+      expect(draft.databricks?.dev.workspace_url).toBe('');
     });
 
     it('does not put databricks stages into the aws half, or vice versa', () => {
-      const draft = draftFromTenant({
-        name: 'DB Tenant',
-        line_of_business: 'Claims',
-        description: '',
-        platform: 'databricks',
-        stages: { dev: DB_STAGE, prod: DB_STAGE },
-        entra_group_ids: [],
-      });
+      const draft = draftFromTenant(tenantView({ platform: 'databricks', stages: { dev: DB_STAGE, prod: DB_STAGE } }));
       expect(draft.stages.dev.account_id).toBe('');
       expect(draft.databricks?.dev.account_id).toBe('acct-uuid');
     });
 
-    // The end-to-end shape of the bug, exercised the way the modal actually does it:
-    // record → draftFromTenant → (admin changes nothing) → buildUpdatePayload. This is the
-    // assertion that would have caught the ARN wipe.
-    it('a no-op edit round-trip preserves the stored secret ARN', () => {
-      const draft = draftFromTenant({
-        name: 'DB Tenant',
-        line_of_business: 'Claims',
-        description: '',
-        platform: 'databricks',
-        stages: { dev: DB_STAGE, prod: DB_STAGE },
-        entra_group_ids: ['g1'],
-      });
+    it('a no-op edit round-trip (record → draft → update payload) preserves the stored secret ARN', () => {
+      const draft = draftFromTenant(
+        tenantView({ platform: 'databricks', stages: { dev: DB_STAGE, prod: DB_STAGE }, entra_group_ids: ['g1'] }),
+      );
       const payload = buildUpdatePayload(draft);
       for (const stage of ['dev', 'prod']) {
-        const s = payload.stages[stage] as DatabricksStageConfig & { sp_client_secret?: string };
+        const s = payload.stages?.[stage] as DatabricksStageConfigInput;
         expect(s.sp_client_secret_arn).toBe(DB_STAGE.sp_client_secret_arn);
         expect('sp_client_secret' in s).toBe(false);
       }
     });
 
-    it('round-trips a databricks tenant back to a submittable draft', () => {
-      const draft = draftFromTenant({
-        name: 'DB Tenant',
-        line_of_business: 'Claims',
-        description: '',
-        platform: 'databricks',
-        stages: { dev: DB_STAGE, prod: DB_STAGE },
-        entra_group_ids: ['g1'],
-        account_admin_secret_arn: 'arn:aws:secretsmanager:::secret:admin',
-      });
-      // Submittable with NO secret typed — neither the stage secrets nor the account-admin
-      // credential — because both are already stored. This is the shape of a real no-op edit,
-      // and T14's new requirement must not break it.
+    it('round-trips a databricks tenant back to a submittable draft with no secret typed, because both are already stored', () => {
+      const draft = draftFromTenant(
+        tenantView({
+          platform: 'databricks',
+          stages: { dev: DB_STAGE, prod: DB_STAGE },
+          entra_group_ids: ['g1'],
+          account_admin_secret_arn: 'arn:aws:secretsmanager:::secret:admin',
+        }),
+      );
       expect(canSubmit(draft)).toBe(true);
     });
 
-    // The other half of that, and the CREATE-only line: a tenant that has NO stored account-admin
-    // credential (every Databricks tenant created before T14) stays EDITABLE — §3B makes
-    // `invoke_unavailable` a supported, operable state, and "unlock federation later" is the
-    // documented sequence, so a rename or an Entra-group add must not require first obtaining a
-    // Tier-3 credential. The same draft as a CREATE is still refused.
     it('keeps a tenant with no stored account-admin credential editable, but refuses it on create', () => {
-      const draft = draftFromTenant({
-        name: 'DB Tenant',
-        line_of_business: 'Claims',
-        description: '',
-        platform: 'databricks',
-        stages: { dev: DB_STAGE, prod: DB_STAGE },
-        entra_group_ids: ['g1'],
-      });
+      const draft = draftFromTenant(
+        tenantView({ platform: 'databricks', stages: { dev: DB_STAGE, prod: DB_STAGE }, entra_group_ids: ['g1'] }),
+      );
       expect(canSubmit(draft, true)).toBe(true);
       expect(canSubmit(draft)).toBe(false);
-      // Supplying the pair on an edit stays possible (and still has to be coherent).
       expect(
         canSubmit({ ...draft, account_admin_client_id: 'admin-id', account_admin_secret: 's' }, true),
       ).toBe(true);
       expect(canSubmit({ ...draft, account_admin_client_id: 'admin-id' }, true)).toBe(false);
+    });
+  });
+
+  describe('draftStageKeys', () => {
+    it('derives the pair from a two-stage draft that carries no explicit list', () => {
+      expect(draftStageKeys(VALID_DRAFT)).toEqual(['dev', 'prod']);
+      expect(draftStageKeys(VALID_DB_DRAFT)).toEqual(['dev', 'prod']);
+    });
+    it('reads the platform-relevant map: databricks keys for a databricks draft', () => {
+      const draft: TenantDraft = {
+        ...VALID_DB_DRAFT,
+        stages: { dev: EMPTY_TENANT_DRAFT.stages.dev },
+        databricks: { dev: VALID_DB_STAGE, staging: VALID_DB_STAGE, prod: VALID_DB_STAGE },
+      };
+      expect(draftStageKeys(draft)).toEqual(['dev', 'staging', 'prod']);
+    });
+    it('honours an explicit stageKeys list', () => {
+      expect(draftStageKeys({ ...VALID_DRAFT, stageKeys: ['prod'] })).toEqual(['prod']);
+    });
+  });
+
+  describe('draftDatabricksStages', () => {
+    it('materialises a blank Databricks stage for every listed key, so a key added on the AWS side has a twin and a platform toggle never lands on undefined', () => {
+      const draft: TenantDraft = {
+        ...VALID_DB_DRAFT,
+        stageKeys: ['dev', 'staging'],
+        databricks: { dev: VALID_DB_STAGE },
+      };
+      const stages = draftDatabricksStages(draft);
+      expect(Object.keys(stages)).toEqual(['dev', 'staging']);
+      expect(stages.dev).toEqual(VALID_DB_STAGE);
+      expect(stages.staging.workspace_url).toBe('');
+      expect(stages.staging.workspace_id).toBe('0');
+    });
+    it('reads every listed key as a blank stage for a draft that carries no databricks map at all', () => {
+      const stages = draftDatabricksStages({ ...VALID_DRAFT, platform: 'databricks', stageKeys: ['dev', 'prod'] });
+      expect(Object.keys(stages)).toEqual(['dev', 'prod']);
+      expect(stages.prod.sp_client_id).toBe('');
+      expect(stages.prod.has_sp_secret).toBe(false);
+    });
+  });
+
+  describe('arbitrary stage keys round-trip (draftFromTenant -> buildCreatePayload)', () => {
+    it('preserves an open set of stage names, in order', () => {
+      const draft = draftFromTenant(
+        tenantView({
+          stages: {
+            dev: tenantStageConfig({ account_id: '111111111111' }),
+            staging: tenantStageConfig({ account_id: '222222222222', region: 'us-west-2' }),
+            prod: tenantStageConfig({ account_id: '333333333333', region: 'eu-west-1' }),
+          },
+        }),
+      );
+      expect(draftStageKeys(draft)).toEqual(['dev', 'staging', 'prod']);
+      const payload = buildCreatePayload(draft);
+      expect(Object.keys(payload.stages)).toEqual(['dev', 'staging', 'prod']);
+      expect(payload.stages.staging.account_id).toBe('222222222222');
+      expect(payload.stages.prod.region).toBe('eu-west-1');
+    });
+
+    it('round-trips arbitrary databricks stage keys too', () => {
+      const DB = databricksStageConfigOutput({ workspace_url: FAKE_WORKSPACE });
+      const draft = draftFromTenant(tenantView({ platform: 'databricks', stages: { dev: DB, staging: DB } }));
+      expect(draftStageKeys(draft)).toEqual(['dev', 'staging']);
+      const payload = buildUpdatePayload(draft);
+      expect(Object.keys(payload.stages ?? {})).toEqual(['dev', 'staging']);
+      const staging = payload.stages?.staging as DatabricksStageConfigInput;
+      expect(staging.workspace_url).toBe(FAKE_WORKSPACE);
+    });
+  });
+
+  describe('addStage / removeStage', () => {
+    const single = (): TenantDraft =>
+      draftFromTenant(tenantView({ stages: { dev: tenantStageConfig() } }));
+
+    it('appends a blank stage to BOTH maps (so a platform toggle keeps it)', () => {
+      const two = addStage(single(), 'prod');
+      expect(draftStageKeys(two)).toEqual(['dev', 'prod']);
+      expect(two.stages.prod.account_id).toBe('');
+      expect(two.stages.prod.region).toBe('us-east-1');
+      expect(two.databricks?.prod.workspace_url).toBe('');
+    });
+
+    it('is non-mutating and a no-op for a blank or duplicate key', () => {
+      const one = single();
+      expect(addStage(one, 'dev')).toBe(one);
+      expect(addStage(one, '   ')).toBe(one);
+      expect(draftStageKeys(one)).toEqual(['dev']);
+    });
+
+    it('removeStage drops a key from every map', () => {
+      const back = removeStage(addStage(single(), 'prod'), 'prod');
+      expect(draftStageKeys(back)).toEqual(['dev']);
+      expect(back.stages.prod).toBeUndefined();
+      expect(back.databricks?.prod).toBeUndefined();
+    });
+
+    it('removeStage refuses to remove the last remaining stage', () => {
+      const one = single();
+      expect(removeStage(one, 'dev')).toBe(one);
+    });
+  });
+
+  describe('nextSuggestedStageKey', () => {
+    it('offers prod until it is present, then nothing', () => {
+      const one = draftFromTenant(tenantView({ stages: { dev: tenantStageConfig() } }));
+      expect(nextSuggestedStageKey(one)).toBe('prod');
+      expect(nextSuggestedStageKey(addStage(one, 'prod'))).toBeNull();
+    });
+  });
+
+  describe('canSubmit — at least one stage, every listed stage complete', () => {
+    it('accepts a single complete dev stage — prod is no longer forced', () => {
+      const one = draftFromTenant(
+        tenantView({ stages: { dev: tenantStageConfig({ account_id: '111122223333' }) }, entra_group_ids: ['g1'] }),
+      );
+      expect(canSubmit(one)).toBe(true);
+    });
+    it('still refuses a draft with no stages at all', () => {
+      expect(canSubmit({ ...VALID_DRAFT, stageKeys: [], stages: {} })).toBe(false);
+    });
+    it('refuses when any LISTED stage is incomplete (an added stage must be filled)', () => {
+      const one = draftFromTenant(
+        tenantView({ stages: { dev: tenantStageConfig({ account_id: '111122223333' }) }, entra_group_ids: ['g1'] }),
+      );
+      expect(canSubmit(addStage(one, 'prod'))).toBe(false);
+    });
+    it('databricks: one complete stage is enough', () => {
+      const draft: TenantDraft = {
+        ...VALID_DB_DRAFT,
+        stageKeys: ['dev'],
+        databricks: { dev: VALID_DB_STAGE },
+      };
+      expect(canSubmit(draft)).toBe(true);
+    });
+  });
+
+  describe('compactBindingModeLabel — the dense-list pill shows the short half; the verbatim label is unchanged', () => {
+    it('shortens invoke_unavailable to "Invoke unavailable"', () => {
+      expect(compactBindingModeLabel('invoke_unavailable')).toBe('Invoke unavailable');
+      expect(bindingModeLabel('invoke_unavailable')).toBe('Invoke unavailable — federation required');
+    });
+    it('leaves the already-short labels verbatim', () => {
+      expect(compactBindingModeLabel('federation')).toBe('Federation');
+      expect(compactBindingModeLabel('sp_secret')).toBe('SP secret');
+    });
+    it('is null for aws, unknown and absent modes (like bindingModeLabel)', () => {
+      expect(compactBindingModeLabel('')).toBeNull();
+      expect(compactBindingModeLabel(undefined)).toBeNull();
+      expect(compactBindingModeLabel('something_new')).toBeNull();
+    });
+  });
+
+  describe('PRIVILEGE_STATEMENT — the per-platform privilege copy above the credential fields', () => {
+    it('is at most three sentences per platform', () => {
+      for (const p of ['aws', 'databricks'] as const) {
+        const sentences = PRIVILEGE_STATEMENT[p].split('.').filter((s) => s.trim().length > 0);
+        expect(sentences.length).toBeGreaterThan(0);
+        expect(sentences.length).toBeLessThanOrEqual(3);
+      }
+    });
+    it('databricks reuses the federation-required vocabulary', () => {
+      expect(PRIVILEGE_STATEMENT.databricks).toContain('invoke is refused');
+      expect(PRIVILEGE_STATEMENT.databricks.toLowerCase()).toContain('user sync');
+    });
+    it('aws says the push role is trusted to GitHub Actions and never assumed by AGP', () => {
+      expect(PRIVILEGE_STATEMENT.aws).toContain('The push role is never assumed by AGP');
+      expect(PRIVILEGE_STATEMENT.aws).toContain('GitHub Actions');
+    });
+    it('aws states what the roles unlock and names the inventory-only fallback', () => {
+      expect(PRIVILEGE_STATEMENT.aws.toLowerCase()).toContain('inventory-only');
+      expect(PRIVILEGE_STATEMENT.aws).toContain('deploy');
+    });
+  });
+
+  describe('compareStageKeys / unionStageKeys — stage columns in an order that is a function of the names, not of load order', () => {
+    function tenantWithStages(keys: string[]): TenantView {
+      const stages: TenantView['stages'] = {};
+      for (const k of keys) stages[k] = tenantStageConfig();
+      return tenantView({ stages });
+    }
+
+    it('sorts dev first and prod last regardless of insertion order', () => {
+      expect(['prod', 'dev'].sort(compareStageKeys)).toEqual(['dev', 'prod']);
+      expect(['dev', 'prod'].sort(compareStageKeys)).toEqual(['dev', 'prod']);
+    });
+
+    it('sorts every other stage name alphabetically between dev and prod', () => {
+      expect(['prod', 'staging', 'dev', 'canary'].sort(compareStageKeys)).toEqual([
+        'dev',
+        'canary',
+        'staging',
+        'prod',
+      ]);
+    });
+
+    it('unionStageKeys is independent of which tenant loads first (the reported flap)', () => {
+      const a = [tenantWithStages(['prod', 'dev']), tenantWithStages(['dev'])];
+      const b = [tenantWithStages(['dev']), tenantWithStages(['prod', 'dev'])];
+      expect(unionStageKeys(a)).toEqual(['dev', 'prod']);
+      expect(unionStageKeys(b)).toEqual(['dev', 'prod']);
+    });
+
+    it('unions stage keys across tenants without duplicates', () => {
+      const tenants = [tenantWithStages(['dev']), tenantWithStages(['dev', 'prod', 'canary'])];
+      expect(unionStageKeys(tenants)).toEqual(['dev', 'canary', 'prod']);
     });
   });
 });

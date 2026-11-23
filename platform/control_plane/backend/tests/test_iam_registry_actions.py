@@ -1,4 +1,4 @@
-"""E32 guard: the ECS task role must grant agent-registry:* and RETAIN workload identity.
+"""The ECS task role must grant agent-registry:* and retain workload identity.
 
 AWS moved ONLY Registry to the `agent-registry` namespace. bedrock-agentcore:* no longer
 authorizes registry calls, but workload identity + OAuth credential providers deliberately
@@ -54,8 +54,8 @@ def test_drops_renamed_search_action(ecs_tf):
 
 
 def test_retains_broad_agentcore_wildcard(ecs_tf):
-    """Runtime/Identity/Gateway/Cedar stayed in `bedrock-agentcore` — E32 must not have
-    turned the ADD into a replace."""
+    """Runtime/Identity/Gateway/Cedar stayed in `bedrock-agentcore`; the registry move is an add,
+    never a replace."""
     assert '"bedrock-agentcore:*"' in ecs_tf
 
 
@@ -69,36 +69,9 @@ def test_provisioning_roles_grant_both_namespaces(tf_path):
     assert '"agent-registry:*"' in text, tf_path.name
 
 
-# ---------------------------------------------------------------------------
-# E36/T21: the `agp-deployment-*` deploy-role naming contract, three sides.
-#
-# The role NAME (modules/default_tenant) and the sts:AssumeRole RESOURCE wildcards
-# (modules/codebuild, and modules/ecs since E36/T11) are ONE contract — the name pattern
-# IS the authorization boundary. Rename one side alone and the first symptom is a live
-# AccessDenied inside a CodeBuild run (provisioning) or a failed teardown, both invisible
-# to the whole offline suite. So the sides are EXTRACTED and compared to each other, not
-# spot-checked independently.
-#
-# The E34/T13b rename that CREATED this contract (the retired resource prefix -> `agp-`) needs
-# no separate `not in` assertion here, and deliberately gets none: pinning the extracted prefix
-# to `DEPLOY_ROLE_PREFIX` below already fails on a revert of ANY side, and
-# `tests/test_no_legacy_vocabulary.py` independently forbids the retired prefix across the whole
-# tracked tree — these three `.tf` files included, which is strictly stronger than a local
-# substring check. Writing the old literal here would only trip that guard.
-# ---------------------------------------------------------------------------
-
 DEPLOY_ROLE_PREFIX = "agp-deployment-"
-
-# `name = "agp-deployment-${var.name_prefix}-default"` — the shape side. The interpolation
-# is matched loosely (`${...}`) because WHICH variable carries the per-tenant suffix is not
-# part of this contract; only the prefix in front of it is.
-DEPLOY_ROLE_NAME_RE = re.compile(
-    r'name\s*=\s*"(?P<prefix>[a-z0-9-]+?-)\$\{[^}]+\}-default"'
-)
-# `"arn:aws:iam::*:role/agp-deployment-*"` — the grant side.
+DEPLOY_ROLE_NAME_RE = re.compile(r'name\s*=\s*"(?P<prefix>[a-z0-9-]+?-)\$\{[^}]+\}-default"')
 ASSUMABLE_ROLE_ARN_RE = re.compile(r'"arn:aws:iam::\*:role/(?P<prefix>[a-z0-9-]+?-)\*"')
-# A commented-out ARN grants nothing, so it must not satisfy the grant side: widening the
-# real `Resource` to `role/*` while leaving the old value as a `#` note would otherwise pass.
 HCL_COMMENT = re.compile(r"^\s*(#|//).*$", re.MULTILINE)
 
 
@@ -113,11 +86,20 @@ def default_tenant_tf() -> str:
 
 
 def test_deploy_role_name_matches_every_assume_grant(default_tenant_tf, codebuild_tf, ecs_tf):
-    """The prefix the deploy-role is NAMED with must be the prefix each assuming role is
-    GRANTED — compared side-to-side, so a one-sided rename cannot pass."""
+    """The `agp-deployment-*` deploy-role naming contract, three sides compared to each other.
+
+    The role name (modules/default_tenant) and the sts:AssumeRole resource wildcards (modules/codebuild,
+    modules/ecs) are one contract: the name pattern is the authorization boundary, and a one-sided
+    rename first shows as a live AccessDenied inside a CodeBuild run or a failed teardown, invisible to
+    the offline suite. So the sides are extracted and compared, never spot-checked. `DEPLOY_ROLE_NAME_RE`
+    reads the name side, `name = "<prefix>${...}-default"`, with the interpolated variable left loose
+    because which one carries the per-tenant suffix is not the contract; `ASSUMABLE_ROLE_ARN_RE` reads the
+    grant side, `"arn:aws:iam::*:role/<prefix>*"`, after `HCL_COMMENT` strips commented-out lines, since
+    a `#` note of the old ARN beside a widened `role/*` grants nothing. The list equality against
+    `DEPLOY_ROLE_PREFIX` also pins uniqueness, so a second `…-default` role name fails instead of
+    widening the boundary, and a revert of any side fails here without a `not in` on the retired prefix.
+    """
     named = DEPLOY_ROLE_NAME_RE.findall(default_tenant_tf)
-    # Exactly one match: the list-equality also pins uniqueness, so a SECOND `…-default`
-    # role name would fail here rather than silently widening the boundary.
     assert named == [DEPLOY_ROLE_PREFIX], (
         str(DEFAULT_TENANT_TF.relative_to(INFRA)),
         DEPLOY_ROLE_NAME_RE.pattern,
@@ -126,3 +108,25 @@ def test_deploy_role_name_matches_every_assume_grant(default_tenant_tf, codebuil
     for label, text in (("codebuild", codebuild_tf), ("ecs", ecs_tf)):
         granted = ASSUMABLE_ROLE_ARN_RE.findall(HCL_COMMENT.sub("", text))
         assert named[0] in granted, (label, named[0], granted)
+
+
+MCP_SECRET_RESOURCE = (
+    '"arn:${data.aws_partition.current.partition}:secretsmanager:'
+    "${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}"
+    ':secret:agp-mcp/*"'
+)
+
+
+def test_deploy_role_reads_only_the_mcp_secret_namespace(default_tenant_tf):
+    """CreateApiKeyCredentialProvider (external secret) reads the customer's secret with the caller's
+    credentials, the deploy role the gateway module's provider assumes, so that role needs read on the
+    reserved `agp-mcp/` namespace and only that namespace: never a wildcard action, never an inlined
+    account id. Invisible offline; the first symptom would be an AccessDenied mid-apply."""
+    text = HCL_COMMENT.sub("", default_tenant_tf)
+    assert '"secretsmanager:GetSecretValue"' in text
+    assert '"secretsmanager:DescribeSecret"' in text
+    assert f"Resource = {MCP_SECRET_RESOURCE}" in text
+    assert '"secretsmanager:*"' not in text
+    assert not re.search(r"secretsmanager:[a-z0-9-]*:\d{12}:", text)
+    for source in ("aws_caller_identity", "aws_region", "aws_partition"):
+        assert f'data "{source}" "current"' in text, source

@@ -158,7 +158,19 @@ phases:
           exit 1
         fi
       - |
-        if [ -n "$TARGET_ROLE_ARN" ] && [ "$IAC_TYPE" != "agentcore_runtime" ]; then
+        # AMBIENT TARGET-ACCOUNT CREDS — a POSITIVE allowlist, never an exclusion (E30/T9).
+        # This used to read `!= "agentcore_runtime"`, which opens for every IAC_TYPE nobody thought
+        # about — and `agentcore_harness` was exactly that. Both agentcore branches must run under
+        # the AMBIENT CodeBuild (tooling-account) role, for two independent reasons:
+        #   1. Their calls here are CONTROL-PLANE ones — the scratch secret, the agent registry
+        #      record, and `terraform init` against the control-plane STATE_BUCKET/LOCK_TABLE. Under
+        #      target creds those run in the TENANT account, where none of it exists.
+        #   2. Their Terraform module's own provider already assumes `deploy_role_arn`, so exporting
+        #      the same role here is a DOUBLE hop.
+        # Single-account deploys mask both (same account either way), so this can only be caught by
+        # the contract test — see test_the_ambient_target_creds_gate_is_a_POSITIVE_iac_type_allowlist.
+        # A NEW iac_type must be added here DELIBERATELY, which is the whole point of the positive form.
+        if [ -n "$TARGET_ROLE_ARN" ] && [ "$IAC_TYPE" = "terraform" ]; then
           CREDS=$(aws sts assume-role --role-arn "$TARGET_ROLE_ARN" --role-session-name "deploy-$DEPLOYMENT_ID" --output json)
           export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.Credentials.AccessKeyId')
           export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.Credentials.SecretAccessKey')
@@ -199,6 +211,11 @@ phases:
         # AGENT_ID / STAGE / IMAGE_TAG are plain shell assignments, not exports). Writes the
         # low-level DDB item JSON to the path given as argv[1].
         #
+        # E40/T6: the artifact id is OPTIONAL — an agent build carries AGENT_ID, an MCP-server
+        # (gateway) build carries MCP_SERVER_ID and no AGENT_ID at all. Each is read with `.get` and
+        # OMITTED when empty: a bare `os.environ['AGENT_ID']` would KeyError on every gateway build,
+        # and `_dep` is `|| true` with stderr suppressed, so that build would have NO history, silently.
+        #
         # NOTE `source_sha` is deliberately absent: the buildspec has no commit sha in scope. The
         # sha lives ONLY on the backend-written `started` row (from the OIDC-proven token), so any
         # reader collapsing the two rows for one build_id must take source_sha from the `started`
@@ -211,11 +228,17 @@ phases:
         r, s = os.environ['REPO_SK'], os.environ['STAGE']
         o = os.environ['D_OUT']
         k = '%s#%s#%s#%s' % (r, s, ts, i[-4:])
-        it = {'pk': 'deployment', 'sk': k, 'id': i, 'repo_id': r, 'agent_id': os.environ['AGENT_ID'],
+        it = {'pk': 'deployment', 'sk': k, 'id': i, 'repo_id': r,
               'stage': s, 'seq_key': k, 'image_tag': os.environ['IMAGE_TAG'],
               'build_id': os.environ.get('CODEBUILD_BUILD_ID') or None, 'outcome': o,
-              'started_at': ts, 'completed_at': ts,
-              'error': 'the runtime build failed' if o == 'failed' else None}
+              'started_at': ts, 'completed_at': ts}
+        a, m = os.environ.get('AGENT_ID'), os.environ.get('MCP_SERVER_ID')
+        # E40 L5: name what failed; the CodeBuild log holds the cause.
+        it['error'] = ('the gateway build failed' if m else 'the runtime build failed') if o == 'failed' else None
+        if a:
+            it['agent_id'] = a
+        if m:
+            it['mcp_server_id'] = m
         json.dump({k2: ({'NULL': True} if v is None else {'S': v}) for k2, v in it.items()},
                   open(sys.argv[1], 'w'))
         PYEOF
@@ -236,6 +259,154 @@ phases:
             exit 1
           fi
         else
+        # E30/T9 — SHARED STATUS / HISTORY / SERVING-TAG WRITE-BACK.
+        # These four helpers used to live INSIDE the `agentcore_runtime` case body, which meant the
+        # config path had none of them. That is a correctness gap, not cosmetic: `_dep` is the ONLY
+        # writer of a terminal `Deployment` row, and `_has_succeeded` (backend project_service.py)
+        # scans exactly those rows to answer "may this tag be rolled back?" and to set promote's
+        # `serving` stamp. It fails CLOSED, so a config agent would have been permanently
+        # un-rollbackable and never recorded as serving — silently, since nothing errors.
+        # Hoisted to shared scope rather than duplicated: one definition cannot drift from itself,
+        # and the row shape is a cross-process contract with the backend (C1).
+        #
+        # AGENT_ID: env WINS, else derive from the tag prefix — BUT THE DERIVATION IS SCOPED TO THE
+        # CONTAINER PATH, and that scoping is load-bearing rather than tidiness.
+        # The container path sends no AGENT_ID and has always sliced it off the `<agent_id>-` tag
+        # prefix; that behaviour is preserved byte-for-byte. The config path SENDS it, because its
+        # tag is a bare 40-hex commit sha with no prefix to slice.
+        # An UNGATED default silently kills the harness branch's `[ -z "$AGENT_ID" ]` refusal: a sha
+        # contains no `-`, so `${IMAGE_TAG%%-*}` returns the WHOLE sha, AGENT_ID is never empty, and
+        # a backend regression that stopped sending it would key state at
+        # `agentcore-harness/<sha>/<stage>` — a fresh harness on every push with the predecessor
+        # orphaned and unreclaimable. Gating on the container iac_type keeps that guard LIVE.
+        # It also keeps the legacy `terraform` branch with NO agent id at all (its pre-hoist state),
+        # which is what scopes the REPO_SK query below away from a path that has no agent and runs
+        # under target-account credentials.
+        [ "$IAC_TYPE" = "agentcore_runtime" ] && AGENT_ID="${AGENT_ID:-${IMAGE_TAG%%-*}}"
+        # E28/T4b: the `pk = "repository"` FILTER is load-bearing. `agent_id-index` is a GSI over
+        # EVERY row carrying an agent_id, and the append-only deployment partition
+        # (models/deployment.py) carries one too — so after the first deployment this query
+        # returns 2+ items for one agent, and GSI item order is NOT contractual. When a
+        # deployment row sorts first, REPO_SK becomes a composite key like
+        # `repo-abc#dev#2026-...#1027`, which PASSES the `!= "None"` guard below and makes _u /
+        # _st / _tag / _dep all write to a key that does not exist — silently breaking the
+        # PRE-EXISTING cicd_status write-back, nondeterministically. KEYS_ONLY projects pk, so
+        # filtering on it here is free and needs no index change.
+        # COST NOTE (parked; cost/latency, NOT correctness): a FilterExpression is applied AFTER
+        # the read, so this query reads RCU proportional to the agent's ENTIRE deployment
+        # history and the CLI auto-paginates it — growing with every build. Acceptable at
+        # current volumes. The fix, if it ever matters, is a repo-keyed lookup or a sparse
+        # index; it is NOT removing the filter, which is load-bearing above.
+        # Guarded on a non-empty AGENT_ID so the legacy `terraform` branch (which has no agent, and
+        # which is the one path running under ambient TARGET-account creds) does not query the
+        # CONTROL-PLANE table keyed on "" — a guaranteed access-denied on every legacy build.
+        # DELIBERATELY NOT `2>/dev/null`: this is the READ that feeds _u/_st/_tag/_dep, so a DDB or
+        # IAM failure here silently disables all four, and the build log is the only place an
+        # operator can see why the badge and the history stopped updating. Suppression is right for
+        # the WRITE helpers below (best-effort by contract — a history write must never fail a good
+        # deploy) and wrong here. `|| REPO_SK=""` still keeps a failure non-fatal; it just stays VISIBLE.
+        # E40/T6: an MCP-server (gateway) build has NO agent id, so it cannot use this agent-keyed
+        # GSI — the backend sends the repo row's key directly as REPO_SK (= repo.id), and when that is
+        # set it WINS and the query is skipped (no new GSI needed). An `if`, not `A && B || C`: in the
+        # chained form a set REPO_SK would short-circuit straight into `|| REPO_SK=""` and be ERASED.
+        # Agent builds send no REPO_SK, so their path is the query exactly as before.
+        if [ -n "${REPO_SK:-}" ]; then echo "REPO_SK from the build env: $REPO_SK"; else [ -n "$AGENT_ID" ] && REPO_SK=$(aws dynamodb query --table-name "$PROJECTS_TABLE_NAME" --index-name agent_id-index --key-condition-expression "agent_id = :a" --filter-expression "pk = :p" --expression-attribute-values "{\":a\":{\"S\":\"$AGENT_ID\"},\":p\":{\"S\":\"repository\"}}" --query 'Items[0].sk.S' --output text) || REPO_SK=""; fi
+        _u() { [ -n "${REPO_SK:-}" ] && [ "$REPO_SK" != "None" ] && aws dynamodb update-item --table-name "$PROJECTS_TABLE_NAME" --key "{\"pk\":{\"S\":\"repository\"},\"sk\":{\"S\":\"$REPO_SK\"}}" --update-expression "SET $1 = :v" --expression-attribute-values "{\":v\":{\"S\":\"$2\"}}" 2>/dev/null || true; }
+        _st() { _u cicd_status "$1"; }
+        # E28A/T6: one branch PER STAGE — dev writes last_dev_image_tag, prod writes
+        # last_promoted_image_tag. Both are "the tag this stage is now SERVING", and this
+        # build is the only writer that knows the apply actually succeeded (the backend
+        # stamps at StartBuild, which proves only that the build was accepted; T6 made it
+        # skip the tag for exactly that reason, leaving prod with no writer at all).
+        # This does NOT reopen the option T6's research rejected. That rejection was about
+        # the promotion AUDIT fields: `last_promoted_by` cannot move here (no Entra oid in
+        # scope) and `last_promoted_at` is the backend's `_promotion_in_flight` clock, so
+        # deferring it would disarm the concurrency guard. The image tag is neither an actor
+        # nor a clock, and this helper already owns the symmetric dev field.
+        # Two independent statements, each keeping the dev shape's `|| true`: a failed
+        # write must never fail a good deploy, and an empty IMAGE_TAG must write nothing.
+        # E28B/T4 (D-B3): each stage also records the DIGEST it is now serving, alongside the
+        # tag and never instead of it. The tag stays because it is what every existing surface
+        # renders and what a rollback validates against; the digest is added because it is the
+        # only value a production approval can honestly attest to. Same shape as the tag
+        # writes — stage-gated, non-empty-guarded, `|| true` — so a failed write cannot fail a
+        # good deploy, and an empty digest (the legacy tag-only path, and EVERY config build,
+        # which has no image at all) writes nothing rather than persisting a "" that a reader
+        # would treat as a real digest.
+        _tag() { [ "$STAGE" = "dev" ] && [ -n "$IMAGE_TAG" ] && _u last_dev_image_tag "$IMAGE_TAG" || true; [ "$STAGE" = "prod" ] && [ -n "$IMAGE_TAG" ] && _u last_promoted_image_tag "$IMAGE_TAG" || true; [ "$STAGE" = "dev" ] && [ -n "${IMAGE_DIGEST:-}" ] && _u last_dev_digest "$IMAGE_DIGEST" || true; [ "$STAGE" = "prod" ] && [ -n "${IMAGE_DIGEST:-}" ] && _u last_promoted_digest "$IMAGE_DIGEST" || true; }
+        # E28/T4b (D7): append the TERMINAL Deployment row. $1 = succeeded|failed.
+        # The backend appends a `started` row when a build is REQUESTED; only the build itself
+        # knows the outcome, so this is the one writer of a terminal row. Contract C1 —
+        # pk="deployment", sk="{repo_id}#{stage}#{started_at}#{id[-4:]}". This shape MUST stay
+        # byte-compatible with `deployment_seq_key()`/`append_deployment` in backend
+        # project_service.py: a row written under any other key shape lands where
+        # `list_deployments` does not look, i.e. history silently reads empty.
+        # REPO_SK *is* the repo_id (the repository partition keys sk=repo.id) — guarded for the
+        # literal "None" exactly like _u, since an unresolved query returns that string.
+        # No actor/actor_kind: a build has no human actor and inventing one would forge
+        # attribution (C1 keeps a GitHub login and an Entra oid distinct on purpose).
+        # Best-effort (|| true): a failed history write must never fail a good deploy.
+        # The item is minted by PYTHON3, not shell: the sk suffix is `id[-4:]` and the timestamp
+        # is a Python `datetime.isoformat()`, and both are contract-critical. Shell got each
+        # wrong when first written (`${ID##*-}` yields 8 chars not 4; `date +%6N` is not
+        # portable and emitted a literal "6N"), and either bug writes the row where
+        # `list_deployments` cannot see it.
+        # Invokes /tmp/dep.py (heredoc'd in pre_build) as a FILE, never `python3 -c` — an inline
+        # body inside a YAML block scalar carries this block's indentation at runtime, which
+        # `python3 -c` rejects with IndentationError on every interpreter before 3.14. See the
+        # pre_build heredoc for the full reasoning.
+        # EVERY name the script reads is passed INLINE: AGENT_ID and REPO_SK are plain shell
+        # assignments — the file's only `export`s are the 3 AWS credential lines — so a bare
+        # invocation inherits NONE of them and dies on KeyError. Do NOT drop these assignments.
+        # The item path is mktemp'd (a fixed /tmp/dep.json would be shared across the retries
+        # and the failure paths that can both call this within one build).
+        _dep() { [ -n "${REPO_SK:-}" ] && [ "$REPO_SK" != "None" ] && [ -n "$IMAGE_TAG" ] && { D_ITEM=$(mktemp /tmp/dep-item.XXXXXX.json) && D_OUT="$1" REPO_SK="$REPO_SK" AGENT_ID="$AGENT_ID" MCP_SERVER_ID="${MCP_SERVER_ID:-}" STAGE="$STAGE" IMAGE_TAG="$IMAGE_TAG" CODEBUILD_BUILD_ID="${CODEBUILD_BUILD_ID:-}" python3 /tmp/dep.py "$D_ITEM" && { aws dynamodb put-item --table-name "$PROJECTS_TABLE_NAME" --item "file://$D_ITEM" 2>/dev/null && echo "[dep] recorded $1 deployment row for $REPO_SK/$STAGE" || echo "WARN: [dep] deployment history write failed for $REPO_SK/$STAGE (build unaffected)"; } || echo "WARN: [dep] could not build the deployment row for $REPO_SK/$STAGE (build unaffected)"; rm -f "$D_ITEM"; } || true; }
+        # L10: ANY registry write resets APPROVED -> DRAFT and delists the marketplace card. The ARN
+        # write-backs read the settled status first and, only if it was APPROVED, re-assert it after
+        # (submit -> update-status APPROVED), as services/registry_reapproval.py does. "Is this our
+        # write" compares CONTENT, never updatedAt (the async settle stamps a newer one). Never fails
+        # the build: the runtime is live and its ARN recorded, so a miss is a WARNING.
+        _reg_get() { aws agent-registry-control get-registry-record --registry-id "$AGENT_REGISTRY_ID" --record-id "$AGENT_ID" --output json 2>/dev/null; }
+        # Sets REG_PRIOR (settled status, or "unknown") and REG_REASON (the approver's reason).
+        _reg_status() {
+          _n=0; REG_PRIOR=""; REG_REASON=""
+          while [ $_n -lt 10 ]; do
+            _R=$(_reg_get); REG_PRIOR=$(printf "%s" "$_R" | jq -r '.status // ""' 2>/dev/null)
+            if [ -n "$REG_PRIOR" ] && [ "$REG_PRIOR" != "CREATING" ] && [ "$REG_PRIOR" != "UPDATING" ]; then REG_REASON=$(printf "%s" "$_R" | jq -r '.statusReason // ""' 2>/dev/null); return 0; fi
+            _n=$((_n+1)); sleep 1
+          done
+          REG_PRIOR="unknown (${REG_PRIOR:-unreadable})"
+        }
+        # Only APPROVED is re-asserted; any other settled status stays. Inconclusive = WARNING, never silent.
+        _reapprove_after() {
+          if [ "$REG_PRIOR" = "APPROVED" ]; then _reapprove "$1"
+          elif [ "$REG_PRIOR" != "DRAFT" ] && [ "$REG_PRIOR" != "PENDING_APPROVAL" ] && [ "$REG_PRIOR" != "REJECTED" ] && [ "$REG_PRIOR" != "DEPRECATED" ]; then
+            echo "WARNING: agent ${AGENT_NAME:-$AGENT_ID} ($AGENT_ID): its registry status before this build's ARN write-back is $REG_PRIOR — if it was APPROVED, the write reset it to DRAFT and its marketplace card is delisted until it is re-approved."
+          fi
+        }
+        _reapprove() {
+          _want=$(printf "%s" "$1" | jq -S -c .); _S=""; _n=0
+          # Keep the human approver's reason (audit evidence) and mark AGP's re-approval once, max 255.
+          _why=$(jq -rn --arg r "$REG_REASON" --arg s " [re-approved by AGP after a platform write]" 'if $r == "" then "Re-approved by AGP after a platform write (build ARN write-back)" elif ($r | endswith($s)) then $r[:255] else $r[:(255 - ($s | length))] + $s end')
+          while [ $_n -lt 20 ]; do
+            _R=$(_reg_get); _S=$(printf "%s" "$_R" | jq -r '.status // ""' 2>/dev/null)
+            if [ -n "$_S" ] && [ "$_S" != "CREATING" ] && [ "$_S" != "UPDATING" ]; then
+              _got=$(printf "%s" "$_R" | jq -S -c '.descriptors.custom.data | fromjson' 2>/dev/null)
+              if [ "$_got" != "$_want" ]; then
+                # APPROVED with other content can be a stale pre-write read: keep polling. Anything
+                # else is another writer's content — AGP does not approve what it did not write.
+                [ "$_S" = "APPROVED" ] || { _S="$_S, changed by another write"; break; }
+              elif [ "$_S" = "APPROVED" ]; then echo "registry record $AGENT_ID re-approved after the ARN write-back"; return 0
+              elif [ "$_S" = "DRAFT" ]; then aws agent-registry-control submit-registry-record-for-approval --registry-id "$AGENT_REGISTRY_ID" --record-id "$AGENT_ID" > /dev/null 2>&1
+              elif [ "$_S" = "PENDING_APPROVAL" ]; then aws agent-registry-control update-registry-record-status --registry-id "$AGENT_REGISTRY_ID" --record-id "$AGENT_ID" --status APPROVED --status-reason "$_why" > /dev/null 2>&1
+              else break
+              fi
+            fi
+            _n=$((_n+1)); sleep 1
+          done
+          if [ "$_S" = "APPROVED" ]; then echo "registry record $AGENT_ID is APPROVED (content changed by another write)"; return 0; fi
+          echo "WARNING: agent ${AGENT_NAME:-$AGENT_ID} ($AGENT_ID) was APPROVED but could not be re-approved after this build's ARN write-back (now ${_S:-unknown}) — its marketplace card is delisted until it is re-approved."
+        }
         case "$IAC_TYPE" in
           terraform)
             TF_DIR=$(find /tmp/workspace -name "*.tf" -printf '%h\n' | sort -u | head -1)
@@ -256,6 +427,9 @@ phases:
             fi
             ;;
           agentcore_runtime)
+            # AGENT_ID, REPO_SK and the _u/_st/_tag/_dep helpers are defined in SHARED scope above
+            # (E30/T9) so the config path gets them too — the derivation from the tag prefix is
+            # unchanged, it just happens before the `case` now.
             # E32 FAIL-FAST — FIRST statement in this branch, on purpose. Nothing above it can
             # create a resource, and everything below it can.
             #
@@ -281,7 +455,6 @@ phases:
             # Bare `exit 1`, no `_st`/`_dep`: those helpers are not defined until further down this
             # branch, and there is nothing to record anyway — no deployment was attempted.
             if [ -z "$AGENT_REGISTRY_ID" ]; then echo "ERROR: AGENT_REGISTRY_ID is empty, so this build can neither READ the agent's registry record (it needs model_id and the Entra app wiring to provision) nor WRITE the runtime ARN back afterwards. Refusing BEFORE anything is provisioned, because continuing would leave a LIVE runtime that nothing recorded and the delete cascade could never reclaim. The platform supplies this id as a per-build environmentVariablesOverride (RuntimeBuildService.start_runtime_build resolves the registry by NAME and injects it), so start the build through the platform — POST /builds/runtime, or the promote/merge paths — rather than by hand. If you must run 'aws codebuild start-build' directly, pass it yourself alongside IAC_TYPE: --environment-variables-override name=AGENT_REGISTRY_ID,value=<id>,type=PLAINTEXT — get <id> from: aws agent-registry-control list-registries --query \"registries[?name=='agp-agents'].registryId\" --output text" >&2; exit 1; fi
-            AGENT_ID="${IMAGE_TAG%%-*}"
             # ECR_REPO_ARN scopes exec-role pull (empty=module "*").
             ECR_REPO_ARN=""
             [ -n "$ECR_REPO" ] && ECR_REPO_ARN="arn:aws:ecr:${AWS_TARGET_REGION}:${ECR_REPO%%.*}:repository/${ECR_REPO#*/}"
@@ -308,73 +481,6 @@ phases:
             [ -z "$TF_DIR" ] && { echo "ERROR: no TF in workspace"; exit 1; }
             cd "$TF_DIR"
             grep -rq 'backend "s3"' *.tf 2>/dev/null || printf 'terraform {\n  backend "s3" {}\n}\n' > backend_override.tf
-            # E28/T4b: the `pk = "repository"` FILTER is load-bearing. `agent_id-index` is a GSI over
-            # EVERY row carrying an agent_id, and the append-only deployment partition
-            # (models/deployment.py) carries one too — so after the first deployment this query
-            # returns 2+ items for one agent, and GSI item order is NOT contractual. When a
-            # deployment row sorts first, REPO_SK becomes a composite key like
-            # `repo-abc#dev#2026-...#1027`, which PASSES the `!= "None"` guard below and makes _u /
-            # _st / _tag / _dep all write to a key that does not exist — silently breaking the
-            # PRE-EXISTING cicd_status write-back, nondeterministically. KEYS_ONLY projects pk, so
-            # filtering on it here is free and needs no index change.
-            # COST NOTE (parked; cost/latency, NOT correctness): a FilterExpression is applied AFTER
-            # the read, so this query reads RCU proportional to the agent's ENTIRE deployment
-            # history and the CLI auto-paginates it — growing with every build. Acceptable at
-            # current volumes. The fix, if it ever matters, is a repo-keyed lookup or a sparse
-            # index; it is NOT removing the filter, which is load-bearing above.
-            REPO_SK=$(aws dynamodb query --table-name "$PROJECTS_TABLE_NAME" --index-name agent_id-index --key-condition-expression "agent_id = :a" --filter-expression "pk = :p" --expression-attribute-values "{\":a\":{\"S\":\"$AGENT_ID\"},\":p\":{\"S\":\"repository\"}}" --query 'Items[0].sk.S' --output text)
-            _u() { [ -n "${REPO_SK:-}" ] && [ "$REPO_SK" != "None" ] && aws dynamodb update-item --table-name "$PROJECTS_TABLE_NAME" --key "{\"pk\":{\"S\":\"repository\"},\"sk\":{\"S\":\"$REPO_SK\"}}" --update-expression "SET $1 = :v" --expression-attribute-values "{\":v\":{\"S\":\"$2\"}}" 2>/dev/null || true; }
-            _st() { _u cicd_status "$1"; }
-            # E28A/T6: one branch PER STAGE — dev writes last_dev_image_tag, prod writes
-            # last_promoted_image_tag. Both are "the tag this stage is now SERVING", and this
-            # build is the only writer that knows the apply actually succeeded (the backend
-            # stamps at StartBuild, which proves only that the build was accepted; T6 made it
-            # skip the tag for exactly that reason, leaving prod with no writer at all).
-            # This does NOT reopen the option T6's research rejected. That rejection was about
-            # the promotion AUDIT fields: `last_promoted_by` cannot move here (no Entra oid in
-            # scope) and `last_promoted_at` is the backend's `_promotion_in_flight` clock, so
-            # deferring it would disarm the concurrency guard. The image tag is neither an actor
-            # nor a clock, and this helper already owns the symmetric dev field.
-            # Two independent statements, each keeping the dev shape's `|| true`: a failed
-            # write must never fail a good deploy, and an empty IMAGE_TAG must write nothing.
-            # E28B/T4 (D-B3): each stage also records the DIGEST it is now serving, alongside the
-            # tag and never instead of it. The tag stays because it is what every existing surface
-            # renders and what a rollback validates against; the digest is added because it is the
-            # only value a production approval can honestly attest to. Same shape as the tag
-            # writes — stage-gated, non-empty-guarded, `|| true` — so a failed write cannot fail a
-            # good deploy, and an empty digest (the legacy tag-only path) writes nothing rather
-            # than persisting a "" that a reader would treat as a real digest.
-            _tag() { [ "$STAGE" = "dev" ] && [ -n "$IMAGE_TAG" ] && _u last_dev_image_tag "$IMAGE_TAG" || true; [ "$STAGE" = "prod" ] && [ -n "$IMAGE_TAG" ] && _u last_promoted_image_tag "$IMAGE_TAG" || true; [ "$STAGE" = "dev" ] && [ -n "${IMAGE_DIGEST:-}" ] && _u last_dev_digest "$IMAGE_DIGEST" || true; [ "$STAGE" = "prod" ] && [ -n "${IMAGE_DIGEST:-}" ] && _u last_promoted_digest "$IMAGE_DIGEST" || true; }
-            # E28/T4b (D7): append the TERMINAL Deployment row. $1 = succeeded|failed.
-            # The backend appends a `started` row when a build is REQUESTED; only the build itself
-            # knows the outcome, so this is the one writer of a terminal row. Contract C1 —
-            # pk="deployment", sk="{repo_id}#{stage}#{started_at}#{id[-4:]}". This shape MUST stay
-            # byte-compatible with `deployment_seq_key()`/`append_deployment` in backend
-            # project_service.py: a row written under any other key shape lands where
-            # `list_deployments` does not look, i.e. history silently reads empty.
-            # REPO_SK *is* the repo_id (the repository partition keys sk=repo.id) — guarded for the
-            # literal "None" exactly like _u, since an unresolved query returns that string.
-            # No actor/actor_kind: a build has no human actor and inventing one would forge
-            # attribution (C1 keeps a GitHub login and an Entra oid distinct on purpose).
-            # Best-effort (|| true): a failed history write must never fail a good deploy.
-            # The item is minted by PYTHON3, not shell: the sk suffix is `id[-4:]` and the timestamp
-            # is a Python `datetime.isoformat()`, and both are contract-critical. Shell got each
-            # wrong when first written (`${ID##*-}` yields 8 chars not 4; `date +%6N` is not
-            # portable and emitted a literal "6N"), and either bug writes the row where
-            # `list_deployments` cannot see it. python3 is already a hard dependency of this
-            # buildspec (merge_outputs.py, the post_build DDB write).
-            # E28/T4b: append the terminal Deployment row. $1 = succeeded|failed.
-            # Invokes /tmp/dep.py (heredoc'd in pre_build) as a FILE, never `python3 -c` — an inline
-            # body inside a YAML block scalar carries this block's indentation at runtime, which
-            # `python3 -c` rejects with IndentationError on every interpreter before 3.14. See the
-            # pre_build heredoc for the full reasoning.
-            # EVERY name the script reads is passed INLINE: AGENT_ID (:258) and REPO_SK (:274) are
-            # plain shell assignments — the file's only `export`s are the 3 AWS credential lines
-            # (:64-66) — so a bare invocation inherits NONE of them and dies on KeyError. Do NOT
-            # drop these assignments.
-            # The item path is mktemp'd (a fixed /tmp/dep.json would be shared across the retries
-            # and the failure paths that can both call this within one build).
-            _dep() { [ -n "${REPO_SK:-}" ] && [ "$REPO_SK" != "None" ] && [ -n "$IMAGE_TAG" ] && { D_ITEM=$(mktemp /tmp/dep-item.XXXXXX.json) && D_OUT="$1" REPO_SK="$REPO_SK" AGENT_ID="$AGENT_ID" STAGE="$STAGE" IMAGE_TAG="$IMAGE_TAG" CODEBUILD_BUILD_ID="${CODEBUILD_BUILD_ID:-}" python3 /tmp/dep.py "$D_ITEM" && { aws dynamodb put-item --table-name "$PROJECTS_TABLE_NAME" --item "file://$D_ITEM" 2>/dev/null && echo "[dep] recorded $1 deployment row for $REPO_SK/$STAGE" || echo "WARN: [dep] deployment history write failed for $REPO_SK/$STAGE (build unaffected)"; } || echo "WARN: [dep] could not build the deployment row for $REPO_SK/$STAGE (build unaffected)"; rm -f "$D_ITEM"; } || true; }
             # E28B/T4 (D-B3) — RESOLVE THE IMAGE REFERENCE. A digest, when we have one.
             # `container_image_uri` used to be `$ECR_REPO:$IMAGE_TAG` — a MUTABLE tag. The tenant
             # ECR repo is mutable and this image build is not reproducible (a floating
@@ -424,7 +530,9 @@ phases:
               # THE READ-BACK MUST RUN IN THE TARGET ACCOUNT, and neither half of that is automatic.
               # 1) CREDENTIALS. This branch runs under the AMBIENT CodeBuild (tooling-account) role:
               #    the pre_build assume-role at the top of this file is gated on
-              #    `IAC_TYPE != "agentcore_runtime"`, so it never fires here, and `_lg`'s creds are
+              #    a POSITIVE allowlist that names only `terraform`, so it never fires here (E30/T9
+              #    made the form positive; it was `!= "agentcore_runtime"` before, same effect for
+              #    THIS branch), and `_lg`'s creds are
               #    an INLINE ENV PREFIX — verified in a real shell to apply to its ONE command and
               #    be UNSET immediately after. `docker push` above still works only because
               #    `docker login` persists to ~/.docker/config.json, which is exactly what hides
@@ -538,7 +646,241 @@ phases:
             # The retired namespace's leaf was a bare string, so the pre-E32 two-level shape fails
             # PARAM VALIDATION client-side ("Invalid type for parameter ...custom.optionalValue.data,
             # valid types: dict"). Mirrors _wrap_update_descriptors_custom in agent_registry_service.
+            _reg_status
             aws agent-registry-control update-registry-record --registry-id "$AGENT_REGISTRY_ID" --record-id "$AGENT_ID" --descriptors "{\"optionalValue\":{\"custom\":{\"optionalValue\":{\"data\":{\"optionalValue\":$(echo "$NEW_ENV" | jq -Rs .)}}}}}" || { echo "ERROR: runtime $RUNTIME_ARN is LIVE but its ARN was NOT recorded (update-registry-record failed) — it is UNTRACKED and the delete cascade cannot reclaim it. Retry the build; reconcile by hand if it persists."; _st failed; _dep failed; exit 1; }
+            _reapprove_after "$NEW_ENV"
+            _tag; _st deployed; _dep succeeded
+            terraform output -json > /tmp/tf_outputs.json 2>/dev/null || echo '{}' > /tmp/tf_outputs.json
+            python3 /tmp/merge_outputs.py /tmp/tf_outputs.json
+            ;;
+          agentcore_harness)
+            # E30/T9 — the CONFIG-BUILD path. No container: the agent IS `harness.yaml`, which the
+            # module reads with `yamldecode(file(...))` at PLAN time. So the file must exist on this
+            # host before terraform runs, and it lives in the AGENT repo while the module lives in
+            # the infra repo already cloned to /tmp/workspace — hence a SECOND clone.
+            # AGENT_ID is SENT by the backend on this path and is NOT derived here: the shared
+            # resolution above applies `${IMAGE_TAG%%-*}` only when IAC_TYPE is agentcore_runtime,
+            # because that slice needs an `<agent_id>-` tag prefix and this path's tag is a bare
+            # commit sha. That gating is what keeps the guard below a REAL refusal — ungated, a sha
+            # (which has no `-`) would make AGENT_ID the whole sha and the guard unreachable.
+            # Every failure below RECORDS before exiting (`_st failed; _dep failed`) — the helpers are
+            # in shared scope above, so the badge and the history agree instead of the build
+            # vanishing as a bare exit. That is the whole point of the E30/T9 hoist.
+            [ -z "$AGENT_ID" ] && { echo "ERROR: AGENT_ID is empty — the config build env must send it (it cannot be derived from a bare commit sha)."; _st failed; _dep failed; exit 1; }
+            if [ -z "$GIT_AGENT_REPO" ]; then echo "ERROR: GIT_AGENT_REPO is empty — a config build must clone the agent repo that holds harness.yaml. This is a backend bug (runtime_build_service resolves it from the owning repository)."; _st failed; _dep failed; exit 1; fi
+            # Same credential mechanism as the pre_build infra clone: the scratch secret's `.token`
+            # is uniform for PAT and GitHub App connections (E22/T6b). A second clone with its own
+            # credential path would work for PAT and fail silently for App.
+            SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$GIT_SECRET_ARN" --query SecretString --output text)
+            TOKEN=$(echo "$SECRET_JSON" | jq -r '.token // empty')
+            HOST=$(echo "${GIT_BASE_URL:-https://github.com}" | sed 's#https://##; s#/api/v3##')
+            rm -rf /tmp/agent
+            git clone --depth 1 "https://x-access-token:${TOKEN}@${HOST}/${GIT_INFRA_ORG}/${GIT_AGENT_REPO}.git" /tmp/agent || { echo "ERROR: could not clone the agent repo $GIT_INFRA_ORG/$GIT_AGENT_REPO"; _st failed; _dep failed; exit 1; }
+            # PIN THE REVISION THIS BUILD WAS ASKED TO DEPLOY (E30 final review, C1). The clone above
+            # lands on the agent repo's DEFAULT-BRANCH HEAD, while `$IMAGE_TAG` — the commit sha — is
+            # what names the scratch secret, the DEPLOYMENT_ID, the `_tag` write-back and the `_dep`
+            # row. Without this checkout the platform RECORDS one revision and APPLIES another, and
+            # every guard below (harness.yaml exists, the drift guard, the harness_arn guard) tests
+            # PRESENCE rather than IDENTITY, so all of them pass happily on the wrong tree. Three
+            # concrete failures, one root cause: two pushes inside one build duration deploy #2's
+            # harness.yaml under #1's sha (deploy.yml's concurrency group QUEUES rather than
+            # cancels); a rollback to an older sha re-applies the CURRENT config and reports success
+            # against the old tag; and a prod promotion attests to an Owner-approved revision while
+            # shipping HEAD-of-trunk — re-opening for config agents exactly the hole E28B/T4's
+            # `image_digest` closed for containers.
+            # Same idiom as the CodeCommit path above (fetch the sha shallow, then check it out), but
+            # a MISSING commit is a HARD, RECORDED failure here rather than a silent fall-through:
+            # falling back to HEAD when the named commit does not exist IS the defect.
+            git -C /tmp/agent fetch --depth 1 origin "$IMAGE_TAG" \
+              && git -C /tmp/agent checkout --detach FETCH_HEAD \
+              || { echo "ERROR: agent repo has no commit $IMAGE_TAG"; _st failed; _dep failed; exit 1; }
+            HARNESS_CFG=/tmp/agent/harness.yaml
+            [ -f "$HARNESS_CFG" ] || { echo "ERROR: $GIT_AGENT_REPO has no harness.yaml at its root — that file IS the deploy artifact for a config template."; _st failed; _dep failed; exit 1; }
+            REC=$(aws agent-registry-control get-registry-record --registry-id "$AGENT_REGISTRY_ID" --record-id "$AGENT_ID" --output json)
+            AGENT_NAME=$(echo "$REC" | jq -r '.name')
+            [ -z "$AGENT_NAME" ] || [ "$AGENT_NAME" = "null" ] && { echo "ERROR: no registry record for agent $AGENT_ID"; _st failed; _dep failed; exit 1; }
+            # E30A/T1: the Entra wiring for the harness's inbound authorizer, read exactly as the
+            # runtime branch reads it (E32 `descriptors.custom.data` leaf). ENV is also the envelope
+            # the ARN write-back below patches.
+            ENV=$(echo "$REC" | jq -r '.descriptors.custom.data')
+            APP_AUD=$(echo "$ENV" | jq -r '.entra_app_audience // ""')
+            APP_ID=$(echo "$ENV" | jq -r '.entra_app_id // ""')
+            TF_DIR=$(find /tmp/workspace -name "*.tf" -printf '%h\n' | sort -u | head -1)
+            [ -z "$TF_DIR" ] && { echo "ERROR: no TF in workspace"; _st failed; _dep failed; exit 1; }
+            cd "$TF_DIR"
+            grep -rq 'backend "s3"' *.tf 2>/dev/null || printf 'terraform {\n  backend "s3" {}\n}\n' > backend_override.tf
+            cat > deploy.auto.tfvars <<TFVARS
+        agent_id="$AGENT_ID"
+        agent_name="$AGENT_NAME"
+        stage="$STAGE"
+        region="$AWS_TARGET_REGION"
+        harness_config_path="$HARNESS_CFG"
+        deploy_role_arn="$TARGET_ROLE_ARN"
+        tenant_id="$ENTRA_TENANT_ID"
+        entra_app_audience="$APP_AUD"
+        entra_app_id="$APP_ID"
+        TFVARS
+            # E40/T10 (C10): governed gateway tools get TOKEN_EXCHANGE outbound auth. GATEWAY_TOOL_AUTH
+            # is backend-built JSON ({gateway_arn: scope}), so it goes into a .auto.tfvars.json via
+            # `jq --arg` (data, never shell- or HCL-interpolated), and a malformed map is a RECORDED
+            # refusal rather than a harness whose tools silently fall back to the service default.
+            # Unset/empty values write {} and "", which the module renders exactly as before.
+            # The map is tenant-wide (every governed gateway), so it is narrowed to the ARNs THIS
+            # harness.yaml names (E40 I-2): an unrelated gateway never reaches the tfvars or the
+            # drift guard below. `--arg cfg "$(cat ...)"`, not `--rawfile` (jq 1.6+ only).
+            jq -n --arg m "${GATEWAY_TOOL_AUTH:-}" --arg obo "${OBO_PROVIDER_ARN:-}" --arg cfg "$(cat "$HARNESS_CFG" 2>/dev/null)" '{gateway_tool_auth: (if $m == "" then {} else ($m | fromjson) end), obo_provider_arn: $obo} | if (.gateway_tool_auth | type) == "object" and all(.gateway_tool_auth[]; type == "string") then .gateway_tool_auth |= with_entries(select(.key as $k | $cfg | contains($k))) else error("not an object of strings") end' > tool_auth.auto.tfvars.json || { echo "ERROR: GATEWAY_TOOL_AUTH is not a JSON object of gateway ARN -> scope strings. This is a backend bug (runtime_build_service builds it)."; _st failed; _dep failed; exit 1; }
+            # DRIFT GUARD, the agentcore_harness twin of the runtime branch's (E28A/T1b, E30/T9).
+            # THE MODULE IN THE AGP REPO IS NOT THE MODULE THAT RUNS: this branch applies whatever
+            # .tf the cloned per-org `agp-harness-infra` repo contains, and the S3 module zip is
+            # consumed only by a create-once rollout — so every terraform edit here is INERT until
+            # the module is rolled out to the org. Without this guard that is SILENT, because
+            # terraform treats a tfvar with no matching `variable` block as a mere WARNING and
+            # DISCARDS it: against a stale module `harness_config_path` would be dropped and the
+            # apply would fail on an unreadable config, or worse succeed having ignored it.
+            # `harness_config_path` is the right sentinel: it is unconditional (passed on every
+            # config build) and it is the one variable no earlier module version can have had, since
+            # the harness module is what introduced it. Anchored to a real `variable` BLOCK HEADER —
+            # a bare grep would be satisfied by a comment mentioning the word.
+            # Runs BEFORE `terraform init` and AFTER the shared helpers, so the failure is RECORDED.
+            if ! grep -qE '^[[:space:]]*variable[[:space:]]+"harness_config_path"' *.tf 2>/dev/null; then echo "ERROR: STALE HARNESS MODULE — the cloned $GIT_INFRA_ORG/$GIT_INFRA_REPO declares no 'harness_config_path' variable, so the agent's harness.yaml would be silently ignored. Roll the harness module out to the org (terraform apply, then the template rollout with overwrite=true) and retry."; _st failed; _dep failed; exit 1; fi
+            # E30A/T1: a pre-30A module declares `harness_config_path` but not `tenant_id`, so the
+            # three Entra tfvars would be DISCARDED and the harness deployed with NO authorizer —
+            # then written back `provisioned`. `tenant_id` is the 30A sentinel.
+            if ! grep -qE '^[[:space:]]*variable[[:space:]]+"tenant_id"' *.tf 2>/dev/null; then echo "ERROR: STALE HARNESS MODULE — the cloned $GIT_INFRA_ORG/$GIT_INFRA_REPO declares no 'tenant_id' variable, so the harness would deploy WITHOUT its inbound Entra authorizer (E30A) and AGP could not invoke it. Re-run the template rollout so agp-harness-infra carries the 30A module (terraform apply, then the rollout with overwrite=true) and retry."; _st failed; _dep failed; exit 1; fi
+            # E40/T10: a pre-E40 module DISCARDS both tool-auth tfvars, so governed tools would deploy
+            # with no outbound auth and fail at invoke. Only refused when there is something to lose
+            # (a provider AND a non-empty map — already narrowed to this harness's own tools);
+            # otherwise a stale module still builds as today.
+            if [ -n "${OBO_PROVIDER_ARN:-}" ] && [ "$(jq '.gateway_tool_auth | length' tool_auth.auto.tfvars.json 2>/dev/null)" != "0" ] && ! grep -qE '^[[:space:]]*variable[[:space:]]+"gateway_tool_auth"' *.tf 2>/dev/null; then echo "ERROR: STALE HARNESS MODULE — the cloned $GIT_INFRA_ORG/$GIT_INFRA_REPO declares no 'gateway_tool_auth' variable, so governed gateway tools would deploy WITHOUT token-exchange auth (E40). Re-run the template rollout so agp-harness-infra carries the E40 module (terraform apply, then the rollout with overwrite=true) and retry."; _st failed; _dep failed; exit 1; fi
+            # STAGE-SCOPED state key, mirroring the runtime's (E28/T2, D5) and byte-identical to the
+            # module's own documented `local.state_key`. Without the $STAGE segment every stage
+            # shares one state file and one harness, so a prod apply mutates the dev harness.
+            terraform init -input=false -backend-config="bucket=$STATE_BUCKET" -backend-config="key=agentcore-harness/$AGENT_ID/$STAGE/terraform.tfstate" -backend-config="region=$AWS_TARGET_REGION" -backend-config="dynamodb_table=$LOCK_TABLE" || { echo "ERROR: harness terraform init failed"; _st failed; _dep failed; exit 1; }
+            # Guarded explicitly: this buildspec has no `set -e`, so an unguarded apply would let
+            # the build go GREEN having deployed nothing.
+            terraform plan -input=false -out=tfplan && terraform apply -input=false -auto-approve tfplan || { echo "ERROR: harness terraform apply failed"; HN_FAIL=1; }
+            if [ "${HN_FAIL:-0}" = "1" ]; then _st failed; _dep failed; exit 1; fi
+            HARNESS_ARN=$(terraform output -raw harness_arn 2>/dev/null || true)
+            # E30A/T1 (C2): the harness ARN is written back EXACTLY as the runtime branch writes its
+            # runtime ARN — `.agent_arns[$STAGE]`, `.agent_arn`, `identity_status="provisioned"`, same
+            # `update-registry-record` call. No new field: the ARN's `:harness/` resource type is the
+            # discriminator the backend uses. Same three recorded-failure guards, for the same reason
+            # (no `set -e`; `data` is a FULL REPLACE, so an empty envelope would ERASE the record).
+            if [ -z "$HARNESS_ARN" ]; then echo "ERROR: terraform produced no harness_arn — a harness may be LIVE and UNTRACKED (nothing recorded it). Reconcile by hand, then retry."; _st failed; _dep failed; exit 1; fi
+            NEW_ENV=$(echo "$ENV" | jq -c --arg arn "$HARNESS_ARN" --arg s "$STAGE" '.agent_arns[$s]=$arn | .agent_arn=$arn | .identity_status="provisioned"') || NEW_ENV=""
+            if ! echo "$NEW_ENV" | jq -e . > /dev/null 2>&1; then echo "ERROR: could not build the registry envelope for $HARNESS_ARN — NOT writing, because an empty data blob would ERASE the agent record. The harness is LIVE but UNTRACKED; reconcile by hand."; _st failed; _dep failed; exit 1; fi
+            # E43 H3: ANY UpdateRegistryRecord resets an APPROVED record to DRAFT and silently delists
+            # its marketplace card, so a rebuild that changes nothing must not write. Skip only when
+            # the jq-patched envelope equals the current one (all of agent_arns[stage], agent_arn and
+            # identity_status already hold these values) — `agent_arn` alone is "last stage deployed".
+            if [ "$(echo "$ENV" | jq -S -c .)" = "$(echo "$NEW_ENV" | jq -S -c .)" ]; then
+              echo "registry record unchanged — skipping write (keeps approval status)"
+            else
+              _reg_status
+              aws agent-registry-control update-registry-record --registry-id "$AGENT_REGISTRY_ID" --record-id "$AGENT_ID" --descriptors "{\"optionalValue\":{\"custom\":{\"optionalValue\":{\"data\":{\"optionalValue\":$(echo "$NEW_ENV" | jq -Rs .)}}}}}" || { echo "ERROR: harness $HARNESS_ARN is LIVE but its ARN was NOT recorded (update-registry-record failed) — it is UNTRACKED. Retry the build; reconcile by hand if it persists."; _st failed; _dep failed; exit 1; }
+              _reapprove_after "$NEW_ENV"
+            fi
+            # The SUCCESS write-back, same trio and same order as the runtime branch's. `_tag` writes
+            # only the stage's image tag (the digest halves no-op here — a config build has no
+            # IMAGE_DIGEST), and `_dep succeeded` is the terminal row that makes this tag a legal
+            # rollback target and lets a promote stamp `serving`. Without it `_has_succeeded` is
+            # permanently False for every config agent, which fails CLOSED and silently.
+            _tag; _st deployed; _dep succeeded
+            terraform output -json > /tmp/tf_outputs.json 2>/dev/null || echo '{}' > /tmp/tf_outputs.json
+            python3 /tmp/merge_outputs.py /tmp/tf_outputs.json
+            ;;
+          agentcore_gateway)
+            # E40/T6 — an MCP-SERVER repo's config build (contract C6). The harness arm's twin MINUS
+            # the registry: the deploy artifact is `gateway.yaml` + the OpenAPI spec it names, both
+            # in the MCP repo, applied by the gateway module cloned from the infra repo.
+            # NO REGISTRY READ OR WRITE, deliberately. The Entra wiring arrives in the env (the
+            # backend minted the MCP's app at materialize), and the gateway's ARN/id/url go onto the
+            # REPO row — the backend's reconcile adopts them into the MCP record. A build-side
+            # `update-registry-record` would reset an APPROVED record to DRAFT and delist its
+            # marketplace card (E43 H3), and the MCP envelope sits in server.json `_meta`, which jq
+            # cannot patch safely.
+            # NO AGENT_ID on this path: the repo row is keyed by the env REPO_SK (shared lookup
+            # above), and `_dep` writes `mcp_server_id` instead of `agent_id`.
+            # Every failure below RECORDS before exiting (`_st failed; _dep failed`), as in harness.
+            [ -z "$MCP_SERVER_ID" ] && { echo "ERROR: MCP_SERVER_ID is empty — the gateway build env must send it (it keys the Terraform state)."; _st failed; _dep failed; exit 1; }
+            [ -z "$MCP_NAME" ] && { echo "ERROR: MCP_NAME is empty — the gateway module names the gateway and its role from it."; _st failed; _dep failed; exit 1; }
+            if [ -z "$GIT_AGENT_REPO" ]; then echo "ERROR: GIT_AGENT_REPO is empty — a gateway build must clone the MCP repo that holds gateway.yaml. This is a backend bug (runtime_build_service resolves it from the owning repository)."; _st failed; _dep failed; exit 1; fi
+            # Without the audience the gateway's inbound authorizer would accept no token, so every
+            # agent call would be refused — fail here, not after a green apply.
+            [ -z "$ENTRA_APP_AUDIENCE" ] && { echo "ERROR: ENTRA_APP_AUDIENCE is empty — the MCP server has no Entra app yet (materialize mints it), so the gateway would refuse every caller."; _st failed; _dep failed; exit 1; }
+            # The repo row IS this path's ARN write-back. With no REPO_SK every `_u` below is a no-op,
+            # so the gateway would come up LIVE and UNTRACKED — refuse before applying anything.
+            # (`_st`/`_dep` no-op too without it, so only the log records this one.)
+            if [ -z "$REPO_SK" ] || [ "$REPO_SK" = "None" ]; then echo "ERROR: REPO_SK is empty — the gateway build env must send the repo id, which is where the gateway ARN is written back."; _st failed; _dep failed; exit 1; fi
+            # Same scratch-secret clone + revision pin as the harness arm (E22/T6b, E30 C1): one
+            # credential idiom for PAT and App, and the tree applied is the sha this build names.
+            SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$GIT_SECRET_ARN" --query SecretString --output text)
+            TOKEN=$(echo "$SECRET_JSON" | jq -r '.token // empty')
+            HOST=$(echo "${GIT_BASE_URL:-https://github.com}" | sed 's#https://##; s#/api/v3##')
+            rm -rf /tmp/agent
+            git clone --depth 1 "https://x-access-token:${TOKEN}@${HOST}/${GIT_INFRA_ORG}/${GIT_AGENT_REPO}.git" /tmp/agent || { echo "ERROR: could not clone the MCP repo $GIT_INFRA_ORG/$GIT_AGENT_REPO"; _st failed; _dep failed; exit 1; }
+            git -C /tmp/agent fetch --depth 1 origin "$IMAGE_TAG" \
+              && git -C /tmp/agent checkout --detach FETCH_HEAD \
+              || { echo "ERROR: MCP repo has no commit $IMAGE_TAG"; _st failed; _dep failed; exit 1; }
+            GW_CFG=/tmp/agent/gateway.yaml
+            [ -f "$GW_CFG" ] || { echo "ERROR: $GIT_AGENT_REPO has no gateway.yaml at its root — that file IS the deploy artifact for an MCP server."; _st failed; _dep failed; exit 1; }
+            # CONTAINMENT BY RESOLVED PATH, not by spelling: a repo can commit `gateway.yaml` or the
+            # spec as a SYMLINK, e.g. to `.git/config`, which holds the clone token in its remote URL —
+            # and the module inlines the spec into a gateway target anyone with tool access can read.
+            # `realpath -e` resolves every link (and fails on a dangling one); the result must sit
+            # under /tmp/agent/ and NOT under /tmp/agent/.git/. Prints the resolved path on success.
+            _in_clone() { R=$(realpath -e "$1" 2>/dev/null) && [ "${R#/tmp/agent/}" != "$R" ] && [ "${R#/tmp/agent/.git/}" = "$R" ] && echo "$R"; }
+            GW_CFG=$(_in_clone "$GW_CFG") || { echo "ERROR: gateway.yaml in $GIT_AGENT_REPO resolves outside the repo (or into .git/) — refusing to read it."; _st failed; _dep failed; exit 1; }
+            # The OpenAPI spec path comes from gateway.yaml's top-level `openapi_spec`, relative to
+            # the repo root. Read with grep/sed: the image has no yq and PyYAML is not guaranteed,
+            # and C5 pins a flat `key: value` line. Quotes and a trailing comment are stripped.
+            # An absolute or `..` path is refused: the module inlines the file into the gateway
+            # target, so it must not be able to name a file on the build host.
+            SPEC_REL=$(grep -E '^openapi_spec:' "$GW_CFG" | head -1 | sed -E 's/^openapi_spec:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//' | tr -d "\"'")
+            # An `if`, not a nested `case`: a nested case terminator would end this arm for every reader.
+            if [ -z "$SPEC_REL" ] || [ "${SPEC_REL#/}" != "$SPEC_REL" ] || echo "$SPEC_REL" | grep -q '[.][.]'; then echo "ERROR: gateway.yaml openapi_spec must be a path inside the repo (got '$SPEC_REL')."; _st failed; _dep failed; exit 1; fi
+            SPEC_PATH="/tmp/agent/$SPEC_REL"
+            [ -f "$SPEC_PATH" ] || { echo "ERROR: $GIT_AGENT_REPO has no $SPEC_REL — gateway.yaml openapi_spec names a file that does not exist."; _st failed; _dep failed; exit 1; }
+            SPEC_PATH=$(_in_clone "$SPEC_PATH") || { echo "ERROR: gateway.yaml openapi_spec '$SPEC_REL' resolves outside the repo (or into .git/) — refusing to inline it into the gateway."; _st failed; _dep failed; exit 1; }
+            TF_DIR=$(find /tmp/workspace -name "*.tf" -printf '%h\n' | sort -u | head -1)
+            [ -z "$TF_DIR" ] && { echo "ERROR: no TF in workspace"; _st failed; _dep failed; exit 1; }
+            cd "$TF_DIR"
+            grep -rq 'backend "s3"' *.tf 2>/dev/null || printf 'terraform {\n  backend "s3" {}\n}\n' > backend_override.tf
+            # tenant_id is the ENTRA tenant (the authorizer's discovery URL), the same project-level
+            # var the harness arm passes — not the env TENANT_ID, which is AGP's tenant record id.
+            cat > deploy.auto.tfvars <<TFVARS
+        mcp_server_id="$MCP_SERVER_ID"
+        mcp_name="$MCP_NAME"
+        stage="$STAGE"
+        region="$AWS_TARGET_REGION"
+        deploy_role_arn="$TARGET_ROLE_ARN"
+        tenant_id="$ENTRA_TENANT_ID"
+        entra_app_audience="$ENTRA_APP_AUDIENCE"
+        entra_app_id="$ENTRA_APP_ID"
+        gateway_config_path="$GW_CFG"
+        openapi_spec_path="$SPEC_PATH"
+        TFVARS
+            # DRIFT GUARD, the harness arm's twin: the module that runs is the cloned infra repo's,
+            # and terraform DISCARDS a tfvar with no `variable` block (a WARNING only). Against the
+            # wrong or a stale module gateway.yaml would be silently ignored. `gateway_config_path`
+            # is the sentinel — no other module declares it. Anchored to a real block header.
+            if ! grep -qE '^[[:space:]]*variable[[:space:]]+"gateway_config_path"' *.tf 2>/dev/null; then echo "ERROR: STALE GATEWAY MODULE — the cloned $GIT_INFRA_ORG/$GIT_INFRA_REPO declares no 'gateway_config_path' variable, so gateway.yaml would be silently ignored. Roll the gateway module out to the org (terraform apply, then the template rollout with overwrite=true) and retry."; _st failed; _dep failed; exit 1; fi
+            # STAGE-SCOPED state key under the MCP id, same shape as the runtime/harness keys.
+            terraform init -input=false -backend-config="bucket=$STATE_BUCKET" -backend-config="key=agentcore-gateway/$MCP_SERVER_ID/$STAGE/terraform.tfstate" -backend-config="region=$AWS_TARGET_REGION" -backend-config="dynamodb_table=$LOCK_TABLE" || { echo "ERROR: gateway terraform init failed"; _st failed; _dep failed; exit 1; }
+            # Guarded explicitly: no `set -e` in this file.
+            terraform plan -input=false -out=tfplan && terraform apply -input=false -auto-approve tfplan || { echo "ERROR: gateway terraform apply failed"; GW_FAIL=1; }
+            if [ "${GW_FAIL:-0}" = "1" ]; then _st failed; _dep failed; exit 1; fi
+            GW_ARN=$(terraform output -raw gateway_arn 2>/dev/null || true)
+            GW_ID=$(terraform output -raw gateway_id 2>/dev/null || true)
+            GW_URL=$(terraform output -raw gateway_url 2>/dev/null || true)
+            if [ -z "$GW_ARN" ] || [ -z "$GW_ID" ] || [ -z "$GW_URL" ]; then echo "ERROR: terraform produced no gateway_arn/gateway_id/gateway_url — a gateway may be LIVE and UNTRACKED (nothing recorded it). Reconcile by hand, then retry."; _st failed; _dep failed; exit 1; fi
+            # The write-back (C6): ONE update-item SETting all three on the repo row, and a HARD,
+            # recorded failure — NOT `_u`. This row is the ONLY record of the gateway (the backend's
+            # reconcile adopts it into the MCP record from here), exactly as the registry write is the
+            # harness arm's, so a best-effort write would leave a LIVE, UNTRACKED gateway behind a
+            # green build. One item write so a partial failure cannot leave an arn with no url.
+            # A rebuild writes identical values, so a retry is safe.
+            aws dynamodb update-item --table-name "$PROJECTS_TABLE_NAME" --key "{\"pk\":{\"S\":\"repository\"},\"sk\":{\"S\":\"$REPO_SK\"}}" --update-expression "SET gateway_arn = :a, gateway_id = :i, gateway_url = :u" --expression-attribute-values "{\":a\":{\"S\":\"$GW_ARN\"},\":i\":{\"S\":\"$GW_ID\"},\":u\":{\"S\":\"$GW_URL\"}}" > /dev/null || { echo "ERROR: gateway $GW_ARN is LIVE but was NOT recorded on repo $REPO_SK (update-item failed) — it is UNTRACKED. Retry the build; reconcile by hand if it persists."; _st failed; _dep failed; exit 1; }
             _tag; _st deployed; _dep succeeded
             terraform output -json > /tmp/tf_outputs.json 2>/dev/null || echo '{}' > /tmp/tf_outputs.json
             python3 /tmp/merge_outputs.py /tmp/tf_outputs.json

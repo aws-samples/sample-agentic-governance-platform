@@ -1,20 +1,4 @@
-// Experiments — the frictionless multi-tenant experimentation surface (Epic 18,
-// Task 6). Maria's #1 unmet want: spin up an isolated sandbox AWS account and
-// collaborate with no CLI and no waiting. "New experiment" instantly provisions a
-// sandbox — an animated stage checklist driven by the pure provisioning stage
-// machine — then surfaces a ready card with a "Promote to use-case →" link into
-// the Studio.
-//
-// All pure logic (the stage machine + deterministic account ids) is provisioning.ts;
-// the seed data + shared store are Task 3; the page frame + emerald-on-glass tokens
-// are Task 1. This file is only the React composition + the staged provisioning
-// interaction on top of those.
-//
-// House style: emerald-on-glass Ops tokens (opsUi.ts), inline-SVG glyphs (no icon
-// lib), Tailwind v4 utility strings, 2-space indent — matching the other Ops pages.
-
 import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react';
-import { Link } from 'react-router-dom';
 
 import { ComingSoonBanner } from '../shared/comingSoon';
 import OpsPage from './OpsPage';
@@ -23,16 +7,10 @@ import { TENANTS, type Tenant } from './demoData';
 import { useDemoStore } from './demoStore';
 import { experimentStages, advance, isComplete, mockAccountId, type ProvStage } from './provisioning';
 
-// ───────────────────────────── constants ─────────────────────────────
-
-// Reuse the exact business-unit + region strings the seed tenants use, so the
-// form selects reconcile with the rest of the demo world (no invented values).
 const BUSINESS_UNITS = Array.from(new Set(TENANTS.map((t) => t.businessUnit)));
 const REGIONS = Array.from(new Set(TENANTS.map((t) => t.region)));
 
-const STAGE_INTERVAL_MS = 600; // gap between provisioning beats
-
-// ───────────────────────────── inline glyphs (no icon lib) ─────────────────────────────
+const STAGE_INTERVAL_MS = 600;
 
 function CheckGlyph({ className }: { className?: string }) {
   return (
@@ -59,9 +37,6 @@ function Spinner(): JSX.Element {
   );
 }
 
-// ───────────────────────────── helpers ─────────────────────────────
-
-/** Up-to-2-letter initials for a collaborator avatar. */
 function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return '?';
@@ -69,7 +44,6 @@ function initials(name: string): string {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
-/** Parse the comma/newline-separated collaborator field into trimmed names. */
 function parseCollaborators(raw: string): string[] {
   return raw
     .split(/[,\n]/)
@@ -77,28 +51,19 @@ function parseCollaborators(raw: string): string[] {
     .filter(Boolean);
 }
 
-// ───────────────────────────── the page ─────────────────────────────
-
 export default function Experiments(): JSX.Element {
   const { state, dispatch } = useDemoStore();
 
-  // Collaborators are demo-only metadata (not on the Tenant), so we track them in
-  // a local map keyed by account so the cards can render avatars.
   const [collaboratorsByAccount, setCollaboratorsByAccount] = useState<Record<string, string[]>>({});
 
-  // --- new-experiment form ------------------------------------------------
   const [formOpen, setFormOpen] = useState(false);
   const [name, setName] = useState('');
   const [businessUnit, setBusinessUnit] = useState(BUSINESS_UNITS[0]);
   const [region, setRegion] = useState(REGIONS[0]);
   const [collaboratorsRaw, setCollaboratorsRaw] = useState('');
 
-  // --- provisioning animation ---------------------------------------------
-  // `pending` is the tenant being provisioned; `stages` is its live checklist.
-  // Both are null/empty when no provisioning is in flight.
   const [pending, setPending] = useState<Tenant | null>(null);
   const [stages, setStages] = useState<ProvStage[]>([]);
-  // The just-finished experiment, surfaced as a ready card with the Promote link.
   const [readyTenant, setReadyTenant] = useState<Tenant | null>(null);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -108,24 +73,7 @@ export default function Experiments(): JSX.Element {
       intervalRef.current = null;
     }
   };
-  // Cancel any in-flight interval on unmount.
   useEffect(() => clearTimer, []);
-
-  // Completion side-effects live here (NOT in the setStages updater) so they fire
-  // exactly once. React StrictMode double-invokes state updaters in dev; running
-  // dispatch(ADD_EXPERIMENT) inside the updater would append the tenant twice.
-  // `pending` is the source of truth for the in-flight tenant and doubles as a
-  // run-once guard: when the stages finish we commit `pending`, then clear it, so
-  // this effect's body runs a single time per provisioning run.
-  useEffect(() => {
-    if (!pending || stages.length === 0 || !isComplete(stages)) return;
-    clearTimer();
-    dispatch({ type: 'ADD_EXPERIMENT', tenant: pending });
-    setReadyTenant(pending);
-    setPending(null);
-    setStages([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stages, pending]);
 
   const resetForm = () => {
     setName('');
@@ -138,8 +86,6 @@ export default function Experiments(): JSX.Element {
     e.preventDefault();
     if (!name.trim() || pending) return;
 
-    // Deterministic account id seeded from the current experiment count so a
-    // fresh run of the demo always yields the same sequence (no Math.random).
     const seed = state.experiments.length + 1;
     const account = mockAccountId(seed);
     const collaborators = parseCollaborators(collaboratorsRaw);
@@ -153,25 +99,27 @@ export default function Experiments(): JSX.Element {
       status: 'active',
     };
 
+    let current = experimentStages();
     setCollaboratorsByAccount((prev) => ({ ...prev, [account]: collaborators }));
     setReadyTenant(null);
     setPending(tenant);
-    setStages(experimentStages());
+    setStages(current);
     setFormOpen(false);
     resetForm();
 
-    // Drive the checklist forward one beat at a time. The updater is PURE — it
-    // only advances the stages. The completion side-effects (commit the tenant +
-    // reveal the ready card + stop the timer) live in the StrictMode-safe effect
-    // above, which watches `stages`/`pending` and fires exactly once.
     clearTimer();
     intervalRef.current = setInterval(() => {
-      setStages((prev) => advance(prev));
+      current = advance(current);
+      setStages(current);
+      if (!isComplete(current)) return;
+      clearTimer();
+      dispatch({ type: 'ADD_EXPERIMENT', tenant });
+      setReadyTenant(tenant);
+      setPending(null);
+      setStages([]);
     }, STAGE_INTERVAL_MS);
   };
 
-  // Don't double-render the pending tenant — it joins `state.experiments` only on
-  // completion, so the seed grid is just the committed experiments.
   const experiments = state.experiments;
   const newExperimentDisabled = pending !== null;
 
@@ -194,7 +142,6 @@ export default function Experiments(): JSX.Element {
     >
       <ComingSoonBanner />
 
-      {/* ── New-experiment form ─────────────────────────────────────────── */}
       {formOpen && (
         <form onSubmit={onSubmit} className={`${OPS_CARD} p-5 mb-6`}>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -267,7 +214,6 @@ export default function Experiments(): JSX.Element {
         </form>
       )}
 
-      {/* ── Provisioning checklist (in flight) ──────────────────────────── */}
       {pending && (
         <div className={`${OPS_CARD} p-5 mb-6`}>
           <div className="flex items-center justify-between gap-4 mb-4">
@@ -293,7 +239,6 @@ export default function Experiments(): JSX.Element {
         </div>
       )}
 
-      {/* ── Ready card (just finished) ──────────────────────────────────── */}
       {readyTenant && (
         <div className={`${OPS_CARD} p-5 mb-6 border-emerald-300 ring-1 ring-emerald-200/60`}>
           <div className="flex items-start justify-between gap-4">
@@ -308,17 +253,10 @@ export default function Experiments(): JSX.Element {
                 </p>
               </div>
             </div>
-            <Link
-              to="/ops/studio"
-              className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-300 bg-white text-emerald-700 text-sm font-medium hover:bg-emerald-50 transition-colors"
-            >
-              Promote to use-case →
-            </Link>
           </div>
         </div>
       )}
 
-      {/* ── Experiments grid ────────────────────────────────────────────── */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {experiments.map((t) => (
           <ExperimentCard key={t.id} tenant={t} collaborators={collaboratorsByAccount[t.account] ?? []} />
@@ -327,8 +265,6 @@ export default function Experiments(): JSX.Element {
     </OpsPage>
   );
 }
-
-// ───────────────────────────── sub-components ─────────────────────────────
 
 function Field({ label, htmlFor, children }: { label: string; htmlFor: string; children: ReactNode }): JSX.Element {
   return (

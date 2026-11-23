@@ -1,7 +1,7 @@
-"""Unit tests for the Agent models + lifecycle/status mapping (Epic 4, Task 1).
+"""Unit tests for the Agent models + lifecycle/status mapping.
 
-Spec: the Epic 4 agent-registry plan (Task 1) and the AWS Agent Registry research notes
-      (§4 envelope, §5 status mapping) — design artifacts kept outside this repository.
+Spec: the AWS Agent Registry research notes on the envelope and the status mapping, kept
+outside this repository.
 
 These are pure-python tests: no boto3, no FastAPI, no AWS.
 """
@@ -17,9 +17,9 @@ from models.agent import (
     STATUS_TO_LIFECYCLE,
     TRANSITION_TO_STATUS,
     Agent,
+    AgentAuthType,
     AgentCreate,
     AgentUpdate,
-    AuthType,
     DataClassification,
     IdentityStatus,
     LifecycleState,
@@ -30,8 +30,6 @@ from models.agent import (
     lifecycle_for_status,
 )
 
-
-# The full native registry status enum (research §5). The mapping must be total over this set.
 NATIVE_STATUSES = [
     "DRAFT",
     "PENDING_APPROVAL",
@@ -45,10 +43,6 @@ NATIVE_STATUSES = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Mapping
-# ---------------------------------------------------------------------------
-
 def test_status_to_lifecycle_is_total_over_native_statuses():
     """Every native registry status maps to a LifecycleState (mapping is total)."""
     for status in NATIVE_STATUSES:
@@ -57,13 +51,12 @@ def test_status_to_lifecycle_is_total_over_native_statuses():
 
 
 def test_status_to_lifecycle_specific_mappings():
-    """The terminal/approval statuses map per research §5."""
+    """The terminal/approval statuses map ."""
     assert STATUS_TO_LIFECYCLE["DRAFT"] == LifecycleState.PROPOSED
     assert STATUS_TO_LIFECYCLE["PENDING_APPROVAL"] == LifecycleState.PENDING_APPROVAL
     assert STATUS_TO_LIFECYCLE["APPROVED"] == LifecycleState.APPROVED
     assert STATUS_TO_LIFECYCLE["REJECTED"] == LifecycleState.REJECTED
     assert STATUS_TO_LIFECYCLE["DEPRECATED"] == LifecycleState.DEPRECATED
-    # transient sync states
     assert STATUS_TO_LIFECYCLE["CREATING"] == LifecycleState.PROPOSED
     assert STATUS_TO_LIFECYCLE["UPDATING"] == LifecycleState.APPROVED
     assert STATUS_TO_LIFECYCLE["CREATE_FAILED"] == LifecycleState.PROPOSED
@@ -77,10 +70,6 @@ def test_transition_to_status_mapping():
         "deprecate": "DEPRECATED",
     }
 
-
-# ---------------------------------------------------------------------------
-# to_envelope
-# ---------------------------------------------------------------------------
 
 def _make_agent() -> Agent:
     return Agent(
@@ -97,7 +86,7 @@ def _make_agent() -> Agent:
         mcp_server_ids=["mcp-7f3a"],
         origin=Origin.REGISTERED,
         endpoint_url="https://agents.example.com/claims-triage-de",
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         agent_arn="arn:aws:bedrock-agentcore:eu-central-1:123456789012:runtime/claims-triage-de",
         lifecycle_state=LifecycleState.APPROVED,
         entra_app_id=None,
@@ -122,7 +111,6 @@ def test_to_envelope_includes_governance_fields():
     assert env["business_unit"] == "Claims"
     assert env["mcp_server_ids"] == ["mcp-7f3a"]
     assert env["entra_app_id"] is None
-    # enums serialized as their .value (JSON-safe)
     assert env["platform"] == "aws_bedrock"
     assert env["origin"] == "Registered"
     assert env["data_classification"] == "Confidential"
@@ -130,46 +118,36 @@ def test_to_envelope_includes_governance_fields():
 
 def test_to_envelope_enums_are_json_safe_strings():
     env = _make_agent().to_envelope()
-    # round-trips through json without error -> enums are plain strings
     reparsed = json.loads(json.dumps(env))
     assert reparsed["platform"] == "aws_bedrock"
     assert reparsed["origin"] == "Registered"
 
 
-# ---------------------------------------------------------------------------
-# Invocation fields (Epic 4b, Task 1): endpoint_url / auth_type / agent_arn
-# ---------------------------------------------------------------------------
-
 def test_to_envelope_includes_invocation_fields():
     """The envelope carries the new invocation fields, auth_type as its .value."""
     env = _make_agent().to_envelope()
     assert env["endpoint_url"] == "https://agents.example.com/claims-triage-de"
-    assert env["auth_type"] == "entra"  # .value string, JSON-safe
-    assert (
-        env["agent_arn"]
-        == "arn:aws:bedrock-agentcore:eu-central-1:123456789012:runtime/claims-triage-de"
-    )
-    # still JSON-safe end-to-end
+    assert env["auth_type"] == "entra"
+    assert env["agent_arn"] == "arn:aws:bedrock-agentcore:eu-central-1:123456789012:runtime/claims-triage-de"
     reparsed = json.loads(json.dumps(env))
     assert reparsed["auth_type"] == "entra"
 
 
 def test_auth_type_enum_values():
-    """AuthType mirrors the str-Enum style; values are the wire strings."""
-    assert AuthType.NONE.value == "none"
-    assert AuthType.ENTRA.value == "entra"
-    assert AuthType.API_KEY.value == "api_key"
+    """AgentAuthType mirrors the str-Enum style; values are the wire strings."""
+    assert AgentAuthType.NONE.value == "none"
+    assert AgentAuthType.ENTRA.value == "entra"
+    assert AgentAuthType.API_KEY.value == "api_key"
 
 
 def test_from_record_invocation_fields_default_when_missing():
     """Old envelopes predate the invocation keys -> backward-compatible defaults."""
-    # _make_agent envelope minus the invocation keys (simulating a pre-4b record)
     envelope = _make_agent().to_envelope()
     for key in ("endpoint_url", "auth_type", "agent_arn"):
         envelope.pop(key, None)
     agent = Agent.from_record(_fake_record(status="APPROVED"), envelope)
     assert agent.endpoint_url is None
-    assert agent.auth_type == AuthType.NONE
+    assert agent.auth_type == AgentAuthType.NONE
     assert agent.agent_arn is None
 
 
@@ -178,7 +156,7 @@ def test_round_trip_preserves_invocation_fields():
     original = _make_agent()
     rebuilt = Agent.from_record(_fake_record(status="APPROVED"), original.to_envelope())
     assert rebuilt.endpoint_url == original.endpoint_url
-    assert rebuilt.auth_type == AuthType.ENTRA
+    assert rebuilt.auth_type == AgentAuthType.ENTRA
     assert rebuilt.agent_arn == original.agent_arn
 
 
@@ -186,21 +164,17 @@ def test_agent_create_defaults_auth_type_none():
     """AgentCreate inherits the invocation fields; auth_type defaults to NONE."""
     c = AgentCreate(name="fraud-watch-eu", tenant_id="default")
     assert c.endpoint_url is None
-    assert c.auth_type == AuthType.NONE
+    assert c.auth_type == AgentAuthType.NONE
     assert c.agent_arn is None
 
 
 def test_agent_update_accepts_invocation_fields_exclude_none():
     """AgentUpdate accepts the 3 invocation fields; exclude_none keeps only the set ones."""
-    u = AgentUpdate(endpoint_url="https://x/y", auth_type=AuthType.API_KEY)
+    u = AgentUpdate(endpoint_url="https://x/y", auth_type=AgentAuthType.API_KEY)
     dumped = u.model_dump(exclude_none=True)
-    assert dumped == {"endpoint_url": "https://x/y", "auth_type": AuthType.API_KEY}
+    assert dumped == {"endpoint_url": "https://x/y", "auth_type": AgentAuthType.API_KEY}
     assert "agent_arn" not in dumped
 
-
-# ---------------------------------------------------------------------------
-# from_record
-# ---------------------------------------------------------------------------
 
 def _fake_record(status: str = "APPROVED") -> dict:
     return {
@@ -272,12 +246,8 @@ def test_round_trip_preserves_governance_fields():
     assert rebuilt.framework == original.framework
 
 
-# ---------------------------------------------------------------------------
-# Model split / defaults
-# ---------------------------------------------------------------------------
-
 def test_agent_create_minimal_only_name():
-    """AgentCreate requires only name + tenant_id (E24); sponsor optional -> 'Ownerless'."""
+    """AgentCreate requires only name + tenant_id; sponsor optional -> 'Ownerless'."""
     c = AgentCreate(name="fraud-watch-eu", tenant_id="default")
     assert c.name == "fraud-watch-eu"
     assert c.purpose == ""
@@ -298,12 +268,14 @@ def test_agent_id_has_no_default():
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        Agent(
-            name="x",
-            lifecycle_state=LifecycleState.PROPOSED,
-            created_at=datetime(2026, 6, 1),
-            updated_at=datetime(2026, 6, 1),
-        )  # missing required id
+        Agent.model_validate(
+            {
+                "name": "x",
+                "lifecycle_state": LifecycleState.PROPOSED,
+                "created_at": datetime(2026, 6, 1),
+                "updated_at": datetime(2026, 6, 1),
+            }
+        )
 
 
 def test_lifecycle_for_status_maps_known_status():
@@ -332,21 +304,14 @@ def test_from_record_raises_on_unmapped_status():
         )
 
 
-# ---------------------------------------------------------------------------
-# Entra identity fields (Epic 6, Task T-MODEL): entra_sp_id / entra_app_audience /
-# invoker_role_id / admin_role_id / identity_status. Service-written (like
-# entra_app_id) -> on the Agent read model + envelope only, NOT Create/Update.
-# Research §4. Additive + backward-compatible: ENVELOPE_SCHEMA_VERSION stays 1.
-# ---------------------------------------------------------------------------
-
 def _make_agent_with_identity() -> Agent:
-    """An Agent with all 5 E6 identity fields set to distinct sentinel values."""
+    """An Agent with all 5 identity fields set to distinct sentinel values."""
     agent = _make_agent()
     agent.entra_sp_id = "sp-1111"
     agent.entra_app_audience = "api://agp-agent-rec-1"
     agent.invoker_role_id = "role-invoker-2222"
     agent.admin_role_id = "role-admin-3333"
-    agent.identity_status = "provisioned"
+    agent.identity_status = IdentityStatus.PROVISIONED
     return agent
 
 
@@ -358,7 +323,6 @@ def test_to_envelope_includes_identity_fields():
     assert env["invoker_role_id"] == "role-invoker-2222"
     assert env["admin_role_id"] == "role-admin-3333"
     assert env["identity_status"] == "provisioned"
-    # still JSON-safe end-to-end (plain strings)
     reparsed = json.loads(json.dumps(env))
     assert reparsed["entra_sp_id"] == "sp-1111"
     assert reparsed["identity_status"] == "provisioned"
@@ -384,9 +348,9 @@ def test_from_record_reads_identity_fields():
 
 
 def test_from_record_defaults_identity_status_none_when_missing():
-    """A pre-E6 envelope lacks the identity keys -> identity_status defaults to 'none',
+    """An older envelope lacks the identity keys -> identity_status defaults to 'none',
     the other 4 fields default to None (backward-compatible hydration)."""
-    envelope = {"schema_version": 1, "mcp_server_ids": []}  # pre-E6: no identity keys
+    envelope = {"schema_version": 1, "mcp_server_ids": []}
     agent = Agent.from_record(_fake_record(status="APPROVED"), envelope)
     assert agent.identity_status == "none"
     assert agent.entra_sp_id is None
@@ -398,13 +362,11 @@ def test_from_record_defaults_identity_status_none_when_missing():
 def test_from_record_reads_explicit_identity_status():
     """A real non-default identity_status ("failed") survives the read, AND an empty-string
     value collapses to "none" — pins both arms of the `or "none"` fallback deliberately."""
-    # a real non-default value is read through verbatim
     survived = Agent.from_record(
         _fake_record(status="APPROVED"),
         {"schema_version": 1, "mcp_server_ids": [], "identity_status": "failed"},
     )
     assert survived.identity_status == "failed"
-    # an explicit falsy value (empty string) collapses to the "none" default
     collapsed = Agent.from_record(
         _fake_record(status="APPROVED"),
         {"schema_version": 1, "mcp_server_ids": [], "identity_status": ""},
@@ -428,30 +390,20 @@ def test_agent_create_does_not_accept_identity_fields():
     carry them. The models declare no model_config, so pydantic v2's default
     extra='ignore' applies -> an unexpected field is silently dropped (NOT raised, and
     we must NOT add extra='forbid' -- the workspace shares one .env and forbids it)."""
-    assert "entra_sp_id" not in AgentCreate(name="x", tenant_id="default", entra_sp_id="y").model_dump()
+    extra = AgentCreate.model_validate({"name": "x", "tenant_id": "default", "entra_sp_id": "y"})
+    assert "entra_sp_id" not in extra.model_dump()
 
 
 def test_envelope_schema_version_still_1():
-    """T-MODEL is additive + backward-compatible -> the envelope schema version stays 1."""
+    """The identity fields are additive + backward-compatible -> the envelope schema version stays 1."""
     from models.agent import ENVELOPE_SCHEMA_VERSION
 
     assert ENVELOPE_SCHEMA_VERSION == 1
     assert _make_agent_with_identity().to_envelope()["schema_version"] == 1
 
 
-# ---------------------------------------------------------------------------
-# IdentityStatus is a pinned str-Enum (Epic 36/T20, verification item 16)
-#
-# The field used to be a free `str`. It is now `IdentityStatus`, a `str, Enum`, so
-# every existing `== "provisioned"` gate keeps working untouched. Reads stay
-# TOLERANT (coerce-unknown-to-NONE + warn) because the CodeBuild buildspec patches
-# `identity_status="provisioned"` straight into the stored envelope with `jq`
-# (infrastructure/modules/codebuild/buildspec.yml:525) — an external writer.
-# ---------------------------------------------------------------------------
-
 def test_identity_status_enum_values():
-    """The CLOSED four-value union, mirrored verbatim by the frontend's
-    `identity_status` union (`frontend/src/api/client.ts:151`, `:527`)."""
+    """The CLOSED four-value union."""
     assert IdentityStatus.NONE.value == "none"
     assert IdentityStatus.PENDING.value == "pending"
     assert IdentityStatus.PROVISIONED.value == "provisioned"
@@ -466,7 +418,6 @@ def test_identity_status_compares_equal_to_its_wire_string():
     assert IdentityStatus.PROVISIONED == "provisioned"
     assert IdentityStatus.NONE == "none"
     assert IdentityStatus.FAILED == "failed"
-    # and the gates' negative arm still discriminates
     assert IdentityStatus.PENDING != "provisioned"
 
 
@@ -489,13 +440,13 @@ def test_to_envelope_stores_the_plain_value_never_the_enum_repr():
     assert "IdentityStatus" not in json.dumps(env)
 
 
-def test_to_envelope_tolerates_a_service_assigned_raw_string():
+def test_to_envelope_tolerates_a_service_assigned_raw_string(monkeypatch):
     """The 10 provisioning writers assign a MEMBER
     (`services/agent_identity_service.py:282` -> `IdentityStatus.FAILED`), but pydantic
     does NOT validate assignment, so nothing STOPS a future writer from assigning a raw
     string — the serializer must pass one through instead of blowing up on `.value`."""
     agent = _make_agent()
-    agent.identity_status = "failed"
+    monkeypatch.setattr(agent, "identity_status", "failed")
     env = agent.to_envelope()
     assert env["identity_status"] == "failed"
     assert type(env["identity_status"]) is str
@@ -531,10 +482,10 @@ def test_coerce_identity_status_is_total():
     """The helper is total over anything a stored envelope can hold."""
     assert coerce_identity_status("pending") is IdentityStatus.PENDING
     assert coerce_identity_status(IdentityStatus.FAILED) is IdentityStatus.FAILED
-    assert coerce_identity_status(None) is IdentityStatus.NONE      # key absent
-    assert coerce_identity_status("") is IdentityStatus.NONE        # stored empty string
-    assert coerce_identity_status("bogus") is IdentityStatus.NONE   # foreign writer
-    assert coerce_identity_status(17) is IdentityStatus.NONE        # wrong type entirely
+    assert coerce_identity_status(None) is IdentityStatus.NONE
+    assert coerce_identity_status("") is IdentityStatus.NONE
+    assert coerce_identity_status("bogus") is IdentityStatus.NONE
+    assert coerce_identity_status(17) is IdentityStatus.NONE
 
 
 def test_identity_status_round_trip_stays_a_plain_string_in_the_envelope():
@@ -548,18 +499,6 @@ def test_identity_status_round_trip_stays_a_plain_string_in_the_envelope():
     assert type(rebuilt.to_envelope()["identity_status"]) is str
 
 
-# ---------------------------------------------------------------------------
-# Databricks runtime fields (Epic 29/T5, contract C-4): runtime_handle /
-# runtime_kind / binding_mode / databricks_sp_id / databricks_sp_secret_arn /
-# oauth2_app_client_id, plus the `is_databricks_governed` gate.
-#
-# The SEVENTH additive round on this envelope — same rules as the six before it:
-# every new key is written unconditionally by `to_envelope` and read with
-# `envelope.get(...)`, so a pre-E29 envelope hydrates them all as None and
-# ENVELOPE_SCHEMA_VERSION stays 1.
-# ---------------------------------------------------------------------------
-
-# a workspace URL of the shape the plan's Global Constraints pin for test fakes
 _DB_HANDLE = "https://dbc-test.cloud.databricks.com/apps/claims-triage"
 
 
@@ -567,12 +506,11 @@ def _make_databricks_agent(**overrides) -> Agent:
     """A federation-mode Databricks-governed Agent: handle + ENTRA + DATABRICKS."""
     agent = _make_agent()
     agent.platform = Platform.DATABRICKS
-    agent.auth_type = AuthType.ENTRA
+    agent.auth_type = AgentAuthType.ENTRA
     agent.runtime_handle = _DB_HANDLE
     agent.runtime_kind = "app"
     agent.binding_mode = "federation"
     agent.oauth2_app_client_id = "db-oauth-client-1111"
-    # sp_secret-mode fields — set too so the round-trip covers all six keys at once
     agent.databricks_sp_id = "db-sp-app-2222"
     agent.databricks_sp_secret_arn = "arn:aws:secretsmanager:eu-central-1:secret:agp/agent/rec-1-abcdef"
     for key, value in overrides.items():
@@ -595,8 +533,8 @@ def test_is_databricks_governed_falsified_by_missing_runtime_handle():
 def test_is_databricks_governed_falsified_by_non_entra_auth():
     """Leg 2: auth_type must be ENTRA — the gate is an IDENTITY gate, so an api_key
     or unauthenticated agent is never Entra-provisioned."""
-    assert _make_databricks_agent(auth_type=AuthType.API_KEY).is_databricks_governed is False
-    assert _make_databricks_agent(auth_type=AuthType.NONE).is_databricks_governed is False
+    assert _make_databricks_agent(auth_type=AgentAuthType.API_KEY).is_databricks_governed is False
+    assert _make_databricks_agent(auth_type=AgentAuthType.NONE).is_databricks_governed is False
 
 
 def test_is_databricks_governed_falsified_by_non_databricks_platform():
@@ -612,7 +550,7 @@ def test_is_databricks_governed_and_is_agentcore_are_mutually_exclusive():
     This is what makes the route's if/elif dispatch a real dispatch and not a race."""
     db = _make_databricks_agent()
     assert db.is_databricks_governed is True and db.is_agentcore is False
-    ac = _make_agent()  # arn + ENTRA + AWS_BEDROCK
+    ac = _make_agent()
     assert ac.is_agentcore is True and ac.is_databricks_governed is False
 
 
@@ -626,7 +564,7 @@ def test_is_databricks_governed_agent_module_function_delegates():
 
 
 def test_to_envelope_includes_databricks_fields():
-    """All six C-4 keys ride the envelope with their values, JSON-safe (plain strings)."""
+    """All six platform keys ride the envelope with their values, JSON-safe (plain strings)."""
     env = _make_databricks_agent().to_envelope()
     assert env["runtime_handle"] == _DB_HANDLE
     assert env["runtime_kind"] == "app"
@@ -654,10 +592,10 @@ def test_round_trip_preserves_databricks_fields():
 
 
 def test_from_record_tolerates_pre_e29_envelope_without_databricks_fields():
-    """THE ADDITIVE FENCE: a pre-E29 envelope (no C-4 keys at all) hydrates all six as
+    """THE ADDITIVE FENCE: an older envelope (none of the six keys) hydrates all six as
     None and is NOT an error — every stored record in the registry today is that shape.
     The agent is then simply not Databricks-governed."""
-    envelope = {"schema_version": 1, "mcp_server_ids": []}  # pre-E29: no C-4 keys
+    envelope = {"schema_version": 1, "mcp_server_ids": []}
     agent = Agent.from_record(_fake_record(status="APPROVED"), envelope)
     assert agent.runtime_handle is None
     assert agent.runtime_kind is None
@@ -669,7 +607,7 @@ def test_from_record_tolerates_pre_e29_envelope_without_databricks_fields():
 
 
 def test_databricks_fields_do_not_bump_envelope_schema_version():
-    """C-4 is additive -> the envelope version stays 1 (Global Constraints)."""
+    """The six keys are additive -> the envelope version stays 1."""
     from models.agent import ENVELOPE_SCHEMA_VERSION
 
     assert ENVELOPE_SCHEMA_VERSION == 1
@@ -677,7 +615,7 @@ def test_databricks_fields_do_not_bump_envelope_schema_version():
 
 
 def test_agent_create_accepts_databricks_fields():
-    """C-4 puts the six on AgentBase, so AgentCreate carries them: registration is where
+    """The six live on AgentBase, so AgentCreate carries them: registration is where
     the handle/kind/binding_mode arrive (discovery-picked), unlike the service-written
     Entra ids. They default to None on a minimal create."""
     minimal = AgentCreate(name="fraud-watch-eu", tenant_id="default")

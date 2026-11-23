@@ -64,18 +64,8 @@ variable "container_image" {
   type        = string
 }
 
-variable "application_catalog_table_name" {
-  description = "Application Catalog DynamoDB table name"
-  type        = string
-}
-
 variable "application_catalog_table_arn" {
   description = "Application Catalog DynamoDB table ARN"
-  type        = string
-}
-
-variable "deployment_metadata_table_name" {
-  description = "Deployment Metadata DynamoDB table name"
   type        = string
 }
 
@@ -106,11 +96,6 @@ variable "project_ecr_push_role_arn" {
   description = "Shared GitHub-OIDC push-role ARN — stamped onto materialized repos as AWS_ECR_PUSH_ROLE_ARN when their connection has no per-org role. A DETERMINISTIC string from the root: the role is created by the backend on the first GitHub connection, not by Terraform (its trust names the OIDC provider, which IAM validates at role-create time)."
 }
 
-variable "frontend_bucket_name" {
-  description = "Frontend S3 bucket name"
-  type        = string
-}
-
 variable "frontend_bucket_arn" {
   description = "Frontend S3 bucket ARN"
   type        = string
@@ -120,11 +105,6 @@ variable "tags" {
   description = "Common tags"
   type        = map(string)
   default     = {}
-}
-
-variable "app_factory_table_name" {
-  description = "Name of the App Factory DynamoDB table"
-  type        = string
 }
 
 variable "app_factory_table_arn" {
@@ -211,6 +191,54 @@ variable "tenants_table_name" {
 
 variable "tenants_table_arn" {
   description = "Tenants DynamoDB table ARN (E24)"
+  type        = string
+  default     = ""
+}
+
+variable "evals_table_name" {
+  description = "Evals DynamoDB table name (E42); empty ⇒ backend uses in-memory fallback"
+  type        = string
+  default     = ""
+}
+
+variable "evals_table_arn" {
+  description = "Evals DynamoDB table ARN (E42)"
+  type        = string
+  default     = ""
+}
+
+variable "containment_table_name" {
+  description = "Containment DynamoDB table name (E41); empty ⇒ backend uses in-memory fallback"
+  type        = string
+  default     = ""
+}
+
+variable "containment_table_arn" {
+  description = "Containment DynamoDB table ARN (E41)"
+  type        = string
+  default     = ""
+}
+
+variable "audit_table_name" {
+  description = "Append-only audit DynamoDB table name (E41); empty ⇒ backend uses in-memory fallback"
+  type        = string
+  default     = ""
+}
+
+variable "audit_table_arn" {
+  description = "Append-only audit DynamoDB table ARN (E41)"
+  type        = string
+  default     = ""
+}
+
+variable "evals_bucket_name" {
+  description = "Evals S3 bucket name holding eval run records (E42); empty ⇒ backend uses in-memory fallback"
+  type        = string
+  default     = ""
+}
+
+variable "evals_bucket_arn" {
+  description = "Evals S3 bucket ARN (E42)"
   type        = string
   default     = ""
 }
@@ -339,4 +367,10 @@ variable "langfuse_admin_secret_name" {
   description = "Secrets Manager secret name holding the Langfuse seed-org/admin credentials. Set as LANGFUSE_ADMIN_SECRET_NAME on the backend task."
   type        = string
   default     = ""
+}
+
+variable "studio_model_id" {
+  description = "Bedrock cross-region inference profile id Studio's Compose with AI calls. Set as STUDIO_MODEL_ID on the backend task."
+  type        = string
+  default     = "us.anthropic.claude-sonnet-4-6"
 }

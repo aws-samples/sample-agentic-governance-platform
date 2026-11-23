@@ -1,64 +1,51 @@
-"""MCP Entra identity provisioning orchestrator (Epic 7, Task T-IDENTITY).
+"""Entra identity provisioning for AgentCore gateway and runtime MCP servers.
 
-``McpIdentityService`` is the heart of "registering an MCP makes the platform wire it
-up." For a manually-created AgentCore **Gateway** (or **Runtime-MCP**) it runs the same
-shape of background provisioning E6 ran for agents — create the per-MCP Entra app reg +
-SP (roles assignable **to applications**), require assignment — but the load-bearing
-middle step is configuring the resource's OWN inbound ``CUSTOM_JWT`` authorizer to trust
-our Entra tenant (gateway → ``UpdateGateway``; runtime → the E6 ``UpdateAgentRuntime``
-path, verbatim). It also live-scans the tools BEFORE locking the gateway down (so the
-scan needs no token) and persists everything onto the registry record.
+``McpIdentityService.provision`` wires a registered MCP up: it reads the resource (capturing the
+gateway URL verbatim), discovers the gateway's tools, creates the per-MCP Entra app registration
+and service principal, sets the SP's ``appRoleAssignmentRequired`` to ``False``, configures the
+resource's own inbound ``CUSTOM_JWT`` authorizer to trust our tenant, and persists every id onto
+the registry record. There is no consent step here: the agent-to-MCP delegated consent is granted
+at grant time (``services.agent_mcp_grant``).
 
-It is a CLONE of ``agent_identity_service`` in mechanics (persist-immediately after each
-Entra write, off-loop boto3 dispatch, gateway-id/RID-from-ARN, poll-to-READY, the
-failure→``identity_status='failed'``+raise contract) but with THREE deliberate,
-load-bearing structural DEVIATIONS from the agent template (see CRITIC-C2 on ``provision``):
-  (a) there is **NO ``grant_*_obo_consent`` step** — the agent→MCP delegated consent
-      moves to GRANT time (T-ROUTES), so ``provision`` NEVER calls it;
-  (b) a **NEW pre-lockdown tool-scan** precedes app creation (the gateway isn't locked
-      down yet, so the scan needs no token); and therefore
-  (c) create is NOT step 1.
+Provisioning is idempotent and resumable: the Entra app is created only when the record carries
+no ``entra_sp_id``, the Graph writes and the authorizer configuration converge on re-run, and the
+one ``pending`` persist after the Entra step carries the gateway fields, the tools and the five
+Entra ids in a single write. On any failure except the best-effort tool discovery the record is
+persisted ``identity_status='failed'`` and :class:`McpProvisioningError` is raised.
 
-It is **idempotent + resumable** (the "Re-provision" button): step (3) is skipped when
-the MCP already carries an ``entra_sp_id`` (a re-provision), the Graph PATCH +
-authorizer GET→Update are idempotent, and the pre-lockdown scan is skipped once the
-gateway is already ``CUSTOM_JWT``. On ANY failure (except the swallowed best-effort scan)
-it persists ``identity_status='failed'`` and raises :class:`McpProvisioningError`.
-
-Mechanics source: research §1.1 (gateway GetGateway→replay(``name``/``roleArn``/
-``protocolType``/``protocolConfiguration``)→``UpdateGateway``→poll-to-READY;
-gatewayId-from-ARN; the optional-field replay loop), §1.2 (runtime = E6 verbatim),
-§1.3 (``gatewayUrl`` stored verbatim), §1.4 (audience-form — feed BOTH forms),
-§3 design decision (pre-lockdown scan). ``agent_identity_service`` is the template.
+Tool discovery is best-effort and never wipes seeded tools: the native control-plane read
+(``ListGatewayTargets`` -> ``GetGatewayTarget`` -> inline tool schemas) needs no token and works
+on a locked gateway; the token-less wire scan is the fallback for a still-open gateway whose native
+read found nothing. ``available_tools`` is overwritten only on a non-empty result.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import json
 import logging
 import time
+from collections.abc import Awaitable, Mapping
+from typing import Any, ClassVar, Optional
 
 import anyio
 import anyio.to_thread
-import boto3
+import yaml
 
+from core import aws_clients
+from core.errors import AppError, Outcome
 from models.mcp_server import IdentityStatus, Kind, McpServer, McpTool
-from services.graph_service import GraphError, GraphService
+from services.graph_errors import GraphError
+from services.graph_service import GraphService
 from services.mcp_server_service import McpServerRegistryService
 from services.mcp_tool_scanner import McpScanError, scan_mcp_tools
 
 logger = logging.getLogger(__name__)
 
-# Poll-to-READY loop bounds (research §1.1 — UpdateGateway/UpdateAgentRuntime are async;
-# the resource advances UPDATING→READY, ~minute+). Bounded so a stuck/never-READY
-# resource fails loudly instead of hanging the background task forever. Same values as
-# agent_identity_service.
 _POLL_MAX_ATTEMPTS = 60
 _POLL_INTERVAL_SECONDS = 5.0
 
-# Status that means success. A ``*_FAILED`` / ``*_UNSUCCESSFUL`` (or exhausting the loop)
-# is a provisioning failure. Covers BOTH the gateway status enum
-# (``CREATING|UPDATING|UPDATE_UNSUCCESSFUL|DELETING|READY|FAILED``, research §1.1) and the
-# runtime enum (``CREATE_FAILED|UPDATE_FAILED|…``, E6).
 _READY_STATUS = "READY"
 _FAILED_STATUSES = frozenset(
     {
@@ -70,44 +57,195 @@ _FAILED_STATUSES = frozenset(
     }
 )
 
-# Gateway authorizer types that mean "not yet locked down" — the pre-lockdown wire scan
-# needs no token only while the gateway is open (research §3 design decision). Once it is
-# ``CUSTOM_JWT`` the scan would need a bearer, so we skip it (keep existing tools).
 _OPEN_AUTHORIZER_TYPES = frozenset({"NONE", "AWS_IAM"})
 
-# ListGatewayTargets pagination guard (T-NATIVE-TOOLSCAN). The native tool read pages on
-# ``nextToken``; cap the page count so a misbehaving control plane can never spin the
-# background task forever (mirrors the scanner's ``_MAX_PAGES`` stance).
 _MAX_TARGET_PAGES = 20
+
+_OPENAPI_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
+
+_GATEWAY_OPTIONAL_FIELDS = (
+    "protocolType",
+    "protocolConfiguration",
+    "description",
+    "kmsKeyArn",
+    "interceptorConfigurations",
+    "policyEngineConfiguration",
+    "exceptionLevel",
+)
+
+_RUNTIME_OPTIONAL_FIELDS = (
+    "protocolConfiguration",
+    "requestHeaderConfiguration",
+    "environmentVariables",
+    "lifecycleConfiguration",
+    "metadataConfiguration",
+    "filesystemConfigurations",
+    "description",
+)
 
 
 def should_provision_mcp(mcp: McpServer) -> bool:
-    """The provisioning gate: which MCP records get an Entra identity (research §6.4).
-
-    CRITIC-I2: research §6.4's gate is "kind ∈ {gateway, runtime} AND handle AND
-    auth_type=entra". ``McpServer`` has NO ``auth_type`` field (MCP records don't carry
-    one) — so ``kind + handle`` IS the sufficient gate here; the §6.4 ``auth_type`` clause
-    does not apply to MCP records. (Documented divergence, intentional.)
-
-    True only for an AgentCore Gateway carrying a ``gateway_arn`` OR an AgentCore
-    Runtime-MCP carrying a ``runtime_arn``. ``standard`` (external/metadata-only) records
-    and handle-less records are skipped.
-    """
+    """The provisioning gate: an AgentCore gateway carrying a ``gateway_arn`` or an AgentCore
+    runtime MCP carrying a ``runtime_arn``. Standard (external, metadata-only) records and
+    handle-less records are skipped; MCP records carry no ``auth_type``, so kind plus handle is
+    the whole gate."""
     return (mcp.kind == Kind.GATEWAY and bool(mcp.gateway_arn)) or (
         mcp.kind == Kind.RUNTIME and bool(mcp.runtime_arn)
     )
 
 
-class McpProvisioningError(Exception):
-    """A step in the (non-atomic) Entra+AWS MCP provisioning sequence failed.
+class _NoTimestampLoader(yaml.SafeLoader):
+    """``SafeLoader`` without the implicit timestamp resolver: an unquoted ``2026-10-05`` stays
+    the string it is in the spec instead of becoming a ``date`` the record write cannot
+    json-serialise (or a mapping key json cannot encode).
 
-    The MCP's ``identity_status`` is persisted as ``'failed'`` before this is raised, so a
-    later re-provision (idempotent + resumable) can retry.
+    It also refuses YAML aliases: OpenAPI reuses through ``$ref``, never anchors, and a few
+    hundred bytes of nested aliases expand exponentially in the JSON round-trip below (an
+    "alias bomb" that OOM-kills the task). An alias makes the spec unparseable."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("YAML aliases are not supported in OpenAPI specs")
+        return super().compose_node(parent, index)
+
+
+_NoTimestampLoader.yaml_implicit_resolvers = {
+    first: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:timestamp"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
+def _no_base60(construct):
+    """YAML 1.1 base-60 ints/floats (``1:30``) stay strings: OpenAPI never means them, and
+    SafeLoader builds them in quadratic time (one ``*= 60`` per segment of a long scalar)."""
+
+    def _construct(loader, node):
+        value = loader.construct_scalar(node)
+        return value if ":" in value else construct(loader, node)
+
+    return _construct
+
+
+_NoTimestampLoader.add_constructor("tag:yaml.org,2002:int", _no_base60(yaml.SafeLoader.construct_yaml_int))
+_NoTimestampLoader.add_constructor(
+    "tag:yaml.org,2002:float", _no_base60(yaml.SafeLoader.construct_yaml_float)
+)
+
+
+def _parse_openapi(payload: str) -> dict | None:
+    """An inline OpenAPI spec as a dict: JSON first, then YAML. ``None`` when it is neither.
+
+    The YAML result is round-tripped through JSON so anything still non-JSON (``!!binary``,
+    ``!!set``) becomes a string; a structure JSON cannot hold (a self-referencing alias) is
+    unparseable, not a crash."""
+    try:
+        spec = json.loads(payload)
+    except ValueError:
+        try:
+            spec = yaml.load(payload, Loader=_NoTimestampLoader)  # noqa: S506 — a SafeLoader subclass with the timestamp resolver removed; expires 2027-10-23; added E49A-50A/T6
+            spec = json.loads(json.dumps(spec, default=str))
+        except (yaml.YAMLError, TypeError, ValueError):
+            return None
+    return spec if isinstance(spec, dict) else None
+
+
+def _operation_input_schema(path_item: dict, op: dict) -> dict:
+    """The tool input schema of one OpenAPI operation: an object built from the path and operation
+    parameters (operation wins on a name clash) and the ``application/json`` request body, where an
+    object body contributes its properties and any other body becomes a ``body`` property."""
+    params = {
+        p["name"]: p
+        for p in (path_item.get("parameters") or []) + (op.get("parameters") or [])
+        if isinstance(p, dict) and p.get("name")
+    }
+    properties: dict = {}
+    required: list[str] = []
+    for name, p in params.items():
+        prop = dict(p.get("schema") or {})
+        if p.get("description"):
+            prop["description"] = p["description"]
+        properties[name] = prop
+        if p.get("required"):
+            required.append(name)
+    body = (((op.get("requestBody") or {}).get("content") or {}).get("application/json") or {}).get("schema")
+    if isinstance(body, dict):
+        if body.get("type") == "object" and "properties" in body:
+            properties.update(body["properties"])
+            required.extend(body.get("required") or [])
+        else:
+            properties["body"] = body
+            if (op.get("requestBody") or {}).get("required"):
+                required.append("body")
+    input_schema: dict = {"type": "object", "properties": properties}
+    if required:
+        input_schema["required"] = required
+    return input_schema
+
+
+def _openapi_tools(target_name: str, payload: str) -> list[McpTool]:
+    """One :class:`McpTool` per OpenAPI operation that has an ``operationId``: the gateway's
+    invocable name is ``<target>___<operationId>``, so an operation without one has no name and
+    is skipped. ``$ref``s are kept as written (display only; the gateway does the real binding).
+    An unparseable spec yields no tools."""
+    spec = _parse_openapi(payload)
+    if spec is None:
+        logger.warning("[mcp_identity] OpenAPI target %s has an unparseable inline spec", target_name)
+        return []
+    tools: list[McpTool] = []
+    for path_item in (spec.get("paths") or {}).values():
+        if not isinstance(path_item, dict):
+            continue
+        for method in _OPENAPI_METHODS:
+            op = path_item.get(method)
+            if not isinstance(op, dict) or not op.get("operationId"):
+                continue
+            tools.append(
+                McpTool(
+                    name=f"{target_name}___{op['operationId']}",
+                    description=op.get("summary") or op.get("description") or "",
+                    input_schema=_operation_input_schema(path_item, op),
+                )
+            )
+    return tools
+
+
+def _same_tools(a: list[McpTool], b: list[McpTool]) -> bool:
+    """Value equality of two tool lists, order-insensitive (a re-ordered discovery is no change)."""
+
+    def key(tools: list[McpTool]) -> list[str]:
+        return sorted(json.dumps(t.model_dump(), sort_keys=True) for t in tools)
+
+    return key(a) == key(b)
+
+
+async def _await(awaitable: Awaitable[Any]) -> Any:
+    return await awaitable
+
+
+def _run(result):
+    """Drive a GraphService coroutine from sync code: a fresh loop when awaitable, a plain value
+    passes through."""
+    if inspect.isawaitable(result):
+        return asyncio.run(_await(result))
+    return result
+
+
+class McpProvisioningError(AppError):
+    """A step of the non-atomic Entra and AWS MCP provisioning sequence failed.
+
+    The record's ``identity_status`` is persisted ``'failed'`` before this is raised, so a later
+    re-provision can resume. The detail is fixed; the message names the MCP and the step for the
+    log and never carries a Graph body or an AWS message.
     """
+
+    domain: ClassVar[str] = "mcp_identity"
+    kinds: ClassVar[Mapping[str, Outcome]] = {
+        "provisioning_failed": Outcome(502, "MCP identity provisioning failed")
+    }
 
 
 class McpIdentityService:
-    """Orchestrates Entra identity provisioning for an AgentCore Gateway / Runtime-MCP."""
+    """Orchestrates Entra identity provisioning for an AgentCore gateway or runtime MCP."""
 
     def __init__(
         self,
@@ -115,7 +253,7 @@ class McpIdentityService:
         graph: GraphService,
         registry: McpServerRegistryService,
         control_client=None,
-        region: str = "us-east-1",
+        region: str | None = None,
         tenant_id: str,
         login_base: str,
     ) -> None:
@@ -124,342 +262,265 @@ class McpIdentityService:
         self._region = region
         self._tenant_id = tenant_id
         self._login_base = login_base.rstrip("/")
-        # boto3 ``bedrock-agentcore-control`` client. Injectable for tests (a MagicMock);
-        # built by default (no live AWS in unit tests, which always inject). Control-plane
-        # signing name is ``bedrock-agentcore-control``. (Same as agent_identity_service.)
-        self._control = control_client or boto3.client(
-            "bedrock-agentcore-control", region_name=region
-        )
-
-    # -- public ------------------------------------------------------------
+        self._control = control_client or aws_clients.client("bedrock-agentcore-control", region=region)
 
     async def provision(self, mcp: McpServer) -> McpServer:
-        """Idempotent, resumable provisioning. CANONICAL ORDER (NOT the agent clone's
-        order — see CRITIC-C2 in the module docstring).
+        """Idempotent, resumable provisioning (see the module docstring for the sequence).
 
-        (1) derive gateway_id (from gateway_arn) / runtime id (from runtime_arn);
-            GetGateway / GetAgentRuntime; capture gateway_url VERBATIM (gateway path)
-            → set mcp.gateway_url + mcp.gateway_id; persist (still 'pending').
-        (2) Tool discovery (best-effort, CRITIC-I1): gateway only; runtime → skip.
-            PRIMARY: native control-plane read — ListGatewayTargets → GetGatewayTarget
-            → inlinePayload (token-less; works on a locked CUSTOM_JWT gateway). FALLBACK:
-            token-less wire-scan (scan_mcp_tools(gateway_url, bearer=None)) ONLY when the
-            native read found nothing AND the authorizer is still NONE/AWS_IAM. Any
-            read/scan error is swallowed (never strand identity as 'failed'); overwrite
-            available_tools ONLY on a NON-EMPTY result (never wipe E5 seeds).
-        (3) if NOT mcp.entra_sp_id: create_mcp_app → set ALL FIVE ids (CRITIC-I4) →
-            persist IMMEDIATELY (status stays 'pending') [E6 CRITIQUE-FIX-A]. Re-provision
-            (entra_sp_id already set) → skip create.
-        (4) set_assignment_required(mcp.entra_sp_id, required=False) — EXPLICIT False:
-            the delegated/OBO user is gated by the agent→MCP consent grant, NOT by an MCP
-            app-role assignment (which Entra enforces against the USER → AADSTS50105). See
-            research §2.4/§2.5 + the inline comment at the call site.
-        (5) configure the inbound authorizer OFF-LOOP (anyio.to_thread.run_sync — never
-            block the uvicorn loop): GATEWAY → _configure_gateway_authorizer ; RUNTIME →
-            _configure_runtime_authorizer.
-        (6) persist identity_status='provisioned'.
-
-        On ANY failure (except the swallowed step-2 scan): persist
-        identity_status='failed' + raise McpProvisioningError. Steps individually
-        idempotent → re-provision resumes cleanly.
+        The sync boto3 steps run off the event loop through ``anyio.to_thread.run_sync`` because
+        this runs as a background task on the uvicorn loop and the authorizer configuration polls
+        for minutes. On any failure except tool discovery: ``identity_status='failed'`` is persisted
+        and :class:`McpProvisioningError` is raised from the cause.
         """
         try:
-            logger.info(
-                "[mcp_identity] provisioning MCP %s (kind=%s)", mcp.id, mcp.kind
-            )
-            # (1) Read the resource + capture its identifiers. For a gateway, the
-            # gatewayUrl is stored VERBATIM (research §1.3 — never hand-construct it) and
-            # the short gatewayId is parsed from the arn (research §1.1). The current
-            # authorizerType decides whether the pre-lockdown scan can run token-less.
-            current_authorizer_type: str | None = None
-            if mcp.kind == Kind.GATEWAY:
-                gateway_id = self._gateway_id_from_arn(mcp.gateway_arn)
-                mcp.gateway_id = gateway_id
-                gw = self._control.get_gateway(gatewayIdentifier=gateway_id)
-                # gatewayUrl VERBATIM from the API (research §1.3).
-                if gw.get("gatewayUrl"):
-                    mcp.gateway_url = gw["gatewayUrl"]
-                current_authorizer_type = gw.get("authorizerType")
-                # The authorizer type is a key DECISION input — it explains whether the
-                # token-less wire-scan fallback is even eligible (it isn't once CUSTOM_JWT).
-                logger.info(
-                    "[mcp_identity] MCP %s gateway_id=%s authorizer=%s",
-                    mcp.id,
-                    gateway_id,
-                    current_authorizer_type,
-                )
-            else:
-                # Runtime-MCP: read it so a stuck/failed read surfaces early + parity with
-                # the gateway path; nothing to capture (no gatewayUrl analogue).
-                runtime_id = mcp.runtime_arn.rsplit("/", 1)[-1]
-                self._control.get_agent_runtime(agentRuntimeId=runtime_id)
-            # Capture what we learned (gateway_url / gateway_id) IN MEMORY only — still
-            # 'pending'. The earliest write is intentionally dropped (T-PERSIST-RETRY):
-            # the route already stamps 'pending' + persists before scheduling provision,
-            # so a write here is redundant (and an extra UPDATING-state race surface). The
-            # single persist after step (3) carries gateway_url/gateway_id + the entra ids
-            # in ONE write. (Re-provision: that persist runs in both branches — see below.)
+            logger.info("[mcp_identity] provisioning MCP %s (kind=%s)", mcp.id, mcp.kind)
+            handle, current_authorizer_type = self._read_resource(mcp)
             mcp.identity_status = IdentityStatus.PENDING
-
-            # (2) Tool discovery (best-effort, CRITIC-I1). For a GATEWAY the PRIMARY path
-            # is the NATIVE control-plane read (ListGatewayTargets → GetGatewayTarget):
-            # it needs NO token and works on a locked CUSTOM_JWT gateway (the now-common
-            # case — gateways are born CUSTOM_JWT, T-AUTHZ-AT-CREATE, so the wire-scan is
-            # never eligible). The pre-lockdown wire-scan (research §3) stays ONLY as a
-            # fallback for the rare still-open gateway whose native read found nothing.
-            # A flaky read/scan must NOT strand identity as 'failed', and a transient
-            # empty/error result must NOT wipe E5-seeded tools — so we overwrite
-            # available_tools ONLY on a successful NON-EMPTY result. runtime → skip.
-            if mcp.kind == Kind.GATEWAY and mcp.gateway_id:
-                tools: list[McpTool] = []
-                # Track WHICH discovery path produced the tools so the outcome line can
-                # answer "why are there N tools" without a code dig (T-OBSERVABILITY).
-                source = "none"
-                # NATIVE read first — SYNC boto3 control calls, dispatched OFF the loop
-                # (like the authorizer config) so the uvicorn loop never blocks.
-                try:
-                    tools = await anyio.to_thread.run_sync(
-                        self._read_gateway_tools_native, mcp.gateway_id
-                    )
-                    if tools:
-                        source = "native"
-                except Exception as native_err:  # noqa: BLE001 — best-effort (CRITIC-I1)
-                    logger.warning(
-                        "[mcp_identity] native tool read failed for MCP %s (continuing): %s",
-                        mcp.id,
-                        native_err,
-                    )
-                # Fallback: only if the native read found nothing AND the gateway is still
-                # open (so a token-less wire-scan is still possible — research §3).
-                if (
-                    not tools
-                    and mcp.gateway_url
-                    and (current_authorizer_type in _OPEN_AUTHORIZER_TYPES)
-                ):
-                    try:
-                        tools = await scan_mcp_tools(mcp.gateway_url, bearer=None)
-                        if tools:
-                            source = "wire-scan"
-                    except McpScanError as scan_err:
-                        # Tolerant marker: log + continue. Do NOT fail provisioning, do
-                        # NOT wipe seeded tools (CRITIC-I1).
-                        logger.warning(
-                            "[mcp_identity] pre-lockdown wire-scan failed for MCP %s "
-                            "(continuing, seeded tools kept): %s",
-                            mcp.id,
-                            scan_err,
-                        )
-                # CRITIC-I1: overwrite ONLY on a non-empty result; never wipe E5-seeded
-                # tools on an empty/error discovery.
-                if tools:
-                    mcp.available_tools = tools
-                # ONE outcome line — makes "why are there 0 tools" answerable from logs.
-                # source ∈ {native, wire-scan, none}; count is what discovery returned
-                # this pass (the seeded tools are kept on a 0/error result, see above).
-                logger.info(
-                    "[mcp_identity] MCP %s tool discovery: %d tools via %s",
-                    mcp.id,
-                    len(tools),
-                    source,
-                )
-            elif mcp.kind != Kind.GATEWAY:
-                # Runtime-MCP: tool discovery is gateway-only — say so explicitly so a
-                # "0 tools on a runtime" is a logged DECISION, not a silent gap.
-                logger.info(
-                    "[mcp_identity] MCP %s tool discovery skipped (kind=%s, gateway-only)",
-                    mcp.id,
-                    mcp.kind,
-                )
-
-            # (3) Create the per-MCP Entra app reg + SP — UNLESS the MCP already carries an
-            # entra_sp_id (a re-provision: skip create). CRITIC-I4: set ALL FIVE ids.
-            if not mcp.entra_sp_id:
-                created = await self._graph.create_mcp_app(mcp.id, mcp.name)
-                mcp.entra_app_id = created["app_id"]
-                mcp.entra_sp_id = created["sp_id"]
-                # AUDIENCE-FORM (research §1.4): set entra_app_audience to the app URI
-                # form; the authorizer step feeds BOTH this and the client GUID
-                # (entra_app_id) to allowedAudience so whichever form the real token
-                # carries validates.
-                mcp.entra_app_audience = created["app_uri"]
-                mcp.invoker_role_id = created["invoker_role_id"]
-                mcp.admin_role_id = created["admin_role_id"]
-                # FIX (mirror E6): guard the get-or-create branch — _resolve_existing_app
-                # can return sp_id=None (app exists from a prior partial run, SP not yet
-                # created). Persisting entra_sp_id=None then calling set_assignment_required
-                # on a /servicePrincipals/None path would malform, and the falsy
-                # entra_sp_id would make the next re-provision re-enter create_mcp_app →
-                # 409 on the duplicate identifierUri. The APP ids we DID get are set above
-                # so the duplicate-resolve works next time; raise here to route through the
-                # failure path WITHOUT advancing to steps 4-5.
-                if not mcp.entra_sp_id:
-                    raise McpProvisioningError(
-                        f"create_mcp_app returned no sp_id for MCP {mcp.id}"
-                    )
-            # ONE persist after the Entra-app block — runs in BOTH branches (freshly
-            # created OR re-provision). This is the SINGLE 'pending' write of the sequence
-            # (the redundant step-1 write was dropped, T-PERSIST-RETRY): it carries
-            # gateway_url/gateway_id + available_tools + the five Entra ids in one write.
-            # E6 CRITIQUE-FIX-A preserved: a freshly-created app reg is persisted
-            # IMMEDIATELY, before steps 4-5. The sequence is non-atomic — if a later step
-            # fails and we hadn't persisted first, the failure-persist would write
-            # entra_sp_id=None, the re-provision skip-guard would re-create the app, and
-            # the duplicate identifierUri would 409 forever. On re-provision it persists
-            # the gateway_url/gateway_id learned this pass even though create was skipped.
-            self._registry.persist_identity(mcp)
-            # CRITIC-C2 (a): there is intentionally NO grant_*_obo_consent step here — the
-            # agent→MCP delegated consent fires at GRANT time (T-ROUTES), not provision.
-
-            # (4) Set the MCP SP's appRoleAssignmentRequired to FALSE — EXPLICITLY
-            # (research §2.4/§2.5). In the agent→MCP DELEGATED/OBO flow Entra enforces the
-            # resource app's assignment-required against the USER, not the calling agent SP;
-            # our locked design NEVER assigns users to MCP servers (the user is granted the
-            # AGENT, the AGENT is granted the MCP via a consent grant), so a True flag here
-            # would block the delegated user with AADSTS50105 by design (live-confirmed). The
-            # OBO admission gate that REMAINS is the per-agent agent→MCP oauth2PermissionGrant
-            # (grant_agent_obo_consent, fired at grant time); revoke it → OBO fails AADSTS65001.
-            # This deliberately drops the agent-SP app-role *assignment* as an admission gate —
-            # it is only consulted in an app-only/M2M token, a path we do NOT use (OBO works).
-            # EXPLICIT False (not "skip the call") so a re-provision of an MCP whose SP is
-            # currently True (e.g. flipped manually, or any prior-true record) converges to
-            # False — idempotent + self-healing.
-            await self._graph.set_assignment_required(mcp.entra_sp_id, required=False)
-
-            # (5) Configure the resource's inbound CUSTOM_JWT authorizer. SYNC blocking
-            # boto3 with a ~minute+ poll-to-READY; provision() runs on the single uvicorn
-            # event loop (via BackgroundTasks), so dispatch it OFF the loop
-            # (CRITIQUE-FIX-B) to avoid freezing health checks. Branch on kind.
+            await self._discover_tools(mcp, current_authorizer_type)
+            sp_id = await self._ensure_entra_app(mcp)
+            await anyio.to_thread.run_sync(self._registry.persist_identity, mcp)
+            await self._graph.set_assignment_required(sp_id, required=False)
             if mcp.kind == Kind.GATEWAY:
-                await anyio.to_thread.run_sync(
-                    self._configure_gateway_authorizer, mcp.gateway_id, mcp
-                )
+                await anyio.to_thread.run_sync(self._configure_gateway_authorizer, handle, mcp)
             else:
-                await anyio.to_thread.run_sync(
-                    self._configure_runtime_authorizer, mcp.runtime_arn, mcp
-                )
-            logger.info(
-                "[mcp_identity] MCP %s inbound CUSTOM_JWT authorizer configured", mcp.id
-            )
-
-            # (6) Done.
+                await anyio.to_thread.run_sync(self._configure_runtime_authorizer, handle, mcp)
+            logger.info("[mcp_identity] MCP %s inbound CUSTOM_JWT authorizer configured", mcp.id)
             mcp.identity_status = IdentityStatus.PROVISIONED
-            self._registry.persist_identity(mcp)
+            await anyio.to_thread.run_sync(self._registry.persist_identity, mcp)
             logger.info("[mcp_identity] MCP %s provisioned", mcp.id)
             return mcp
-
-        except Exception as err:  # noqa: BLE001 — any failure → failed status + re-raise
-            mcp.identity_status = IdentityStatus.FAILED
-            try:
-                self._registry.persist_identity(mcp)
-            except Exception:  # noqa: BLE001 — don't mask the original failure
-                logger.exception(
-                    "[mcp_identity] failed to persist 'failed' status for MCP %s",
-                    mcp.id,
-                )
-            # Surface the failure (mirror E6 CRITIQUE-FIX-E) WITHOUT leaking secrets.
-            # A GraphError's str() carries status + Graph error code + (for
-            # RESOURCE-endpoint errors) a safe message — none of which contain a token or
-            # the client secret — so a plain WARNING with its str() is safe. For ANY OTHER
-            # (unexpected) error we log the FULL TRACEBACK via logger.exception so the next
-            # silent failure is diagnosable from logs instead of a code dig (T-OBSERVABILITY).
-            # Python tracebacks print the stack, NOT local-variable values, and this flow
-            # holds no secret locals (agent_credential_service is out of scope here), so the
-            # traceback is safe to emit.
+        except Exception as err:
+            await self._persist_failed(mcp)
             if isinstance(err, GraphError):
-                logger.warning(
-                    "[mcp_identity] provisioning failed for MCP %s: %s", mcp.id, err
-                )
+                logger.warning("[mcp_identity] provisioning failed for MCP %s: %s", mcp.id, err)
             else:
-                logger.exception(
-                    "[mcp_identity] provisioning failed for MCP %s (unexpected error)",
+                logger.exception("[mcp_identity] provisioning failed for MCP %s (unexpected error)", mcp.id)
+            raise McpProvisioningError(f"provisioning failed for MCP {mcp.id}") from err
+
+    def _read_resource(self, mcp: McpServer) -> tuple[str, Optional[str]]:
+        """Read the resource and capture its identifiers in memory.
+
+        For a gateway: the short gateway id is parsed from the ARN (control calls take the id, not
+        the ARN), the ``gatewayUrl`` is stored verbatim, and the current ``authorizerType`` is
+        returned because it decides whether the token-less wire scan is still possible. For a
+        runtime: the read only surfaces a missing or failed resource early. Returns the handle the
+        authorizer step needs (gateway id or runtime ARN) and the authorizer type.
+        """
+        if mcp.kind == Kind.GATEWAY:
+            gateway_arn = mcp.gateway_arn
+            if not gateway_arn:
+                raise McpProvisioningError(f"MCP {mcp.id} is a gateway without a gateway_arn")
+            gateway_id = self._gateway_id_from_arn(gateway_arn)
+            mcp.gateway_id = gateway_id
+            gw = self._control.get_gateway(gatewayIdentifier=gateway_id)
+            if gw.get("gatewayUrl"):
+                mcp.gateway_url = gw["gatewayUrl"]
+            current_authorizer_type = gw.get("authorizerType")
+            logger.info(
+                "[mcp_identity] MCP %s gateway_id=%s authorizer=%s",
+                mcp.id,
+                gateway_id,
+                current_authorizer_type,
+            )
+            return gateway_id, current_authorizer_type
+        runtime_arn = mcp.runtime_arn
+        if not runtime_arn:
+            raise McpProvisioningError(f"MCP {mcp.id} is a runtime without a runtime_arn")
+        self._control.get_agent_runtime(agentRuntimeId=runtime_arn.rsplit("/", 1)[-1])
+        return runtime_arn, None
+
+    async def _discover_tools(self, mcp: McpServer, current_authorizer_type: Optional[str]) -> None:
+        """Best-effort tool discovery for a gateway; a runtime has no tools to discover.
+
+        The native read runs first and off the loop; the token-less wire scan runs only when it
+        found nothing and the gateway is still open. A failed read or scan is logged and never
+        fails provisioning; ``available_tools`` is overwritten only on a non-empty result, so an
+        empty or failed discovery keeps the seeded tools. One outcome line names the source.
+        """
+        if mcp.kind != Kind.GATEWAY:
+            logger.info(
+                "[mcp_identity] MCP %s tool discovery skipped (kind=%s, gateway-only)", mcp.id, mcp.kind
+            )
+            return
+        if not mcp.gateway_id:
+            return
+        tools: list[McpTool] = []
+        source = "none"
+        try:
+            tools = await anyio.to_thread.run_sync(self._read_gateway_tools_native, mcp.gateway_id)
+            if tools:
+                source = "native"
+        except Exception:
+            logger.warning(
+                "[mcp_identity] native tool read failed for MCP %s (continuing)", mcp.id, exc_info=True
+            )
+        if not tools and mcp.gateway_url and current_authorizer_type in _OPEN_AUTHORIZER_TYPES:
+            try:
+                tools = await scan_mcp_tools(mcp.gateway_url, bearer=None)
+                if tools:
+                    source = "wire-scan"
+            except McpScanError as scan_err:
+                logger.warning(
+                    "[mcp_identity] pre-lockdown wire-scan failed for MCP %s "
+                    "(continuing, seeded tools kept): %s",
                     mcp.id,
+                    scan_err,
                 )
-            raise McpProvisioningError(
-                f"provisioning failed for MCP {mcp.id}"
-            ) from err
+        if tools:
+            mcp.available_tools = tools
+        logger.info("[mcp_identity] MCP %s tool discovery: %d tools via %s", mcp.id, len(tools), source)
+
+    async def _ensure_entra_app(self, mcp: McpServer) -> str:
+        """Create the per-MCP Entra app registration and SP unless the record already carries an
+        ``entra_sp_id`` (a re-provision), setting all five ids.
+
+        ``entra_app_audience`` is the app URI form; the authorizer step feeds both it and the client
+        GUID to ``allowedAudience`` so whichever form a token carries validates. A get-or-create
+        that found the app but no SP raises before any later step: the app ids set here make the
+        next re-provision resolve the duplicate instead of re-creating the identifier URI.
+        """
+        if mcp.entra_sp_id:
+            return mcp.entra_sp_id
+        created = await self._graph.create_mcp_app(mcp.id, mcp.name)
+        mcp.entra_app_id = created["app_id"]
+        mcp.entra_sp_id = created["sp_id"]
+        mcp.entra_app_audience = created["app_uri"]
+        mcp.invoker_role_id = created["invoker_role_id"]
+        mcp.admin_role_id = created["admin_role_id"]
+        if not mcp.entra_sp_id:
+            raise McpProvisioningError(f"create_mcp_app returned no sp_id for MCP {mcp.id}")
+        return mcp.entra_sp_id
+
+    async def _persist_failed(self, mcp: McpServer) -> None:
+        mcp.identity_status = IdentityStatus.FAILED
+        try:
+            await anyio.to_thread.run_sync(self._registry.persist_identity, mcp)
+        except Exception:
+            logger.exception("[mcp_identity] failed to persist 'failed' status for MCP %s", mcp.id)
+
+    def mint_app(self, mcp: McpServer) -> McpServer:
+        """Create the MCP's Entra app and SP and persist once; no gateway call.
+
+        A repository-built gateway does not exist at materialize time, but Terraform needs the
+        app's audience and id to create it born ``CUSTOM_JWT``, so the app is minted first and the
+        build creates the gateway around it. Sync like the materialize step that calls it; the
+        Graph coroutines run on a fresh loop. Idempotent: returns ``mcp`` unchanged when
+        ``entra_sp_id`` is set. ``identity_status`` becomes ``pending``.
+        """
+        if mcp.entra_sp_id:
+            return mcp
+        try:
+            created = _run(self._graph.create_mcp_app(mcp.id, mcp.name))
+            mcp.entra_app_id = created["app_id"]
+            mcp.entra_sp_id = created["sp_id"]
+            mcp.entra_app_audience = created["app_uri"]
+            mcp.invoker_role_id = created["invoker_role_id"]
+            mcp.admin_role_id = created["admin_role_id"]
+            if not mcp.entra_sp_id:
+                raise McpProvisioningError(f"create_mcp_app returned no sp_id for MCP {mcp.id}")
+            mcp.identity_status = IdentityStatus.PENDING
+            self._registry.persist_identity(mcp)
+            _run(self._graph.set_assignment_required(mcp.entra_sp_id, required=False))
+        except McpProvisioningError:
+            raise
+        except Exception as err:
+            raise McpProvisioningError(f"minting the Entra app failed for MCP {mcp.id}") from err
+        logger.info("[mcp_identity] MCP %s Entra app minted (no gateway yet)", mcp.id)
+        return mcp
+
+    def adopt_built_gateway(
+        self, mcp: McpServer, *, gateway_arn: str, gateway_id: str, gateway_url: str
+    ) -> McpServer:
+        """Record a Terraform-built gateway on the MCP record.
+
+        ``GetGateway`` as the existence check, native tool discovery (OpenAPI included), then one
+        persist with the gateway fields, the tools and ``identity_status=PROVISIONED``, or no write
+        at all when every one of those already matches: every repository read reconciles through
+        here and a registry write resets ``APPROVED`` to ``DRAFT``. Never calls ``UpdateGateway``
+        (Terraform owns the authorizer). Discovery is best-effort and keeps the existing tools on
+        an empty or failed read. Raises :class:`McpProvisioningError` when the gateway cannot be
+        read.
+        """
+        try:
+            self._control.get_gateway(gatewayIdentifier=gateway_id)
+        except Exception as err:
+            raise McpProvisioningError(f"gateway {gateway_id} for MCP {mcp.id} could not be read") from err
+        tools: list[McpTool] = []
+        try:
+            tools = self._read_gateway_tools_native(gateway_id)
+        except Exception:
+            logger.warning(
+                "[mcp_identity] native tool read failed adopting MCP %s (keeping tools)",
+                mcp.id,
+                exc_info=True,
+            )
+        tools = tools or mcp.available_tools
+        if (
+            mcp.gateway_arn == gateway_arn
+            and mcp.gateway_id == gateway_id
+            and mcp.gateway_url == gateway_url
+            and mcp.identity_status == IdentityStatus.PROVISIONED
+            and _same_tools(tools, mcp.available_tools)
+        ):
+            return mcp
+        mcp.gateway_arn = gateway_arn
+        mcp.gateway_id = gateway_id
+        mcp.gateway_url = gateway_url
+        mcp.available_tools = tools
+        mcp.identity_status = IdentityStatus.PROVISIONED
+        self._registry.persist_identity(mcp)
+        logger.info(
+            "[mcp_identity] MCP %s adopted built gateway %s (%d tools)", mcp.id, gateway_id, len(tools)
+        )
+        return mcp
 
     async def refresh_tools(self, mcp: McpServer) -> McpServer:
-        """Re-read the gateway's tools natively + persist — WITHOUT touching identity/authorizer.
+        """Re-read a gateway's tools natively and persist them, without touching identity.
 
-        The fast, SYNCHRONOUS twin of the step-2 tool discovery inside :meth:`provision`,
-        for the FE "refresh tools" button: read the tools natively (``ListGatewayTargets`` →
-        ``GetGatewayTarget`` → inline lambda toolSchema, token-less, works on a locked
-        CUSTOM_JWT gateway) + persist + return the fresh record immediately. It does NOT
-        re-provision: ``identity_status``, the inbound authorizer, and every ``entra_*``
-        field are left untouched.
-
-        Gateway-only (the native read is gateway target-based). Derives the gatewayId
-        (prefer ``mcp.gateway_id``; fall back to ``_gateway_id_from_arn(mcp.gateway_arn)``);
-        if neither handle is present (not a gateway / no handle) it returns the mcp
-        unchanged — the route already guards this, but be defensive.
-
-        Off-loops the sync boto3 read (``anyio.to_thread.run_sync``), like ``provision`` does.
-        Best-effort + overwrite-only-on-non-empty (CRITIC-I1): a read error is logged + the
-        mcp is returned UNCHANGED (never raise — a flaky read must not 500 the refresh
-        button), and ``available_tools`` is overwritten + persisted ONLY on a non-empty
-        result (never wipe existing tools on an empty/error read, and avoid a needless
-        write / UPDATING-race when nothing changed).
+        Derives the gateway id from ``mcp.gateway_id`` or ``mcp.gateway_arn``; with neither the
+        record is returned unchanged. A read failure is logged and the record returned unchanged
+        (a flaky read must not fail the refresh button); ``available_tools`` is overwritten and
+        persisted only on a non-empty result that differs from the stored list, because every
+        registry write resets an ``APPROVED`` record to ``DRAFT``.
         """
         gateway_id = mcp.gateway_id or (
             self._gateway_id_from_arn(mcp.gateway_arn) if mcp.gateway_arn else None
         )
         if not gateway_id:
-            # Not a gateway / no handle to read — nothing to refresh (route guards this too).
             return mcp
 
         tools: list[McpTool] = []
         try:
-            # SYNC boto3 control calls dispatched OFF the loop (like provision's native read).
-            tools = await anyio.to_thread.run_sync(
-                self._read_gateway_tools_native, gateway_id
-            )
-        except Exception as err:  # noqa: BLE001 — best-effort (CRITIC-I1): never 500/raise
+            tools = await anyio.to_thread.run_sync(self._read_gateway_tools_native, gateway_id)
+        except Exception:
             logger.warning(
-                "[mcp_identity] refresh tool read failed for MCP %s (returning unchanged): %s",
+                "[mcp_identity] refresh tool read failed for MCP %s (returning unchanged)",
                 mcp.id,
-                err,
+                exc_info=True,
             )
             return mcp
 
-        # Overwrite-only-on-non-empty (CRITIC-I1): never wipe existing tools on an empty
-        # read; persist ONLY when something actually came back (avoid a needless write).
-        if tools:
+        if tools and not _same_tools(tools, mcp.available_tools):
             mcp.available_tools = tools
-            self._registry.persist_identity(mcp)
-        # Outcome line — makes "the refresh button returned 0 tools" answerable from logs.
-        logger.info(
-            "[mcp_identity] refresh_tools MCP %s: %d tools", mcp.id, len(tools)
-        )
+            await anyio.to_thread.run_sync(self._registry.persist_identity, mcp)
+        logger.info("[mcp_identity] refresh_tools MCP %s: %d tools", mcp.id, len(tools))
         return mcp
-
-    # -- helpers -----------------------------------------------------------
 
     @staticmethod
     def _gateway_id_from_arn(gateway_arn: str) -> str:
-        """Parse the short gatewayId from a gatewayArn (research §1.1 — control calls take
-        the gatewayId, NOT the ARN; the "RID-not-ARN" lesson repeats). ARN tail is
-        ``.../gateway/{gatewayId}``."""
+        """The short gatewayId from a gatewayArn, whose tail is ``.../gateway/{gatewayId}``."""
         return gateway_arn.rsplit("/", 1)[-1]
 
     def _read_gateway_tools_native(self, gateway_id: str) -> list[McpTool]:
-        """Read a gateway's tools from the control plane (no token; works on a locked
-        CUSTOM_JWT gateway — T-NATIVE-TOOLSCAN / research §5.3).
+        """Read a gateway's tools from the control plane; no token, works on a locked gateway.
 
-        ``ListGatewayTargets`` → ``GetGatewayTarget`` → for each LAMBDA target with an
-        inline ``toolSchema``, map ``inlinePayload`` → :class:`McpTool` whose name is the
-        INVOCABLE ``<targetName>___<toolName>`` (triple underscore, stored verbatim).
-        Targets that are not natively-readable (``openApiSchema`` / ``smithyModel`` /
-        ``mcpServer`` / ``apiGateway``, or a lambda using an s3 ``toolSchema`` instead of
-        ``inlinePayload``) are SKIPPED — they need the wire scan / a token (logged at
-        debug). ``ListGatewayTargets`` is paginated on ``nextToken`` (bounded by
-        ``_MAX_TARGET_PAGES``). Best-effort: a boto error reading ONE target is logged +
-        skipped, not fatal, so one bad target doesn't lose the rest. Returns the
-        aggregated tool list (possibly empty). SYNC boto3 — dispatched off-loop by the
-        caller (``anyio.to_thread.run_sync``), like the authorizer config.
+        ``ListGatewayTargets`` (paginated, bounded by ``_MAX_TARGET_PAGES``) then
+        ``GetGatewayTarget`` per target; see :meth:`_target_tools` for which targets contribute.
+        Best-effort per target: one bad target is skipped, not fatal. Sync boto3, dispatched off
+        the loop by the caller. The summary line counts targets seen and skipped so "the gateway
+        has tools but we read none" is answerable from the log.
         """
         tools: list[McpTool] = []
-        # Counters for the single end-of-read summary line (T-OBSERVABILITY) — makes
-        # "the gateway has tools but we read 0" diagnosable (target seen but skipped).
         n_targets = 0
         n_skipped = 0
         next_token: str | None = None
@@ -473,56 +534,16 @@ class McpIdentityService:
                 if not target_id:
                     continue
                 n_targets += 1
-                try:
-                    gt = self._control.get_gateway_target(
-                        gatewayIdentifier=gateway_id, targetId=target_id
-                    )
-                except Exception as err:  # noqa: BLE001 — best-effort per-target
+                target_tools = self._target_tools(gateway_id, target_id, item.get("name") or "")
+                if target_tools is None:
                     n_skipped += 1
-                    logger.debug(
-                        "[mcp_identity] GetGatewayTarget failed for target %s on gateway "
-                        "%s (skipping): %s",
-                        target_id,
-                        gateway_id,
-                        err,
-                    )
-                    continue
-
-                tc = gt.get("targetConfiguration") or {}
-                lam = (tc.get("mcp") or {}).get("lambda") or {}
-                inline_payload = (lam.get("toolSchema") or {}).get("inlinePayload")
-                if not inline_payload:
-                    # Not a lambda inline-schema target — needs the wire scan / a token.
-                    n_skipped += 1
-                    logger.debug(
-                        "[mcp_identity] gateway %s target %s has no inline lambda "
-                        "toolSchema (skipping native read)",
-                        gateway_id,
-                        target_id,
-                    )
-                    continue
-
-                # The invocable name prefix is the TARGET name (research §5.3): prefer the
-                # GetGatewayTarget name, fall back to the list item's name.
-                target_name = gt.get("name") or item.get("name") or ""
-                for tool in inline_payload:
-                    tool_name = tool.get("name")
-                    if not tool_name:
-                        continue  # defensive: skip nameless entries, don't crash
-                    tools.append(
-                        McpTool(
-                            name=f"{target_name}___{tool_name}",
-                            description=tool.get("description") or "",
-                            input_schema=tool.get("inputSchema") or {},
-                        )
-                    )
-
+                else:
+                    tools.extend(target_tools)
             next_token = page.get("nextToken")
             if not next_token:
                 break
         logger.info(
-            "[mcp_identity] native tool read for gateway %s: %d tools across %d targets "
-            "(%d skipped)",
+            "[mcp_identity] native tool read for gateway %s: %d tools across %d targets (%d skipped)",
             gateway_id,
             len(tools),
             n_targets,
@@ -530,185 +551,170 @@ class McpIdentityService:
         )
         return tools
 
+    def _target_tools(self, gateway_id: str, target_id: str, list_name: str) -> list[McpTool] | None:
+        """The tools one gateway target declares, or ``None`` when the target is skipped.
+
+        A LAMBDA target with an inline ``toolSchema`` maps each entry to the invocable
+        ``<targetName>___<toolName>``; an OpenAPI target with an inline spec maps one tool per
+        ``operationId`` (an unparseable or empty spec is a skip, logged, and never loses the other
+        targets). Every other target (S3-hosted specs, ``smithyModel``, ``mcpServer``,
+        ``apiGateway``, a lambda with an S3 schema) needs the wire scan and is skipped, as is a
+        target whose read fails. The target name is the invocable prefix: ``GetGatewayTarget``'s
+        name first, the list item's as the fallback.
+        """
+        try:
+            gt = self._control.get_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id)
+        except Exception:
+            logger.debug(
+                "[mcp_identity] GetGatewayTarget failed for target %s on gateway %s (skipping)",
+                target_id,
+                gateway_id,
+                exc_info=True,
+            )
+            return None
+        tc = gt.get("targetConfiguration") or {}
+        target_name = gt.get("name") or list_name
+        spec_payload = ((tc.get("mcp") or {}).get("openApiSchema") or {}).get("inlinePayload")
+        if spec_payload:
+            try:
+                openapi_tools = _openapi_tools(target_name, spec_payload)
+            except Exception:
+                logger.warning(
+                    "[mcp_identity] OpenAPI target %s on gateway %s skipped",
+                    target_name,
+                    gateway_id,
+                    exc_info=True,
+                )
+                return None
+            return openapi_tools or None
+        lam = (tc.get("mcp") or {}).get("lambda") or {}
+        inline_payload = (lam.get("toolSchema") or {}).get("inlinePayload")
+        if not inline_payload:
+            logger.debug(
+                "[mcp_identity] gateway %s target %s has no inline lambda toolSchema (skipping native read)",
+                gateway_id,
+                target_id,
+            )
+            return None
+        return [
+            McpTool(
+                name=f"{target_name}___{tool['name']}",
+                description=tool.get("description") or "",
+                input_schema=tool.get("inputSchema") or {},
+            )
+            for tool in inline_payload
+            if tool.get("name")
+        ]
+
     def _discovery_url(self) -> str:
-        """The Entra v2 OIDC well-known URL for our tenant (matches the runtime authorizer
-        discoveryUrl agent_identity_service builds)."""
-        return (
-            f"{self._login_base}/{self._tenant_id}"
-            "/v2.0/.well-known/openid-configuration"
-        )
+        """The Entra v2 OIDC well-known URL for our tenant, the same one the agent-side runtime
+        authorizer uses."""
+        return f"{self._login_base}/{self._tenant_id}/v2.0/.well-known/openid-configuration"
 
     @staticmethod
     def _allowed_audience(mcp: McpServer) -> list[str]:
-        """Both audience forms (CRITIC-M3 / research §1.4): the api:// URI AND the app
-        client GUID, in that order, dropping any that's unset. The real OBO'd token's
-        ``aud`` can be either form, so the authorizer accepts both (each is per-MCP-unique
-        → cross-MCP-replay safe)."""
+        """Both audience forms, the ``api://`` URI and the app client GUID, in that order, dropping
+        any that is unset: a token's ``aud`` can be either, and each is per-MCP unique."""
         return [a for a in (mcp.entra_app_audience, mcp.entra_app_id) if a]
 
-    # -- gateway authorizer (sync, off-loop) -------------------------------
-
-    def _configure_gateway_authorizer(self, gateway_id: str, mcp: McpServer) -> None:
-        """SYNC blocking boto3: set the gateway's inbound CUSTOM_JWT authorizer (research §1.1).
-
-        ``UpdateGateway`` is a **full-replace PUT** (NOT the ``{"optionalValue":…}`` PATCH
-        ``UpdateRegistryRecord`` uses). Required input: ``gatewayIdentifier``, ``name``
-        (must equal the create-time name), ``roleArn``, ``authorizerType``. So this
-        ``get_gateway`` → replays ``name``/``roleArn``/``protocolType``/
-        ``protocolConfiguration`` (+ optional ``description``/``kmsKeyArn``/
-        ``interceptorConfigurations``/``policyEngineConfiguration``/``exceptionLevel`` only
-        if present, to avoid dropping them — esp. ``protocolConfiguration`` which carries
-        ``searchType=SEMANTIC`` that can only be set at create) + adds
-        ``authorizerConfiguration`` + ``authorizerType="CUSTOM_JWT"`` → ``update_gateway``
-        → polls ``get_gateway`` to READY. ``gatewayIdentifier`` takes the short gatewayId,
-        NOT the ARN.
-        """
-        gw = self._control.get_gateway(gatewayIdentifier=gateway_id)
-
-        # Audience guard (#2 fix): fail loud before the Update rather than silently
-        # configuring an open-to-nobody authorizer (empty allowedAudience rejects all tokens
-        # with no clear error). Routes through the caller's failure path (persist 'failed').
+    def _require_audience(self, mcp: McpServer) -> list[str]:
+        """The allowed audience, refusing an empty one before any update: an empty
+        ``allowedAudience`` rejects every token with no clear error."""
         audience = self._allowed_audience(mcp)
         if not audience:
             raise McpProvisioningError(
                 f"refusing to configure CUSTOM_JWT with empty allowedAudience for MCP {mcp.id}"
             )
+        return audience
 
-        authorizer_configuration = {
-            "customJWTAuthorizer": {
-                "discoveryUrl": self._discovery_url(),
-                # Audience ONLY (E6 Decision 3) — no allowedClients / customClaims.
-                # BOTH forms (CRITIC-M3 / research §1.4).
-                "allowedAudience": audience,
-            }
-        }
+    def _configure_gateway_authorizer(self, gateway_id: str, mcp: McpServer) -> None:
+        """Sync boto3: set the gateway's inbound ``CUSTOM_JWT`` authorizer and poll to READY.
 
-        # Full-replace: the required fields + the new authorizer.
+        ``UpdateGateway`` is a full-replace PUT, so the required fields (``name``, ``roleArn``) and
+        every optional field present on the gateway are replayed from ``GetGateway``;
+        ``protocolConfiguration`` carries settings that can only be set at create time. AGP owns
+        ``discoveryUrl`` and ``allowedAudience`` only: under the same Entra issuer every other
+        authorizer field already on the gateway is carried through (a Terraform-built gateway is
+        born with ``allowedScopes=["Invoke"]``, the gate that refuses app-only tokens), while a
+        gateway locked to another issuer is rebuilt fresh because its clients and scopes belong
+        to that IdP.
+        """
+        gw = self._control.get_gateway(gatewayIdentifier=gateway_id)
+        audience = self._require_audience(mcp)
+        discovery_url = self._discovery_url()
+        existing = (gw.get("authorizerConfiguration") or {}).get("customJWTAuthorizer") or {}
+        if existing.get("discoveryUrl") != discovery_url:
+            existing = {}
         kwargs: dict = {
             "gatewayIdentifier": gw["gatewayId"],
             "name": gw["name"],
             "roleArn": gw["roleArn"],
             "authorizerType": "CUSTOM_JWT",
-            "authorizerConfiguration": authorizer_configuration,
+            "authorizerConfiguration": {
+                "customJWTAuthorizer": {
+                    **existing,
+                    "discoveryUrl": discovery_url,
+                    "allowedAudience": audience,
+                }
+            },
         }
-        # Replay optional fields ONLY if present (research §1.1) so we never drop them.
-        # protocolType/protocolConfiguration carry the create-time MCP + semantic-search
-        # config; the rest are optional gateway settings.
-        for key in (
-            "protocolType",
-            "protocolConfiguration",
-            "description",
-            "kmsKeyArn",
-            "interceptorConfigurations",
-            "policyEngineConfiguration",
-            "exceptionLevel",
-        ):
+        for key in _GATEWAY_OPTIONAL_FIELDS:
             if gw.get(key):
                 kwargs[key] = gw[key]
-
         self._control.update_gateway(**kwargs)
-
         self._poll_gateway_ready(gateway_id)
 
     def _poll_gateway_ready(self, gateway_id: str) -> None:
-        """Poll ``get_gateway`` until status READY (bounded loop + sleep).
-
-        A ``*_FAILED`` / ``UPDATE_UNSUCCESSFUL`` status, or exhausting
-        ``_POLL_MAX_ATTEMPTS``, raises so the caller marks the MCP ``failed``.
-        ``time.sleep`` is patched to a no-op in tests.
-        """
+        """Poll ``get_gateway`` until READY; a failed status or an exhausted budget raises so the
+        caller marks the MCP ``failed``."""
         for _ in range(_POLL_MAX_ATTEMPTS):
             resp = self._control.get_gateway(gatewayIdentifier=gateway_id)
             status = resp.get("status")
             if status == _READY_STATUS:
                 return
             if status in _FAILED_STATUSES:
-                raise RuntimeError(
-                    f"gateway {gateway_id} reached terminal status {status}"
-                )
+                raise RuntimeError(f"gateway {gateway_id} reached terminal status {status}")
             time.sleep(_POLL_INTERVAL_SECONDS)
-        raise RuntimeError(
-            f"gateway {gateway_id} did not reach READY within "
-            f"{_POLL_MAX_ATTEMPTS} polls"
-        )
-
-    # -- runtime authorizer (sync, off-loop) — E6 verbatim -----------------
+        raise RuntimeError(f"gateway {gateway_id} did not reach READY within {_POLL_MAX_ATTEMPTS} polls")
 
     def _configure_runtime_authorizer(self, runtime_arn: str, mcp: McpServer) -> None:
-        """SYNC blocking boto3: set a Runtime-MCP's inbound JWT authorizer.
+        """Sync boto3: set a runtime MCP's inbound JWT authorizer and poll to READY.
 
-        Research §1.2: a runtime with ``serverProtocol=MCP`` uses the IDENTICAL
-        ``customJWTAuthorizer`` shape and the IDENTICAL ``GetAgentRuntime →
-        replay(agentRuntimeArtifact/roleArn/networkConfiguration) → UpdateAgentRuntime →
-        poll-to-READY`` path E6 built and live-confirmed — reused verbatim, swapping the
-        audience (BOTH forms, CRITIC-M3). ``RID``-not-ARN: the control calls take
-        ``agentRuntimeId`` (the ARN's last ``/``-segment).
+        The same ``customJWTAuthorizer`` shape and the same ``GetAgentRuntime`` -> replay ->
+        ``UpdateAgentRuntime`` path as the agent side; the control calls take the runtime id (the
+        ARN's last segment). Optional fields present on the runtime are replayed so the update
+        drops none of them.
         """
         runtime_id = runtime_arn.rsplit("/", 1)[-1]
-
         current = self._control.get_agent_runtime(agentRuntimeId=runtime_id)
-
-        # Audience guard (mirror of the gateway path): fail loud before the Update.
-        audience = self._allowed_audience(mcp)
-        if not audience:
-            raise McpProvisioningError(
-                f"refusing to configure CUSTOM_JWT with empty allowedAudience for MCP {mcp.id}"
-            )
-
-        authorizer_configuration = {
-            "customJWTAuthorizer": {
-                "discoveryUrl": self._discovery_url(),
-                # Audience ONLY — no allowedClients / customClaims. BOTH forms (CRITIC-M3).
-                "allowedAudience": audience,
-            }
-        }
-
-        # Full-replace: replay the required fields from the GET + add the authorizer.
-        # Also replay optional fields ONLY if present, to avoid silently dropping
-        # environmentVariables, protocolConfiguration, requestHeaderConfiguration,
-        # lifecycleConfiguration, metadataConfiguration, filesystemConfigurations, or
-        # description that were set at create time — the runtime twin of the gateway
-        # optional-field replay loop above.
+        audience = self._require_audience(mcp)
         kwargs: dict = {
             "agentRuntimeId": runtime_id,
             "agentRuntimeArtifact": current["agentRuntimeArtifact"],
             "roleArn": current["roleArn"],
             "networkConfiguration": current["networkConfiguration"],
-            "authorizerConfiguration": authorizer_configuration,
+            "authorizerConfiguration": {
+                "customJWTAuthorizer": {
+                    "discoveryUrl": self._discovery_url(),
+                    "allowedAudience": audience,
+                }
+            },
         }
-        for key in (
-            "protocolConfiguration",
-            "requestHeaderConfiguration",
-            "environmentVariables",
-            "lifecycleConfiguration",
-            "metadataConfiguration",
-            "filesystemConfigurations",
-            "description",
-        ):
+        for key in _RUNTIME_OPTIONAL_FIELDS:
             if current.get(key):
                 kwargs[key] = current[key]
-
         self._control.update_agent_runtime(**kwargs)
-
         self._poll_runtime_ready(runtime_id)
 
     def _poll_runtime_ready(self, runtime_id: str) -> None:
-        """Poll ``get_agent_runtime`` until status READY (bounded loop + sleep).
-
-        A ``*_FAILED`` status, or exhausting ``_POLL_MAX_ATTEMPTS``, raises so the caller
-        marks the MCP ``failed``. ``time.sleep`` is patched to a no-op in tests.
-        """
+        """Poll ``get_agent_runtime`` until READY; a failed status or an exhausted budget raises so
+        the caller marks the MCP ``failed``."""
         for _ in range(_POLL_MAX_ATTEMPTS):
             resp = self._control.get_agent_runtime(agentRuntimeId=runtime_id)
             status = resp.get("status")
             if status == _READY_STATUS:
                 return
             if status in _FAILED_STATUSES:
-                raise RuntimeError(
-                    f"runtime {runtime_id} reached terminal status {status}"
-                )
+                raise RuntimeError(f"runtime {runtime_id} reached terminal status {status}")
             time.sleep(_POLL_INTERVAL_SECONDS)
-        raise RuntimeError(
-            f"runtime {runtime_id} did not reach READY within "
-            f"{_POLL_MAX_ATTEMPTS} polls"
-        )
+        raise RuntimeError(f"runtime {runtime_id} did not reach READY within {_POLL_MAX_ATTEMPTS} polls")

@@ -1,63 +1,38 @@
-// CedarPoliciesTab — the gateway MCP detail "Policies" tab (Epic 8, T6).
-//
-// Fills the E5-stubbed, gateway-only Policies tab with the Cedar per-tool
-// authorization UI. The MCP-side mirror of McpConnectedAgentsTab's shape — same
-// glass CARD chrome, the same CSS-only Spinner, the same optimistic-add/remove +
-// REPLICATION_RECONCILE_MS reconciling refetch, the same mountedRef unmount guard,
-// closePicker/Escape handling, and focus-return-to-trigger — but the resource is
-// a Cedar policy on the gateway's native AgentCore Policy Engine, not an Entra
-// app-role assignment.
-//
-// The flow: an operator picks an Entra USER (whose PrincipalHit.id IS the oid) +
-// a tool (or "All tools") + Allow → the backend generates a Cedar `permit` policy
-// keyed on the user's oid and applies it to the gateway's Policy Engine. The FIRST
-// policy creates + attaches the engine in ENFORCE (default-deny) — so a two-step
-// warning gate precedes the first add. A segmented Enforce / Log only / Disable
-// control flips the gateway's enforcement posture. Once the gateway IS enforcing, a
-// persistent amber note states the consequence the emerald banner cannot: every
-// uncovered call is denied in AWS, and that deny never reaches this console. Its copy
-// lives in `cedarPosture.ts` — the same product decision as the confirm dialog's, so
-// it is single-sourced and vitest-pinned rather than duplicated here (E36/T10).
-
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { cedarPoliciesApi, principalsApi } from '../../api/client';
 import type {
-  CedarCondition,
-  CedarEffect,
-  CedarEnforcementMode,
   CedarPolicyRow,
+  CedarPolicySet,
+  ConditionIn,
+  EnforcementRequest,
   McpServer,
   PrincipalHit,
 } from '../../api/client';
-import { AgentAvatar, emailAlias } from './agentUi';
+import { useLoad } from '../../api/useLoad';
+import { AgentAvatar } from './agentUi';
+import { emailAlias } from './agentBadges';
 import {
   buildAddPolicyBody,
   conditionLabel,
   operatorsForType,
   paramsFromSchema,
   policyToolLabel,
+  isContainmentRow,
+  isWholeGatewayDeny,
 } from './cedarPolicyForm';
-import { postureWarning } from './cedarPosture';
+import { ENFORCEMENT_COPY, ENFORCE_FLIP_WARNING, postureWarning } from './cedarPosture';
+import { useReturnFocus } from '../shared/useReturnFocus';
 
-// Card chrome — identical to McpConnectedAgentsTab's CARD so the tab body sits in
-// the same surface family as Overview/Tools/Connected Agents.
 const CARD = 'bg-white/70 backdrop-blur rounded-xl border border-slate-200/60 shadow-sm';
 
-// The Policy Engine is eventually consistent after a create/attach/delete (the
-// gateway is briefly UPDATING). After a mutate we wait this long, then refetch to
-// reconcile the optimistic state with the engine's truth. Mirrors the
-// connected-agents tab's REPLICATION_RECONCILE_MS (Policy Engine settle is a bit
-// slower than Graph replication, so we give it a touch longer).
-const REPLICATION_RECONCILE_MS = 1500;
+const POLICY_ENGINE_SETTLE_MS = 1500;
 
-// Sentinel select value for "All tools on this gateway" (distinct from any real
-// tool name, which is always a non-empty AgentCore action token).
 const ALL_TOOLS = '__ALL__';
 const MIN_QUERY = 2;
 const DEBOUNCE_MS = 300;
 
-// A small CSS-only spinner (no icon library) — slate ring with a blue arc.
-// Copied verbatim from McpConnectedAgentsTab's Spinner.
+const EMPTY_POLICIES: CedarPolicyRow[] = [];
+
 function Spinner() {
   return (
     <span
@@ -67,36 +42,11 @@ function Spinner() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Enforcement banner — the gateway's live authorization posture.
-// none=slate (open), log_only=amber (evaluated-not-enforced), enforce=emerald
-// (default-deny). Semantic tints mirror the badge idiom across the governance UI.
-// ---------------------------------------------------------------------------
-
-const ENFORCEMENT_COPY: Record<CedarEnforcementMode, { ring: string; dot: string; heading: string; body: string }> = {
-  none: {
-    ring: 'border-slate-200/70',
-    dot: 'bg-slate-400',
-    heading: 'No policy engine attached',
-    body: 'Every assigned user can call any tool on this gateway. Add a policy to switch to default-deny.',
-  },
-  log_only: {
-    ring: 'border-amber-200/80',
-    dot: 'bg-amber-500',
-    heading: 'Logging only',
-    body: 'Policies are evaluated and logged to CloudWatch, but not enforced — every assigned user can still call any tool.',
-  },
-  enforce: {
-    ring: 'border-emerald-200/80',
-    dot: 'bg-emerald-500',
-    heading: 'Enforcing — default-deny',
-    body: 'Only users named in a policy can call tools. Assigned users not covered by a policy are blocked.',
-  },
+const ENFORCEMENT_STYLE: Record<McpServer['cedar_enforcement_mode'], { ring: string; dot: string }> = {
+  none: { ring: 'border-slate-200/70', dot: 'bg-slate-400' },
+  log_only: { ring: 'border-amber-200/80', dot: 'bg-amber-500' },
+  enforce: { ring: 'border-emerald-200/80', dot: 'bg-emerald-500' },
 };
-
-// ---------------------------------------------------------------------------
-// CedarPoliciesTab
-// ---------------------------------------------------------------------------
 
 export default function CedarPoliciesTab({
   mcp,
@@ -107,53 +57,44 @@ export default function CedarPoliciesTab({
 }) {
   const mcpId = mcp.id;
 
-  // The gateway must be wired (identity provisioned + gateway_id) before Cedar
-  // can attach a Policy Engine to it.
   const gatewayReady = mcp.identity_status === 'provisioned' && !!mcp.gateway_id;
 
-  const [policies, setPolicies] = useState<CedarPolicyRow[]>([]);
-  const [enforcementMode, setEnforcementMode] = useState<CedarEnforcementMode>(
-    mcp.cedar_enforcement_mode ?? 'none',
+  const { state: policyState, patch: patchPolicies } = useLoad<CedarPolicySet | null>(
+    () => (gatewayReady ? cedarPoliciesApi.list(mcpId) : Promise.resolve(null)),
+    [mcpId, gatewayReady],
+    'Failed to load policies.',
   );
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const policies = policyState.data?.policies ?? EMPTY_POLICIES;
+  const enforcementMode: McpServer['cedar_enforcement_mode'] =
+    policyState.data?.enforcement_mode ?? mcp.cedar_enforcement_mode;
+  const loading = policyState.kind === 'loading';
+  const loadError = policyState.kind === 'error' ? policyState.message : null;
 
-  // Mutation (add/remove/setEnforcement) UI state — mirrors the connected-agents
-  // tab's actionPending / actionError idiom.
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // Add-policy inline form state.
   const [picking, setPicking] = useState(false);
   const [query, setQuery] = useState('');
-  const [results, setResults] = useState<PrincipalHit[]>([]);
-  const [searching, setSearching] = useState(false);
-  const [searchError, setSearchError] = useState<string | null>(null);
-  const [searched, setSearched] = useState(false);
+  const [settledSearch, setSettledSearch] = useState<{
+    query: string;
+    hits: PrincipalHit[];
+    error: string | null;
+  } | null>(null);
   const [selectedUser, setSelectedUser] = useState<PrincipalHit | null>(null);
   const [toolValue, setToolValue] = useState<string>(ALL_TOOLS);
 
-  // Effect (Allow/Deny), the all-users Deny scope ("Everyone"), and the typed
-  // parameter conditions appended to the policy. Conditions are only meaningful
-  // for a specific tool (the param schema must be known) — All tools drops them.
-  const [effect, setEffect] = useState<CedarEffect>('allow');
+  const [effect, setEffect] = useState<CedarPolicyRow['effect']>('allow');
   const [allUsers, setAllUsers] = useState(false);
-  const [conditions, setConditions] = useState<CedarCondition[]>([]);
+  const [conditions, setConditions] = useState<ConditionIn[]>([]);
 
-  // Two-step warning gate: when the engine does not yet exist (mode 'none'), the
-  // first add — and switching INTO enforce — must clear an explicit default-deny
-  // confirm. We model it as a pending intent the confirm panel resolves.
   const [armedWarning, setArmedWarning] = useState<null | { kind: 'add' } | { kind: 'enforce' }>(null);
 
-  // Per-row expanded raw-Cedar view.
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  // Focus-return-to-trigger when the picker closes.
   const addTriggerRef = useRef<HTMLButtonElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const returnFocus = useReturnFocus(addTriggerRef);
 
-  // Unmount guard — the reconcile refetch fires on a timer, so it can land after
-  // the user navigates away.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -164,9 +105,7 @@ export default function CedarPoliciesTab({
 
   const resetForm = useCallback(() => {
     setQuery('');
-    setResults([]);
-    setSearched(false);
-    setSearchError(null);
+    setSettledSearch(null);
     setSelectedUser(null);
     setToolValue(ALL_TOOLS);
     setEffect('allow');
@@ -179,10 +118,9 @@ export default function CedarPoliciesTab({
     setPicking(false);
     setActionError(null);
     resetForm();
-    window.setTimeout(() => addTriggerRef.current?.focus(), 0);
-  }, [resetForm]);
+    returnFocus();
+  }, [resetForm, returnFocus]);
 
-  // Close picker on Escape while it is open.
   useEffect(() => {
     if (!picking) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -195,85 +133,30 @@ export default function CedarPoliciesTab({
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [picking, closePicker]);
 
-  // Focus the search box when the picker opens OR when the user steps back
-  // (selectedUser → null) from the tool-select step to the search step.
-  // Mirrors the existing open-focus idiom: window.setTimeout(..., 0) runs after
-  // the re-render so the input is in the DOM before focus is attempted.
   useEffect(() => {
-    if (picking && !selectedUser && !allUsers) window.setTimeout(() => searchInputRef.current?.focus(), 0);
+    if (picking && !selectedUser && !allUsers) searchInputRef.current?.focus();
   }, [picking, selectedUser, allUsers]);
 
-  // Silent reconcile fetch after a mutate (absorb Policy Engine settle). A failed
-  // reconcile leaves the optimistic state in place — the next action or remount
-  // resyncs.
   const reconcile = useCallback(async () => {
-    try {
-      const fresh = await cedarPoliciesApi.list(mcpId);
-      if (mountedRef.current) {
-        setPolicies(fresh.policies);
-        setEnforcementMode(fresh.enforcement_mode);
-      }
-    } catch {
-      // swallow — background refetch error must not clobber the UI.
-    }
-  }, [mcpId]);
+    const fresh = await cedarPoliciesApi.list(mcpId).catch(() => null);
+    if (fresh === null || !mountedRef.current) return;
+    patchPolicies(() => fresh);
+  }, [mcpId, patchPolicies]);
 
-  // Initial load (skipped until the gateway is wired — nothing to attach against).
-  useEffect(() => {
-    if (!gatewayReady) {
-      setLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    setLoadError(null);
-    cedarPoliciesApi
-      .list(mcpId)
-      .then((res) => {
-        if (cancelled) return;
-        setPolicies(res.policies);
-        setEnforcementMode(res.enforcement_mode);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : 'Failed to load policies.');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [mcpId, gatewayReady]);
-
-  // Debounced Entra USER search (filtered to type==='user' — Cedar keys on a
-  // user's oid). Each keystroke cancels the prior in-flight debounce.
+  // Decision: docs/adr/frontend-loading-state.md
   useEffect(() => {
     if (!picking) return;
     const q = query.trim();
-    if (q.length < MIN_QUERY) {
-      setResults([]);
-      setSearched(false);
-      setSearchError(null);
-      setSearching(false);
-      return;
-    }
+    if (q.length < MIN_QUERY) return;
     let cancelled = false;
-    setSearching(true);
-    setSearchError(null);
     const handle = window.setTimeout(async () => {
       try {
         const hits = await principalsApi.search(q);
         if (cancelled) return;
-        setResults(hits.filter((h) => h.type === 'user'));
+        setSettledSearch({ query: q, hits: hits.filter((h) => h.type === 'user'), error: null });
       } catch (err: unknown) {
         if (cancelled) return;
-        setSearchError(err instanceof Error ? err.message : 'Search failed.');
-        setResults([]);
-      } finally {
-        if (!cancelled) {
-          setSearching(false);
-          setSearched(true);
-        }
+        setSettledSearch({ query: q, hits: [], error: err instanceof Error ? err.message : 'Search failed.' });
       }
     }, DEBOUNCE_MS);
     return () => {
@@ -282,25 +165,26 @@ export default function CedarPoliciesTab({
     };
   }, [picking, query]);
 
-  // Tool options for the select — the gateway's discovered tools + "All tools".
+  const trimmedQuery = query.trim();
+  const searchable = trimmedQuery.length >= MIN_QUERY;
+  const currentSearch = searchable && settledSearch?.query === trimmedQuery ? settledSearch : null;
+  const results = currentSearch?.hits ?? [];
+  const searched = currentSearch !== null;
+  const searching = searchable && currentSearch === null;
+  const searchError = currentSearch?.error ?? null;
+
   const toolOptions = useMemo(
     () => (mcp.available_tools ?? []).map((t) => t.name),
     [mcp.available_tools],
   );
 
-  // Whether the picked scope is the whole gateway (no specific tool). Conditions
-  // are hidden for All tools (the param schema is unknown) and never sent.
   const allTools = toolValue === ALL_TOOLS;
 
-  // Top-level params of the selected tool (number/string only — 'other' types
-  // have no legal operators, so they're dropped from the condition builder).
-  // Empty for All tools or a tool with no usable params → the builder is hidden.
   const toolParams = useMemo(() => {
     const t = (mcp.available_tools ?? []).find((tool) => tool.name === toolValue);
     return t ? paramsFromSchema(t.input_schema).filter((p) => p.type !== 'other') : [];
   }, [toolValue, mcp.available_tools]);
 
-  // Add a condition row defaulted to the first usable param + its first legal op.
   const addCondition = useCallback(() => {
     const first = toolParams[0];
     if (!first) return;
@@ -312,8 +196,6 @@ export default function CedarPoliciesTab({
     setConditions((prev) => prev.filter((_, i) => i !== idx));
   }, []);
 
-  // Re-default op + type and clear the value when the row's param changes, so a
-  // stale string op can't sit on a numeric param (and vice versa).
   const changeConditionParam = useCallback(
     (idx: number, paramName: string) => {
       const param = toolParams.find((p) => p.name === paramName);
@@ -334,16 +216,8 @@ export default function CedarPoliciesTab({
     setConditions((prev) => prev.map((c, i) => (i === idx ? { ...c, value } : c)));
   }, []);
 
-  // -- mutations ------------------------------------------------------------
-
-  // Whether the engine does not yet exist (the first policy / first enforce must
-  // clear the default-deny warning).
   const engineUnattached = enforcementMode === 'none';
 
-  // Actually POST the policy (called once any required warning is cleared). The
-  // principal is the picked user, or null for an all-users Deny ("Everyone").
-  // Conditions only ride along on a specific tool (buildAddPolicyBody drops them
-  // for All tools too — belt and braces).
   const submitAdd = useCallback(async () => {
     if (actionPending || (!selectedUser && !allUsers)) return;
     setActionPending(true);
@@ -358,18 +232,21 @@ export default function CedarPoliciesTab({
     try {
       const created = await cedarPoliciesApi.add(mcpId, body);
       if (!mountedRef.current) return;
-      // Optimistically insert the authoritative row the server returned.
-      setPolicies((prev) => {
-        if (prev.some((p) => p.policy_id === created.policy_id)) return prev;
-        return [...prev, created];
-      });
-      // The first policy attaches the engine in ENFORCE — reflect that locally so
-      // the banner + the warning gate update without waiting for the reconcile.
-      if (engineUnattached) setEnforcementMode('enforce');
+      patchPolicies((cur) =>
+        cur === null
+          ? cur
+          : {
+              ...cur,
+              policies: cur.policies.some((p) => p.policy_id === created.policy_id)
+                ? cur.policies
+                : [...cur.policies, created],
+              enforcement_mode: engineUnattached ? 'enforce' : cur.enforcement_mode,
+            },
+      );
       closePicker();
       window.setTimeout(() => {
         void reconcile();
-      }, REPLICATION_RECONCILE_MS);
+      }, POLICY_ENGINE_SETTLE_MS);
     } catch (err: unknown) {
       if (mountedRef.current) {
         setActionError(err instanceof Error ? err.message : 'Failed to add policy.');
@@ -378,11 +255,8 @@ export default function CedarPoliciesTab({
     } finally {
       if (mountedRef.current) setActionPending(false);
     }
-  }, [actionPending, selectedUser, allUsers, allTools, toolValue, effect, conditions, mcpId, engineUnattached, closePicker, reconcile]);
+  }, [actionPending, selectedUser, allUsers, allTools, toolValue, effect, conditions, mcpId, engineUnattached, closePicker, reconcile, patchPolicies]);
 
-  // Submit-disabled gate. A row is incomplete when its param or value is empty.
-  // Allow always needs a user; Deny needs a user OR "Everyone"; an unconditional
-  // all-users + all-tools Deny is rejected (would block the whole gateway).
   const conditionsIncomplete = !allTools && conditions.some(
     (c) => !c.param || c.value.trim() === '' || (c.type === 'number' && !/^-?\d+$/.test(c.value.trim())),
   );
@@ -391,9 +265,8 @@ export default function CedarPoliciesTab({
     (effect === 'allow' && !selectedUser) ||
     (effect === 'deny' && !selectedUser && !allUsers) ||
     conditionsIncomplete ||
-    (effect === 'deny' && allUsers && allTools && conditions.length === 0);
+    isWholeGatewayDeny(effect, allUsers, allTools, conditions);
 
-  // Submit handler — gate behind the default-deny warning on the first add.
   const handleAddSubmit = useCallback(() => {
     if (!selectedUser && !allUsers) return;
     if (engineUnattached) {
@@ -409,40 +282,41 @@ export default function CedarPoliciesTab({
       setActionPending(true);
       setActionError(null);
       const prev = policies;
-      setPolicies((cur) => cur.filter((p) => p.policy_id !== row.policy_id));
+      patchPolicies((cur) =>
+        cur === null ? cur : { ...cur, policies: cur.policies.filter((p) => p.policy_id !== row.policy_id) },
+      );
       if (expandedId === row.policy_id) setExpandedId(null);
       try {
         await cedarPoliciesApi.remove(mcpId, row.policy_id);
         window.setTimeout(() => {
           void reconcile();
-        }, REPLICATION_RECONCILE_MS);
+        }, POLICY_ENGINE_SETTLE_MS);
       } catch (err: unknown) {
         if (mountedRef.current) {
-          setPolicies(prev); // rollback
+          patchPolicies((cur) => (cur === null ? cur : { ...cur, policies: prev }));
           setActionError(err instanceof Error ? err.message : 'Failed to remove policy.');
         }
       } finally {
         if (mountedRef.current) setActionPending(false);
       }
     },
-    [actionPending, policies, expandedId, mcpId, reconcile],
+    [actionPending, policies, expandedId, mcpId, reconcile, patchPolicies],
   );
 
-  // Apply an enforcement-mode change (Enforce / Log only / Disable). Switching
-  // INTO enforce while the engine is unattached is gated behind the same
-  // default-deny warning.
   const applyEnforcement = useCallback(
-    async (mode: CedarEnforcementMode | 'disabled') => {
+    async (mode: EnforcementRequest['mode']) => {
       if (actionPending) return;
       setActionPending(true);
       setActionError(null);
       setArmedWarning(null);
       try {
         const res = await cedarPoliciesApi.setEnforcement(mcpId, mode);
-        if (mountedRef.current) setEnforcementMode(res.enforcement_mode);
+        if (mountedRef.current) {
+          patchPolicies((cur) => (cur === null ? cur : { ...cur, enforcement_mode: res.enforcement_mode }));
+        }
         window.setTimeout(() => {
           void reconcile();
-        }, REPLICATION_RECONCILE_MS);
+        }, POLICY_ENGINE_SETTLE_MS);
       } catch (err: unknown) {
         if (mountedRef.current) {
           setActionError(err instanceof Error ? err.message : 'Failed to change enforcement.');
@@ -451,14 +325,12 @@ export default function CedarPoliciesTab({
         if (mountedRef.current) setActionPending(false);
       }
     },
-    [actionPending, mcpId, reconcile],
+    [actionPending, mcpId, reconcile, patchPolicies],
   );
 
   const handleModeClick = useCallback(
-    (mode: CedarEnforcementMode | 'disabled') => {
-      if (mode === enforcementMode) return; // no-op on the active mode
-      // Switching into enforce while nothing is attached flips the gateway to
-      // default-deny — gate it behind the warning.
+    (mode: EnforcementRequest['mode']) => {
+      if (mode === enforcementMode) return;
       if (mode === 'enforce' && engineUnattached) {
         setArmedWarning({ kind: 'enforce' });
         return;
@@ -468,7 +340,6 @@ export default function CedarPoliciesTab({
     [enforcementMode, engineUnattached, applyEnforcement],
   );
 
-  // Resolve the armed default-deny warning (confirm → the underlying action).
   const confirmWarning = useCallback(() => {
     if (!armedWarning) return;
     if (armedWarning.kind === 'add') {
@@ -478,9 +349,6 @@ export default function CedarPoliciesTab({
     }
   }, [armedWarning, submitAdd, applyEnforcement]);
 
-  // -- render ---------------------------------------------------------------
-
-  // Gateway not wired yet → a single guidance banner, no policy UI.
   if (!gatewayReady) {
     return (
       <div className={`${CARD} p-6`}>
@@ -493,16 +361,11 @@ export default function CedarPoliciesTab({
     );
   }
 
-  const banner = ENFORCEMENT_COPY[enforcementMode];
+  const banner = { ...ENFORCEMENT_STYLE[enforcementMode], ...ENFORCEMENT_COPY[enforcementMode] };
 
-  // The persistent ENFORCE consequence note (E36/T10). The banner above states the posture;
-  // this states what it costs — every uncovered call on the gateway is denied in AWS, and
-  // that deny never reaches this console. Copy lives in `cedarPosture.ts` because it is the
-  // same product decision as the confirm dialog below, and only the `.ts` is vitest-gated.
   const postureNote = postureWarning(enforcementMode);
 
-  // Segmented mode control descriptors. Disable maps to the 'disabled' wire value.
-  const MODES: { key: CedarEnforcementMode | 'disabled'; label: string; active: boolean; activeCls: string }[] = [
+  const MODES: { key: EnforcementRequest['mode']; label: string; active: boolean; activeCls: string }[] = [
     { key: 'enforce', label: 'Enforce', active: enforcementMode === 'enforce', activeCls: 'bg-emerald-600 text-white' },
     { key: 'log_only', label: 'Log only', active: enforcementMode === 'log_only', activeCls: 'bg-amber-500 text-white' },
     { key: 'disabled', label: 'Disable', active: enforcementMode === 'none', activeCls: 'bg-slate-600 text-white' },
@@ -510,7 +373,6 @@ export default function CedarPoliciesTab({
 
   return (
     <div className="space-y-4">
-      {/* ----- Enforcement banner + mode control ----- */}
       <div className={`${CARD} ${banner.ring} p-5`}>
         <div className="flex items-start justify-between gap-4 flex-wrap">
           <div className="flex items-start gap-3 min-w-0">
@@ -545,16 +407,10 @@ export default function CedarPoliciesTab({
           )}
         </div>
 
-        {/* Default-deny warning gate — shown when arming the first attach (add or
-            switching into enforce while unattached). */}
         {armedWarning && (
           <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50/70 p-4" role="alert">
             <h3 className="text-sm font-semibold text-amber-800">Switch this gateway to default-deny?</h3>
-            <p className="text-sm text-amber-700 mt-1">
-              Applying a policy engine switches this gateway to default-deny — only users named in
-              policies will be able to call its tools. Agents and users not covered by a policy will be
-              blocked.
-            </p>
+            <p className="text-sm text-amber-700 mt-1">{ENFORCE_FLIP_WARNING}</p>
             <div className="mt-3 flex items-center gap-2">
               <button
                 type="button"
@@ -576,12 +432,6 @@ export default function CedarPoliciesTab({
           </div>
         )}
 
-        {/* Persistent ENFORCE consequence note. Shares the warning-gate's slot and amber
-            treatment, and the two can never collide: the gate only arms while the engine is
-            unattached (mode 'none'), and this only renders for 'enforce'. `role="status"`
-            (polite), not "alert" — it is present on every visit to an enforcing gateway, so
-            an assertive announcement would be noise. The ⚠ glyph carries the warning
-            without relying on colour. */}
         {postureNote && (
           <div
             role="status"
@@ -595,9 +445,7 @@ export default function CedarPoliciesTab({
         )}
       </div>
 
-      {/* ----- Policies card ----- */}
       <div className={`${CARD} overflow-hidden`}>
-        {/* Card header: title + Add. */}
         <div className="flex items-center justify-between gap-3 px-5 py-4 border-b border-slate-200/60">
           <div>
             <h2 className="text-sm font-semibold text-slate-800">Cedar policies</h2>
@@ -622,7 +470,6 @@ export default function CedarPoliciesTab({
           )}
         </div>
 
-        {/* Add-policy form (inline, above the table). */}
         {picking && (
           <div className="px-5 py-4 border-b border-slate-200/60 bg-slate-50/50">
             <div className="flex items-center justify-between gap-3 mb-3">
@@ -630,10 +477,6 @@ export default function CedarPoliciesTab({
                 <h3 className="text-sm font-semibold text-slate-800">
                   {effect === 'allow' ? 'Allow a user to call a tool' : 'Deny a tool call'}
                 </h3>
-                {/* Allow / Deny segmented control — emerald active for Allow, red for
-                    Deny (mirrors the enforcement MODES segmented styling). Switching to
-                    Allow clears the all-users "Everyone" scope (an all-users permit is
-                    invalid). */}
                 <div
                   role="group"
                   aria-label="Policy effect"
@@ -675,7 +518,6 @@ export default function CedarPoliciesTab({
               </button>
             </div>
 
-            {/* Step 1: pick an Entra user (or "Everyone" for a Deny). */}
             {!selectedUser && !allUsers ? (
               <>
                 <label htmlFor="cedar-user-search" className="sr-only">
@@ -691,8 +533,6 @@ export default function CedarPoliciesTab({
                   className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
                   autoComplete="off"
                 />
-                {/* "Everyone" — an all-users guardrail Deny. Offered only for Deny
-                    (an all-users permit would defeat default-deny). Advances to Step 2. */}
                 {effect === 'deny' && (
                   <button
                     type="button"
@@ -759,9 +599,7 @@ export default function CedarPoliciesTab({
                 </div>
               </>
             ) : (
-              /* Step 2: chosen scope → tool select + (specific-tool) conditions + submit. */
               <div>
-                {/* Chosen-scope chip — a picked user, or "Everyone" for an all-users Deny. */}
                 <div className="flex items-center gap-2 mb-3 text-sm text-slate-600">
                   <span className="text-slate-400">{effect === 'allow' ? 'Allowing' : 'Denying'}</span>
                   {allUsers ? (
@@ -785,8 +623,6 @@ export default function CedarPoliciesTab({
                   )}
                 </div>
 
-                {/* Tool select. Changing the tool clears any conditions (their param
-                    schema no longer applies). */}
                 <div className="flex items-end gap-2 flex-wrap">
                   <div>
                     <label htmlFor="cedar-tool" className="block text-[11px] uppercase tracking-wide text-slate-400 font-medium mb-1">
@@ -809,8 +645,6 @@ export default function CedarPoliciesTab({
                   </div>
                 </div>
 
-                {/* Condition builder — only for a specific tool with usable params.
-                    Each row: param select → operator select → typed value → remove. */}
                 {!allTools && toolParams.length > 0 && (
                   <div className="mt-4">
                     <div className="flex items-center justify-between gap-2 mb-1.5">
@@ -888,7 +722,6 @@ export default function CedarPoliciesTab({
                   </div>
                 )}
 
-                {/* Submit + Back. */}
                 <div className="flex items-center gap-2 flex-wrap mt-4">
                   <button
                     type="button"
@@ -926,12 +759,10 @@ export default function CedarPoliciesTab({
           </div>
         )}
 
-        {/* Mutation error (e.g. a 422 from the engine) — non-blocking. */}
         {actionError && (
           <p className="px-5 pt-3 text-sm text-red-600" role="alert">{actionError}</p>
         )}
 
-        {/* Body: loading / error / empty / table. */}
         {loading ? (
           <div className="px-5 py-8 text-center">
             <div className="inline-flex items-center gap-2.5 text-sm text-slate-400">
@@ -956,16 +787,17 @@ export default function CedarPoliciesTab({
               const allTools = !row.tool;
               const label = policyToolLabel(row);
               const isDeny = row.effect === 'deny';
-              // An all-users guardrail row: managed by us, no oid, but a label
-              // ("Everyone"). Foreign/headerless rows (managed === false) keep the
-              // plain "—" + raw-Cedar treatment with no chips.
-              const isEveryone = row.managed === true && !row.user_oid && !!row.user_label;
+              const isContain = isContainmentRow(row);
+              const isEveryone = !isContain && row.managed === true && !row.user_oid && !!row.user_label;
               const rowConditions = row.conditions ?? [];
               return (
                 <li key={row.policy_id} className="px-5 py-3">
                   <div className="flex items-center gap-3">
-                    {/* User cell — "Everyone" gets a distinct violet treatment. */}
-                    {isEveryone ? (
+                    {isContain ? (
+                      <span aria-hidden="true" className="shrink-0 inline-flex items-center justify-center h-8 w-8 rounded-full bg-rose-100 text-rose-700">
+                        <span className="h-2.5 w-2.5 rounded-sm bg-rose-600" />
+                      </span>
+                    ) : isEveryone ? (
                       <span aria-hidden="true" className="shrink-0 inline-flex items-center justify-center h-8 w-8 rounded-full bg-violet-100 text-violet-700 text-sm font-semibold">
                         ∀
                       </span>
@@ -973,7 +805,16 @@ export default function CedarPoliciesTab({
                       <AgentAvatar name={row.user_label ?? '—'} size="sm" />
                     )}
                     <div className="min-w-0 flex-1">
-                      {isEveryone ? (
+                      {isContain ? (
+                        <>
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-rose-50 text-rose-700">
+                            Agent containment
+                          </span>
+                          {row.agent_app_id && (
+                            <span className="block mt-0.5 font-mono text-xs text-slate-400 truncate">{row.agent_app_id}</span>
+                          )}
+                        </>
+                      ) : isEveryone ? (
                         <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-violet-50 text-violet-700">
                           Everyone
                         </span>
@@ -989,7 +830,6 @@ export default function CedarPoliciesTab({
                       )}
                     </div>
 
-                    {/* Condition chips — one small pill per condition (managed rows only). */}
                     {rowConditions.length > 0 && (
                       <span className="hidden sm:flex shrink min-w-0 items-center gap-1 flex-wrap justify-end">
                         {rowConditions.map((c, i) => (
@@ -1003,7 +843,6 @@ export default function CedarPoliciesTab({
                       </span>
                     )}
 
-                    {/* Tool pill — All tools is violet (gateway-wide), a specific tool is slate. */}
                     <span
                       className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
                         allTools ? 'bg-violet-50 text-violet-700' : 'bg-slate-100 text-slate-600'
@@ -1012,7 +851,6 @@ export default function CedarPoliciesTab({
                       {label}
                     </span>
 
-                    {/* Effect badge — Allow = emerald, Deny = red (from row.effect). */}
                     <span
                       className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
                         isDeny ? 'bg-red-50 text-red-700' : 'bg-emerald-50 text-emerald-700'
@@ -1021,7 +859,6 @@ export default function CedarPoliciesTab({
                       {isDeny ? 'Deny' : 'Allow'}
                     </span>
 
-                    {/* View Cedar toggle. */}
                     <button
                       type="button"
                       onClick={() => setExpandedId(expanded ? null : row.policy_id)}
@@ -1033,8 +870,7 @@ export default function CedarPoliciesTab({
                       Cedar
                     </button>
 
-                    {/* Remove ✕ (Operator+). */}
-                    {canManage && (
+                    {canManage && !isContain && (
                       <button
                         type="button"
                         onClick={() => handleRemove(row)}
@@ -1047,7 +883,10 @@ export default function CedarPoliciesTab({
                     )}
                   </div>
 
-                  {/* Expandable raw Cedar. */}
+                  {isContain && (
+                    <p className="mt-1 ml-11 text-xs text-slate-500">Restore the agent on its Containment tab to lift this forbid.</p>
+                  )}
+
                   {expanded && (
                     <pre className="mt-2 ml-10 overflow-x-auto rounded-lg bg-slate-900 p-3 text-xs leading-relaxed text-slate-100">
                       {row.cedar_text}

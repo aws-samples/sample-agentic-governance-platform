@@ -1,0 +1,75 @@
+# A minimal Claims API. Replace it with your API's real spec — or edit servers[0].url and the
+# operations to match. Each operationId becomes one MCP tool (`api___<operationId>`).
+openapi: 3.0.3
+info:
+  title: Claims API
+  version: 1.0.0
+servers:
+  # REQUIRED edit: the deploy refuses this placeholder.
+  - url: https://REPLACE-ME.example.com
+paths:
+  /policies/{policyId}:
+    get:
+      operationId: getPolicy
+      summary: Get an insurance policy by id
+      parameters:
+        - name: policyId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The policy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policyId: { type: string }
+                  holder: { type: string }
+                  status: { type: string }
+  /claims:
+    post:
+      operationId: openClaim
+      summary: Open a new claim against a policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [policyId, description]
+              properties:
+                policyId: { type: string }
+                description: { type: string }
+      responses:
+        "201":
+          description: The opened claim
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claimId: { type: string }
+                  status: { type: string }
+  /claims/{claimId}:
+    get:
+      operationId: getClaimStatus
+      summary: Get the status of a claim
+      parameters:
+        - name: claimId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The claim status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claimId: { type: string }
+                  status: { type: string }

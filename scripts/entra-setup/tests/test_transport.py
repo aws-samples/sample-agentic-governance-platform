@@ -17,23 +17,18 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from unittest import mock
 
 import pytest
 import requests
 
-# The script is a standalone single file, not an installed package: put its
-# directory on the import path so the tests run the same way regardless of the
-# working directory pytest was invoked from.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import setup_entra  # noqa: E402  (import follows the sys.path bootstrap above)
+import setup_entra
 
 
-# ===========================================================================
-# Fakes
-# ===========================================================================
 class FakeResponse:
     """Minimal stand-in for ``requests.Response``.
 
@@ -42,8 +37,7 @@ class FakeResponse:
     when it reads an error message off a response that has none.
     """
 
-    def __init__(self, status_code: int, body: dict | None = None,
-                 headers: dict | None = None) -> None:
+    def __init__(self, status_code: int, body: dict | None = None, headers: dict | None = None) -> None:
         self.status_code = status_code
         self._body = body
         self.headers = headers or {}
@@ -72,9 +66,7 @@ class FakeSession:
     def request(self, method: str, url: str, **kwargs) -> FakeResponse:
         self.calls.append({"method": method, "url": url, **kwargs})
         if not self._responses:
-            raise AssertionError(
-                "the client issued more requests than the test queued responses for"
-            )
+            raise AssertionError("the client issued more requests than the test queued responses for")
         queued = self._responses.pop(0)
         if isinstance(queued, Exception):
             raise queued
@@ -102,9 +94,6 @@ def recorded_sleeps(monkeypatch) -> list[float]:
     return sleeps
 
 
-# ===========================================================================
-# Token acquisition
-# ===========================================================================
 def test_get_az_token_parses_the_cli_output() -> None:
     """The three fields the run needs come straight off the CLI's JSON.
 
@@ -129,7 +118,6 @@ def test_get_az_token_parses_the_cli_output() -> None:
     assert token.access_token == "an-access-token"
     assert token.tenant_id == "22222222-2222-2222-2222-222222222222"
     assert token.expires_on == 1786000000
-    # The documented, cloud-aware token request — never a hardcoded Graph host.
     assert "ms-graph" in run.call_args.args[0]
 
 
@@ -170,11 +158,14 @@ def test_get_az_token_rejects_unparseable_output() -> None:
 @pytest.mark.parametrize(
     "stdout",
     [
-        # An expiry that is not a whole number of seconds.
-        '{"accessToken": "a-token", "tenant": "a-tenant", "expires_on": "soon"}',
-        '{"accessToken": "a-token", "tenant": "a-tenant", "expires_on": "1786000000.0"}',
-        # Valid JSON that is not an object at all.
-        "[1, 2, 3]",
+        pytest.param(
+            '{"accessToken": "a-token", "tenant": "a-tenant", "expires_on": "soon"}', id="expiry-not-a-number"
+        ),
+        pytest.param(
+            '{"accessToken": "a-token", "tenant": "a-tenant", "expires_on": "1786000000.0"}',
+            id="expiry-not-an-integer",
+        ),
+        pytest.param("[1, 2, 3]", id="not-an-object"),
     ],
 )
 def test_get_az_token_rejects_a_token_response_it_cannot_read(stdout: str) -> None:
@@ -209,9 +200,20 @@ def test_get_az_token_bounds_how_long_it_waits_for_the_cli() -> None:
     assert "60 seconds" in str(excinfo.value)
 
 
-# ===========================================================================
-# Retry classification
-# ===========================================================================
+def test_a_cli_timeout_leaves_the_partial_output_out_of_the_error() -> None:
+    """``TimeoutExpired`` carries the stdout captured so far, the stream that holds the access token,
+    so the PreflightError raised for it is not chained to it and no traceback can print it."""
+    timeout = subprocess.TimeoutExpired(cmd="az", timeout=60, output='{"accessToken": "fake-access-token"}')
+
+    with mock.patch.object(setup_entra.subprocess, "run", side_effect=timeout):
+        with pytest.raises(setup_entra.PreflightError) as excinfo:
+            setup_entra.get_az_token()
+
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+    assert "fake-access-token" not in "".join(traceback.format_exception(excinfo.value))
+
+
 @pytest.mark.parametrize("transient_status", [400, 404])
 def test_transient_status_is_retried_then_succeeds(
     transient_status: int, recorded_sleeps: list[float]
@@ -258,18 +260,10 @@ def test_throttling_honours_retry_after(recorded_sleeps: list[float]) -> None:
 @pytest.mark.parametrize(
     ("retry_after", "expected_sleep"),
     [
-        # An absurd value is capped at the Retry-After ceiling: ten retries each
-        # waiting an hour would turn a bounded window into a silence of hours.
-        ("3600", 60.0),
-        # A plausible value is obeyed AS ASKED even though it exceeds the linear
-        # schedule's 8 s cap. Clamping it to 8 s would put every retry inside the
-        # window the server asked us to wait out, failing a call that would have
-        # succeeded — this case is the one that pins that.
-        ("30", 30.0),
-        # Unusable values fall back to the schedule rather than reaching
-        # time.sleep, which rejects a negative argument outright.
-        ("-5", 1.0),
-        ("xyz", 1.0),
+        pytest.param("3600", 60.0, id="an-absurd-value-is-capped-at-the-retry-after-ceiling"),
+        pytest.param("30", 30.0, id="a-plausible-value-is-obeyed-beyond-the-schedule-cap"),
+        pytest.param("-5", 1.0, id="a-negative-value-takes-the-schedule-never-reaching-sleep"),
+        pytest.param("xyz", 1.0, id="junk-takes-the-schedule"),
     ],
 )
 def test_retry_after_is_clamped_into_the_bounded_window(
@@ -303,8 +297,11 @@ def test_forbidden_fails_fast_with_directory_role_guidance(
     right API permissions, otherwise the token would not have been issued.
     """
     session = FakeSession(
-        [FakeResponse(403, graph_error_body(code="Authorization_RequestDenied",
-                                           message="Insufficient privileges."))]
+        [
+            FakeResponse(
+                403, graph_error_body(code="Authorization_RequestDenied", message="Insufficient privileges.")
+            )
+        ]
     )
     client = setup_entra.GraphClient(fake_token(), session=session)
 
@@ -321,12 +318,14 @@ def test_forbidden_fails_fast_with_directory_role_guidance(
 @pytest.mark.parametrize(
     "message",
     [
-        # Matches only the first pinned phrase.
-        "A conflicting object with one or more of the specified property values already exists.",
-        # Matches only the second: the phrase exists precisely because a duplicate
-        # grant is not always reported with the word "exists", and a message that
-        # contained both would leave the second phrase unexercised.
-        "Permission entry already present for principal 33333333-3333-3333-3333-333333333333.",
+        pytest.param(
+            "A conflicting object with one or more of the specified property values already exists.",
+            id="the-already-exists-phrase",
+        ),
+        pytest.param(
+            "Permission entry already present for principal 33333333-3333-3333-3333-333333333333.",
+            id="the-permission-entry-already-phrase-which-never-says-exists",
+        ),
     ],
 )
 def test_already_exists_is_terminal_not_retried(
@@ -338,13 +337,7 @@ def test_already_exists_is_terminal_not_retried(
     is the only discriminator — and the check has to run BEFORE the retry
     decision, or an already-satisfied grant gets retried for the full window.
     """
-    # Each message exercises exactly one of the pinned phrases, so removing either
-    # one of them breaks this test rather than leaving it quietly green.
-    matched = [
-        phrase
-        for phrase in setup_entra.ALREADY_EXISTS_SUBSTRINGS
-        if phrase in message.lower()
-    ]
+    matched = [phrase for phrase in setup_entra.ALREADY_EXISTS_SUBSTRINGS if phrase in message.lower()]
     assert len(matched) == 1
 
     session = FakeSession([FakeResponse(status, graph_error_body(message=message))])
@@ -363,15 +356,12 @@ def test_retries_are_bounded_and_then_give_up(recorded_sleeps: list[float]) -> N
     Eleven attempts with a per-attempt delay capped at eight seconds spends about
     52 seconds waiting and then reports the failure instead of hanging forever.
     """
-    session = FakeSession(
-        [FakeResponse(400, graph_error_body(message="still not replicated"))] * 11
-    )
+    session = FakeSession([FakeResponse(400, graph_error_body(message="still not replicated"))] * 11)
     client = setup_entra.GraphClient(fake_token(), session=session)
 
     with pytest.raises(setup_entra.GraphError) as excinfo:
         client.post("/servicePrincipals", {"appId": "an-app-id"})
 
-    # Plain GraphError — neither of the two fail-fast subclasses.
     assert type(excinfo.value) is setup_entra.GraphError
     assert len(session.calls) == 11
     assert recorded_sleeps == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.0, 8.0]
@@ -381,8 +371,10 @@ def test_retries_are_bounded_and_then_give_up(recorded_sleeps: list[float]) -> N
 def test_server_errors_are_retried(recorded_sleeps: list[float]) -> None:
     """5xx is transient by definition; one retry is enough to prove it is in the set."""
     session = FakeSession(
-        [FakeResponse(503, graph_error_body(code="serviceNotAvailable", message="busy")),
-         FakeResponse(200, {"ok": True})]
+        [
+            FakeResponse(503, graph_error_body(code="serviceNotAvailable", message="busy")),
+            FakeResponse(200, {"ok": True}),
+        ]
     )
     client = setup_entra.GraphClient(fake_token(), session=session)
 
@@ -408,9 +400,7 @@ def test_a_dropped_connection_is_retried_then_succeeds(
     )
     client = setup_entra.GraphClient(fake_token(), session=session)
 
-    assert client.post("/applications", {"displayName": "an app"}) == {
-        "id": "new-object-id"
-    }
+    assert client.post("/applications", {"displayName": "an app"}) == {"id": "new-object-id"}
     assert len(session.calls) == 2
     assert recorded_sleeps == [1.0]
 
@@ -430,16 +420,12 @@ def test_an_unreachable_graph_gives_up_with_a_classified_failure(
     with pytest.raises(setup_entra.GraphError) as excinfo:
         client.post("/applications", {"displayName": "an app"})
 
-    # Plain GraphError — neither of the two fail-fast subclasses.
     assert type(excinfo.value) is setup_entra.GraphError
     assert len(session.calls) == 11
     assert recorded_sleeps == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.0, 8.0]
     assert "Timeout" in str(excinfo.value)
 
 
-# ===========================================================================
-# Request construction
-# ===========================================================================
 def test_get_sends_bearer_and_query_parameters() -> None:
     """Every call is a bearer-authenticated request against the versioned base URL."""
     session = FakeSession([FakeResponse(200, {"value": []})])
@@ -460,8 +446,7 @@ def test_patch_returns_nothing_for_an_empty_response_body() -> None:
     session = FakeSession([FakeResponse(204)])
     client = setup_entra.GraphClient(fake_token(), session=session)
 
-    assert client.patch("/servicePrincipals/sp-id",
-                        {"appRoleAssignmentRequired": True}) is None
+    assert client.patch("/servicePrincipals/sp-id", {"appRoleAssignmentRequired": True}) is None
     assert session.calls[0]["method"] == "PATCH"
 
 
@@ -516,7 +501,6 @@ def test_every_request_is_time_boxed_and_never_weakens_tls(
     client.post("/applications", {"displayName": "an app"})
     client.patch("/servicePrincipals/sp-id", {"appRoleAssignmentRequired": True})
 
-    # Four calls for three verbs: the PATCH went to the wire twice.
     assert len(session.calls) == 4
     for call in session.calls:
         assert call["timeout"] == 30
@@ -535,9 +519,7 @@ def test_failures_never_put_the_access_token_in_their_message(
     a message containing the token, so a client that echoed the exception it caught
     would fail this test.
     """
-    auth_session = FakeSession(
-        [FakeResponse(403, graph_error_body(message="Insufficient privileges."))]
-    )
+    auth_session = FakeSession([FakeResponse(403, graph_error_body(message="Insufficient privileges."))])
     with pytest.raises(setup_entra.GraphAuthError) as auth_failure:
         setup_entra.GraphClient(fake_token(), session=auth_session).post(
             "/applications", {"displayName": "an app"}

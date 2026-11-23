@@ -3,8 +3,9 @@ import json
 from datetime import datetime
 
 import pytest
-from models.mcp_server import McpServer
+
 from models.agent import Agent, LifecycleState
+from models.mcp_server import McpServer
 from services import agent_mcp_env
 
 _DT = datetime(2026, 6, 17, 12, 0, 0)
@@ -12,9 +13,13 @@ _DT = datetime(2026, 6, 17, 12, 0, 0)
 
 def _mcp(id, name, aud, url):
     return McpServer(
-        id=id, name=name, entra_app_audience=aud, gateway_url=url,
+        id=id,
+        name=name,
+        entra_app_audience=aud,
+        gateway_url=url,
         lifecycle_state=LifecycleState.APPROVED,
-        created_at=_DT, updated_at=_DT,
+        created_at=_DT,
+        updated_at=_DT,
     )
 
 
@@ -30,28 +35,23 @@ def test_build_env_lists_all_mcps_with_provider():
     assert servers[0]["audience"] == "api://agp-mcp-CZR2"
     assert servers[0]["gateway_url"] == "https://cc/mcp"
     assert servers[0]["label"] == "contact_center"
-    # legacy single-MCP keys are neutralized so they cannot linger as real values.
     assert env["MCP_AUDIENCE"] == ""
     assert env["MCP_GATEWAY_URL"] == ""
 
 
 def test_build_env_dedupes_colliding_labels():
-    # 2-MCP same-name case: first keeps bare slug, second gets a unique suffix.
     mcps = [
         _mcp("AAAAAA11", "Support", "api://agp-mcp-AAAAAA11", "https://a/mcp"),
         _mcp("BBBBBB22", "Support", "api://agp-mcp-BBBBBB22", "https://b/mcp"),
     ]
     env = agent_mcp_env.build_runtime_mcp_env(mcps, "p")
     labels = [s["label"] for s in json.loads(env["MCP_SERVERS"])]
-    assert len(set(labels)) == 2  # collision broken by id-suffix
+    assert len(set(labels)) == 2
     assert labels[0] == "support"
-    assert labels[1].startswith("support_")  # suffixed; exact form is an impl detail
+    assert labels[1].startswith("support_")
 
 
 def test_build_env_dedupes_three_way_shared_prefix_collision():
-    # 3-MCP case: all named "Support", ids share the first 6 chars — the old [:6] logic
-    # would assign "support_AAAAAA" to both the second AND third entry. The full-id
-    # approach must produce 3 distinct labels.
     mcps = [
         _mcp("AAAAAA01", "Support", "api://agp-mcp-AA01", "https://a/mcp"),
         _mcp("AAAAAA02", "Support", "api://agp-mcp-AA02", "https://b/mcp"),
@@ -59,30 +59,35 @@ def test_build_env_dedupes_three_way_shared_prefix_collision():
     ]
     env = agent_mcp_env.build_runtime_mcp_env(mcps, "p")
     labels = [s["label"] for s in json.loads(env["MCP_SERVERS"])]
-    assert len(set(labels)) == 3  # all three must be distinct
+    assert len(set(labels)) == 3
 
 
 def test_build_env_empty_set_is_prompt_only():
     env = agent_mcp_env.build_runtime_mcp_env([], None)
     assert env["MCP_SERVERS"] == "[]"
-    assert "CREDENTIAL_PROVIDER_NAME" not in env  # no provider when none given
+    assert "CREDENTIAL_PROVIDER_NAME" not in env
     assert env["MCP_AUDIENCE"] == "" and env["MCP_GATEWAY_URL"] == ""
 
 
 @pytest.mark.asyncio
 async def test_rebuild_resolves_registry_and_pushes_env(monkeypatch):
-    agent = Agent(id="ImD", name="CC", mcp_server_ids=["CZR2", "GONE"],
-                  oauth2_credential_provider_name="agp-agent-obo-ImD",
-                  agent_arn="arn:…:runtime/cc-x",
-                  lifecycle_state=LifecycleState.APPROVED,
-                  created_at=_DT, updated_at=_DT)
+    agent = Agent(
+        id="ImD",
+        name="CC",
+        mcp_server_ids=["CZR2", "GONE"],
+        oauth2_credential_provider_name="agp-agent-obo-ImD",
+        agent_arn="arn:…:runtime/cc-x",
+        lifecycle_state=LifecycleState.APPROVED,
+        created_at=_DT,
+        updated_at=_DT,
+    )
     pushed = {}
 
     class FakeMcpReg:
         def get(self, mid):
             if mid == "CZR2":
                 return _mcp("CZR2", "Contact Center", "api://agp-mcp-CZR2", "https://cc/mcp")
-            return None  # GONE → skipped + warned
+            return None
 
     class FakeIdentity:
         def set_runtime_environment(self, arn, env):
@@ -96,44 +101,48 @@ async def test_rebuild_resolves_registry_and_pushes_env(monkeypatch):
 
     assert pushed["arn"] == "arn:…:runtime/cc-x"
     servers = json.loads(pushed["env"]["MCP_SERVERS"])
-    assert [s["id"] for s in servers] == ["CZR2"]  # GONE skipped, not fatal
+    assert [s["id"] for s in servers] == ["CZR2"]
 
 
 @pytest.mark.asyncio
 async def test_rebuild_noop_without_agent_arn(monkeypatch):
-    agent = Agent(id="meta", name="m", mcp_server_ids=["CZR2"], agent_arn=None,
-                  lifecycle_state=LifecycleState.APPROVED,
-                  created_at=_DT, updated_at=_DT)
+    agent = Agent(
+        id="meta",
+        name="m",
+        mcp_server_ids=["CZR2"],
+        agent_arn=None,
+        lifecycle_state=LifecycleState.APPROVED,
+        created_at=_DT,
+        updated_at=_DT,
+    )
     called = {"set": False}
 
     class FakeIdentity:
         def set_runtime_environment(self, arn, env):
             called["set"] = True
 
-    monkeypatch.setattr(agent_mcp_env, "_get_mcp_registry", lambda: type("R", (), {"get": lambda self, m: None})())
+    monkeypatch.setattr(
+        agent_mcp_env, "_get_mcp_registry", lambda: type("R", (), {"get": lambda self, m: None})()
+    )
     monkeypatch.setattr(agent_mcp_env, "_get_agent_identity_service", lambda: FakeIdentity())
 
     await agent_mcp_env.rebuild_runtime_mcp_env(agent)
-    assert called["set"] is False  # no runtime to update
+    assert called["set"] is False
 
-
-# ---------------------------------------------------------------------------
-# E28A/T1 — the grant env must reach EVERY per-stage runtime
-# ---------------------------------------------------------------------------
-# T1b stage-scopes the runtime module's resource names, so two runtimes co-exist per agent.
-# This dispatch pushed to the ONE stored scalar ARN, leaving the other runtime holding stale
-# or absent grant env (D-A4 defect 4). A grant is a governance fact about the AGENT — not about
-# a stage — so it fans out to all of them, via the identity service's agent-level entry point.
 
 @pytest.mark.asyncio
 async def test_rebuild_pushes_to_every_per_stage_runtime(monkeypatch):
-    agent = Agent(id="ImD", name="CC", mcp_server_ids=["CZR2"],
-                  oauth2_credential_provider_name="agp-agent-obo-ImD",
-                  agent_arn="arn:…:runtime/cc_prod",
-                  agent_arns={"dev": "arn:…:runtime/cc_dev",
-                              "prod": "arn:…:runtime/cc_prod"},
-                  lifecycle_state=LifecycleState.APPROVED,
-                  created_at=_DT, updated_at=_DT)
+    agent = Agent(
+        id="ImD",
+        name="CC",
+        mcp_server_ids=["CZR2"],
+        oauth2_credential_provider_name="agp-agent-obo-ImD",
+        agent_arn="arn:…:runtime/cc_prod",
+        agent_arns={"dev": "arn:…:runtime/cc_dev", "prod": "arn:…:runtime/cc_prod"},
+        lifecycle_state=LifecycleState.APPROVED,
+        created_at=_DT,
+        updated_at=_DT,
+    )
     pushed = []
 
     class FakeMcpReg:
@@ -149,7 +158,6 @@ async def test_rebuild_pushes_to_every_per_stage_runtime(monkeypatch):
 
     await agent_mcp_env.rebuild_runtime_mcp_env(agent)
 
-    # BOTH runtimes got the injection — and the SAME env, since a grant is agent-level.
     assert sorted(arn for arn, _ in pushed) == ["arn:…:runtime/cc_dev", "arn:…:runtime/cc_prod"]
     for _, env in pushed:
         assert json.loads(env["MCP_SERVERS"])[0]["id"] == "CZR2"
@@ -160,11 +168,15 @@ async def test_rebuild_injects_the_others_then_raises_when_one_runtime_fails(mon
     """Attempt-all-then-raise. A dev runtime that cannot be reached must not stop prod from
     being brought into line — but the grant route turns the raise into a fail-loud 5xx, because
     a successful grant must imply a fully-wired agent."""
-    agent = Agent(id="ImD", name="CC", mcp_server_ids=[],
-                  agent_arns={"dev": "arn:…:runtime/cc_dev",
-                              "prod": "arn:…:runtime/cc_prod"},
-                  lifecycle_state=LifecycleState.APPROVED,
-                  created_at=_DT, updated_at=_DT)
+    agent = Agent(
+        id="ImD",
+        name="CC",
+        mcp_server_ids=[],
+        agent_arns={"dev": "arn:…:runtime/cc_dev", "prod": "arn:…:runtime/cc_prod"},
+        lifecycle_state=LifecycleState.APPROVED,
+        created_at=_DT,
+        updated_at=_DT,
+    )
     pushed = []
 
     class FakeIdentity:
@@ -173,8 +185,9 @@ async def test_rebuild_injects_the_others_then_raises_when_one_runtime_fails(mon
                 raise RuntimeError("AccessDenied")
             pushed.append(arn)
 
-    monkeypatch.setattr(agent_mcp_env, "_get_mcp_registry",
-                        lambda: type("R", (), {"get": lambda self, m: None})())
+    monkeypatch.setattr(
+        agent_mcp_env, "_get_mcp_registry", lambda: type("R", (), {"get": lambda self, m: None})()
+    )
     monkeypatch.setattr(agent_mcp_env, "_get_agent_identity_service", lambda: FakeIdentity())
 
     with pytest.raises(RuntimeError):
@@ -187,18 +200,24 @@ async def test_rebuild_injects_the_others_then_raises_when_one_runtime_fails(mon
 async def test_rebuild_still_pushes_for_a_legacy_scalar_only_record(monkeypatch):
     """A legacy record (no map) must still get its one injection — every agent in the registry
     is this shape today."""
-    agent = Agent(id="leg", name="CC", mcp_server_ids=[],
-                  agent_arn="arn:…:runtime/cc-x",
-                  lifecycle_state=LifecycleState.APPROVED,
-                  created_at=_DT, updated_at=_DT)
+    agent = Agent(
+        id="leg",
+        name="CC",
+        mcp_server_ids=[],
+        agent_arn="arn:…:runtime/cc-x",
+        lifecycle_state=LifecycleState.APPROVED,
+        created_at=_DT,
+        updated_at=_DT,
+    )
     calls = []
 
     class FakeIdentity:
         def set_runtime_environment(self, arn, env):
             calls.append(arn)
 
-    monkeypatch.setattr(agent_mcp_env, "_get_mcp_registry",
-                        lambda: type("R", (), {"get": lambda self, m: None})())
+    monkeypatch.setattr(
+        agent_mcp_env, "_get_mcp_registry", lambda: type("R", (), {"get": lambda self, m: None})()
+    )
     monkeypatch.setattr(agent_mcp_env, "_get_agent_identity_service", lambda: FakeIdentity())
 
     await agent_mcp_env.rebuild_runtime_mcp_env(agent)
@@ -209,34 +228,28 @@ async def test_rebuild_still_pushes_for_a_legacy_scalar_only_record(monkeypatch)
 @pytest.mark.asyncio
 async def test_rebuild_noop_when_the_agent_has_no_runtime_at_all(monkeypatch):
     """No map AND no scalar (metadata-only / pre-registration) stays a no-op, unchanged."""
-    agent = Agent(id="meta", name="m", mcp_server_ids=[], agent_arn=None,
-                  lifecycle_state=LifecycleState.APPROVED,
-                  created_at=_DT, updated_at=_DT)
+    agent = Agent(
+        id="meta",
+        name="m",
+        mcp_server_ids=[],
+        agent_arn=None,
+        lifecycle_state=LifecycleState.APPROVED,
+        created_at=_DT,
+        updated_at=_DT,
+    )
     called = {"set": False}
 
     class FakeIdentity:
         def set_runtime_environment(self, arn, env):
             called["set"] = True
 
-    monkeypatch.setattr(agent_mcp_env, "_get_mcp_registry",
-                        lambda: type("R", (), {"get": lambda self, m: None})())
+    monkeypatch.setattr(
+        agent_mcp_env, "_get_mcp_registry", lambda: type("R", (), {"get": lambda self, m: None})()
+    )
     monkeypatch.setattr(agent_mcp_env, "_get_agent_identity_service", lambda: FakeIdentity())
 
     await agent_mcp_env.rebuild_runtime_mcp_env(agent)
     assert called["set"] is False
-
-
-# ---------------------------------------------------------------------------
-# E36/T12 — reconcile-on-read: heal a runtime whose MCP env was wiped
-# ---------------------------------------------------------------------------
-# A runtime REPLACEMENT (our pipeline's terraform apply, or a customer's own
-# `agentcore launch`) drops the backend-injected env, and the platform gets no signal at all.
-# `GET /agents/{id}/runtime` already reads the live `environmentVariables`, so the DETECTION is
-# free: grants on the record but no `MCP_SERVERS` on the runtime it JUST READ is a wipe, and the
-# fix is the EXISTING idempotent rebuild. Deliberately NOT lane-scoped (research §3) — it heals
-# platform-deployed and registered-external agents alike, because the trigger is self-limiting:
-# an agent with no grants never reconciles, a correctly-wired runtime never reconciles, and a read
-# that never reached the runtime holds no evidence and so never reconciles either.
 
 
 def _granted_agent(**overrides):
@@ -246,7 +259,8 @@ def _granted_agent(**overrides):
         mcp_server_ids=overrides.pop("mcp_server_ids", ["CZR2"]),
         agent_arn="arn:…:runtime/cc-x",
         lifecycle_state=LifecycleState.APPROVED,
-        created_at=_DT, updated_at=_DT,
+        created_at=_DT,
+        updated_at=_DT,
         **overrides,
     )
 
@@ -275,8 +289,9 @@ def _spy_set_env(monkeypatch):
         def set_runtime_environment(self, arn, env, *, wait_ready: bool = True):
             calls.append({"arn": arn, "wait_ready": wait_ready})
 
-    monkeypatch.setattr(agent_mcp_env, "_get_mcp_registry",
-                        lambda: type("R", (), {"get": lambda self, m: None})())
+    monkeypatch.setattr(
+        agent_mcp_env, "_get_mcp_registry", lambda: type("R", (), {"get": lambda self, m: None})()
+    )
     monkeypatch.setattr(agent_mcp_env, "_get_agent_identity_service", lambda: FakeIdentity())
     return calls
 
@@ -293,7 +308,7 @@ async def test_reconcile_rebuilds_when_grants_exist_but_the_runtime_lost_mcp_ser
     )
 
     assert applied is True
-    assert [a.id for a, _ in seen] == ["ImD"]  # delegated to the existing idempotent rebuild
+    assert [a.id for a, _ in seen] == ["ImD"]
 
 
 @pytest.mark.asyncio
@@ -349,9 +364,7 @@ async def test_reconcile_is_a_noop_when_the_runtime_is_already_wired(monkeypatch
     agent = _granted_agent()
     seen = _spy_rebuild(monkeypatch)
 
-    applied = await agent_mcp_env.reconcile_runtime_mcp_env(
-        agent, {"MCP_SERVERS": "[]"}
-    )
+    applied = await agent_mcp_env.reconcile_runtime_mcp_env(agent, {"MCP_SERVERS": "[]"})
 
     assert applied is False
     assert seen == []
@@ -362,14 +375,14 @@ async def test_reconcile_swallows_a_rebuild_failure(monkeypatch):
     """The rebuild RAISES on an unreachable runtime (attempt-all-then-raise) — correct for the
     grant route, which must fail loud. Here it must NEVER propagate: this is a best-effort heal
     hanging off a read surface that is contractually 200-or-a-status, and a cross-account tenant
-    runtime raises on EVERY attempt (research §3), which would otherwise 5xx the fleet view."""
+    runtime raises on EVERY attempt , which would otherwise 5xx the fleet view."""
     agent = _granted_agent()
     seen = _spy_rebuild(monkeypatch, boom=RuntimeError("AccessDenied"))
 
     applied = await agent_mcp_env.reconcile_runtime_mcp_env(agent, {})
 
-    assert applied is False  # nothing was established, so nothing is claimed
-    assert len(seen) == 1  # it was attempted
+    assert applied is False
+    assert len(seen) == 1
 
 
 @pytest.mark.asyncio
@@ -422,12 +435,11 @@ async def test_reconcile_drops_a_second_trigger_while_one_is_in_flight(monkeypat
     await started.wait()
 
     assert await agent_mcp_env.reconcile_runtime_mcp_env(agent, {}) is False
-    assert len(seen) == 1  # the concurrent trigger wrote nothing
+    assert len(seen) == 1
 
     release.set()
     assert await first is True
 
-    # …and the guard is RELEASED, so the next read can still heal (no permanent lock-out).
     release.clear()
     started.clear()
     later = asyncio.ensure_future(agent_mcp_env.reconcile_runtime_mcp_env(agent, {}))
@@ -463,3 +475,100 @@ async def test_the_in_flight_guard_is_per_agent_not_global(monkeypatch):
     release.set()
     assert await first is True
     assert sorted(seen) == ["ImD", "Oth"]
+
+
+def _registry_of(*ids):
+    class R:
+        def get(self, mid):
+            return (
+                _mcp(mid, f"srv {mid}", f"api://agp-mcp-{mid}", f"https://{mid}/mcp") if mid in ids else None
+            )
+
+    return R()
+
+
+def _capture_env(monkeypatch, *ids):
+    pushed: list[dict] = []
+
+    class FakeIdentity:
+        def set_runtime_environment(self, arn, env, *, wait_ready: bool = True):
+            pushed.append(env)
+
+    monkeypatch.setattr(agent_mcp_env, "_get_mcp_registry", lambda: _registry_of(*ids))
+    monkeypatch.setattr(agent_mcp_env, "_get_agent_identity_service", lambda: FakeIdentity())
+    return pushed
+
+
+def test_runtime_mcp_ids_is_granted_first_then_declared_deduped():
+    agent = _granted_agent(mcp_server_ids=["G1", "D2"], declared_mcp_server_ids=["D1", "D2", "D1"])
+    assert agent_mcp_env.runtime_mcp_ids(agent) == ["G1", "D2", "D1"]
+
+
+def test_runtime_mcp_ids_tolerates_an_agent_without_the_field():
+    from types import SimpleNamespace
+
+    assert agent_mcp_env.runtime_mcp_ids(SimpleNamespace(mcp_server_ids=["G1"])) == ["G1"]
+    assert agent_mcp_env.runtime_mcp_ids(SimpleNamespace(mcp_server_ids=[])) == []
+
+
+@pytest.mark.asyncio
+async def test_rebuild_wires_declared_and_granted_servers(monkeypatch):
+    pushed = _capture_env(monkeypatch, "G1", "D1")
+    agent = _granted_agent(mcp_server_ids=["G1"], declared_mcp_server_ids=["D1"])
+
+    await agent_mcp_env.rebuild_runtime_mcp_env(agent)
+
+    assert [s["id"] for s in json.loads(pushed[0]["MCP_SERVERS"])] == ["G1", "D1"]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_with_neither_list_pushes_an_empty_server_list(monkeypatch):
+    pushed = _capture_env(monkeypatch)
+    agent = _granted_agent(mcp_server_ids=[])
+
+    await agent_mcp_env.rebuild_runtime_mcp_env(agent)
+
+    assert pushed[0]["MCP_SERVERS"] == "[]"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_triggers_for_a_declared_only_agent(monkeypatch):
+    agent = _granted_agent(mcp_server_ids=[], declared_mcp_server_ids=["D1"])
+    seen = _spy_rebuild(monkeypatch)
+
+    applied = await agent_mcp_env.reconcile_runtime_mcp_env(agent, {})
+
+    assert applied is True
+    assert [a.id for a, _ in seen] == ["ImD"]
+
+
+@pytest.mark.asyncio
+async def test_a_revoke_of_a_declared_server_keeps_it_wired(monkeypatch):
+    """The revoke removes only the GRANT (`mcp_server_ids`); the rebuilt env still carries the
+    declared server, so the runtime tries it and Entra refuses it (the Contain story)."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from services.agent_mcp_grant import revoke_agent_mcp_grant
+
+    pushed = _capture_env(monkeypatch, "D1")
+    agent = _granted_agent(mcp_server_ids=["D1"], declared_mcp_server_ids=["D1"], entra_sp_id="agent-sp")
+    mcp = _mcp("D1", "srv D1", "api://agp-mcp-D1", "https://D1/mcp")
+    mcp.entra_sp_id = "mcp-sp"
+
+    graph = MagicMock()
+    graph.list_assignments = AsyncMock(side_effect=[[{"id": "as-1", "principalId": "agent-sp"}], []])
+    graph.revoke_app_role = AsyncMock(return_value=None)
+    graph.revoke_agent_obo_consent = AsyncMock(return_value=None)
+    agents = MagicMock()
+    agents.list.return_value = [agent]
+
+    with (
+        patch("api.routes.mcp_server_grants.get_mcp_graph_service", return_value=graph),
+        patch("api.routes.agents.get_service", return_value=agents),
+    ):
+        await revoke_agent_mcp_grant(mcp, "as-1")
+
+    assert agent.mcp_server_ids == []
+    agents.persist_identity.assert_called_once_with(agent)
+    graph.revoke_agent_obo_consent.assert_awaited_once_with("agent-sp", "mcp-sp")
+    assert [s["id"] for s in json.loads(pushed[-1]["MCP_SERVERS"])] == ["D1"]

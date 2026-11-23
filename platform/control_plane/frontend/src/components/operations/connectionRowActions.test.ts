@@ -1,28 +1,13 @@
-// connectionRowActions.test.ts — the connections-admin row's action split, as UNITS (E28D/T4).
-//
-// WHY THIS FILE EXISTS AT ALL. `ConnectionsAdmin.tsx` is 1471 lines with ZERO tests of its own,
-// and vitest here collects `src/**/*.test.ts` in a node environment with NO jsdom — so nothing in
-// that file can be mounted, clicked or rendered by any test in this project. The row-action split
-// it shipped had no stated rule (an unconditional "Roll out templates" sitting inline as a peer of
-// the row's health verb, while the OAuth-client action that unblocks every human in the org hid
-// behind the kebab), and an unstated rule is a rule that drifts. Moving the decision into
-// `connectionRowActions.ts` is what makes it assertable; this file is the assertion.
-//
-// E28B's lesson (nine vacuous guards) is the shape rule: no test below reads the module's own
-// constants back to itself or greps a `.tsx` for a class name. Every case calls the function and
-// asserts its OUTPUT for a given connection.
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
-import { describe, expect, it } from 'vitest';
-
+import type { Connection } from '../../api/client';
 import {
   connectionRowActions,
+  connectionStatusPill,
   oauthClientSubline,
   templatesReconcilePath,
   type ConnectionRowSource,
 } from './connectionRowActions.ts';
-
-// --- Fixtures --------------------------------------------------------------
-// Shaped as the three fields of `Connection` (api/client.ts:1553-1572) this module reads.
 
 const conn = (over: Partial<ConnectionRowSource> = {}): ConnectionRowSource => ({
   status: 'connected',
@@ -33,24 +18,26 @@ const conn = (over: Partial<ConnectionRowSource> = {}): ConnectionRowSource => (
 
 const keys = (items: { key: string }[]) => items.map((i) => i.key);
 
+describe('ConnectionRowSource is the wire row', () => {
+  it("the client's Connection assigns to it, so a row object passes straight in", () => {
+    expectTypeOf<Connection>().toExtend<ConnectionRowSource>();
+  });
+});
+
 describe('connectionRowActions — inline is the row\'s ONE health/setup verb', () => {
-  it('gives a pending github_app row Finish setup, and nothing else inline', () => {
-    // A pending App connection cannot be Re-tested into shape (minting against
-    // installation_id=None fails), so the two verbs must mutually exclude.
+  it('gives a pending github_app row Finish setup, and nothing else inline: a token minted against an uninstalled App fails, so Re-test cannot be the verb', () => {
     const { inline } = connectionRowActions(conn({ status: 'pending', auth_type: 'github_app' }));
     expect(keys(inline)).toEqual(['finish-setup']);
     expect(inline[0].label).toBe('Finish setup');
     expect(inline[0].kind).toBe('default');
   });
 
-  it('gives every other row Re-test, and nothing else inline', () => {
+  it('gives every other row Re-test, and nothing else inline, a pending PAT row included: it has no install to finish', () => {
     for (const c of [
       conn({ status: 'connected', auth_type: 'github_app' }),
       conn({ status: 'error', auth_type: 'github_app' }),
       conn({ status: 'connected', auth_type: 'pat' }),
       conn({ status: 'error', auth_type: 'pat' }),
-      // A PAT row can be pending without needing finalize — there is no install to resolve,
-      // so Re-test is the honest verb. This is the case the `&&` in the rule exists for.
       conn({ status: 'pending', auth_type: 'pat' }),
     ]) {
       const { inline } = connectionRowActions(c);
@@ -70,9 +57,7 @@ describe('connectionRowActions — inline is the row\'s ONE health/setup verb', 
     }
   });
 
-  it('keeps "Roll out templates" OUT of the inline slot', () => {
-    // The regression this task closes: the rarest action, opening a heavy provider-backed modal,
-    // was an unconditional inline peer of the health verb.
+  it('keeps "Roll out templates" OUT of the inline slot: the rarest action, opening a provider-backed modal, is no peer of the health verb', () => {
     for (const auth_type of ['pat', 'github_app'] as const) {
       const { inline } = connectionRowActions(conn({ auth_type }));
       expect(keys(inline)).not.toContain('roll-out-templates');
@@ -106,9 +91,7 @@ describe('connectionRowActions — the menu carries everything else, destructive
     }
   });
 
-  it('separates Delete from the item above it with a divider — and ONLY Delete', () => {
-    // There was no divider before this change: Delete sat flush against its neighbour in a
-    // two-item menu, which is a mis-click waiting to happen on the one irreversible action.
+  it('separates Delete from the item above it with a divider — and ONLY Delete: a lone irreversible action never sits flush against its neighbour', () => {
     for (const auth_type of ['pat', 'github_app'] as const) {
       const { menu } = connectionRowActions(conn({ auth_type }));
       const divided = menu.filter((i) => i.dividerBefore);
@@ -124,15 +107,12 @@ describe('connectionRowActions — the menu carries everything else, destructive
 });
 
 describe('connectionRowActions — the auth-type gates', () => {
-  it('offers the OAuth-client item to github_app rows ONLY', () => {
-    // The OAuth client is a property of a GitHub App; a PAT connection has none to add.
+  it('offers the OAuth-client item to github_app rows ONLY: the client is a property of the App, and a PAT connection has none to add', () => {
     expect(keys(connectionRowActions(conn({ auth_type: 'github_app' })).menu)).toContain('oauth-client');
     expect(keys(connectionRowActions(conn({ auth_type: 'pat' })).menu)).not.toContain('oauth-client');
   });
 
-  it('offers Replace token to non-github_app rows ONLY', () => {
-    // An App mints its own installation tokens — there is no stored token to replace, so the
-    // affordance would be a click with nothing behind it.
+  it('offers Replace token to non-github_app rows ONLY: an App mints its own installation tokens, so there is no stored token to replace', () => {
     expect(keys(connectionRowActions(conn({ auth_type: 'pat' })).menu)).toContain('replace-token');
     expect(keys(connectionRowActions(conn({ auth_type: 'github_app' })).menu)).not.toContain('replace-token');
   });
@@ -144,9 +124,7 @@ describe('connectionRowActions — the auth-type gates', () => {
     }
   });
 
-  it('flips the OAuth-client label on whether a client is already stored', () => {
-    // The two labels name DIFFERENT consequences: adding unblocks account linking for the whole
-    // org, replacing rotates a secret that already works.
+  it('flips the OAuth-client label on whether a client is already stored: adding unblocks account linking for the org, replacing rotates a secret that already works', () => {
     const absent = connectionRowActions(conn({ has_oauth_client: false })).menu.find(
       (i) => i.key === 'oauth-client',
     );
@@ -185,10 +163,7 @@ describe('connectionRowActions — roll out is a NAVIGATION, not a second modal 
 });
 
 describe('templatesReconcilePath — the one URL the navigate item points at', () => {
-  it('targets the Templates page with the row\'s connection id', () => {
-    // `?connection=` is the plumbing the Templates page ALREADY reads twice: it seeds the
-    // catalog's org (Templates.tsx:115) and it opens the reconcile surface for that row
-    // (Templates.tsx:257). So the link needs no second param to arrive in the right place.
+  it('targets the Templates page with the row\'s connection id, the one param that both scopes that page and opens its reconcile surface', () => {
     expect(templatesReconcilePath('conn-123')).toBe('/ops/templates?connection=conn-123');
   });
 
@@ -196,46 +171,34 @@ describe('templatesReconcilePath — the one URL the navigate item points at', (
     expect(templatesReconcilePath('a&b=c d')).toBe('/ops/templates?connection=a%26b%3Dc%20d');
   });
 
-  it('omits `seed=1` — the seed prompt belongs to the post-install arrival, not to a browse', () => {
-    // ConnectionCallback deep-links with `&seed=1` because that operator just finished an
-    // install and IS being asked for consent to seed. An admin clicking a row action is
-    // inspecting, so asking them to consent to a write they did not ask for is a mis-prompt.
+  it('omits `seed=1`: the seed consent belongs to the post-install arrival, and an admin browsing a row did not ask for a write', () => {
     expect(templatesReconcilePath('conn-123')).not.toContain('seed');
   });
 });
 
 describe('oauthClientSubline — the amber line becomes the affordance', () => {
-  it('is absent on a PAT row', () => {
-    // The line makes a claim about a GitHub App's OAuth client. A PAT row has no App, so the
-    // line would be reporting on something that does not exist.
+  it('is absent on a PAT row: the line reports on a GitHub App\'s OAuth client, and a PAT connection has no App', () => {
     expect(oauthClientSubline(conn({ auth_type: 'pat', has_oauth_client: false }))).toBeNull();
     expect(oauthClientSubline(conn({ auth_type: 'pat', has_oauth_client: true }))).toBeNull();
   });
 
-  it('is ACTIONABLE and warn-toned when the client is missing', () => {
-    // "Not set" is the state that blocks every human in the org from linking their account.
-    // The operator reads the problem in the Status cell — they should be able to act on it there,
-    // instead of hunting for the verb in the Actions column.
+  it('is ACTIONABLE and warn-toned when the client is missing: the operator reads the blocking state in the Status cell and acts on it there', () => {
     const line = oauthClientSubline(conn({ auth_type: 'github_app', has_oauth_client: false }));
     expect(line).not.toBeNull();
-    expect(line?.actionable).toBe(true);
+    expect(line?.rendersAsButton).toBe(true);
     expect(line?.tone).toBe('warn');
     expect(line?.label).toBe('OAuth client: not set');
   });
 
-  it('is inert and muted once a client is stored', () => {
-    // Nothing is blocked, so a button here would invite an accidental secret rotation. The
-    // rotation stays in the kebab, where a deliberate act belongs.
+  it('is inert and muted once a client is stored: a button there would invite an accidental secret rotation, which stays in the kebab', () => {
     const line = oauthClientSubline(conn({ auth_type: 'github_app', has_oauth_client: true }));
     expect(line).not.toBeNull();
-    expect(line?.actionable).toBe(false);
+    expect(line?.rendersAsButton).toBe(false);
     expect(line?.tone).toBe('muted');
     expect(line?.label).toBe('OAuth client: ready');
   });
 
-  it('opens the SAME action the kebab item opens when actionable', () => {
-    // Two affordances for one modal is fine; two affordances that diverge is the bug this
-    // whole task is about.
+  it('opens the SAME action the kebab item opens when it renders as a button: two affordances for one modal may not diverge', () => {
     const c = conn({ auth_type: 'github_app', has_oauth_client: false });
     const line = oauthClientSubline(c);
     const kebab = connectionRowActions(c).menu.find((i) => i.key === 'oauth-client');
@@ -250,13 +213,29 @@ describe('oauthClientSubline — the amber line becomes the affordance', () => {
     expect(missing?.title).not.toBe(ready?.title);
   });
 
-  it('never claims readiness it cannot see — status does not enter the line', () => {
-    // The OAuth client is NOT part of the connection's health: an App works fine without one,
-    // and a connection in `error` can still have a perfectly good client stored. Letting
-    // `status` recolor this line would conflate two independent facts.
+  it('never claims readiness it cannot see — status does not enter the line: an App works without a client, and an errored connection can still hold a good one', () => {
     for (const status of ['connected', 'error', 'pending'] as const) {
       expect(oauthClientSubline(conn({ status, has_oauth_client: true }))?.tone).toBe('muted');
       expect(oauthClientSubline(conn({ status, has_oauth_client: false }))?.tone).toBe('warn');
     }
+  });
+});
+
+describe('connectionStatusPill', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('labels every declared status', () => {
+    expect(connectionStatusPill('connected').label).toBe('Connected');
+    expect(connectionStatusPill('error').label).toBe('Error');
+    expect(connectionStatusPill('pending').label).toBe('Pending install');
+  });
+
+  it('renders the raw word for a connection status outside the union, without throwing', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const pill = connectionStatusPill('suspended' as never);
+    expect(pill.label).toBe('suspended');
+    expect(pill.cls).toMatch(/slate/);
+    connectionStatusPill('suspended' as never);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });

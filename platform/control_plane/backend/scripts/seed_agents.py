@@ -1,17 +1,21 @@
 #!/usr/bin/env python
-"""Seed ~20 representative demo agents into the AWS Agent Registry (Epic 4, Task 10).
+"""Seed ~20 representative demo agents into the AWS Agent Registry.
 
 This is a USER / CONTROLLER step: it makes live AWS calls (via
 ``AgentRegistryService`` -> ``bedrock-agentcore-control``, Bedrock AgentCore,
 Public Preview) and therefore needs AWS credentials with the registry
 permissions (research §8) AND a provisioned ``AGENT_REGISTRY_ID``. It is NOT run
 by automation in no-commit mode; the controller runs it once to populate the
-governance registry with demo data so the C-4 list view and C-5 approval flow
-have a credible mix of agents to show.
+governance registry with demo data so the list view and the approval flow have a
+credible mix of agents to show.
 
 What it does:
   1. Build ~20 ``AgentCreate`` payloads (defined as data below) spread across
-     platforms / business units / regions / data classifications / origins.
+     platforms / business units / regions / data classifications / origins. Each
+     entry's ``lifecycle`` key is a seed-only directive, not an ``AgentCreate`` field:
+     ``"proposed"`` (the default; stays DRAFT), ``"pending_approval"`` (submit),
+     ``"approved"`` (submit + approve) or ``"deprecated"`` (submit + approve +
+     deprecate). It is dropped before the payload is built.
   2. For each: ``service.create(AgentCreate(**fields), created_by="seed")``.
      Idempotent — a name that already exists raises ``NameTakenError`` which is
      caught + logged ("skip, already exists"), so re-running does not duplicate.
@@ -62,28 +66,7 @@ import sys
 
 logger = logging.getLogger("seed_agents")
 
-
-# ---------------------------------------------------------------------------
-# Demo agent data (module-level constants — pure data, no AWS, import-safe).
-#
-# Each dict is the kwargs for an AgentCreate. Spread per the plan / Task 10:
-#   - platform: mostly aws_bedrock, 2 azure, 1 salesforce, a couple others.
-#   - business_unit: Claims, Underwriting, Finance, Broker Ops, Actuarial,
-#     Customer Service.
-#   - region: DE, IT, FR, SE, EU.
-#   - data_classification: Public / Internal / Confidential / Restricted.
-#   - origin: mostly Registered, a few Deployed.
-#   - names: realistic, unique, kebab-case.
-#
-# The `lifecycle` key is NOT an AgentCreate field — it is a seed-only directive
-# telling the script which lifecycle to drive the created agent into. It is
-# popped off before constructing the AgentCreate. Values:
-#   "proposed" (default; stays DRAFT), "approved" (submit + approve),
-#   "deprecated" (submit + approve + deprecate).
-# ---------------------------------------------------------------------------
-
 DEMO_AGENTS: list[dict] = [
-    # --- Claims ----------------------------------------------------------
     {
         "name": "claims-triage-de",
         "purpose": "Triage inbound motor claims for the DE market and route to the right adjuster queue.",
@@ -132,7 +115,6 @@ DEMO_AGENTS: list[dict] = [
         "origin": "Registered",
         "lifecycle": "pending_approval",
     },
-    # --- Underwriting ----------------------------------------------------
     {
         "name": "underwriting-copilot-fr",
         "purpose": "Assist underwriters with risk scoring and policy recommendations for the FR market.",
@@ -169,7 +151,6 @@ DEMO_AGENTS: list[dict] = [
         "origin": "Deployed",
         "lifecycle": "proposed",
     },
-    # --- Finance ---------------------------------------------------------
     {
         "name": "finance-close-assistant-eu",
         "purpose": "Summarize month-end close exceptions and draft reconciliation notes for Finance.",
@@ -206,7 +187,6 @@ DEMO_AGENTS: list[dict] = [
         "origin": "Registered",
         "lifecycle": "deprecated",
     },
-    # --- Broker Ops ------------------------------------------------------
     {
         "name": "broker-assist-it",
         "purpose": "Answer broker questions about products and quote status for the IT market.",
@@ -243,7 +223,6 @@ DEMO_AGENTS: list[dict] = [
         "origin": "Registered",
         "lifecycle": "pending_approval",
     },
-    # --- Actuarial -------------------------------------------------------
     {
         "name": "actuarial-data-prep-eu",
         "purpose": "Prepare and validate datasets for reserving models across EU markets.",
@@ -280,7 +259,6 @@ DEMO_AGENTS: list[dict] = [
         "origin": "Registered",
         "lifecycle": "proposed",
     },
-    # --- Customer Service ------------------------------------------------
     {
         "name": "customer-care-bot-de",
         "purpose": "Answer policyholder questions and handle simple service requests for the DE market.",
@@ -332,22 +310,17 @@ DEMO_AGENTS: list[dict] = [
 ]
 
 
-# Lifecycle directives the seed understands (the `lifecycle` key in DEMO_AGENTS).
-# "proposed" / "pending_approval" leave the record short of APPROVED; "approved"
-# drives submit+approve; "deprecated" drives submit+approve+deprecate (DEPRECATED
-# requires APPROVED first per the native lifecycle — research §5).
 _VALID_LIFECYCLES = {"proposed", "pending_approval", "approved", "deprecated"}
 
 
 def _build_agent_create(fields: dict):
     """Construct an AgentCreate from a DEMO_AGENTS dict (minus the `lifecycle`
     directive). Pure Pydantic — no AWS. Imported lazily so importing this module
-    triggers no settings/AWS setup."""
+    triggers no settings/AWS setup. ``tenant_id`` is required on AgentCreate: demo
+    agents belong to the seed ``"default"`` tenant unless the entry says otherwise."""
     from models.agent import AgentCreate
 
     payload = {k: v for k, v in fields.items() if k != "lifecycle"}
-    # E24: tenant_id is REQUIRED on AgentCreate — demo agents belong to the seed
-    # "default" tenant unless the DEMO_AGENTS entry says otherwise.
     payload.setdefault("tenant_id", "default")
     return AgentCreate(**payload)
 
@@ -381,7 +354,9 @@ def dry_run() -> int:
             agent.origin.value,
         )
 
-    logger.info("DRY RUN OK — %d/%d AgentCreate payloads validated, all names unique.", validated, len(DEMO_AGENTS))
+    logger.info(
+        "DRY RUN OK — %d/%d AgentCreate payloads validated, all names unique.", validated, len(DEMO_AGENTS)
+    )
     print(f"validated {validated} agent payloads (dry run, no AWS)")
     return 0
 
@@ -389,13 +364,14 @@ def dry_run() -> int:
 def _drive_lifecycle(service, agent, lifecycle: str) -> None:
     """Drive a freshly-created agent into its target lifecycle state.
 
-    Defensive: any transition failure is logged and swallowed so one bad
-    transition can't abort the whole seed. DEPRECATED requires APPROVED first
-    (research §5), so the deprecate path approves before deprecating.
+    Seeding is best-effort: any failed transition, whatever its class (the service's own
+    errors include a plain ``AgentNotFoundError``), is logged with its traceback and
+    swallowed so one bad transition can't abort the whole seed. DEPRECATED requires
+    APPROVED first (research §5), so the deprecate path approves before deprecating.
     """
     try:
         if lifecycle == "proposed":
-            return  # stays DRAFT — nothing to do
+            return
         if lifecycle == "pending_approval":
             service.submit_for_approval(agent.id)
             logger.info("    submitted %r for approval -> pending_approval", agent.name)
@@ -405,11 +381,10 @@ def _drive_lifecycle(service, agent, lifecycle: str) -> None:
             service.transition(agent.id, "approve", "Seed: approved for demo")
             logger.info("    approved %r", agent.name)
             if lifecycle == "deprecated":
-                # DEPRECATED is reachable only from APPROVED (research §5).
                 service.transition(agent.id, "deprecate", "Seed: deprecated for demo")
                 logger.info("    deprecated %r", agent.name)
-    except Exception as exc:  # noqa: BLE001 — keep seeding even if a transition fails
-        logger.warning(
+    except Exception as exc:
+        logger.exception(
             "    lifecycle transition for %r (target %s) failed: %s — continuing",
             agent.name,
             lifecycle,
@@ -424,7 +399,6 @@ def seed(registry_id: str, region: str) -> int:
     top-level) so importing this module is side-effect-free.
     """
     from services.agent_registry_service import AgentRegistryService, NameTakenError
-    from models.agent import AgentCreate  # noqa: F401 — built via _build_agent_create
 
     service = AgentRegistryService(registry_id=registry_id, region=region)
 
@@ -439,8 +413,8 @@ def seed(registry_id: str, region: str) -> int:
             logger.info("  skip, already exists: %r", name)
             skipped += 1
             continue
-        except Exception as exc:  # noqa: BLE001 — log + continue, don't abort the seed
-            logger.error("  failed to create %r: %s — continuing", name, exc)
+        except Exception as exc:
+            logger.exception("  failed to create %r: %s — continuing", name, exc)
             continue
 
         logger.info("  created %r -> id=%s (target lifecycle: %s)", name, agent.id, lifecycle)
@@ -491,12 +465,9 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # --dry-run never constructs the service or calls AWS — pure Pydantic.
     if args.dry_run:
         return dry_run()
 
-    # Defaults from settings; imported here (not at module top) so importing this
-    # module never triggers Settings() validation or any AWS setup.
     from core.config import settings
 
     registry_id = args.registry_id or settings.AGENT_REGISTRY_ID
@@ -516,8 +487,8 @@ def main(argv=None) -> int:
 
     try:
         return seed(registry_id=registry_id, region=region)
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        logger.error("Seeding failed: %s", exc)
+    except Exception as exc:
+        logger.exception("Seeding failed: %s", exc)
         logger.error(
             "Check that: (1) AWS credentials are configured with the registry "
             "permissions (research §8); (2) AGENT_REGISTRY_ID=%r is a real, "

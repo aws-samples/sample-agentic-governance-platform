@@ -1,4 +1,4 @@
-"""Tests for the read-only Langfuse metrics service (Epic 26, Task 5 — contract C3).
+"""Tests for the read-only Langfuse metrics service.
 
 Executable spec for ``LangfuseMetricsService``: per-agent daily metrics + trace list
 read from Langfuse's public API, plus server-side fan-out aggregation for
@@ -7,8 +7,8 @@ project/tenant/platform scopes. Pure reads — no external mutations.
 ALL HTTP is mocked (no live Langfuse): every test builds an ``httpx.AsyncClient`` over
 an ``httpx.MockTransport`` whose handler routes on ``request.url.path`` and returns an
 ``httpx.Response`` — mirroring ``test_graph_service.py``. Secrets Manager is a
-``MagicMock`` returning the per-agent ``{public_key, secret_key}`` JSON (the C1 SM
-shape), so no boto3/AWS is touched. The TTL cache clock is INJECTED (a ``FakeClock``)
+``MagicMock`` returning the per-agent ``{public_key, secret_key}`` JSON, so no
+boto3/AWS is touched. The TTL cache clock is INJECTED (a ``FakeClock``)
 so the 60s window is advanced deterministically instead of sleeping.
 
 The repo is not in pytest-asyncio ``auto`` mode, so each async test is decorated with
@@ -28,10 +28,14 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from models.agent import Agent, AuthType, LifecycleState, Platform
+from models.agent import Agent, AgentAuthType, LifecycleState, Platform
+from models.base import WireModel
 from services.langfuse_metrics_service import (
     AgentMetrics,
+    AgentScopeRow,
     LangfuseMetricsService,
+    ScopeMetrics,
+    TracePage,
     TraceRow,
 )
 
@@ -41,9 +45,6 @@ DATE_FROM = date(2026, 7, 9)
 DATE_TO = date(2026, 7, 16)
 
 
-# ---------------------------------------------------------------------------
-# Test doubles
-# ---------------------------------------------------------------------------
 class FakeClock:
     """A monotonic-style clock whose value only moves when the test advances it."""
 
@@ -61,7 +62,7 @@ def _agent(
     *,
     agent_id: str = "rec-abc123",
     name: str = "Claims Triage DE",
-    secret_name: Optional[str] = "langfuse-agent-rec-abc123-keys",
+    secret_name: Optional[str] = "langfuse-agent-rec-abc123-keys",  # noqa: S107 — a Secrets Manager name, not a credential; expires 2027-10-23; added E49A-50A/T8
     project_id: Optional[str] = "clx-proj-1",
 ) -> Agent:
     now = datetime.now(timezone.utc)
@@ -71,7 +72,7 @@ def _agent(
         purpose="Triage inbound motor claims",
         lifecycle_state=LifecycleState.APPROVED,
         platform=Platform.AWS_BEDROCK,
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         tenant_id="tenant-de",
         langfuse_project_id=project_id,
         langfuse_key_secret_name=secret_name,
@@ -80,7 +81,7 @@ def _agent(
     )
 
 
-def _sm_mock(public_key: str = "pk-lf-abc", secret_key: str = "sk-lf-xyz") -> MagicMock:
+def _sm_mock(public_key: str = "pk-lf-abc", secret_key: str = "sk-lf-xyz") -> MagicMock:  # noqa: S107 — a fake key pair for the mock, not a credential; expires 2027-10-23; added E49A-50A/T8
     """A Secrets Manager client mock returning the per-agent key pair JSON."""
     sm = MagicMock(name="secretsmanager")
     sm.get_secret_value.return_value = {
@@ -159,9 +160,6 @@ def _daily_payload() -> dict:
     }
 
 
-# ===========================================================================
-# 1) get_agent_metrics normalizes the daily payload → totals + daily + by_model
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_get_agent_metrics_normalizes_daily():
     def handler(request: httpx.Request) -> httpx.Response:
@@ -197,23 +195,18 @@ async def test_get_agent_metrics_normalizes_daily():
     assert by_model["titan-embed"].tokens == 50
 
 
-# ===========================================================================
-# 2) unprovisioned agent (no key) ⇒ zeroed AgentMetrics, NO HTTP call, no raise
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_unprovisioned_agent_returns_zeroed():
     called = {"http": False}
 
-    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+    def handler(request: httpx.Request) -> httpx.Response:
         called["http"] = True
         return httpx.Response(200, json=_daily_payload())
 
     sm = _sm_mock()
     svc = _svc(handler, sm=sm)
 
-    metrics = await svc.get_agent_metrics(
-        _agent(secret_name=None, project_id=None), DATE_FROM, DATE_TO
-    )
+    metrics = await svc.get_agent_metrics(_agent(secret_name=None, project_id=None), DATE_FROM, DATE_TO)
 
     assert isinstance(metrics, AgentMetrics)
     assert metrics.totals.traces == 0
@@ -226,9 +219,6 @@ async def test_unprovisioned_agent_returns_zeroed():
     sm.get_secret_value.assert_not_called()
 
 
-# ===========================================================================
-# 3) get_scope_metrics fans out + sums; one unprovisioned agent degrades to zero
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_get_scope_metrics_fans_out_and_sums():
     calls = {"n": 0}
@@ -251,7 +241,7 @@ async def test_get_scope_metrics_fans_out_and_sums():
 
     # Only the 2 provisioned agents hit Langfuse (distinct secret names ⇒ 2 calls).
     assert calls["n"] == 2
-    # totals = 2× a single agent's totals (the unprovisioned one contributed zero).
+    # totals = 2x a single agent's totals (the unprovisioned one contributed zero).
     assert scope.totals.traces == 30  # 15 * 2
     assert scope.totals.cost_usd == 7.0  # 3.5 * 2
     assert scope.totals.tokens == 700  # 350 * 2
@@ -268,9 +258,6 @@ async def test_get_scope_metrics_fans_out_and_sums():
     assert by_model["titan-embed"].tokens == 100  # 50 * 2
 
 
-# ===========================================================================
-# 3b) degrade-and-continue: a provisioned agent whose read FAILS contributes zero
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_get_scope_metrics_failed_read_degrades():
     def handler(request: httpx.Request) -> httpx.Response:
@@ -283,11 +270,9 @@ async def test_get_scope_metrics_failed_read_degrades():
     # a2's secret returns a pk that flags the handler to 500 via the auth header.
     sm = MagicMock(name="secretsmanager")
 
-    def _get(SecretId: str):  # noqa: N803 — boto3 kwarg name
+    def _get(SecretId: str):
         pk = "pk-bad" if "a2" in SecretId else "pk-ok"
-        return {
-            "SecretString": json.dumps({"public_key": pk, "secret_key": "sk"})
-        }
+        return {"SecretString": json.dumps({"public_key": pk, "secret_key": "sk"})}
 
     sm.get_secret_value.side_effect = _get
 
@@ -315,9 +300,6 @@ async def test_get_scope_metrics_failed_read_degrades():
     assert scope.totals.tokens == 350
 
 
-# ===========================================================================
-# 4) ~60s TTL cache: two calls in the window ⇒ ONE HTTP call; past 60s ⇒ refetch
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_ttl_cache_reuses_within_window():
     calls = {"n": 0}
@@ -346,9 +328,6 @@ async def test_ttl_cache_reuses_within_window():
     assert calls["n"] == 2
 
 
-# ===========================================================================
-# 4b) cache key includes the date range ⇒ a different window is a distinct fetch
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_ttl_cache_keyed_on_date_range():
     calls = {"n": 0}
@@ -368,9 +347,6 @@ async def test_ttl_cache_keyed_on_date_range():
     assert calls["n"] == 2  # different (secret, from, to) key ⇒ not a cache hit
 
 
-# ===========================================================================
-# 5) get_agent_traces maps the traces payload → TraceRow[] + total
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_get_agent_traces_shape():
     payload = {
@@ -420,14 +396,11 @@ async def test_get_agent_traces_shape():
     assert rows[1].latency_ms is None
 
 
-# ===========================================================================
-# 5b) unprovisioned agent ⇒ empty traces, NO HTTP call, no raise
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_get_agent_traces_unprovisioned_empty():
     called = {"http": False}
 
-    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+    def handler(request: httpx.Request) -> httpx.Response:
         called["http"] = True
         return httpx.Response(200, json={"data": [], "meta": {"totalItems": 0}})
 
@@ -440,10 +413,6 @@ async def test_get_agent_traces_unprovisioned_empty():
     sm.get_secret_value.assert_not_called()
 
 
-# ===========================================================================
-# Cost by user — the v2 metrics query DSL grouped on ``userId``. ``/metrics/daily``
-# has no user dimension, so this is a SECOND call per get_agent_metrics.
-# ===========================================================================
 @pytest.mark.asyncio
 async def test_get_agent_metrics_includes_cost_by_user():
     def handler(request: httpx.Request) -> httpx.Response:
@@ -490,3 +459,117 @@ async def test_by_user_failure_leaves_the_rest_of_the_metrics_intact():
     assert metrics.by_user == []
     assert metrics.totals.traces == 15  # daily metrics survive
     assert len(metrics.by_model) > 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_daily_read_is_not_cached():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/metrics/daily"):
+            calls["n"] += 1
+            return httpx.Response(500) if calls["n"] == 1 else httpx.Response(200, json=_daily_payload())
+        return httpx.Response(200, json={"data": []})
+
+    svc = _svc(handler)
+    first = await svc.get_agent_metrics(_agent(), DATE_FROM, DATE_TO)
+    second = await svc.get_agent_metrics(_agent(), DATE_FROM, DATE_TO)
+
+    assert first.totals.traces == 0
+    assert second.totals.traces == 15
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_scope_by_user_rolls_up_the_same_user_across_agents():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/metrics/daily"):
+            return httpx.Response(200, json=_daily_payload())
+        return httpx.Response(
+            200, json={"data": [{"userId": "maria.gomez", "sum_totalCost": 0.05, "count_count": 7}]}
+        )
+
+    agents = [
+        _agent(agent_id="a1", secret_name="langfuse-agent-a1-keys"),
+        _agent(agent_id="a2", secret_name="langfuse-agent-a2-keys"),
+    ]
+    scope = await _svc(handler).get_scope_metrics(agents, DATE_FROM, DATE_TO)
+
+    assert [(u.user_id, u.cost_usd, u.traces) for u in scope.by_user] == [("maria.gomez", 0.1, 14)]
+
+
+def test_the_wire_models_inherit_wire_model():
+    assert issubclass(TracePage, WireModel)
+    assert issubclass(ScopeMetrics, WireModel)
+    assert issubclass(AgentScopeRow, WireModel)
+    assert set(TracePage.model_fields) == {"data", "total"}
+
+
+@pytest.mark.asyncio
+async def test_get_agent_traces_validates_through_trace_page():
+    payload = {
+        "data": [
+            {
+                "id": "trace-1",
+                "timestamp": "2026-07-15T10:00:00Z",
+                "name": "fnol-agent-invocation",
+                "userId": "user-oid-1",
+                "latency": 1.25,
+                "totalCost": 0.42,
+            }
+        ],
+        "meta": {"page": 1, "limit": 50, "totalItems": 137, "totalPages": 3},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    svc = _svc(handler)
+    result = await svc.get_agent_traces(_agent(), page=1, limit=50)
+    page = TracePage.model_validate(result)
+
+    assert page.total == 137
+    assert page.data == result["data"]
+    assert page.model_dump() == {
+        "data": [
+            {
+                "id": "trace-1",
+                "timestamp": "2026-07-15T10:00:00Z",
+                "name": "fnol-agent-invocation",
+                "user_id": "user-oid-1",
+                "latency_ms": 1250.0,
+                "cost_usd": 0.42,
+            }
+        ],
+        "total": 137,
+    }
+
+    empty = await svc.get_agent_traces(_agent(secret_name=None, project_id=None))
+    assert TracePage.model_validate(empty).model_dump() == {"data": [], "total": 0}
+
+
+@pytest.mark.asyncio
+async def test_scope_metrics_wraps_the_merged_aggregate_with_by_agent():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/metrics/daily"):
+            return httpx.Response(200, json=_daily_payload())
+        return httpx.Response(200, json={"data": []})
+
+    svc = _svc(handler)
+    agent = _agent(agent_id="a1", secret_name="langfuse-agent-a1-keys")
+    merged = await svc.get_scope_metrics([agent], DATE_FROM, DATE_TO)
+    per_agent = await svc.get_agent_metrics(agent, DATE_FROM, DATE_TO)
+
+    scope = ScopeMetrics(
+        **merged.model_dump(),
+        by_agent=[
+            AgentScopeRow(
+                agent_id=agent.id, agent_name=agent.name, tenant_id=agent.tenant_id, totals=per_agent.totals
+            )
+        ],
+    )
+
+    assert scope.totals == merged.totals
+    assert scope.by_agent[0].totals.traces == 15
+    assert scope.by_agent[0].tenant_id == "tenant-de"
+    assert set(scope.model_dump()) == {"totals", "daily", "by_model", "by_user", "by_agent"}

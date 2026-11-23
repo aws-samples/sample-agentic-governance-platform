@@ -1,42 +1,3 @@
-// authRetry.test.ts — the BOUNDED 401 recovery (E36/T19, research item 10).
-//
-// WHY THIS FILE IS THE CONTRACT. The old interceptor answered every 401 the same way —
-// clear the token, `window.location.reload()` — which recovers EXPIRY and nothing else. On a
-// STRUCTURAL 401 (wrong audience, roles on the wrong app registration, the wrong scope baked
-// into the build) the fresh token is rejected identically, so the browser loops 401 → reload
-// → 401 for as long as the tab is open. `vitest` has no DOM here, so the decision is
-// extracted and the `sessionStorage`/`window` calls stay in `client.ts`; what this file pins
-// is therefore everything that is not IO:
-//
-//   • the BUDGET is exactly one reload per session — `decide401` is the only thing that says
-//     so, and off-by-one in either direction is the whole defect (0 reloads = expiry never
-//     recovers; 2+ = still a loop, just slower);
-//   • `decide401` is TOTAL. Its input comes back off `sessionStorage`, which is a string a
-//     user can edit, so a garbage counter must resolve to a decision rather than throw
-//     inside an error interceptor;
-//   • the two MESSAGES, verbatim. `Session expired. Please log in again.` is quoted in
-//     `docs/token-propagation.md` §2 and is the string this interceptor has always rejected
-//     with, so it must not drift; the halt message is new copy that has to stop a user
-//     retrying something that cannot work. Copy has no compiler — the `cedarPosture.ts`
-//     precedent — so it is pinned here;
-//   • the storage KEY, verbatim. It is a cross-page contract (the value is written before a
-//     reload and read after it), so renaming it silently restores the unbounded loop.
-
-//   • since fix round 1, the SHAPE of the two IO arms as well (D-4). `client.ts` cannot be
-//     imported here (it pulls in axios, and the arms touch `sessionStorage`/`window`), so
-//     "the success path resets the counter" and "the halt path does not reload" were verified by
-//     reading alone. They are now read MECHANICALLY, on the `repoRow.test.ts:593` /
-//     `repositoryDetailTabs.test.ts:2420` idiom: the source as text, raw — no lowercasing, no
-//     comment stripping, because normalizing is how a guard stops seeing what it guards. The
-//     comments in the guarded files are written not to quote the strings forbidden below.
-
-//   • since the final review's F1, that no storage access in either guarded file is RAW. The
-//     wrapper only helps if it is the ONLY spelling: one surviving `sessionStorage.` call is the
-//     whole defect back, and it would be back in the one file this lane cannot import. So the
-//     guard is stated negatively (no raw call anywhere) as well as positively (the wrapper at
-//     each of the four sites) — a positive-only guard passes happily while a second, unwrapped
-//     call sits three lines below the wrapped one.
-
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -44,44 +5,46 @@ import {
   AUTH_401_HALT_MESSAGE,
   AUTH_401_RELOAD_MESSAGE,
   clearsAuth401Suspicion,
+  coalesceAsync,
   decide401,
   readAttempts,
   safeStorage,
 } from './authRetry';
-// Vite's `?raw` rather than `node:fs`: `tsconfig.app.json` sets `types: ["vite/client"]` (no
-// `node`), so `node:fs` has no declarations here while `vite/client` declares `*?raw`. The
-// explicit extension is load-bearing on a case-insensitive filesystem.
-import clientSrc from './client.ts?raw';
-import entraProviderSrc from '../auth/EntraProvider.tsx?raw';
+import { stripComments } from '../rawSource';
+import clientRaw from './client.ts?raw';
+import entraProviderRaw from '../auth/EntraProvider.tsx?raw';
+import tokenBrokerRaw from '../auth/tokenBroker.ts?raw';
+
+const clientSrc = stripComments(clientRaw);
+const entraProviderSrc = stripComments(entraProviderRaw);
+const tokenBrokerSrc = stripComments(tokenBrokerRaw);
 
 describe('decide401 — one reload per session, then stop', () => {
   it('reloads on the first 401 of the session', () => {
-    // Expiry is the common case and reloading genuinely fixes it: MSAL still holds the
-    // account, so the provider re-acquires silently. Refusing to reload here would turn
-    // every ordinary token expiry into a dead page.
     expect(decide401(0)).toBe('reload');
   });
 
   it('halts on the second', () => {
-    // A 401 that survives a reload is not expiry. Reloading again cannot change the outcome,
-    // because the input that produced the rejected token is baked into the bundle.
     expect(decide401(1)).toBe('halt');
   });
 
   it.each([2, 3, 10, 1000])('stays halted at %i attempts', (attempts) => {
     expect(decide401(attempts)).toBe('halt');
   });
+
+  it('the reload budget is exactly one per session', () => {
+    const first = readAttempts(null);
+    expect(decide401(first)).toBe('reload');
+    const second = readAttempts(String(first + 1));
+    expect(decide401(second)).toBe('halt');
+    expect(decide401(readAttempts(String(second + 1)))).toBe('halt');
+  });
 });
 
 describe('decide401 — total, because its input is an editable string', () => {
-  // It is called from inside an axios ERROR interceptor: a throw here would replace the 401
-  // rejection with a different error and lose the diagnostic. Every case below resolves.
   it.each([-1, -0.5, 0.5, 0.999, Number.NaN])(
-    'answers reload for %o (under one attempt, or no attempt count at all)',
+    'answers reload for %o (under one attempt, or no attempt count at all): the safe direction, since the reload path writes a clean integer',
     (attempts) => {
-      // `reload` is the SAFE direction for a value we cannot trust: the reload path WRITES a
-      // clean integer on its way out, so the very next 401 halts. Choosing `halt` here would
-      // strand a user on a corrupt counter with no way back.
       expect(decide401(attempts)).toBe('reload');
     },
   );
@@ -99,8 +62,6 @@ describe('readAttempts — normalising what came out of sessionStorage', () => {
   });
 
   it('treats an absent key as no attempts', () => {
-    // `sessionStorage.getItem` answers `null` for a key that was never written — the first
-    // 401 of a session, and the state after any successful response clears it.
     expect(readAttempts(null)).toBe(0);
     expect(readAttempts(undefined)).toBe(0);
     expect(readAttempts('')).toBe(0);
@@ -108,7 +69,7 @@ describe('readAttempts — normalising what came out of sessionStorage', () => {
   });
 
   it.each(['abc', 'NaN', 'Infinity', '-1', '-99', '1,2'])(
-    'treats garbage (%o) as no attempts rather than guessing',
+    'readAttempts is total on garbage input: %o reads as no attempts rather than guessing',
     (stored) => {
       expect(readAttempts(stored)).toBe(0);
     },
@@ -123,17 +84,59 @@ describe('readAttempts — normalising what came out of sessionStorage', () => {
   });
 
   it('composes with decide401 into the documented behaviour', () => {
-    // The two calls the interceptor makes, in order, for the two states that matter.
     expect(decide401(readAttempts(null))).toBe('reload');
     expect(decide401(readAttempts('1'))).toBe('halt');
   });
 });
 
+describe('coalesceAsync — concurrent callers share ONE in-flight invocation', () => {
+  it('calls fn exactly once for a burst of concurrent callers, and all get its answer', async () => {
+    let calls = 0;
+    const shared = coalesceAsync(async () => {
+      calls += 1;
+      return 'token-a';
+    });
+    const results = await Promise.all([shared(), shared(), shared()]);
+    expect(calls).toBe(1);
+    expect(results).toEqual(['token-a', 'token-a', 'token-a']);
+  });
+
+  it('calls fn again for a caller arriving AFTER the in-flight call has settled', async () => {
+    let calls = 0;
+    const shared = coalesceAsync(async () => {
+      calls += 1;
+      return `token-${calls}`;
+    });
+    expect(await shared()).toBe('token-1');
+    expect(await shared()).toBe('token-2');
+    expect(calls).toBe(2);
+  });
+
+  it('clears the slot on a REJECTION too, so one failure does not poison every later caller', async () => {
+    let calls = 0;
+    const shared = coalesceAsync(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('transient');
+      return 'token-ok';
+    });
+    await expect(shared()).rejects.toThrow('transient');
+    expect(await shared()).toBe('token-ok');
+    expect(calls).toBe(2);
+  });
+
+  it('shares the SAME rejection across a burst that fails together', async () => {
+    const err = new Error('structural');
+    const shared = coalesceAsync(async () => {
+      throw err;
+    });
+    const burst = [shared(), shared(), shared()];
+    await Promise.allSettled(burst);
+    for (const p of burst) await expect(p).rejects.toBe(err);
+  });
+});
+
 describe('the storage key', () => {
-  it('is the pinned literal', () => {
-    // Written before a reload and read after it, so this is a contract between two page
-    // loads, not a local detail. It is also namespaced (`agp.`) because it shares
-    // `sessionStorage` with MSAL's own cache (`msalConfig.ts` sets `cacheLocation`).
+  it('is the pinned literal: a contract between two page loads, namespaced apart from the MSAL cache it shares sessionStorage with', () => {
     expect(AUTH_401_COUNT_KEY).toBe('agp.auth.401count');
   });
 });
@@ -153,36 +156,27 @@ describe('the two messages', () => {
   });
 
   it('does not tell the user to do the thing that cannot work', () => {
-    // The whole point of halting is that "log in again" is false advice here. If the halt
-    // copy ever inherits the expiry copy's instruction, the loop is back — in the user's
-    // hands instead of the browser's.
     expect(AUTH_401_HALT_MESSAGE).not.toContain('Please log in again');
     expect(AUTH_401_HALT_MESSAGE).not.toBe(AUTH_401_RELOAD_MESSAGE);
   });
 
-  it('says the cause is configuration, not the session', () => {
-    // `docs/token-propagation.md` §11 sends an operator looking for exactly these three
-    // causes; naming them is what makes the message forwardable to someone who can act.
+  it('says the cause is configuration, not the session: the three causes docs/token-propagation.md §11 sends an operator to check', () => {
     expect(AUTH_401_HALT_MESSAGE).toContain('audience');
     expect(AUTH_401_HALT_MESSAGE).toContain('scope');
     expect(AUTH_401_HALT_MESSAGE).toContain('role assignments');
   });
 
   it('leaks no token, id or URL', () => {
-    // It is rendered to an end user through `err.message` like any other API error.
     expect(AUTH_401_HALT_MESSAGE).not.toMatch(/Bearer|eyJ|http/i);
   });
 });
 
-describe('clearsAuth401Suspicion — only an AUTHENTICATED 2xx retires the count (D-3)', () => {
+describe('clearsAuth401Suspicion — only an authenticated 2xx retires the count', () => {
   it('accepts a bearer header', () => {
     expect(clearsAuth401Suspicion('Bearer abc.def.ghi')).toBe(true);
   });
 
-  it('refuses a request that carried no Authorization header', () => {
-    // The case that matters: an unauthenticated 2xx is evidence the SERVER is up, never that
-    // THIS TOKEN is accepted. `healthApi`'s route takes no principal, so a status poll on it
-    // would otherwise clear the counter on every tick and un-bound the loop.
+  it('an unauthenticated 2xx does not clear the suspicion: a request that carried no Authorization header is refused', () => {
     expect(clearsAuth401Suspicion(undefined)).toBe(false);
     expect(clearsAuth401Suspicion(null)).toBe(false);
     expect(clearsAuth401Suspicion('')).toBe(false);
@@ -190,50 +184,32 @@ describe('clearsAuth401Suspicion — only an AUTHENTICATED 2xx retires the count
   });
 
   it.each([0, 1, true, false, {}, [], ['Bearer x']])(
-    'refuses the non-string %o axios could leave on a config',
+    'refuses the non-string %o axios could leave on a config: failing to clear costs one reload, clearing wrongly costs the bound',
     (header) => {
-      // TOTAL, on `readAttempts`' reasoning — it reads whatever is on the request config, and
-      // "not a bearer" is the conservative answer: failing to clear costs one extra reload,
-      // clearing wrongly costs the bound.
       expect(clearsAuth401Suspicion(header)).toBe(false);
     },
   );
 });
 
-// ---------------------------------------------------------------------------
-// The two IO arms, read as source (D-4). Both behaviours are `client.ts`-only and this lane
-// cannot import that file, so these guards are the ONLY thing standing between either arm and a
-// silent regression — including regressions of D-1 and D-3, which is what makes them worth their
-// fragility.
-// ---------------------------------------------------------------------------
 describe('client.ts success arm — resets the counter, and only on an authenticated 2xx', () => {
   it('clears the key on the success path', () => {
-    // Previously the identity function: nothing cleared the count, so the budget was
-    // per-session rather than per-incident.
     expect(clientSrc).toMatch(
       /if \(clearsAuth401Suspicion\(response\.config\.headers\?\.Authorization\)\) \{\s*safeStorage\.remove\(AUTH_401_COUNT_KEY\);/,
     );
   });
 
   it('asks the shared predicate rather than re-deciding in the arm', () => {
-    // A hand-rolled truthiness check here would be a second spelling of the rule, in the one
-    // place no test can reach — which is exactly how D-3 became invisible.
     expect(clientSrc.match(/clearsAuth401Suspicion\(/g)).toHaveLength(1);
     expect(clientSrc).toMatch(/clearsAuth401Suspicion,/);
   });
 });
 
 describe('client.ts 401 arm — one decision per page load, and halt never reloads', () => {
-  it('latches the decision in module scope (D-1)', () => {
-    // The reload discards module state, which is what makes the latch safe AND what makes it
-    // insufficient on its own — hence both this and the sessionStorage counter.
+  it('latches the decision in module scope, which the reload resets, so the sessionStorage counter carries the bound across it', () => {
     expect(clientSrc).toMatch(/let latched401: 'reload' \| 'halt' \| null = null;/);
   });
 
-  it('reads the counter and decides ONCE, behind the latch', () => {
-    // The burst case: `Home.tsx` fires two list calls in a `Promise.all`, so a per-request
-    // decision let the second request read the 1 its sibling had just written and halt during
-    // the FIRST incident — a false "check the sign-in configuration" on an ordinary expiry.
+  it('reads the counter and decides once behind the latch, so a burst of concurrent 401s cannot halt on the write of a sibling request', () => {
     expect(clientSrc).toMatch(
       /if \(latched401 === null\) \{\s*const attempts = readAttempts\(safeStorage\.read\(AUTH_401_COUNT_KEY\)\);\s*latched401 = decide401\(attempts\);/,
     );
@@ -248,21 +224,63 @@ describe('client.ts 401 arm — one decision per page load, and halt never reloa
   });
 
   it('reloads in exactly one place, and it is not the halt branch', () => {
-    // THE defect this whole task exists to bound: a halt that still reloaded would be the
-    // unbounded loop with extra steps. Both halves are asserted because either alone leaves it
-    // live — a single call site could still be the wrong one, and a guarded call site says
-    // nothing about a second unguarded one.
     expect(clientSrc.match(/window\.location\.reload/g)).toHaveLength(1);
     expect(clientSrc).toMatch(
-      /if \(latched401 === 'halt'\) \{[^}]*return Promise\.reject\(new Error\(AUTH_401_HALT_MESSAGE\)\);/,
+      /if \(latched401 === 'halt'\) \{[^}]*return Promise\.reject\(new ApiFailure\(401, null, undefined, AUTH_401_HALT_MESSAGE\)\);/,
+    );
+  });
+
+  it('the halt branch only rejects: auth_token stays', () => {
+    expect(clientSrc).toMatch(
+      /if \(latched401 === 'halt'\) \{\s*return Promise\.reject\(new ApiFailure\(401, null, undefined, AUTH_401_HALT_MESSAGE\)\);\s*\}/,
     );
   });
 });
 
-describe('EntraProvider — a freshly issued token retires the suspicion (D-2)', () => {
-  it('clears the count right after storing a successfully acquired token', () => {
-    // Ordering, not mere presence: the reset belongs to the SUCCESS path. In the `catch` it
-    // would forgive the tokenless mount it is meant to rescue the user from.
+describe('client.ts 401 arm — one force-refreshed retry BEFORE the reload/halt breaker', () => {
+  it('attempts the retry inside the 401 branch, ahead of the latch block', () => {
+    const branch = clientSrc.indexOf('if (error.response?.status === 401) {');
+    const retry = clientSrc.indexOf('_agpForceRefreshRetried');
+    const latch = clientSrc.indexOf('if (latched401 === null) {');
+    expect(branch).toBeGreaterThan(-1);
+    expect(retry).toBeGreaterThan(branch);
+    expect(retry).toBeLessThan(latch);
+  });
+
+  it('caps the retry at exactly one per request via a flag on the request config, so a second 401 falls through to the breaker', () => {
+    expect(clientSrc).toMatch(/if \(config && !config\._agpForceRefreshRetried\) \{/);
+    expect(clientSrc.match(/_agpForceRefreshRetried/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('retries through the SAME client instance, carrying the refreshed bearer', () => {
+    expect(clientSrc).toMatch(/config\.headers\.Authorization = `Bearer \$\{refreshed\}`;/);
+    expect(clientSrc).toMatch(/return client\(config\);/);
+  });
+
+  it('reaches MSAL only through a DYNAMIC import, so the DOM-less lane can still import this file', () => {
+    expect(clientSrc).toMatch(/await import\('\.\.\/auth\/tokenBroker'\)/);
+    expect(clientSrc).not.toMatch(/^import .* from '\.\.\/auth\/tokenBroker';/m);
+  });
+
+  it('reads the legacy localStorage mirror only when MSAL answered null, never as the source of truth', () => {
+    expect(clientSrc).toMatch(/const fallbackToken = token \?\? safeLocalStorage\.getItem\('auth_token'\);/);
+  });
+});
+
+describe('tokenBroker — one coalesced slot per refresh kind', () => {
+  it('keeps acquire(false) and acquire(true) in two coalesceAsync slots, so a forced refresh never joins an in-flight cached call and a cached read never waits on a forced one', () => {
+    expect(tokenBrokerSrc.match(/coalesceAsync\(\(\) => acquire\(false\)\)/g)).toHaveLength(1);
+    expect(tokenBrokerSrc.match(/coalesceAsync\(\(\) => acquire\(true\)\)/g)).toHaveLength(1);
+    expect(tokenBrokerSrc).toMatch(/opts\?\.forceRefresh \? acquireForced\(\) : acquireCached\(\)/);
+  });
+
+  it('never redirects from the request path: the provider owns interaction', () => {
+    expect(tokenBrokerSrc).not.toMatch(/acquireTokenRedirect|loginRedirect/);
+  });
+});
+
+describe('EntraProvider — a freshly issued token retires the suspicion', () => {
+  it('clears the count right after storing a successfully acquired token, inside the try and before its catch', () => {
     const stored = entraProviderSrc.indexOf("localStorage.setItem('auth_token', result.accessToken);");
     const cleared = entraProviderSrc.indexOf('safeStorage.remove(AUTH_401_COUNT_KEY);');
     const caught = entraProviderSrc.indexOf('} catch (err) {');
@@ -272,7 +290,6 @@ describe('EntraProvider — a freshly issued token retires the suspicion (D-2)',
   });
 
   it('imports the key and the wrapper instead of retyping either', () => {
-    // A second spelling of a cross-page-load contract restores the loop silently.
     expect(entraProviderSrc).toMatch(
       /import \{ AUTH_401_COUNT_KEY, safeStorage \} from '\.\.\/api\/authRetry';/,
     );
@@ -280,15 +297,9 @@ describe('EntraProvider — a freshly issued token retires the suspicion (D-2)',
   });
 });
 
-// ---------------------------------------------------------------------------
-// safeStorage — the F1 fix. Storage may THROW, and both call sites are on a SUCCESS path.
-// ---------------------------------------------------------------------------
-describe('safeStorage — no storage condition may reach the auth flow (F1 / D-5)', () => {
+describe('safeStorage — no storage condition may reach the auth flow', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  // A hostile storage: exists, and refuses. This is Safari with "block all cookies", a
-  // storage-blocked iframe, or a full quota — `SecurityError`/`QuotaExceededError`, thrown
-  // from the accessor itself. `uiPreference.test.ts:34` is the precedent for the shape.
   function installThrowingStorage() {
     vi.stubGlobal('sessionStorage', {
       getItem: () => {
@@ -314,8 +325,6 @@ describe('safeStorage — no storage condition may reach the auth flow (F1 / D-5
   }
 
   it('round-trips through a working storage — the wrapper is not a stub', () => {
-    // Asserted first and deliberately: a wrapper that silently did nothing would satisfy every
-    // "never throws" test below while quietly deleting the bound it exists to preserve.
     const store = installWorkingStorage();
     safeStorage.write(AUTH_401_COUNT_KEY, '1');
     expect(store.get(AUTH_401_COUNT_KEY)).toBe('1');
@@ -325,20 +334,14 @@ describe('safeStorage — no storage condition may reach the auth flow (F1 / D-5
     expect(safeStorage.read(AUTH_401_COUNT_KEY)).toBeNull();
   });
 
-  it('never throws when storage THROWS', () => {
-    // THE finding. `EntraProvider`'s call sits inside the `try` whose `catch` does
-    // `setToken(null)` + `localStorage.removeItem('auth_token')`, so a throw here converts a
-    // token acquired one line earlier into a tokenless mount; `client.ts`' call sits in the
-    // SUCCESS interceptor, so a throw there rejects an otherwise-2xx response app-wide.
+  it('never throws when storage throws, so a blocked storage can neither reject a 2xx nor void a freshly acquired token', () => {
     installThrowingStorage();
     expect(() => safeStorage.read(AUTH_401_COUNT_KEY)).not.toThrow();
     expect(() => safeStorage.write(AUTH_401_COUNT_KEY, '1')).not.toThrow();
     expect(() => safeStorage.remove(AUTH_401_COUNT_KEY)).not.toThrow();
   });
 
-  it('never throws when there is no storage global at all', () => {
-    // No stub installed — this lane runs under NODE, so the absent case is simply the default
-    // state here and needs no mock to reach. It is also the SSR/prerender case.
+  it('never throws when there is no storage global at all, the default state of the node lane', () => {
     expect(() => safeStorage.read(AUTH_401_COUNT_KEY)).not.toThrow();
     expect(() => safeStorage.write(AUTH_401_COUNT_KEY, '1')).not.toThrow();
     expect(() => safeStorage.remove(AUTH_401_COUNT_KEY)).not.toThrow();
@@ -351,30 +354,19 @@ describe('safeStorage — no storage condition may reach the auth flow (F1 / D-5
     install();
     const stored = safeStorage.read(AUTH_401_COUNT_KEY);
     expect(stored).toBeNull();
-    // The documented degradation, spelled out as the composition the interceptor performs: with
-    // no readable counter the cross-page-load bound is gone and only `latched401` remains. That
-    // is the deliberate direction — halting instead would strand every blocked-storage tab on
-    // "ask an administrator" for an ordinary expiry a reload fixes.
     expect(decide401(readAttempts(stored))).toBe('reload');
   });
 });
 
-describe('no storage access in either guarded file is RAW (F1)', () => {
-  // The wrapper only helps if it is the ONLY spelling. A single surviving `sessionStorage.`
-  // call re-arms the finding, in the one file this DOM-less lane cannot import — so this is
-  // stated as an absence, which is the only form that catches a NEW unwrapped call. The
-  // comments in both guarded files are written not to spell a bare `sessionStorage.` access.
+describe('no storage access in either guarded file is raw: the wrapper is the only spelling', () => {
   it.each<[string, string]>([
     ['client.ts', clientSrc],
     ['EntraProvider.tsx', entraProviderSrc],
   ])('%s makes no direct sessionStorage call', (_name, src) => {
-    // Property access in either spelling — `sessionStorage.getItem` and `sessionStorage['x']`.
     expect(src).not.toMatch(/sessionStorage\s*[.[]/);
   });
 
-  it('routes all four call sites through the wrapper', () => {
-    // Counted, not merely present: three in `client.ts` (success-arm clear, 401-arm read,
-    // reload-branch write) and one in `EntraProvider.tsx` (fresh-token clear).
+  it('routes all four call sites through the wrapper: three in client.ts, one in EntraProvider.tsx', () => {
     expect(clientSrc.match(/safeStorage\.(read|write|remove)\(/g)).toHaveLength(3);
     expect(entraProviderSrc.match(/safeStorage\.(read|write|remove)\(/g)).toHaveLength(1);
   });

@@ -1,0 +1,10 @@
+{
+  "id": "crewai-agentcore",
+  "name": "CrewAI + AgentCore",
+  "framework": "crewai",
+  "infra_template_id": "agentcore-runtime",
+  "description": "Barebones single-crew CrewAI agent on Bedrock AgentCore — build-only CI, platform-owned runtime IaC.",
+  "aws_services": ["bedrock", "ecr", "agentcore"],
+  "tags": ["starter", "python", "crewai"],
+  "version": "1.0.0"
+}

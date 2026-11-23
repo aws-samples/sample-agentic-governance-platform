@@ -9,16 +9,16 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException
 
-# Reset module cache between tests so settings monkeypatches take effect.
+
 @pytest.fixture(autouse=True)
 def reset_module():
+    """Evict the validator and its settings so each test's monkeypatched environment is read."""
     import sys
+
     for mod in ["core.security_entra", "core.config"]:
         sys.modules.pop(mod, None)
     yield
 
-
-# === Test fixtures ===
 
 @pytest.fixture
 def tenant_id():
@@ -60,6 +60,7 @@ def rsa_key_pair():
 @pytest.fixture
 def make_token(rsa_key_pair, tenant_id, audience):
     """Factory: build a signed JWT with overridable claims."""
+
     def _make(**overrides):
         now = int(dt.datetime.now(dt.timezone.utc).timestamp())
         claims = {
@@ -75,7 +76,6 @@ def make_token(rsa_key_pair, tenant_id, audience):
             "tid": tenant_id,
         }
         claims.update(overrides)
-        # Strip None values so callers can drop claims with overrides={"roles": None}
         claims = {k: v for k, v in claims.items() if v is not None}
         return pyjwt.encode(
             claims,
@@ -83,14 +83,14 @@ def make_token(rsa_key_pair, tenant_id, audience):
             algorithm="RS256",
             headers={"kid": rsa_key_pair["kid"]},
         )
+
     return _make
 
 
 @pytest.fixture
 def patched_jwks(rsa_key_pair):
-    """Patch PyJWKClient so the validator uses our test public key."""
-    # Build a fake signing key object with `.key` attribute matching what PyJWT's
-    # signing_key.key would return.
+    """Patch PyJWKClient so the validator uses our test public key through a `.key`-shaped object."""
+
     class FakeSigningKey:
         def __init__(self, key):
             self.key = key
@@ -110,8 +110,6 @@ def configured_settings(monkeypatch, tenant_id, audience, spa_client_id, backend
     monkeypatch.setenv("ENTRA_SPA_CLIENT_ID", spa_client_id)
     monkeypatch.setenv("ENTRA_BACKEND_CLIENT_ID", backend_client_id)
 
-
-# === Tests ===
 
 def test_valid_token_returns_claims(make_token, patched_jwks, configured_settings):
     """Happy path: a properly signed Entra token returns the claims dict."""
@@ -151,7 +149,10 @@ def test_wrong_audience_returns_401(make_token, patched_jwks, configured_setting
 
 
 def test_aud_spa_client_id_is_accepted(
-    make_token, patched_jwks, configured_settings, spa_client_id,
+    make_token,
+    patched_jwks,
+    configured_settings,
+    spa_client_id,
 ):
     """Legacy SPA-scope tokens carry aud=<SPA client-id GUID> — still accepted."""
     from core.security_entra import verify_entra_token
@@ -162,7 +163,10 @@ def test_aud_spa_client_id_is_accepted(
 
 
 def test_aud_backend_client_id_is_accepted(
-    make_token, patched_jwks, configured_settings, backend_client_id,
+    make_token,
+    patched_jwks,
+    configured_settings,
+    backend_client_id,
 ):
     """v2.0 tokens for the backend app's own exposed scope carry
     aud=<backend client-id GUID> (the current frontend path) — must be accepted."""
@@ -187,7 +191,7 @@ def test_expired_token_returns_401(make_token, patched_jwks, configured_settings
 
 
 def test_token_expired_within_leeway_is_accepted(make_token, patched_jwks, configured_settings):
-    """E36/T17: a token that expired 30 s ago is still accepted — clock-skew leeway.
+    """A token that expired 30 s ago is still accepted: clock-skew leeway.
 
     The default JWT_LEEWAY_SECONDS is 60, so a container whose clock runs up to a
     minute fast no longer answers every request with a blanket 401. This pins the
@@ -203,7 +207,7 @@ def test_token_expired_within_leeway_is_accepted(make_token, patched_jwks, confi
 
 
 def test_token_expired_beyond_leeway_is_rejected(make_token, patched_jwks, configured_settings):
-    """E36/T17: leeway is a 60 s grace, not an amnesty — 120 s past expiry still 401s."""
+    """Leeway is a 60 s grace, not an amnesty: 120 s past expiry still 401s."""
     from core.security_entra import verify_entra_token
 
     now = int(dt.datetime.now(dt.timezone.utc).timestamp())
@@ -216,7 +220,9 @@ def test_token_expired_beyond_leeway_is_rejected(make_token, patched_jwks, confi
 
 
 def test_missing_role_claim_does_not_fail_validation(
-    make_token, patched_jwks, configured_settings,
+    make_token,
+    patched_jwks,
+    configured_settings,
 ):
     """Missing `roles` claim is allowed at validation; role mapping (rbac.py) handles default-to-viewer."""
     from core.security_entra import verify_entra_token
@@ -234,6 +240,15 @@ def test_garbage_token_returns_401(configured_settings):
     with pytest.raises(HTTPException) as exc:
         verify_entra_token("not-a-jwt")
     assert exc.value.status_code == 401
+
+
+def test_peek_unverified_reads_a_claim_without_a_signature_check_and_shrugs_at_garbage(make_token):
+    from core.security_entra import _peek_unverified
+
+    assert _peek_unverified(make_token(iss="https://evil.example.com"), "iss") == "https://evil.example.com"
+    assert _peek_unverified(make_token(), "no-such-claim") is None
+    assert _peek_unverified("not-a-jwt", "iss") == "<unparseable>"
+    assert _peek_unverified("", "aud") == "<unparseable>"
 
 
 def test_missing_tenant_id_raises_runtime_error(monkeypatch):

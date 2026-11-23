@@ -1,4 +1,4 @@
-"""Unit tests for the pure Cedar policy text generator + parser (Epic 8, Task T2).
+"""Unit tests for the pure Cedar policy text generator + parser.
 
 ``cedar_policy_text`` is a pure string helper (no boto3, no I/O): ``build_cedar_policy``
 turns the friendly form (user oid + label + gateway ARN + optional tool) into a Cedar
@@ -9,8 +9,16 @@ gateway returns (no local policy mirror).
 
 from __future__ import annotations
 
+import base64
+from typing import Any
+
+import pytest
+
 from services.cedar_policy_text import (
+    PRINCIPAL_AZP_TAG,
     PRINCIPAL_OID_TAG,
+    CedarEffect,
+    build_agent_forbid,
     build_cedar_policy,
     detect_effect,
     param_types_from_schema,
@@ -44,7 +52,6 @@ def test_build_all_tools_omits_action_constraint():
         tool_name=None,
     )
     assert "AgentCore::Action::" not in out
-    # a bare `action,` line exists
     assert any(line.strip() == "action," for line in out.splitlines())
     assert 'resource == AgentCore::Gateway::"arn:gw"' in out
     assert 'principal.getTag("oid") == "eb3da"' in out
@@ -65,7 +72,7 @@ def test_build_includes_agp_header():
     assert "tool=T___get_claim" in header
     assert "label=" in header
     label_token = next(t for t in header.split() if t.startswith("label="))
-    assert label_token != "label="  # a base64 token follows
+    assert label_token != "label="
 
     all_tools = build_cedar_policy(
         principal_oid="eb3da",
@@ -104,6 +111,8 @@ def test_parse_round_trip_specific_tool():
         "tool": "T___get_claim",
         "effect": "allow",
         "conditions": [],
+        "kind": None,
+        "agent_app_id": None,
     }
 
 
@@ -148,7 +157,7 @@ def test_parse_tolerates_extra_whitespace():
 
 def test_build_is_deterministic():
     """Same inputs twice → byte-identical output (no timestamps / randomness)."""
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         principal_oid="eb3da",
         principal_label="lars@x",
         gateway_arn="arn:gw",
@@ -162,7 +171,6 @@ def test_build_rejects_quote_or_newline_in_interpolated_fields():
     principal_label is exempt (base64-encoded) and must still be accepted."""
     import pytest
 
-    # (a) tool_name with a double-quote
     with pytest.raises(ValueError):
         build_cedar_policy(
             principal_oid="eb3da",
@@ -171,7 +179,6 @@ def test_build_rejects_quote_or_newline_in_interpolated_fields():
             tool_name='bad"tool',
         )
 
-    # (b) gateway_arn with a double-quote
     with pytest.raises(ValueError):
         build_cedar_policy(
             principal_oid="eb3da",
@@ -180,7 +187,6 @@ def test_build_rejects_quote_or_newline_in_interpolated_fields():
             tool_name="T___get_claim",
         )
 
-    # (c) principal_oid with a space (whitespace breaks header tokenization)
     with pytest.raises(ValueError):
         build_cedar_policy(
             principal_oid="eb 3da",
@@ -189,7 +195,6 @@ def test_build_rejects_quote_or_newline_in_interpolated_fields():
             tool_name="T___get_claim",
         )
 
-    # (d) principal_oid with a newline
     with pytest.raises(ValueError):
         build_cedar_policy(
             principal_oid="eb3da\nevil",
@@ -198,23 +203,21 @@ def test_build_rejects_quote_or_newline_in_interpolated_fields():
             tool_name="T___get_claim",
         )
 
-    # Normal call must still succeed.
     out = build_cedar_policy(
         principal_oid="eb3da",
         principal_label="lars@x",
         gateway_arn="arn:gw",
         tool_name="T___get_claim",
     )
-    assert out  # non-empty
+    assert out
 
-    # principal_label with spaces / @ / , / quotes is ACCEPTED (base64-protected).
     out2 = build_cedar_policy(
         principal_oid="eb3da",
         principal_label='Lars "The Builder" Svensson <lars@x>, EU',
         gateway_arn="arn:gw",
         tool_name="T___get_claim",
     )
-    assert out2  # must not raise
+    assert out2
 
 
 def test_parse_malformed_base64_label_yields_empty_label():
@@ -225,19 +228,9 @@ def test_parse_malformed_base64_label_yields_empty_label():
         gateway_arn="arn:gw",
         tool_name="T___get_claim",
     )
-    # Corrupt the label= token to non-base64 garbage.
-    corrupted = "\n".join(
-        "label=@@@notb64@@@" if token.startswith("label=") else token
-        for token in out.replace(" ", "\n").split("\n")
-    )
-    # Reconstruct as a single-line header by un-splitting on spaces won't work here;
-    # easier: just replace the label token directly in the header line.
     lines = out.splitlines()
     header_tokens = lines[0].split()
-    header_tokens = [
-        "label=@@@notb64@@@" if t.startswith("label=") else t
-        for t in header_tokens
-    ]
+    header_tokens = ["label=@@@notb64@@@" if t.startswith("label=") else t for t in header_tokens]
     lines[0] = " ".join(header_tokens)
     corrupted_statement = "\n".join(lines)
 
@@ -247,11 +240,8 @@ def test_parse_malformed_base64_label_yields_empty_label():
     assert parsed["user_label"] == ""
 
 
-# --- E10: v2 generator/parser + conditions + deny -----------------------------
-
-
-def test_build_v2_permit_no_conditions_matches_e8_body():
-    """A per-user, specific-tool, no-condition build emits the v2 header but the E8 body."""
+def test_build_v2_permit_no_conditions_keeps_the_v1_body():
+    """A per-user, specific-tool, no-condition build emits the v2 header over the unchanged v1 body."""
     out = build_cedar_policy(
         principal_oid="eb3da",
         principal_label="lars@x",
@@ -304,9 +294,7 @@ def test_build_string_condition_renders_quoted_value():
         effect="allow",
         conditions=[{"param": "client_id", "op": "=", "value": "id1", "type": "string"}],
     )
-    assert (
-        'context.input has client_id && context.input.client_id == "id1"' in out
-    )
+    assert 'context.input has client_id && context.input.client_id == "id1"' in out
 
 
 def test_build_multiple_conditions_anded():
@@ -491,6 +479,8 @@ def test_parse_v1_backcompat_is_allow_no_conditions():
         "tool": "T___get_claim",
         "effect": "allow",
         "conditions": [],
+        "kind": None,
+        "agent_app_id": None,
     }
 
 
@@ -504,6 +494,15 @@ def test_detect_effect():
     """detect_effect peeks the Cedar keyword: forbid → deny, permit → allow."""
     assert detect_effect("forbid(\n  principal,\n  action,\n  resource\n);\n") == "deny"
     assert detect_effect("permit(\n  principal,\n  action,\n  resource\n);\n") == "allow"
+
+
+def test_cedar_effect_is_the_allow_deny_pair():
+    """The API's effect vocabulary is the closed pair the Cedar keywords map to, in that order."""
+    from typing import get_args
+
+    assert get_args(CedarEffect) == ("allow", "deny")
+    for keyword in ("permit", "forbid"):
+        assert detect_effect(f"{keyword}(principal, action, resource);") in get_args(CedarEffect)
 
 
 def test_param_types_from_schema():
@@ -530,9 +529,7 @@ def test_validate_conditions_unknown_param_raises():
 
     schema = {"properties": {"amount": {"type": "number"}}}
     with pytest.raises(ValueError):
-        validate_conditions(
-            [{"param": "nope", "op": "<", "value": "1", "type": "number"}], schema
-        )
+        validate_conditions([{"param": "nope", "op": "<", "value": "1", "type": "number"}], schema)
 
 
 def test_validate_conditions_type_mismatch_raises():
@@ -541,9 +538,7 @@ def test_validate_conditions_type_mismatch_raises():
 
     schema = {"properties": {"client_id": {"type": "string"}}}
     with pytest.raises(ValueError):
-        validate_conditions(
-            [{"param": "client_id", "op": "<", "value": "1", "type": "string"}], schema
-        )
+        validate_conditions([{"param": "client_id", "op": "<", "value": "1", "type": "string"}], schema)
 
 
 def test_validate_conditions_non_integer_numeric_raises():
@@ -552,9 +547,7 @@ def test_validate_conditions_non_integer_numeric_raises():
 
     schema = {"properties": {"amount": {"type": "number"}}}
     with pytest.raises(ValueError):
-        validate_conditions(
-            [{"param": "amount", "op": "<", "value": "1.5", "type": "number"}], schema
-        )
+        validate_conditions([{"param": "amount", "op": "<", "value": "1.5", "type": "number"}], schema)
 
 
 def test_validate_conditions_normalizes_type_from_schema():
@@ -562,21 +555,13 @@ def test_validate_conditions_normalizes_type_from_schema():
     import pytest
 
     schema = {"properties": {"amount": {"type": "number"}}}
-    # Client lies that amount is a string, but with a legal numeric op it normalizes.
     normalized = validate_conditions(
         [{"param": "amount", "op": "<", "value": "1000", "type": "string"}], schema
     )
-    assert normalized == [
-        {"param": "amount", "op": "<", "value": "1000", "type": "number"}
-    ]
-    # A string-only op combined with the schema's number type would still be legal for
-    # `=`/`!=`, so force an op that is illegal once normalized to number? `<` is legal for
-    # number; instead prove the inverse: a numeric op on a schema-string param raises.
+    assert normalized == [{"param": "amount", "op": "<", "value": "1000", "type": "number"}]
     str_schema = {"properties": {"client_id": {"type": "string"}}}
     with pytest.raises(ValueError):
-        validate_conditions(
-            [{"param": "client_id", "op": ">", "value": "1", "type": "number"}], str_schema
-        )
+        validate_conditions([{"param": "client_id", "op": ">", "value": "1", "type": "number"}], str_schema)
 
 
 def test_build_rejects_backslash_in_string_condition_value():
@@ -584,7 +569,6 @@ def test_build_rejects_backslash_in_string_condition_value():
     closing quote and allow clause injection)."""
     import pytest
 
-    # "id1\\" is the 4-char Python string ending in one backslash.
     with pytest.raises(ValueError):
         build_cedar_policy(
             principal_oid="eb3da",
@@ -613,7 +597,7 @@ def test_principal_oid_tag_is_pinned_to_oid():
     """The Cedar principal tag name is the constant ``"oid"`` and the generator interpolates it.
 
     AgentCore surfaces the Entra ``oid`` claim under this exact tag name (verified live once, at
-    the E8 LOG_ONLY→ENFORCE shakeout; not provable offline). A rename would silently
+    the first LOG_ONLY→ENFORCE shakeout; not provable offline). A rename would silently
     default-deny every user, so both the constant and the emitted text are pinned here.
     """
     assert PRINCIPAL_OID_TAG == "oid"
@@ -626,3 +610,66 @@ def test_principal_oid_tag_is_pinned_to_oid():
     assert 'principal.hasTag("oid")' in out
     assert 'principal.getTag("oid")' in out
     assert f'principal.getTag("{PRINCIPAL_OID_TAG}")' in out
+
+
+APP_ID = "11111111-2222-3333-4444-555555555555"
+
+
+def test_principal_azp_tag_is_azp():
+    assert PRINCIPAL_AZP_TAG == "azp"
+
+
+def test_build_agent_forbid_exact_text():
+    """Exact text: bare ``action,`` (all tools), ``hasTag`` guard FIRST (an erroring
+    forbid fails open), empty cond list, kind/agent header tokens."""
+    out = build_agent_forbid(agent_app_id=APP_ID, agent_label="Fraud triage", gateway_arn="arn:gw")
+    label_b64 = base64.b64encode(b"Fraud triage").decode("ascii")
+    cond_b64 = base64.b64encode(b"[]").decode("ascii")
+    assert out == (
+        f"// agp:v2 effect=forbid oid=- tool=* label={label_b64} cond={cond_b64} "
+        f"kind=contain agent={APP_ID}\n"
+        "forbid(\n"
+        "  principal is AgentCore::OAuthUser,\n"
+        "  action,\n"
+        '  resource == AgentCore::Gateway::"arn:gw"\n'
+        ")\n"
+        f'when {{ principal.hasTag("azp") && principal.getTag("azp") == "{APP_ID}" }};\n'
+    )
+
+
+@pytest.mark.parametrize("bad", ['ab"c', "ab\\c", "ab\nc", "a b", ""])
+def test_build_agent_forbid_rejects_bad_app_id(bad):
+    with pytest.raises(ValueError):
+        build_agent_forbid(agent_app_id=bad, agent_label="x", gateway_arn="arn:gw")
+
+
+def test_build_agent_forbid_rejects_bad_gateway_arn():
+    with pytest.raises(ValueError):
+        build_agent_forbid(agent_app_id=APP_ID, agent_label="x", gateway_arn='arn:"gw')
+
+
+def test_parse_agent_forbid_round_trip():
+    out = build_agent_forbid(agent_app_id=APP_ID, agent_label="Fraud triage", gateway_arn="arn:gw")
+    assert parse_cedar_policy(out) == {
+        "user_oid": None,
+        "user_label": "Fraud triage",
+        "tool": None,
+        "effect": "deny",
+        "conditions": [],
+        "kind": "contain",
+        "agent_app_id": APP_ID,
+    }
+
+
+def test_parse_existing_v2_row_has_no_kind():
+    out = build_cedar_policy(
+        principal_oid="eb3da",
+        principal_label="lars@x",
+        gateway_arn="arn:gw",
+        tool_name=None,
+        effect="deny",
+    )
+    parsed = parse_cedar_policy(out)
+    assert parsed is not None
+    assert parsed["kind"] is None
+    assert parsed["agent_app_id"] is None

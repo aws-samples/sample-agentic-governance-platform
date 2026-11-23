@@ -57,9 +57,8 @@ Prerequisite (you create this out-of-band; this script does NOT create it):
   role. `CreateGateway` also needs `iam:PassRole` on this role for the caller
   (research §9). Pass the role's ARN as `--role-arn`.
 
-Run from the backend dir (PYTHONPATH=src matches the other scripts; this module is
-import-side-effect-free so PYTHONPATH is not strictly required, but keep it for
-parity with `ensure_mcp_registry.py`):
+Run from the backend dir (PYTHONPATH=src matches the other scripts and is what the live
+path needs to import `core.aws_clients`; importing this module stays side-effect-free):
 
     cd platform/control_plane/backend && \
         PYTHONPATH=src venv/bin/python scripts/create_example_gateway.py \
@@ -91,14 +90,8 @@ import uuid
 
 logger = logging.getLogger("create_example_gateway")
 
-# Control-plane status fields — terminal "READY" (research §8.1). The exact key is
-# `status` on both Get responses; probe a couple of alternatives defensively in
-# case the shape differs (mirrors ensure_mcp_registry.py).
 _STATUS_KEYS = ("status", "gatewayStatus", "targetStatus")
 _READY_STATUS = "READY"
-# Terminal failure statuses for the gateway (research §1.1 enum) and the target
-# (research §8.1 enum adds SYNCHRONIZE_UNSUCCESSFUL). Anything not READY and not
-# terminal-failure is treated as still-in-progress -> keep polling.
 _GATEWAY_FAILED_STATUSES = ("FAILED", "UPDATE_UNSUCCESSFUL", "DELETING")
 _TARGET_FAILED_STATUSES = (
     "FAILED",
@@ -107,17 +100,11 @@ _TARGET_FAILED_STATUSES = (
     "DELETING",
 )
 
-# Bounded poll-to-READY loop (mirror ensure_mcp_registry.py): ~45 attempts x 4s
-# ~= 3 min. Gateway/target creation is a touch slower than a registry, so the
-# window is a little wider than the registry script's 60s.
 _READY_POLL_ATTEMPTS = 45
 _READY_POLL_DELAY = 4.0
 
-# A tiny but real demo tool schema for the inline lambda target (OPTION A). Each
-# tool is {name, description, inputSchema} per the CreateGatewayTarget
-# `lambda.toolSchema.inlinePayload` (list-of-tool) shape (research §8.1, verified
-# against botocore 1.43.16: inputSchema.type enum includes "object"). Two tools so
-# the demo `tools/list` is non-trivial.
+# One ToolDefinition per tool, the lambda target's toolSchema.inlinePayload shape:
+# https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreateGatewayTarget.html
 _DEMO_TOOL_SCHEMA = [
     {
         "name": "echo",
@@ -151,8 +138,8 @@ _DEMO_TOOL_SCHEMA = [
 def _status_from_resp(resp: dict):
     """Best-effort extraction of a status from a GetGateway/GetGatewayTarget response.
 
-    The verified key is `status`; probe a couple of alternatives defensively in
-    case the response shape differs (mirrors ensure_mcp_registry.py).
+    The verified key is `status`; a couple of alternatives are probed in case the
+    response shape differs.
     """
     for key in _STATUS_KEYS:
         value = resp.get(key)
@@ -161,13 +148,7 @@ def _status_from_resp(resp: dict):
     return None
 
 
-# Default Entra tenant for the demo.
-# The discoveryUrl built from this is only a SANE DEFAULT at create time — the platform
-# re-sets it (along with the real audience) at registration, so a wrong one self-heals.
 _DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
-# Obviously-a-placeholder audience: it is OVERWRITTEN at registration with the real
-# per-MCP audience. It exists only because authorizerType=CUSTOM_JWT requires a non-empty
-# customJWTAuthorizer at create time (the type is immutable post-create — see below).
 _PLACEHOLDER_AUDIENCE = "api://agp-mcp-PLACEHOLDER"
 
 
@@ -198,8 +179,9 @@ def build_create_gateway_kwargs(
     Notes:
       * `placeholder_audience` is a DELIBERATE stand-in (obviously-a-placeholder); the
         platform replaces it with the real per-MCP audience at registration.
-      * `discovery_url` here is a sane default (the demo tenant's well-known URL); the
-        platform RE-SETS it at registration too, so even a wrong discoveryUrl self-heals.
+      * `discovery_url` must be a reachable OIDC well-known URL: CreateGateway fetches it
+        at create time and fails when it cannot, so the tenant it is built from has to be
+        a real one. The platform re-sets it at registration.
 
     protocolType="MCP". The clientToken is a FRESH random uuid4 per create (the AWS API
     requires clientToken min length 33; uuid4 is 36 chars). It was previously a
@@ -229,9 +211,9 @@ def build_create_gateway_kwargs(
 def build_create_target_kwargs(
     gateway_identifier: str,
     target_name: str,
-    lambda_arn: str = None,
-    remote_url: str = None,
-    tool_schema: list = None,
+    lambda_arn: str | None = None,
+    remote_url: str | None = None,
+    tool_schema: list | None = None,
 ) -> dict:
     """The exact kwargs CreateGatewayTarget would receive (research §8.1).
 
@@ -259,25 +241,18 @@ def build_create_target_kwargs(
     target); a fresh uuid4 avoids the cached-token conflict on a clean recreate.
     """
     if bool(lambda_arn) == bool(remote_url):
-        raise ValueError(
-            "exactly one of lambda_arn / remote_url must be provided to build the target kwargs"
-        )
+        raise ValueError("exactly one of lambda_arn / remote_url must be provided to build the target kwargs")
 
-    # Default to the echo/add schema when none is passed (backward-compat). Each
-    # demo domain passes its own schema; omitting it preserves the original behavior.
     if tool_schema is None:
         tool_schema = _DEMO_TOOL_SCHEMA
 
-    kwargs = {
+    kwargs: dict = {
         "gatewayIdentifier": gateway_identifier,
         "name": target_name,
         "clientToken": str(uuid.uuid4()),
     }
 
     if lambda_arn:
-        # research §8.1 OPTION A — inline lambda target. The gateway role invokes
-        # the lambda; GATEWAY_IAM_ROLE means "use the gateway's own service role"
-        # (no separate credential provider object).  # research §8.1
         kwargs["targetConfiguration"] = {
             "mcp": {
                 "lambda": {
@@ -286,18 +261,13 @@ def build_create_target_kwargs(
                 }
             }
         }
-        kwargs["credentialProviderConfigurations"] = [
-            {"credentialProviderType": "GATEWAY_IAM_ROLE"}  # research §8.1
-        ]
+        kwargs["credentialProviderConfigurations"] = [{"credentialProviderType": "GATEWAY_IAM_ROLE"}]
     else:
-        # research §8.1 OPTION B — remote mcpServer target. DYNAMIC listing means
-        # the tools are discovered server-side / via the wire scan (no inline
-        # schema). No credentialProviderConfigurations for a bare demo endpoint.
         kwargs["targetConfiguration"] = {
             "mcp": {
                 "mcpServer": {
                     "endpoint": remote_url,
-                    "listingMode": "DYNAMIC",  # research §8.1
+                    "listingMode": "DYNAMIC",
                 }
             }
         }
@@ -311,10 +281,11 @@ def wait_for_gateway_ready(
     attempts: int = _READY_POLL_ATTEMPTS,
     delay: float = _READY_POLL_DELAY,
 ) -> dict:
-    """Poll GetGateway until status == "READY" (research §8.1). Returns the final response.
+    """Poll GetGateway until status == "READY". Returns the final response.
 
-    A freshly-created gateway is CREATING then READY; creating a target before the
-    gateway is READY can fail. Transient not-ready states (CREATING / UPDATING /
+    The defaults bound the wait at about three minutes (45 polls four seconds apart), a touch
+    wider than the registry script's window. A freshly-created gateway is CREATING then READY;
+    creating a target before the gateway is READY can fail. Transient not-ready states (CREATING / UPDATING /
     an unreadable status, or a transient ConflictException) are expected during the
     wait — we keep polling. A terminal failure status (FAILED / UPDATE_UNSUCCESSFUL
     / DELETING) or exhausting the bounded loop is an error; on a failure status the
@@ -349,10 +320,8 @@ def wait_for_gateway_ready(
         if status in _GATEWAY_FAILED_STATUSES:
             reasons = resp.get("statusReasons") or []
             raise RuntimeError(
-                f"Gateway {gateway_identifier} reached terminal status {status!r}; "
-                f"statusReasons={reasons}"
+                f"Gateway {gateway_identifier} reached terminal status {status!r}; statusReasons={reasons}"
             )
-        # CREATING / UPDATING / unknown-but-non-terminal / absent status -> keep polling.
         time.sleep(delay)
 
     raise TimeoutError(
@@ -382,9 +351,7 @@ def wait_for_target_ready(
     last_resp = {}
     for attempt in range(1, attempts + 1):
         try:
-            resp = ctl.get_gateway_target(
-                gatewayIdentifier=gateway_identifier, targetId=target_id
-            )
+            resp = ctl.get_gateway_target(gatewayIdentifier=gateway_identifier, targetId=target_id)
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code == "ConflictException":
@@ -400,19 +367,15 @@ def wait_for_target_ready(
         last_resp = resp
         status = _status_from_resp(resp)
         last_status = status
-        logger.debug(
-            "get_gateway_target attempt %d/%d: status=%r", attempt, attempts, status
-        )
+        logger.debug("get_gateway_target attempt %d/%d: status=%r", attempt, attempts, status)
         if status == _READY_STATUS:
             logger.info("Gateway target %s is READY.", target_id)
             return resp
         if status in _TARGET_FAILED_STATUSES:
             reasons = resp.get("statusReasons") or []
             raise RuntimeError(
-                f"Gateway target {target_id} reached terminal status {status!r}; "
-                f"statusReasons={reasons}"
+                f"Gateway target {target_id} reached terminal status {status!r}; statusReasons={reasons}"
             )
-        # CREATING / UPDATING / SYNCHRONIZING / *_PENDING_AUTH / absent -> keep polling.
         time.sleep(delay)
 
     raise TimeoutError(
@@ -422,11 +385,6 @@ def wait_for_target_ready(
     )
 
 
-# Bounded paging guard for the list lookups (read-only). A handful of pages is far
-# more than a demo account will ever have; the bound just stops a pathological
-# nextToken loop. The list responses use `items` + `nextToken` (verified against the
-# botocore 1.43.16 model); probe a couple of plausible key names defensively so an
-# unexpected shape degrades to "not found" (-> attempt the create) rather than crashing.
 _LIST_PAGE_LIMIT = 50
 _LIST_ITEMS_KEYS = ("items", "gateways", "gatewayTargets", "targets")
 
@@ -434,7 +392,8 @@ _LIST_ITEMS_KEYS = ("items", "gateways", "gatewayTargets", "targets")
 def _find_gateway_by_name(ctl, gateway_name: str):
     """Look up an existing gateway by exact name; return its summary item or None.
 
-    Pages list_gateways (handling nextToken) and matches on item["name"]. READ-only.
+    Pages list_gateways (handling nextToken) for at most _LIST_PAGE_LIMIT pages, a guard against a
+    pathological nextToken loop, and matches on item["name"]. READ-only.
     Defensive: tolerates response-key variance with .get; if list_gateways is
     unavailable or returns an unexpected shape, the lookup yields None and the caller
     falls back to attempting the create (mirrors the ensure_* idiom in
@@ -495,10 +454,10 @@ def create_example_gateway(
     role_arn: str,
     region: str,
     discovery_url: str,
-    lambda_arn: str = None,
-    remote_url: str = None,
+    lambda_arn: str | None = None,
+    remote_url: str | None = None,
     placeholder_audience: str = _PLACEHOLDER_AUDIENCE,
-    tool_schema: list = None,
+    tool_schema: list | None = None,
 ) -> dict:
     """Create the gateway + one target, wait for both READY. Returns the GetGateway response.
 
@@ -515,16 +474,17 @@ def create_example_gateway(
     (discovery_url + placeholder_audience); the platform overwrites that config at
     registration (see build_create_gateway_kwargs — the type is immutable post-create).
 
+    Both the gateway and the target are get-or-create by name, so a re-run reuses what
+    exists. A reused gateway is polled to READY like a new one (the GetGateway record is
+    what gets returned) and its authorizer is never touched: the platform's registration
+    step owns that config.
+
     Raises on AWS errors / poll timeouts.
     """
-    import boto3  # imported lazily so importing this module is side-effect-free
+    from core.aws_clients import client
 
-    ctl = boto3.client("bedrock-agentcore-control", region_name=region)
+    ctl = client("bedrock-agentcore-control", region=region)
 
-    # Get-or-create the gateway BY NAME (idempotency). Re-running without deleting
-    # reuses the existing gateway (no duplicate, no ConflictException); a fresh uuid4
-    # clientToken on the create path means delete-then-recreate has no cached-token
-    # conflict (AWS caches a clientToken past deletion — see build_create_gateway_kwargs).
     existing_gw = _find_gateway_by_name(ctl, gateway_name)
     if existing_gw:
         gateway_id = existing_gw["gatewayId"]
@@ -539,26 +499,18 @@ def create_example_gateway(
         )
         logger.info("Creating gateway %r in region %s ...", gateway_name, region)
         gw = ctl.create_gateway(**gw_kwargs)
-        # CreateGateway returns gatewayId + gatewayArn + gatewayUrl directly (verified
-        # against botocore 1.43.16). gatewayIdentifier for subsequent calls is the
-        # short gatewayId, NOT the arn (research §8.1 / Spike G note).
+        # gatewayIdentifier is the short gatewayId, not the ARN:
+        # https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_GetGateway.html
         gateway_id = gw.get("gatewayId")
         if not gateway_id:
             raise RuntimeError(
                 f"CreateGateway succeeded but no gatewayId in response; keys: {sorted(gw.keys())}"
             )
-        logger.info(
-            "Created gateway %r -> gatewayId=%s; waiting for READY ...", gateway_name, gateway_id
-        )
+        logger.info("Created gateway %r -> gatewayId=%s; waiting for READY ...", gateway_name, gateway_id)
 
-    # Poll to READY either way — a reused gateway is typically already READY (the poll
-    # returns on the first GetGateway), and we need the full GetGateway record (with
-    # gatewayUrl/gatewayArn) to return regardless. We do NOT update/"fix" a reused
-    # gateway's authorizer — the platform's registration step owns that config.
     gw_ready = wait_for_gateway_ready(ctl, gateway_id)
 
     target_name = f"{gateway_name}-target"
-    # Get-or-create the target BY NAME within this gateway (same idempotency rationale).
     existing_tgt = _find_target_by_name(ctl, gateway_id, target_name)
     if existing_tgt:
         target_id = existing_tgt["targetId"]
@@ -585,9 +537,6 @@ def create_example_gateway(
             )
         logger.info("Created gateway target -> targetId=%s; waiting for READY ...", target_id)
     wait_for_target_ready(ctl, gateway_id, target_id)
-
-    # Return the gateway-ready response; gatewayUrl/gatewayArn come from it verbatim
-    # (research §1.3 — never hand-construct the URL).
     return gw_ready
 
 
@@ -597,17 +546,17 @@ def _print_call_shapes(gw_kwargs: dict, tgt_kwargs: dict) -> None:
     print("\n  bedrock-agentcore-control.CreateGateway(")
     print(_indent(json.dumps(gw_kwargs, indent=2), 4))
     print("  )")
-    print(
-        "\n  # then poll GetGateway(gatewayIdentifier=<gatewayId from the response>) until status==READY\n"
-    )
+    print("\n  # then poll GetGateway(gatewayIdentifier=<gatewayId from the response>) until status==READY\n")
     print("  bedrock-agentcore-control.CreateGatewayTarget(")
     print(_indent(json.dumps(tgt_kwargs, indent=2), 4))
     print("  )")
     print(
-        "\n  # then poll GetGatewayTarget(gatewayIdentifier=<gatewayId>, targetId=<targetId>) until status==READY"
+        "\n  # then poll GetGatewayTarget(gatewayIdentifier=<gatewayId>, targetId=<targetId>) "
+        "until status==READY"
     )
     print(
-        "  # then print the gatewayUrl + gatewayArn (verbatim from the GetGateway response) to register the MCP server"
+        "  # then print the gatewayUrl + gatewayArn (verbatim from the GetGateway response) "
+        "to register the MCP server"
     )
 
 
@@ -702,9 +651,6 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Exactly one of --lambda-arn / --remote-url is required for a target.
-    # argparse's mutually_exclusive_group already forbids BOTH; we additionally
-    # require that one is present (for the live run AND the dry-run validation).
     if not args.lambda_arn and not args.remote_url:
         logger.error(
             "exactly one of --lambda-arn (OPTION A inline lambda) or --remote-url "
@@ -712,9 +658,6 @@ def main(argv=None) -> int:
         )
         return 2
 
-    # Build the call shapes up-front so both the dry-run and the live path use the
-    # SAME kwargs (the dry-run prints exactly what the live path would send). The
-    # target name mirrors create_example_gateway's derivation.
     target_name = f"{args.gateway_name}-target"
     discovery = _discovery_url(args.tenant_id)
     gw_kwargs = build_create_gateway_kwargs(args.gateway_name, args.role_arn, discovery)
@@ -726,7 +669,6 @@ def main(argv=None) -> int:
     )
 
     if args.dry_run:
-        # ZERO boto3 calls — we never even import/construct a client on this path.
         _print_call_shapes(gw_kwargs, tgt_kwargs)
         print("\nDry run OK: args validated, call shapes printed, no AWS calls made.")
         return 0
@@ -740,11 +682,8 @@ def main(argv=None) -> int:
             lambda_arn=args.lambda_arn,
             remote_url=args.remote_url,
         )
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        # botocore exceptions (ClientError, EndpointConnectionError, NoCredentials,
-        # UnknownServiceError, AccessDenied, etc.) plus the poll TimeoutError/
-        # RuntimeError are caught broadly so the user never sees a raw traceback.
-        logger.error("Failed to create the example gateway: %s", exc)
+    except Exception as exc:
+        logger.exception("Failed to create the example gateway: %s", exc)
         logger.error(
             "Check that: (1) AWS credentials are configured with the gateway "
             "permissions AND iam:PassRole on the --role-arn (research §9); (2) the "

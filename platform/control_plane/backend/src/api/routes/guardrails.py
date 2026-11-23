@@ -1,41 +1,34 @@
-"""Guardrail template CRUD API routes.
+"""Guardrail template API: presets, CRUD, publish and metrics.
 
-RBAC (E34/T5): presets/list/get/metrics = VIEWER; create/update/publish = OPERATOR;
-DELETE = ADMIN — deleting a template destroys a live AWS resource (the Bedrock guardrail
-itself, via `guardrail_service.delete_template`), which is a lifecycle act rather than an
-ordinary mutation. It is NOT an enforcement claim: nothing wires a template's guardrail_id
-into a runtime, and neither `models/agent.py` nor `models/mcp_server.py` carries a guardrail
-field. Gating is per-endpoint via trailing `RBACDepends` params, the `mcp_servers.py` idiom.
+Roles per endpoint: presets, list, get and metrics are VIEWER; create, update and publish are
+OPERATOR; delete is ADMIN, because it destroys the Bedrock guardrail behind the template. Gating
+is per endpoint through trailing ``RBACDepends`` parameters. Nothing wires a template's guardrail
+into a runtime; this is template lifecycle, not enforcement.
 
-`created_by` comes from the validated `current_principal`, never a hardcoded "user".
-
-Multi-tenancy (Epic 24, retrofitted in E34/T5): a `tenant_ctx` per-request dependency
-(delegating to `users.get_tenant_ctx` — the ONE resolver-singleton accessor) gates every
-`{template_id}` route via `_load_visible_guardrail` BEFORE any side effect, and
-post-filters `list` results. Create verifies the target tenant exists (400) and that the
-caller is a member of it (403 — no resource exists yet to conceal).
-
-Route ORDER matters: `/presets` must stay declared before `/{template_id}`, or "presets"
-resolves as a template id and the endpoint silently answers 404 instead.
+Tenancy: a per-request ``tenant_ctx`` gates every ``{template_id}`` route through
+:func:`_load_visible_guardrail` before any side effect and post-filters the list. Create checks
+that the target tenant exists and that the caller is a member of it; no resource exists yet, so
+that refusal is a 403. ``created_by`` is the validated principal's identity.
 """
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi import Depends as RBACDepends
-from typing import Optional, List
 import logging
+from typing import List, Optional
 
+from fastapi import APIRouter, Query
+from fastapi import Depends as RBACDepends
+
+from core.config import settings
+from core.rbac import Principal, Role, current_principal, require_role
 from models.guardrail import (
+    GuardrailMetrics,
+    GuardrailPreset,
+    GuardrailStatus,
     GuardrailTemplate,
     GuardrailTemplateCreate,
     GuardrailTemplateUpdate,
-    GuardrailStatus,
-    GuardrailPreset,
-    GuardrailMetrics,
 )
-from services.guardrail_service import GuardrailService
-from services.tenant_resolver import TenantContext, visible
-from core.config import settings
-from core.rbac import Principal, Role, current_principal, require_role
+from services.guardrail_service import GuardrailError, GuardrailService
+from services.tenant_resolver import TenantContext, require_member, visible
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/guardrails", tags=["guardrails"])
@@ -56,48 +49,29 @@ def get_service() -> GuardrailService:
 async def get_tenant_ctx(
     principal: Principal = RBACDepends(current_principal),
 ) -> TenantContext:
-    """Delegate to the ONE resolver-singleton accessor (E24/T5).
-
-    ``users.py`` owns the lazy ``TenantResolver`` singleton (``_tenant_resolver`` /
-    ``get_tenant_resolver()``); this is a thin re-export so guardrails.py has its
-    own per-request ``tenant_ctx`` dependency WITHOUT keeping a second resolver
-    copy — tests patch ``api.routes.users._tenant_resolver`` and both /users/me and
-    every route here observe it. Imported lazily to avoid an import cycle at module
-    load (mirrors ``mcp_servers.get_tenant_ctx``).
-    """
+    """Delegates to the one tenant-resolver singleton ``users.py`` owns, so tests that patch it
+    reach every route here too."""
     from api.routes.users import get_tenant_ctx as _users_get_tenant_ctx
 
     return await _users_get_tenant_ctx(principal)
 
 
-async def _load_visible_guardrail(
-    template_id: str, ctx: TenantContext
-) -> GuardrailTemplate:
-    """Load a template by id and gate it on tenant visibility BEFORE any side effect.
-
-    ONE helper every ``{template_id}`` route calls — missing an endpoint is this
-    retrofit's stated failure mode. A missing OR not-visible template raises the SAME
-    404 literal, byte-identical between the two cases: a distinguishable response
-    would confirm that a foreign tenant's guardrail exists.
-    """
+async def _load_visible_guardrail(template_id: str, ctx: TenantContext) -> GuardrailTemplate:
+    """Load a template and gate it on tenant visibility before any side effect. A missing and a
+    foreign template answer the same 404, so the response confirms nothing about a foreign
+    tenant's guardrails."""
     template = get_service().get_template(template_id)
     if not template or not visible(ctx, template.tenant_id):
-        raise HTTPException(status_code=404, detail="Guardrail template not found")
+        raise GuardrailError(f"guardrail template {template_id} is missing or not visible", kind="not_found")
     return template
 
-
-# --- Presets ---
 
 @router.get("/presets", response_model=List[GuardrailPreset])
 async def list_presets(
     _=RBACDepends(require_role(Role.VIEWER)),
 ):
-    """Get pre-built guardrail configuration presets"""
-    svc = get_service()
-    return svc.get_presets()
+    return get_service().get_presets()
 
-
-# --- CRUD ---
 
 @router.post("", response_model=GuardrailTemplate, status_code=201)
 async def create_guardrail(
@@ -106,28 +80,18 @@ async def create_guardrail(
     ctx: TenantContext = RBACDepends(get_tenant_ctx),
     _=RBACDepends(require_role(Role.OPERATOR)),
 ):
-    """Create a new guardrail template and provision it in Bedrock"""
-    # Multi-tenancy (E24) — tenant_id must exist, then (for a non-global caller) must be
-    # one of the caller's own memberships. No resource exists yet, so 403 (not 404) is
-    # correct here — unlike the visibility-gated routes below.
+    """Create a template and provision its Bedrock guardrail. A failed provisioning answers a
+    fixed 502; the service's failure text stays in the log."""
     from api.routes.tenants import get_tenant_service
-    from services.tenant_service import TenantError
 
-    try:
-        get_tenant_service().get(req.tenant_id)
-    except TenantError:
-        raise HTTPException(status_code=400, detail="unknown tenant")
-    if not ctx.is_global and req.tenant_id not in ctx.tenant_ids:
-        raise HTTPException(status_code=403, detail="tenant not permitted")
+    get_tenant_service().get(req.tenant_id)
+    require_member(ctx, req.tenant_id)
 
-    svc = get_service()
-    template = svc.create_template(req, created_by=principal.email or principal.oid)
+    template = get_service().create_template(req, created_by=principal.email or principal.oid or "")
     if template.status == GuardrailStatus.FAILED:
-        # A FIXED literal, like every other HTTPException in this file (E34/T5b). Interpolating
-        # the last status-history message put the service's AWS failure text in the response
-        # body — a botocore AccessDeniedException names the account id, the execution role and
-        # the instance id. The service logs the real cause; the caller gets the outcome.
-        raise HTTPException(status_code=502, detail="Guardrail creation failed")
+        raise GuardrailError(
+            f"guardrail template {template.template_id} provisioning ended FAILED", kind="creation_failed"
+        )
     return template
 
 
@@ -137,12 +101,8 @@ async def list_guardrails(
     _=RBACDepends(require_role(Role.VIEWER)),
     status: Optional[str] = Query(default=None),
 ):
-    """List all guardrail templates, optionally filtered by status"""
-    svc = get_service()
     status_filter = GuardrailStatus(status) if status else None
-    records = svc.list_templates(status=status_filter)
-    # Tenant post-filter (E24) — filtering lands in the ROUTE, not the service, which
-    # keeps TenantContext out of the service layer (the mcp_servers.py:272 precedent).
+    records = get_service().list_templates(status=status_filter)
     return [t for t in records if visible(ctx, t.tenant_id)]
 
 
@@ -152,7 +112,6 @@ async def get_guardrail(
     ctx: TenantContext = RBACDepends(get_tenant_ctx),
     _=RBACDepends(require_role(Role.VIEWER)),
 ):
-    """Get a single guardrail template by ID"""
     return await _load_visible_guardrail(template_id, ctx)
 
 
@@ -163,12 +122,10 @@ async def update_guardrail(
     ctx: TenantContext = RBACDepends(get_tenant_ctx),
     _=RBACDepends(require_role(Role.OPERATOR)),
 ):
-    """Update a guardrail template configuration"""
     await _load_visible_guardrail(template_id, ctx)
-    svc = get_service()
-    template = svc.update_template(template_id, req)
+    template = get_service().update_template(template_id, req)
     if not template:
-        raise HTTPException(status_code=404, detail="Guardrail template not found")
+        raise GuardrailError(f"guardrail template {template_id} vanished before the update", kind="not_found")
     return template
 
 
@@ -178,12 +135,10 @@ async def delete_guardrail(
     ctx: TenantContext = RBACDepends(get_tenant_ctx),
     _=RBACDepends(require_role(Role.ADMIN)),
 ):
-    """Delete a guardrail template and its Bedrock resource"""
     await _load_visible_guardrail(template_id, ctx)
-    svc = get_service()
-    template = svc.delete_template(template_id)
+    template = get_service().delete_template(template_id)
     if not template:
-        raise HTTPException(status_code=404, detail="Guardrail template not found")
+        raise GuardrailError(f"guardrail template {template_id} vanished before the delete", kind="not_found")
     return template
 
 
@@ -193,19 +148,16 @@ async def publish_guardrail(
     ctx: TenantContext = RBACDepends(get_tenant_ctx),
     _=RBACDepends(require_role(Role.OPERATOR)),
 ):
-    """Publish a new version of the guardrail in Bedrock"""
+    """Publish a new version of the guardrail in Bedrock. A visible draft that was never
+    provisioned answers its own 404 literal, distinct from the visibility gate's."""
     await _load_visible_guardrail(template_id, ctx)
-    svc = get_service()
-    template = svc.publish_version(template_id)
+    template = get_service().publish_version(template_id)
     if not template:
-        # Deliberately a DIFFERENT literal from the tenant/missing 404 above: the
-        # visibility gate has already passed, so this describes a genuinely different
-        # state — a visible draft that was never provisioned in Bedrock.
-        raise HTTPException(status_code=404, detail="Guardrail template not found or has no Bedrock resource")
+        raise GuardrailError(
+            f"guardrail template {template_id} has nothing to publish", kind="not_publishable"
+        )
     return template
 
-
-# --- Observability ---
 
 @router.get("/{template_id}/metrics", response_model=GuardrailMetrics)
 async def get_guardrail_metrics(
@@ -214,10 +166,13 @@ async def get_guardrail_metrics(
     _=RBACDepends(require_role(Role.VIEWER)),
     hours: int = Query(default=24, ge=1, le=168),
 ):
-    """Get observability metrics for a guardrail"""
     template = await _load_visible_guardrail(template_id, ctx)
-    svc = get_service()
     if not template.guardrail_id:
-        raise HTTPException(status_code=400, detail="Guardrail has no Bedrock resource (still in draft)")
+        raise GuardrailError(f"guardrail template {template_id} is a draft", kind="no_bedrock_resource")
 
-    return svc.get_metrics(template.guardrail_id, hours=hours)
+    return get_service().get_metrics(
+        template.guardrail_id,
+        hours=hours,
+        guardrail_arn=template.guardrail_arn,
+        guardrail_version=template.guardrail_version or "DRAFT",
+    )

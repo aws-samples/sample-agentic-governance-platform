@@ -1,4 +1,4 @@
-"""Tests for the ``runtime_catalog`` discovery seam (E29/T3 — contract C-3).
+"""Tests for the ``runtime_catalog`` discovery seam.
 
 Three things are under test and they are deliberately independent:
 
@@ -20,11 +20,13 @@ queries AGP's own store is a seam with two responsibilities.
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
-from typing import Optional
+from typing import Any, Optional
+from unittest.mock import call, patch
 
 import pytest
+from pydantic import ValidationError
 
+from core.aws_clients import AssumedCredentials
 from models.tenant import (
     DatabricksStageConfig,
     Tenant,
@@ -37,6 +39,7 @@ from services.runtime_catalog import (
     CatalogError,
     DatabricksCatalog,
     DiscoveredAgent,
+    DiscoveredAgents,
     RuntimeCatalog,
     mark_already_registered,
 )
@@ -45,12 +48,8 @@ WS = "https://dbc-test.cloud.databricks.com"
 SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:agp-dev/dbx-abc"
 
 
-# --------------------------------------------------------------------------- #
-# Fixtures — tenants
-# --------------------------------------------------------------------------- #
-
 def _dbx_tenant(*, stage="dev", secret_arn=SECRET_ARN, **stage_overrides) -> Tenant:
-    cfg = {
+    cfg: dict[str, Any] = {
         "workspace_url": WS,
         "workspace_id": "1234567890123456",
         "sp_client_id": "sp-abc",
@@ -58,25 +57,34 @@ def _dbx_tenant(*, stage="dev", secret_arn=SECRET_ARN, **stage_overrides) -> Ten
     }
     cfg.update(stage_overrides)
     return Tenant(
-        id="ten-dbx", name="Analytics", line_of_business="A", entra_group_ids=["g"],
+        id="ten-dbx",
+        name="Analytics",
+        line_of_business="A",
+        entra_group_ids=["g"],
         platform=TenantPlatform.DATABRICKS,
         stages={stage: DatabricksStageConfig(**cfg)},
-        created_by="u", created_at="t", updated_at="t",
+        created_by="u",
+        created_at="t",
+        updated_at="t",
     )
 
 
 def _aws_tenant(*, stage="dev", deploy_role_arn="", region="us-east-1") -> Tenant:
     return Tenant(
-        id="ten-aws", name="Retail", line_of_business="R", entra_group_ids=["g"],
-        stages={stage: TenantStageConfig(
-            account_id="111111111111", region=region, deploy_role_arn=deploy_role_arn)},
-        created_by="u", created_at="t", updated_at="t",
+        id="ten-aws",
+        name="Retail",
+        line_of_business="R",
+        entra_group_ids=["g"],
+        stages={
+            stage: TenantStageConfig(
+                account_id="111111111111", region=region, deploy_role_arn=deploy_role_arn
+            )
+        },
+        created_by="u",
+        created_at="t",
+        updated_at="t",
     )
 
-
-# --------------------------------------------------------------------------- #
-# Fakes — a Databricks client that answers the REAL shapes and no more
-# --------------------------------------------------------------------------- #
 
 class _FakeWorkspace:
     """Answers ``mint_m2m_token`` / ``list_apps`` / ``list_serving_endpoints`` only.
@@ -86,8 +94,7 @@ class _FakeWorkspace:
     Secrets Manager is that a catalog with no credential must FAIL rather than list nothing
     and look healthy."""
 
-    def __init__(self, *, apps=None, endpoints=None, apps_error=None, endpoints_error=None,
-                 mint_error=None):
+    def __init__(self, *, apps=None, endpoints=None, apps_error=None, endpoints_error=None, mint_error=None):
         self._apps = apps if apps is not None else []
         self._endpoints = endpoints if endpoints is not None else []
         self._apps_error = apps_error
@@ -124,7 +131,7 @@ class _FakeSecrets:
         self._error = error
         self.requested: list[str] = []
 
-    def get_secret_value(self, SecretId: str):  # noqa: N803 — boto3's parameter name
+    def get_secret_value(self, SecretId: str):
         self.requested.append(SecretId)
         if self._error:
             raise self._error
@@ -133,15 +140,17 @@ class _FakeSecrets:
         return {"SecretString": self._bodies[SecretId]}
 
 
-def _dbx_catalog(workspace, *, secret_body='{"sp_client_secret": "s3cr3t"}', secrets=None):
+def _dbx_catalog(workspace, *, secret_body='{"sp_client_secret": "s3cr3t"}', secrets=None):  # noqa: S107 — a fake secret body for the test double, not a credential; expires 2027-10-23; added E49A-50A/T8
     return DatabricksCatalog(
         workspace=workspace,
         secrets_client=secrets or _FakeSecrets({SECRET_ARN: secret_body}),
     )
 
 
-# Real-shaped app + endpoint records (platform research §2.1 / §2.2).
-def _app(name="fraud-agent", url=f"{WS}/apps/fraud-agent", state="RUNNING", creator="a@b.com"):
+# Real-shaped app + endpoint records.
+def _app(
+    name="fraud-agent", url: Optional[str] = f"{WS}/apps/fraud-agent", state="RUNNING", creator="a@b.com"
+):
     record = {
         "name": name,
         "create_time": "2026-08-01T00:00:00Z",
@@ -154,25 +163,28 @@ def _app(name="fraud-agent", url=f"{WS}/apps/fraud-agent", state="RUNNING", crea
     return record
 
 
-def _endpoint(name="claims-agent", entity_type="CUSTOM_MODEL", ready="READY",
-              endpoint_url=f"{WS}/serving-endpoints/claims-agent", creator="a@b.com"):
+def _endpoint(
+    name="claims-agent",
+    entity_type="CUSTOM_MODEL",
+    ready="READY",
+    endpoint_url: Optional[str] = f"{WS}/serving-endpoints/claims-agent",
+    creator="a@b.com",
+):
     record = {
         "name": name,
         "id": "abcdef0123456789abcdef0123456789",
         "creator": creator,
         "state": {"ready": ready, "config_update": "NOT_UPDATING"},
-        "config": {"served_entities": [
-            {"name": "claims-1", "entity_name": "cat.sch.claims", "entity_type": entity_type},
-        ]},
+        "config": {
+            "served_entities": [
+                {"name": "claims-1", "entity_name": "cat.sch.claims", "entity_type": entity_type},
+            ]
+        },
     }
     if endpoint_url is not None:
         record["endpoint_url"] = endpoint_url
     return record
 
-
-# --------------------------------------------------------------------------- #
-# 1. The seam itself
-# --------------------------------------------------------------------------- #
 
 def test_discovered_agent_fields_and_defaults():
     a = DiscoveredAgent(name="n", runtime_handle="h", kind="app", state="RUNNING")
@@ -183,8 +195,36 @@ def test_discovered_agent_is_frozen():
     """Evidence about a platform at a moment in time — a mutated probe result is a record
     that disagrees with what was observed (``RepoView``'s reasoning)."""
     a = DiscoveredAgent(name="n", runtime_handle="h", kind="app", state="s")
-    with pytest.raises(FrozenInstanceError):
-        a.name = "other"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        a.name = "other"
+
+
+def test_discovered_agents_envelope_validates_the_listing_and_names_the_platform():
+    found = [DiscoveredAgent(name="n", runtime_handle="h", kind="app", state="RUNNING")]
+    envelope = DiscoveredAgents(agents=found, platform=TenantPlatform.DATABRICKS)
+    assert envelope.model_dump(mode="json") == {
+        "agents": [
+            {
+                "name": "n",
+                "runtime_handle": "h",
+                "kind": "app",
+                "state": "RUNNING",
+                "created_by": "",
+                "already_registered": False,
+            }
+        ],
+        "platform": "databricks",
+    }
+    assert DiscoveredAgents.model_validate(envelope.model_dump()) == envelope
+    with pytest.raises(ValidationError):
+        DiscoveredAgents.model_validate({"agents": [{"name": "n"}], "platform": "databricks"})
+
+
+def test_discovered_agents_names_only_a_tenant_platform():
+    for platform in ("aws", "databricks"):
+        assert DiscoveredAgents.model_validate({"agents": [], "platform": platform}).platform == platform
+    with pytest.raises(ValidationError):
+        DiscoveredAgents.model_validate({"agents": [], "platform": "mainframe"})
 
 
 @pytest.mark.parametrize("adapter", [DatabricksCatalog, AgentCoreCatalog])
@@ -201,13 +241,9 @@ def test_adapters_conform_to_the_protocol_signature(adapter):
 
 
 def test_protocol_is_runtime_checkable_against_both_adapters():
-    assert isinstance(DatabricksCatalog(workspace=_FakeWorkspace()), RuntimeCatalog)
+    assert isinstance(_dbx_catalog(_FakeWorkspace()), RuntimeCatalog)
     assert isinstance(AgentCoreCatalog(), RuntimeCatalog)
 
-
-# --------------------------------------------------------------------------- #
-# 2. already_registered — a pure match over handles, not an adapter concern
-# --------------------------------------------------------------------------- #
 
 def test_mark_already_registered_flags_matching_handles():
     found = [
@@ -220,12 +256,17 @@ def test_mark_already_registered_flags_matching_handles():
 
 def test_mark_already_registered_returns_new_objects_and_keeps_every_field():
     """Frozen ⇒ the flag cannot be set in place; the copies must carry everything else."""
-    found = [DiscoveredAgent(name="a", runtime_handle="h-1", kind="app", state="RUNNING",
-                             created_by="x@y.com")]
+    found = [
+        DiscoveredAgent(name="a", runtime_handle="h-1", kind="app", state="RUNNING", created_by="x@y.com")
+    ]
     marked = mark_already_registered(found, {"h-1"})
     assert marked[0] == DiscoveredAgent(
-        name="a", runtime_handle="h-1", kind="app", state="RUNNING",
-        created_by="x@y.com", already_registered=True,
+        name="a",
+        runtime_handle="h-1",
+        kind="app",
+        state="RUNNING",
+        created_by="x@y.com",
+        already_registered=True,
     )
     assert found[0].already_registered is False  # the input is untouched
 
@@ -238,18 +279,19 @@ def test_mark_already_registered_ignores_blank_handles():
     assert mark_already_registered(found, {""})[0].already_registered is False
 
 
-# --------------------------------------------------------------------------- #
-# 3. DatabricksCatalog
-# --------------------------------------------------------------------------- #
-
 @pytest.mark.asyncio
 async def test_databricks_lists_apps_as_the_primary_shape():
     ws = _FakeWorkspace(apps=[_app()])
     agents = await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
-    assert agents == [DiscoveredAgent(
-        name="fraud-agent", runtime_handle=f"{WS}/apps/fraud-agent", kind="app",
-        state="RUNNING", created_by="a@b.com",
-    )]
+    assert agents == [
+        DiscoveredAgent(
+            name="fraud-agent",
+            runtime_handle=f"{WS}/apps/fraud-agent",
+            kind="app",
+            state="RUNNING",
+            created_by="a@b.com",
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -257,15 +299,16 @@ async def test_databricks_merges_apps_and_serving_endpoints():
     ws = _FakeWorkspace(apps=[_app()], endpoints=[_endpoint()])
     agents = await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
     assert [(a.name, a.kind) for a in agents] == [
-        ("fraud-agent", "app"), ("claims-agent", "serving_endpoint"),
+        ("fraud-agent", "app"),
+        ("claims-agent", "serving_endpoint"),
     ]
 
 
 @pytest.mark.asyncio
 async def test_databricks_reads_the_handle_and_never_constructs_it():
-    """C-3's pin. The handle is what T7 will POST to, so a CONSTRUCTED one would send an
-    invoke at a URL Databricks never published — the research notes ``endpoint_url`` is only
-    populated for route-optimized endpoints, so guessing would be wrong most of the time."""
+    """The handle is what the invoke leg will POST to, so a CONSTRUCTED one would send an
+    invoke at a URL Databricks never published; ``endpoint_url`` is only populated for
+    route-optimized endpoints, so guessing would be wrong most of the time."""
     ws = _FakeWorkspace(apps=[_app(url=f"{WS}/apps/renamed-elsewhere")])
     agents = await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
     # The handle follows the RESPONSE, not the app's name.
@@ -274,7 +317,7 @@ async def test_databricks_reads_the_handle_and_never_constructs_it():
 
 @pytest.mark.asyncio
 async def test_databricks_skips_an_app_with_no_readable_url():
-    """The Apps field names are UNVERIFIED until T12 (C-2's own warning). A record whose URL
+    """The Apps field names are unverified against a live workspace. A record whose URL
     key AGP does not recognise is SKIPPED with a safe log — never a KeyError, and never a
     fabricated handle."""
     ws = _FakeWorkspace(apps=[_app(url=None), _app(name="ok")])
@@ -295,14 +338,16 @@ async def test_databricks_accepts_app_url_as_the_alternate_key():
 
 @pytest.mark.asyncio
 async def test_databricks_filters_endpoints_to_custom_model_entities():
-    """Foundation/external models are not agents. Only ``CUSTOM_MODEL`` served entities are
-    (research §2.2), and a workspace's endpoint list is mostly the other kinds."""
-    ws = _FakeWorkspace(endpoints=[
-        _endpoint(name="agent-one", entity_type="CUSTOM_MODEL"),
-        _endpoint(name="fm-endpoint", entity_type="FOUNDATION_MODEL"),
-        _endpoint(name="ext-endpoint", entity_type="EXTERNAL_MODEL"),
-        _endpoint(name="feature-spec", entity_type="FEATURE_SPEC"),
-    ])
+    """Foundation/external models are not agents. Only ``CUSTOM_MODEL`` served entities are,
+    and a workspace's endpoint list is mostly the other kinds."""
+    ws = _FakeWorkspace(
+        endpoints=[
+            _endpoint(name="agent-one", entity_type="CUSTOM_MODEL"),
+            _endpoint(name="fm-endpoint", entity_type="FOUNDATION_MODEL"),
+            _endpoint(name="ext-endpoint", entity_type="EXTERNAL_MODEL"),
+            _endpoint(name="feature-spec", entity_type="FEATURE_SPEC"),
+        ]
+    )
     agents = await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
     assert [a.name for a in agents] == ["agent-one"]
 
@@ -311,11 +356,13 @@ async def test_databricks_filters_endpoints_to_custom_model_entities():
 async def test_databricks_excludes_reserved_databricks_prefixed_endpoints():
     """``databricks-`` is reserved for Databricks' own endpoints — a cheap, documented way
     to keep the foundation-model catalogue out of a customer's agent inventory."""
-    ws = _FakeWorkspace(endpoints=[
-        _endpoint(name="databricks-meta-llama-3-70b-instruct"),
-        _endpoint(name="databricks-claims-agent"),
-        _endpoint(name="our-claims-agent"),
-    ])
+    ws = _FakeWorkspace(
+        endpoints=[
+            _endpoint(name="databricks-meta-llama-3-70b-instruct"),
+            _endpoint(name="databricks-claims-agent"),
+            _endpoint(name="our-claims-agent"),
+        ]
+    )
     agents = await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
     assert [a.name for a in agents] == ["our-claims-agent"]
 
@@ -330,9 +377,7 @@ async def test_databricks_endpoint_state_is_the_raw_ready_string():
 @pytest.mark.asyncio
 async def test_databricks_reads_the_data_plane_endpoint_url_when_the_top_level_one_is_absent():
     record = _endpoint(endpoint_url=None)
-    record["data_plane_info"] = {
-        "query_info": {"endpoint_url": f"{WS}/serving-endpoints/dp/invocations"}
-    }
+    record["data_plane_info"] = {"query_info": {"endpoint_url": f"{WS}/serving-endpoints/dp/invocations"}}
     ws = _FakeWorkspace(endpoints=[record])
     agents = await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
     assert agents[0].runtime_handle == f"{WS}/serving-endpoints/dp/invocations"
@@ -386,12 +431,16 @@ async def test_databricks_raises_a_safe_error_when_the_secret_cannot_be_read():
 
 @pytest.mark.asyncio
 async def test_databricks_surfaces_the_platform_error_kind_not_its_message():
-    ws = _FakeWorkspace(mint_error=DatabricksError(
-        "Databricks rejected the request (mint workspace token, status 401)",
-        kind="invalid_client"))
+    ws = _FakeWorkspace(
+        mint_error=DatabricksError(
+            "Databricks rejected the request (mint workspace token, status 401)", kind="invalid_client"
+        )
+    )
     with pytest.raises(CatalogError) as ei:
         await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
-    assert ei.value.kind == "invalid_client"
+    assert ei.value.kind == "databricks_error"
+    assert ei.value.detail == "platform discovery failed (invalid_client)"
+    assert "status 401" not in ei.value.detail
 
 
 @pytest.mark.asyncio
@@ -404,12 +453,13 @@ async def test_databricks_raises_when_a_listing_fails_rather_than_shortening_the
     )
     with pytest.raises(CatalogError) as ei:
         await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
-    assert ei.value.kind == "PERMISSION_DENIED"
+    assert ei.value.kind == "databricks_error"
+    assert ei.value.detail == "platform discovery failed (PERMISSION_DENIED)"
 
 
 @pytest.mark.asyncio
 async def test_databricks_empty_workspace_lists_nothing_without_error():
-    """An SP with no app grants legitimately sees an empty list (research §5.3) — that is a
+    """An SP with no app grants legitimately sees an empty list; that is a
     successful empty answer, not a failure."""
     assert await _dbx_catalog(_FakeWorkspace()).list_agents(_dbx_tenant(), "dev") == []
 
@@ -434,14 +484,9 @@ async def test_databricks_refuses_an_aws_shaped_stage():
 async def test_databricks_error_message_never_carries_the_secret():
     ws = _FakeWorkspace(apps_error=DatabricksError("boom", kind="bad_response"))
     with pytest.raises(CatalogError) as ei:
-        await _dbx_catalog(ws, secret_body='{"sp_client_secret": "s3cr3t"}').list_agents(
-            _dbx_tenant(), "dev")
+        await _dbx_catalog(ws, secret_body='{"sp_client_secret": "s3cr3t"}').list_agents(_dbx_tenant(), "dev")
     assert "s3cr3t" not in str(ei.value)
 
-
-# --------------------------------------------------------------------------- #
-# 4. AgentCoreCatalog
-# --------------------------------------------------------------------------- #
 
 class _FakeControl:
     """A ``bedrock-agentcore-control`` stand-in with ``list_agent_runtimes`` pagination."""
@@ -467,9 +512,13 @@ class _FakeSts:
         if self._error:
             raise self._error
         self.assumed.append(kwargs)
-        return {"Credentials": {
-            "AccessKeyId": "AK", "SecretAccessKey": "SK", "SessionToken": "ST",
-        }}
+        return {
+            "Credentials": {
+                "AccessKeyId": "AK",
+                "SecretAccessKey": "SK",
+                "SessionToken": "ST",
+            }
+        }
 
 
 def _runtime(name="fraud", arn=None, status="READY"):
@@ -486,6 +535,7 @@ def _runtime(name="fraud", arn=None, status="READY"):
 def _ac_catalog(control, sts=None, seen=None):
     """Build an ``AgentCoreCatalog`` whose control-client factory records how it was built —
     the assume-role idiom's observable effect is WHICH credentials the client gets."""
+
     def factory(*, region, credentials):
         if seen is not None:
             seen.append({"region": region, "credentials": credentials})
@@ -498,11 +548,14 @@ def _ac_catalog(control, sts=None, seen=None):
 async def test_agentcore_lists_runtimes_with_the_arn_as_the_handle():
     control = _FakeControl([{"agentRuntimes": [_runtime()]}])
     agents = await _ac_catalog(control).list_agents(_aws_tenant(), "dev")
-    assert agents == [DiscoveredAgent(
-        name="fraud",
-        runtime_handle="arn:aws:bedrock-agentcore:us-east-1:111111111111:runtime/fraud",
-        kind="agentcore_runtime", state="READY",
-    )]
+    assert agents == [
+        DiscoveredAgent(
+            name="fraud",
+            runtime_handle="arn:aws:bedrock-agentcore:us-east-1:111111111111:runtime/fraud",
+            kind="agentcore_runtime",
+            state="READY",
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -526,10 +579,12 @@ async def test_agentcore_skips_a_runtime_with_no_arn():
 
 @pytest.mark.asyncio
 async def test_agentcore_pages_on_next_token():
-    control = _FakeControl([
-        {"agentRuntimes": [_runtime(name="a")], "nextToken": "t1"},
-        {"agentRuntimes": [_runtime(name="b")]},
-    ])
+    control = _FakeControl(
+        [
+            {"agentRuntimes": [_runtime(name="a")], "nextToken": "t1"},
+            {"agentRuntimes": [_runtime(name="b")]},
+        ]
+    )
     agents = await _ac_catalog(control).list_agents(_aws_tenant(), "dev")
     assert [a.name for a in agents] == ["a", "b"]
     assert control.tokens == [None, "t1"]
@@ -540,10 +595,12 @@ async def test_agentcore_refuses_a_repeated_pagination_token():
     """The exit condition is upstream-controlled. A constant token would spin this coroutine
     forever, holding a request slot — and a truncated inventory presented as complete is the
     governance lie the Databricks pager also refuses."""
-    control = _FakeControl([
-        {"agentRuntimes": [_runtime(name="a")], "nextToken": "same"},
-        {"agentRuntimes": [_runtime(name="b")], "nextToken": "same"},
-    ])
+    control = _FakeControl(
+        [
+            {"agentRuntimes": [_runtime(name="a")], "nextToken": "same"},
+            {"agentRuntimes": [_runtime(name="b")], "nextToken": "same"},
+        ]
+    )
     with pytest.raises(CatalogError) as ei:
         await _ac_catalog(control).list_agents(_aws_tenant(), "dev")
     assert ei.value.kind == "pagination_overflow"
@@ -557,11 +614,10 @@ async def test_agentcore_assumes_the_stages_deploy_role_when_one_is_set():
     sts, seen = _FakeSts(), []
     role = "arn:aws:iam::111111111111:role/agp-deployment-dev"
     catalog = _ac_catalog(control, sts=sts, seen=seen)
-    await catalog.list_agents(
-        _aws_tenant(deploy_role_arn=role, region="eu-west-1"), "dev")
+    await catalog.list_agents(_aws_tenant(deploy_role_arn=role, region="eu-west-1"), "dev")
     assert sts.assumed[0]["RoleArn"] == role
-    assert seen[0]["region"] == "eu-west-1"          # the STAGE's region, not the platform's
-    assert seen[0]["credentials"]["aws_access_key_id"] == "AK"
+    assert seen[0]["region"] == "eu-west-1"  # the STAGE's region, not the platform's
+    assert seen[0]["credentials"] == AssumedCredentials("AK", "SK", "ST")
 
 
 @pytest.mark.asyncio
@@ -576,13 +632,32 @@ async def test_agentcore_reads_in_place_when_the_stage_has_no_deploy_role():
 
 
 @pytest.mark.asyncio
+async def test_agentcore_builds_its_default_clients_through_the_factory():
+    """Without injected clients the catalog reaches AWS through ``core.aws_clients`` alone: the STS
+    client in the platform's region, then the control client in the stage's region carrying the
+    assumed credentials as one typed value, never a spread of keywords."""
+    control = _FakeControl([{"agentRuntimes": [_runtime()]}])
+    role = "arn:aws:iam::111111111111:role/agp-deployment-dev"
+    with patch("core.aws_clients.client", side_effect=[_FakeSts(), control]) as factory:
+        agents = await AgentCoreCatalog().list_agents(
+            _aws_tenant(deploy_role_arn=role, region="eu-west-1"), "dev"
+        )
+    assert [a.name for a in agents] == ["fraud"]
+    assert factory.call_args_list == [
+        call("sts", region=None),
+        call(
+            "bedrock-agentcore-control", region="eu-west-1", credentials=AssumedCredentials("AK", "SK", "ST")
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agentcore_surfaces_an_assume_role_failure_as_a_safe_error():
     control = _FakeControl([{"agentRuntimes": []}])
     sts = _FakeSts(error=RuntimeError("AccessDenied: user is not authorized to sts:AssumeRole"))
     catalog = _ac_catalog(control, sts=sts)
     with pytest.raises(CatalogError) as ei:
-        await catalog.list_agents(
-            _aws_tenant(deploy_role_arn="arn:aws:iam::111111111111:role/r"), "dev")
+        await catalog.list_agents(_aws_tenant(deploy_role_arn="arn:aws:iam::111111111111:role/r"), "dev")
     assert ei.value.kind == "assume_role_failed"
     assert "not authorized" not in str(ei.value)
 
@@ -615,47 +690,62 @@ async def test_agentcore_empty_account_lists_nothing_without_error():
     assert await _ac_catalog(_FakeControl()).list_agents(_aws_tenant(), "dev") == []
 
 
-# --------------------------------------------------------------------------- #
-# 5. CatalogError's kind is a SAFE code
-# --------------------------------------------------------------------------- #
+FIXED_KINDS = (
+    "no_credential",
+    "credential_unreadable",
+    "unknown_stage",
+    "wrong_stage_shape",
+    "assume_role_failed",
+    "listing_failed",
+    "pagination_overflow",
+)
 
-def test_catalog_error_kind_is_a_safe_code():
-    """The route puts ``.kind`` in a 502 body. A Databricks ``PERMISSION_DENIED`` is safe;
-    an upstream string carrying a workspace path is not, so the shape is enforced here."""
-    import re
-
-    for kind in ("no_credential", "credential_unreadable", "unknown_stage",
-                 "wrong_stage_shape", "assume_role_failed", "listing_failed",
-                 "pagination_overflow"):
-        assert re.fullmatch(r"[A-Za-z_]{1,64}", kind)
-
-
-# --------------------------------------------------------------------------- #
-# FIX round 1 — the safe-code check is a fullmatch, EXECUTED (review MINOR)
-#
-# ``_SAFE_KIND.match`` accepted "PERMISSION_DENIED\n<anything>": ``$`` also matches just before a
-# trailing newline, and ``.match`` only anchors the START. That value goes into a 502 body, so the
-# smuggled second line would have crossed. The regex was always right; the CALL was not — which
-# is why these cases are executed rather than asserted by inspection.
-# --------------------------------------------------------------------------- #
-
-@pytest.mark.parametrize("hostile", [
+HOSTILE_CODES = [
     "PERMISSION_DENIED\ninjected",
     "PERMISSION_DENIED\n",
     "ok\r\nSet-Cookie: x=1",
     "kind with spaces",
     "PERMISSION_DENIED 403 /Workspace/secret",
     "arn:aws:iam::111111111111:role/r",
-    "a" * 65,          # over the length bound
+    "a" * 65,
     "",
-    "1nvalid",         # digits are not in the safe class
-])
-def test_catalog_error_normalises_an_unsafe_kind_to_unknown(hostile):
-    assert CatalogError("failed", kind=hostile).kind == "unknown"
+    "1nvalid",
+]
+
+
+@pytest.mark.parametrize("kind", FIXED_KINDS)
+def test_catalog_error_is_502_with_the_discovery_detail_naming_the_kind(kind):
+    err = CatalogError("anything upstream said", kind)
+    assert (err.status_code, err.detail) == (502, f"platform discovery failed ({kind})")
+    assert err.code == f"catalog.{kind}"
+
+
+@pytest.mark.parametrize("hostile", HOSTILE_CODES)
+@pytest.mark.asyncio
+async def test_catalog_error_normalises_an_unsafe_upstream_code_to_unknown(hostile):
+    """The detail carries the platform's code only when it looks like one, matched in full so a
+    trailing newline cannot smuggle a second line into the body."""
+    ws = _FakeWorkspace(mint_error=DatabricksError("Databricks rejected the request", kind=hostile))
+    with pytest.raises(CatalogError) as ei:
+        await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
+    assert (ei.value.kind, ei.value.detail) == ("databricks_error", "platform discovery failed (unknown)")
 
 
 @pytest.mark.parametrize("safe", ["PERMISSION_DENIED", "unreachable", "no_credential", "a"])
-def test_catalog_error_passes_a_genuinely_safe_kind_through(safe):
-    """The normalisation must not be so aggressive that a real upstream code is lost — an
-    operator seeing PERMISSION_DENIED learns something true."""
-    assert CatalogError("failed", kind=safe).kind == safe
+@pytest.mark.asyncio
+async def test_catalog_error_passes_a_safe_upstream_code_through(safe):
+    ws = _FakeWorkspace(mint_error=DatabricksError("Databricks rejected the request", kind=safe))
+    with pytest.raises(CatalogError) as ei:
+        await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
+    assert ei.value.detail == f"platform discovery failed ({safe})"
+
+
+@pytest.mark.asyncio
+async def test_catalog_error_detail_for_databricks_error_carries_no_upstream_body():
+    message = "PERMISSION_DENIED: /Workspace/Users/maria/secret.py; token eyJhbGciOiJSUzI1NiJ9.payload.sig"
+    ws = _FakeWorkspace(mint_error=DatabricksError(message, kind="PERMISSION_DENIED"))
+    with pytest.raises(CatalogError) as ei:
+        await _dbx_catalog(ws).list_agents(_dbx_tenant(), "dev")
+    assert ei.value.detail == "platform discovery failed (PERMISSION_DENIED)"
+    for leaked in ("/Workspace", "maria", "eyJhbGciOi", "s3cr3t"):
+        assert leaked not in ei.value.detail

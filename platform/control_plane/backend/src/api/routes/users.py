@@ -1,12 +1,20 @@
-"""User and authentication API routes"""
+"""The identity route ``GET /users/me`` and the two per-request scope dependencies every tenant- or
+project-scoped route shares: ``get_tenant_ctx`` and ``get_project_ctx``.
+
+Both resolvers are lazy module singletons built from the app-wide service singletons; tests assign
+``_tenant_resolver`` / ``_project_resolver`` directly, so nothing here reaches AWS or Graph in the
+suite.
+"""
 
 import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, Field
+from pydantic import Field
 
-from core.rbac import Principal, Role, _extract_role, current_principal, principal_email
+from core.rbac import Principal, Role, current_principal
+from models.base import WireModel
+from models.user import UserTenant
 from services.project_resolver import ProjectContext
 from services.tenant_resolver import TenantContext
 
@@ -14,21 +22,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-# Lazy TenantResolver singleton (E24/T4) — tests patch ``_tenant_resolver`` directly
-# (the ``tenants.py`` ``_svc`` idiom), so this never runs against live AWS/Graph.
 _tenant_resolver = None
 
 
 def get_tenant_resolver():
-    """Build the resolver from the app-wide singletons: the tenant service
-    (``tenants.get_tenant_service``) + the ONE GraphService (``grants.get_graph_service``).
-    Imported lazily/at call time to avoid import cycles (mirrors ``tenants._list_agents``).
-
-    THE ONE resolver-singleton accessor in the app (E24/T5) — ``agents.py`` and
-    ``mcp_servers.py`` import ``get_tenant_ctx`` below (which calls this) rather than
-    keeping their own ``_tenant_resolver`` copies, so a test patching
-    ``users_module._tenant_resolver`` observes every scoped route.
-    """
+    """The one ``TenantResolver`` accessor in the app, built on first use from the tenant service and
+    the one ``GraphService``; the imports are at call time to avoid import cycles. ``agents.py`` and
+    ``mcp_servers.py`` reach it through ``get_tenant_ctx`` rather than keeping their own copy, so a
+    test that patches ``_tenant_resolver`` here observes every scoped route."""
     global _tenant_resolver
     if _tenant_resolver is None:
         from api.routes.grants import get_graph_service
@@ -42,37 +43,20 @@ def get_tenant_resolver():
 async def get_tenant_ctx(
     principal: Principal = Depends(current_principal),
 ) -> TenantContext:
-    """Shared per-request tenant-scope dependency (E24/T5).
-
-    Used by ``agents.py`` and ``mcp_servers.py`` (``RBACDepends(get_tenant_ctx)``) so
-    every tenant-scoped route resolves the caller EXACTLY once per request via the
-    SAME resolver singleton /users/me uses. Unlike ``users._resolve_tenants`` (which
-    degrades to ``tenants=[]`` so a resolver failure never breaks the identity route),
-    a failure here propagates — a scoped route must never silently treat a broken
-    resolve as "caller sees nothing", which would mask an outage as an empty list
-    instead of a 5xx.
-    """
+    """Per-request tenant scope, resolved once per request through the same resolver ``/users/me``
+    uses. Unlike ``_resolve_tenants`` a failure propagates: a scoped route must never read a broken
+    resolve as "the caller sees nothing", which would mask an outage as an empty list."""
     return await get_tenant_resolver().resolve(principal)
 
 
-# Lazy ProjectResolver singleton (E27/T3) — the project-role twin of ``_tenant_resolver``
-# above. Tests patch ``_project_resolver`` directly, so this never runs against live
-# AWS/Graph.
 _project_resolver = None
 
 
 def get_project_resolver():
-    """Build the resolver from the app-wide singletons: the project-role service
-    (``projects.get_project_role_service``) + the ONE GraphService
-    (``grants.get_graph_service``). Imported lazily/at call time to avoid import cycles
-    (mirrors ``get_tenant_resolver`` above).
-
-    THE ONE project-resolver-singleton accessor in the app (E27/T3) — every
-    project-scoped route reaches it through ``get_project_ctx`` below rather than
-    keeping its own copy, so a test patching ``users_module._project_resolver``
-    observes every gated route, and a role write in one route invalidates the SAME
-    cache the next request reads.
-    """
+    """The one ``ProjectResolver`` accessor in the app, the project-role twin of
+    ``get_tenant_resolver``: built on first use from the project-role service and the one
+    ``GraphService``, reached by every project-scoped route through ``get_project_ctx``, so a role
+    write in one route invalidates the same cache the next request reads."""
     global _project_resolver
     if _project_resolver is None:
         from api.routes.grants import get_graph_service
@@ -86,63 +70,41 @@ def get_project_resolver():
 async def get_project_ctx(
     principal: Principal = Depends(current_principal),
 ) -> ProjectContext:
-    """Shared per-request project-role dependency (E27/T3).
-
-    Used by every project-scoped route (``RBACDepends(get_project_ctx)``) so the caller's
-    per-project authority is resolved EXACTLY once per request via the SAME resolver
-    singleton. Like ``get_tenant_ctx`` (and unlike ``_resolve_tenants``), a failure
-    PROPAGATES — a gated route must never silently treat a broken resolve as "caller
-    holds no role", which would mask an outage as a wall of 403s instead of a 5xx.
-    """
+    """Per-request project-role scope, resolved once per request. Like ``get_tenant_ctx`` a failure
+    propagates: a gated route must never read a broken resolve as "the caller holds no role", which
+    would mask an outage as a wall of 403s."""
     return await get_project_resolver().resolve(principal)
 
 
-class UserInfo(BaseModel):
+class UserInfo(WireModel):
     email: str
     role: str
     role_level: int
     can_deploy: bool
     oid: Optional[str] = None
-    # Entra tokens carry a human `name` claim (e.g. "Maria Bauer"); the FE shows
-    # it in the sidebar footer and falls back to the email alias when None.
-    name: Optional[str] = None
-    # The caller's resolved tenant memberships (E24/T4). Admins get their
-    # memberships too (possibly []) — `role` already tells the FE they're global.
-    # A failed resolve degrades to [] (never breaks /users/me).
-    #
-    # Deliberately `list[dict]` and not a model: :func:`_resolve_tenants` is the single writer and
-    # its projection is per-platform (E29/T9), so the shape is documented there — one place — rather
-    # than split between a model that would have to make every platform's fields optional and a
-    # function that decides which are actually sent. Each entry carries
-    # ``{id, name, line_of_business, platform, binding_mode, stages}``.
-    tenants: list[dict] = Field(default_factory=list)
+    name: Optional[str] = Field(
+        default=None,
+        description="The token's human `name` claim; the interface falls back to the email alias when null",
+    )
+    tenants: list[UserTenant] = Field(
+        default_factory=list,
+        description=(
+            "The caller's resolved tenant memberships, admins included; [] when none or when the "
+            "resolve failed. Each entry carries id, name, line_of_business, platform, binding_mode, "
+            "readiness and stages, projected per platform by the route."
+        ),
+    )
 
 
 def _project_stage(stage) -> dict:
-    """Project ONE tenant stage for /users/me (E29/T9, OB-9).
+    """One tenant stage as ``/users/me`` sends it.
 
-    AWS stages are ``model_dump()``, byte-identical to pre-E29 — that branch is the fence.
-
-    A **Databricks** stage is projected FIELD BY FIELD, and the omissions are the point:
-
-    * ``account_id`` is kept as a KEY but always empty. On a Databricks stage that field holds the
-      Databricks *account UUID*, and the Ops surfaces render ``stages[x].account_id`` under an
-      "account" heading (``ProjectDetail.tsx`` prints ``{stage} account``). Sending the UUID would
-      make that panel print a plausible-looking WRONG answer — worse than a crash, because nothing
-      signals it. An empty string is not a claim, so the AWS-shaped reader shows nothing instead of
-      something false. The key survives so no reader has to learn a second shape (this is a
-      projection fix, not a redesign of a surface E29 does not own).
-    * ``cloud``, ``sp_client_id`` and ``sp_client_secret_arn`` are dropped OUTRIGHT. No /users/me
-      reader wants them, and a Secrets Manager pointer has no business being handed to every member
-      of the tenant — the admin tenant route is where credential metadata belongs.
-
-    What remains is what is TRUE and useful about a Databricks stage: which workspace it is
-    (``workspace_url``, ``workspace_id``) and where (``region``).
-
-    ``DatabricksStageConfig.sp_client_secret`` cannot leak here regardless — it is
-    ``Field(exclude=True)``, so it is absent from every ``model_dump``. This function does not rely
-    on that; it enumerates rather than filters, so a field added to the model in future is omitted
-    by DEFAULT rather than published by default. That direction is deliberate.
+    An AWS stage is ``model_dump()``. A Databricks stage is enumerated field by field: ``workspace_url``,
+    ``workspace_id`` and ``region`` cross; ``account_id`` stays a key but is always empty, because on a
+    Databricks stage it holds the Databricks account UUID and the AWS-shaped readers would print it
+    under an "account" heading; ``cloud``, ``sp_client_id`` and ``sp_client_secret_arn`` are dropped,
+    since no reader here wants them and credential metadata belongs to the admin tenant route.
+    Enumerating rather than filtering means a field added to the model is omitted by default.
     """
     from models.tenant import DatabricksStageConfig
 
@@ -151,127 +113,78 @@ def _project_stage(stage) -> dict:
             "workspace_url": stage.workspace_url,
             "workspace_id": stage.workspace_id,
             "region": stage.region,
-            # AWS-shaped key, deliberately empty — see the docstring.
             "account_id": "",
         }
     return stage.model_dump()
 
 
-async def _resolve_tenants(principal: Principal) -> list[dict]:
-    """Resolve the caller's tenants via TenantResolver, degrading to [] on ANY
-    failure — a broken Graph/DDB read must never take down /users/me.
+async def _resolve_tenants(principal: Principal) -> list[UserTenant]:
+    """The caller's tenants through the resolver, projected for the wire; ``[]`` on any failure, so
+    a broken Graph or DynamoDB read never takes down ``/users/me``.
 
-    E29/T9 (OB-14) widens the projection with ``platform`` and ``binding_mode``. Their absence was
-    a real defect, not an omission of convenience: the agent-registration wizard infers a tenant's
-    platform from this projection and defaults an absent one to ``"aws"`` (the backend's own
-    ``hydrate_tenant_item`` rule), so a NON-ADMIN operator on a Databricks tenant was handed the
-    AgentCore branch — an ARN field for a platform that has no ARNs. The admin path was already
-    correct because the admin tenant directory carries ``platform``; only non-admins, who cannot
-    read that directory, were affected.
-
-    Both are plain scalars off the record and neither is a credential. ``binding_mode`` rides along
-    because the agent-detail badge reports it, and because a caller who can see the tenant can
-    already see the agents whose invoke path it describes. It is REPORTING only — the invoke path
-    re-reads the mode from the tenant record itself and never trusts a client's copy.
+    ``platform`` and ``binding_mode`` are present on every entry (the registration wizard infers
+    the platform from this projection and would guess "aws" for an absent key), ``readiness`` is
+    derived per verb and never stored, and every value is reporting only: the invoke path re-reads
+    the tenant record and never trusts a client's copy.
     """
     try:
         ctx = await get_tenant_resolver().resolve(principal)
-    except Exception:  # noqa: BLE001 — degrade, never 500 the identity route.
+    except Exception:
         logger.exception("Tenant resolution failed for /users/me; returning tenants=[]")
         return []
+    from services.platform_registry import tenant_readiness
+
     return [
-        {
-            "id": t.id,
-            "name": t.name,
-            "line_of_business": t.line_of_business,
-            # ``str(...)`` because ``TenantPlatform`` is a ``str`` Enum: it serializes to its wire
-            # value through FastAPI, but ``UserInfo.tenants`` is ``list[dict]`` (unmodelled), so
-            # nothing downstream would coerce it and the raw member could reach the JSON encoder.
-            # Explicit beats relying on a serializer that is not in this path.
-            "platform": str(t.platform.value if hasattr(t.platform, "value") else t.platform),
-            "binding_mode": t.binding_mode,
-            "stages": {k: _project_stage(v) for k, v in t.stages.items()},
-        }
+        UserTenant.model_validate(
+            {
+                "id": t.id,
+                "name": t.name,
+                "line_of_business": t.line_of_business,
+                "platform": str(t.platform.value if hasattr(t.platform, "value") else t.platform),
+                "binding_mode": t.binding_mode,
+                "readiness": tenant_readiness(t),
+                "stages": {k: _project_stage(v) for k, v in t.stages.items()},
+            }
+        )
         for t in ctx.tenants
     ]
 
 
 @router.get("/me", response_model=UserInfo)
 async def get_current_user(request: Request):
-    """
-    Return the current user's identity + RBAC role + resolved tenants.
+    """The caller's identity, RBAC role and resolved tenants.
 
-    Precedence (mirrors core.rbac):
-      - dev-auth (USE_DEV_AUTH/DEBUG) → identity from x-user-email header (or the
-        default dev user); no token required.
-      - else (Entra) → email from `rbac.principal_email` — THE single precedence
-        `preferred_username` → `email` → `upn` — then "unknown" if the token
-        carries none of the three.
+    Under dev-auth (``Settings.dev_auth_honoured``) the email is the ``x-user-email`` header or the
+    default dev user and no token is read. Under Entra the identity is the validated principal's:
+    the email follows ``rbac.principal_email`` and is ``"unknown"`` when the token carries none of the
+    three claims. That display fallback lives here and never in ``Principal``, so it cannot reach a
+    persisted ``created_by``.
     """
-    # Settings() fresh inside the function so monkeypatched env vars in tests
-    # are honored. See per-epic plan §"Convention discovered in T2".
     from core.config import Settings as _Settings
+
     settings_fresh = _Settings()
 
-    role = _extract_role(request)
-
-    auth = request.headers.get("Authorization", "")
-
-    # current_principal reuses the SAME dev-auth/Entra precedence and the same
-    # already-validated token, so the E24 tenant resolve sees the validated
-    # identity (oid + raw_claims `groups`) in both branches.
     principal = current_principal(request)
+    role = principal.role
     tenants = await _resolve_tenants(principal)
 
-    # === Dev-auth path (local development only) ===
-    if settings_fresh.USE_DEV_AUTH or settings_fresh.DEBUG:
-        email = request.headers.get("x-user-email", "admin@example.com")
+    if settings_fresh.dev_auth_honoured:
         return UserInfo(
-            email=email,
+            email=request.headers.get("x-user-email", "admin@example.com"),
             role=role.name.lower(),
             role_level=int(role),
             can_deploy=role >= Role.OPERATOR,
-            # No Entra `oid` / human-name claim in dev-auth — the FE falls back
-            # to the email alias.
             oid=None,
             name=None,
             tenants=tenants,
         )
 
-    # === Entra path ===
-    # _extract_role has already validated the token, so this decode is for
-    # claim extraction only.
-    email = "unknown"
-    oid: Optional[str] = None
-    name: Optional[str] = None
-    if auth and auth.startswith("Bearer "):
-        from core.security_entra import verify_entra_token
-
-        try:
-            claims = verify_entra_token(auth.split(" ", 1)[1])
-            # ONE email precedence, shared with `current_principal` via
-            # `rbac.principal_email` (E36/T18) — so the address shown here is
-            # the address attributed to this caller's writes. The `"unknown"`
-            # display fallback stays OUTSIDE the helper: it is a presentation
-            # concern and must never reach a persisted `created_by`.
-            email = principal_email(claims) or "unknown"
-            # Entra object id — the stable principal identifier the
-            # frontend compares against app-role-assignment principals
-            # (E6 user→agent grants).
-            oid = claims.get("oid")
-            # Human display name (e.g. "Maria Bauer"). Optional claim — the
-            # FE falls back to the email alias when it's absent.
-            name = claims.get("name")
-        except Exception:
-            # _extract_role already passed; this re-decode shouldn't fail,
-            # but if it does we don't want to 500 the route.
-            email = "unknown"
     return UserInfo(
-        email=email,
+        email=principal.email or "unknown",
         role=role.name.lower(),
         role_level=int(role),
         can_deploy=role >= Role.OPERATOR,
-        oid=oid,
-        name=name,
+        oid=principal.oid,
+        name=principal.raw_claims.get("name"),
         tenants=tenants,
     )

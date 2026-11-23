@@ -7,8 +7,8 @@ import {
   COST_HEALTH, COST_KPIS, SPEND_VELOCITY, COST_BY_MODEL, COST_30DAY_TREND,
   ANOMALY_ALERTS, BU_BUDGETS, AGENT_COSTS, OPTIMIZATION_OPPS, TOTAL_POTENTIAL_SAVINGS,
   FORECAST_12M, UNIT_ECONOMICS, CHARGEBACK_STATEMENT, COMMITMENTS,
-  tooltipStyle,
 } from './mockData';
+import { tooltipStyle } from '../shared/chartTheme';
 import { ComingSoonBanner } from '../shared/comingSoon';
 
 const anomalySeverity: Record<string, string> = {
@@ -56,7 +56,6 @@ export default function FinOps() {
           </div>
         </div>
 
-        {/* Row 1: Health + KPIs */}
         <div className="grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-4 mb-4">
           <div className="bg-white/80 backdrop-blur-sm rounded-2xl border-2 border-emerald-200 p-5 shadow-sm text-center">
             <div className="text-[11px] uppercase tracking-widest text-slate-400">FinOps Health</div>
@@ -82,7 +81,6 @@ export default function FinOps() {
           </div>
         </div>
 
-        {/* Anomaly alerts */}
         {ANOMALY_ALERTS.length > 0 && (
           <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-amber-200 p-4 shadow-sm mb-4">
             <div className="flex items-center gap-2 mb-2">
@@ -102,7 +100,6 @@ export default function FinOps() {
           </div>
         )}
 
-        {/* Row 2: Velocity + model mix */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
           <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm">
             <div className="text-sm font-semibold text-slate-900 mb-3">Spend Velocity (today)</div>
@@ -145,7 +142,6 @@ export default function FinOps() {
           </div>
         </div>
 
-        {/* Row 3: 30d vs budget + BU budgets */}
         <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 mb-4">
           <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm">
             <div className="text-sm font-semibold text-slate-900 mb-3">30-Day Cost vs Budget</div>
@@ -193,7 +189,6 @@ export default function FinOps() {
           </div>
         </div>
 
-        {/* Row 4: 12-month forecast */}
         <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm mb-4">
           <div className="flex items-center justify-between mb-3">
             <div className="text-sm font-semibold text-slate-900">12-Month Forecast</div>
@@ -216,7 +211,6 @@ export default function FinOps() {
           </ResponsiveContainer>
         </div>
 
-        {/* Row 5: Unit Economics */}
         <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm mb-4">
           <div className="text-sm font-semibold text-slate-900 mb-3">Unit Economics</div>
           <table className="w-full text-sm">
@@ -245,7 +239,6 @@ export default function FinOps() {
           </table>
         </div>
 
-        {/* Row 6: Chargeback Statement */}
         <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm mb-4">
           <div className="flex items-center justify-between mb-3">
             <div>
@@ -274,7 +267,6 @@ export default function FinOps() {
           </div>
         </div>
 
-        {/* Row 7: Commitments + Optimizations side-by-side */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
           <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm">
             <div className="flex items-center justify-between mb-3">
@@ -334,7 +326,6 @@ export default function FinOps() {
           </div>
         </div>
 
-        {/* Row 8: Top cost drivers */}
         <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm">
           <div className="text-sm font-semibold text-slate-900 mb-3">Top Cost Drivers — Agents</div>
           <ResponsiveContainer width="100%" height={220}>

@@ -1,64 +1,35 @@
-"""E24 Task 4 — /users/me gains a resolved ``tenants`` list.
+"""``/users/me`` carries the caller's resolved ``tenants`` list.
 
-The route resolves the caller's tenant memberships via ``TenantResolver.resolve``
-(patched here — no live Graph/DDB) and returns them as
-``tenants: list[{id, name, line_of_business, aws_account_dev, aws_account_prod,
-aws_region}]``. A resolver failure must NEVER break /users/me — it degrades to
-``tenants: []``. Admins get their *memberships* (possibly ``[]``) — the ``role``
-field already tells the FE they are global.
+The route resolves the memberships through ``TenantResolver.resolve`` (patched here, no live Graph
+or DynamoDB) and projects each tenant to exactly ``EXPECTED_TENANT_KEYS``; ``platform`` and
+``binding_mode`` are always present because the registration wizard infers the platform from this
+projection and guesses "aws" for an absent key. A Databricks stage is projected to exactly
+``EXPECTED_DATABRICKS_STAGE_KEYS``, the point being what it does not send. A resolver failure
+degrades to ``tenants: []`` and never breaks the route; admins get their memberships too.
 
-Follows ``test_users_me_entra.py``'s idiom: Entra env + module reset + mocked
-``verify_entra_token``; the resolver singleton is pre-seeded by assigning
-``api.routes.users._tenant_resolver`` (the ``tenants.py`` ``_svc``-patch idiom).
+Follows ``test_users_me_entra.py``'s idiom: Entra env, module reset, mocked ``verify_entra_token``,
+and the resolver singleton pre-seeded by assigning ``api.routes.users._tenant_resolver``.
 """
 
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
+from conftest import evict_the_app
 from fastapi.testclient import TestClient
+
+if TYPE_CHECKING:
+    from models.tenant import TenantBindingMode
+
+pytestmark = pytest.mark.usefixtures("app_evicted_under_entra")
 
 FIXED_TS = "2026-07-13T00:00:00+00:00"
 
-EXPECTED_TENANT_KEYS = {
-    "id",
-    "name",
-    "line_of_business",
-    # E29/T9 (OB-14). Their ABSENCE was the defect: the registration wizard infers a tenant's
-    # platform from this projection and defaults an absent one to "aws", so a non-admin operator on
-    # a Databricks tenant got the AgentCore branch — an ARN field for a platform with no ARNs.
-    "platform",
-    "binding_mode",
-    "stages",
-}
+EXPECTED_TENANT_KEYS = {"id", "name", "line_of_business", "platform", "binding_mode", "readiness", "stages"}
 
-# Every field a Databricks stage is allowed to put on this wire (E29/T9, OB-9). Asserted as an
-# EXACT set, not a subset: the point of the projection is what it does NOT send.
 EXPECTED_DATABRICKS_STAGE_KEYS = {"workspace_url", "workspace_id", "region", "account_id"}
 
-# A fake workspace, per the epic's Global Constraints (the one allowed hardcoded URL shape).
 FAKE_WORKSPACE_URL = "https://dbc-test.cloud.databricks.com"
-
-
-@pytest.fixture(autouse=True)
-def reset_modules(monkeypatch):
-    """Configure Entra mode and reload all modules so the env takes effect."""
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("DEBUG", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
-
-    import sys
-    for mod in list(sys.modules):
-        if mod.startswith("core.") or mod.startswith("api.") or mod == "main":
-            sys.modules.pop(mod, None)
-    yield
-
-
-# --- fakes -------------------------------------------------------------------
 
 
 def _tenant(*, id: str, name: str):
@@ -80,10 +51,13 @@ def _tenant(*, id: str, name: str):
     )
 
 
-def _databricks_tenant(*, id: str = "ten-db", name: str = "Claims", binding_mode: str = "sp_secret"):
-    """A platform-typed Databricks tenant whose stage carries EVERY field the model allows —
+def _databricks_tenant(
+    *, id: str = "ten-db", name: str = "Claims", binding_mode: "TenantBindingMode" = "sp_secret"
+):
+    """A platform-typed Databricks tenant whose stage carries EVERY field the model allows,
     including the two that must never reach this wire (``sp_client_id``, ``sp_client_secret_arn``)
-    and the AWS-shaped ``account_id``, which on a Databricks stage is a Databricks account UUID.
+    and the AWS-shaped ``account_id``, which on a Databricks stage is a Databricks account UUID and
+    not an AWS account id.
 
     Populating them all is the point: a fixture that left them empty could not tell a projection
     that omits a field from one that merely had nothing to send.
@@ -103,7 +77,6 @@ def _databricks_tenant(*, id: str = "ten-db", name: str = "Claims", binding_mode
                 workspace_id="1234567890123456",
                 cloud="aws",
                 region="us-east-1",
-                # A Databricks ACCOUNT UUID — NOT an AWS account id, which is the whole OB-9 point.
                 account_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 sp_client_id="sp-client-abc",
                 sp_client_secret_arn="arn:aws:secretsmanager:us-east-1:redacted:secret:x",
@@ -143,9 +116,8 @@ class _FakeResolver:
 
 def _build_client(resolver) -> TestClient:
     """Fresh app + pre-seeded resolver singleton on the freshly-imported module."""
-    from main import app
-
     import api.routes.users as users_module
+    from main import app
 
     users_module._tenant_resolver = resolver
     return TestClient(app)
@@ -160,19 +132,15 @@ def _claims(role_value: str, oid: str = "maria-oid") -> dict:
     }
 
 
-# --- tests ---------------------------------------------------------------------
-
-
 def test_users_me_returns_resolved_tenants_with_exact_keys():
-    """Operator with two memberships → both tenants, each with exactly the six keys."""
+    """Operator with two memberships: both tenants, each with exactly the expected keys; a record
+    predating platform typing still carries platform="aws" and an empty binding mode on the wire."""
     tenants = [_tenant(id="ten-1", name="Retail"), _tenant(id="ten-2", name="Wholesale")]
     resolver = _FakeResolver(context=_context(tenants))
     client = _build_client(resolver)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims("Platform.Operator")):
-        resp = client.get(
-            "/api/v1/users/me", headers={"Authorization": "Bearer fake-token"}
-        )
+        resp = client.get("/api/v1/users/me", headers={"Authorization": "Bearer fake-token"})
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -185,17 +153,37 @@ def test_users_me_returns_resolved_tenants_with_exact_keys():
     assert first["stages"]["dev"]["account_id"] == "111111111111"
     assert first["stages"]["prod"]["account_id"] == "222222222222"
     assert first["stages"]["dev"]["region"] == "eu-central-1"
-    # E29: a pre-E29 record hydrates platform="aws" and carries no binding mode. Both are PRESENT
-    # on the wire — an absent key is what made the wizard guess (OB-14).
     assert first["platform"] == "aws"
     assert first["binding_mode"] == ""
+
+
+def test_users_me_tenants_are_typed_as_user_tenant_and_round_trip_through_it():
+    """The membership projection is a model: every key the route writes is
+    declared, so validating the body back through ``UserTenant`` changes nothing, and each
+    readiness entry names its own verb."""
+    import api.routes.users as users_module
+    from models.user import UserTenant
+
+    assert users_module.UserInfo.model_fields["tenants"].annotation == list[UserTenant]
+
+    tenants = [_tenant(id="ten-1", name="Retail"), _databricks_tenant(binding_mode="federation")]
+    client = _build_client(_FakeResolver(context=_context(tenants)))
+    with patch("core.security_entra.verify_entra_token", return_value=_claims("Platform.Operator")):
+        resp = client.get("/api/v1/users/me", headers={"Authorization": "Bearer fake-token"})
+
+    assert resp.status_code == 200, resp.text
+    for t in resp.json()["tenants"]:
+        assert UserTenant.model_validate(t).model_dump(mode="json") == t
+        assert {verb: entry["verb"] for verb, entry in t["readiness"].items()} == {
+            v: v for v in t["readiness"]
+        }
 
 
 def test_users_me_aws_stage_projection_is_byte_identical_to_model_dump():
     """The AWS branch is the FENCE: its stage projection is exactly ``model_dump()``.
 
     Asserted against the model rather than against a hand-written dict, so a field ADDED to
-    ``TenantStageConfig`` in future must appear here too — which is the pre-E29 contract. The
+    ``TenantStageConfig`` in future must appear here too — which is the original contract. The
     Databricks branch enumerates instead (new fields omitted by default); only this branch
     publishes by default, and that asymmetry should be visible in a test.
     """
@@ -212,7 +200,7 @@ def test_users_me_aws_stage_projection_is_byte_identical_to_model_dump():
 
 
 def test_users_me_projects_platform_and_binding_mode_for_databricks():
-    """OB-14: a Databricks membership states its platform and mode, so the wizard need not guess."""
+    """A Databricks membership states its platform and mode, so the wizard need not guess."""
     tenants = [_databricks_tenant(binding_mode="federation")]
     client = _build_client(_FakeResolver(context=_context(tenants)))
 
@@ -224,13 +212,14 @@ def test_users_me_projects_platform_and_binding_mode_for_databricks():
     assert set(t.keys()) == EXPECTED_TENANT_KEYS
     assert t["platform"] == "databricks"
     assert t["binding_mode"] == "federation"
-    # A plain JSON string, not a serialized enum member — `TenantPlatform` is a str Enum and
-    # `tenants` is an unmodelled `list[dict]`, so nothing downstream would coerce it for us.
     assert isinstance(t["platform"], str)
 
 
 def test_users_me_databricks_stage_omits_aws_only_and_credential_fields():
-    """OB-9: the projected Databricks stage says what is true and omits what would mislead."""
+    """The projected Databricks stage says what is true and omits what would mislead: the exact key
+    set, an empty `account_id` (the frontend renders `stages[x].account_id` under an "account"
+    heading, and the record holds a Databricks account UUID there), no credential metadata, no
+    `cloud`."""
     tenants = [_databricks_tenant()]
     client = _build_client(_FakeResolver(context=_context(tenants)))
 
@@ -240,29 +229,18 @@ def test_users_me_databricks_stage_omits_aws_only_and_credential_fields():
     assert resp.status_code == 200, resp.text
     stage = resp.json()["tenants"][0]["stages"]["dev"]
 
-    # EXACT key set — the omissions are the deliverable, so a subset assertion would not test it.
     assert set(stage.keys()) == EXPECTED_DATABRICKS_STAGE_KEYS
-
-    # What IS true about the stage.
     assert stage["workspace_url"] == FAKE_WORKSPACE_URL
     assert stage["workspace_id"] == "1234567890123456"
     assert stage["region"] == "us-east-1"
-
-    # THE OB-9 DEFECT, pinned. `ProjectDetail.tsx` renders `stages[x].account_id` under a
-    # "{stage} account" heading. The record holds a Databricks account UUID there; sending it would
-    # make that panel print a plausible-looking wrong answer. Empty is not a claim.
     assert stage["account_id"] == ""
     assert "aaaaaaaa" not in resp.text
 
-    # Credential metadata must not be handed to every member of the tenant.
     assert "sp_client_id" not in stage
     assert "sp_client_secret_arn" not in stage
     assert "sp-client-abc" not in resp.text
     assert "secretsmanager" not in resp.text
-    # The write-only secret field cannot appear at all (Field(exclude=True)) — asserted anyway,
-    # because "cannot" is a property of a model this function does not control.
     assert "sp_client_secret" not in stage
-    # `cloud` is dropped: no reader on this wire uses it.
     assert "cloud" not in stage
 
 
@@ -295,9 +273,7 @@ def test_users_me_resolver_receives_validated_principal():
     client = _build_client(resolver)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims("Platform.Operator")):
-        resp = client.get(
-            "/api/v1/users/me", headers={"Authorization": "Bearer fake-token"}
-        )
+        resp = client.get("/api/v1/users/me", headers={"Authorization": "Bearer fake-token"})
 
     assert resp.status_code == 200, resp.text
     assert len(resolver.calls) == 1
@@ -310,14 +286,11 @@ def test_users_me_resolver_failure_degrades_to_empty_tenants():
     client = _build_client(resolver)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims("Platform.Operator")):
-        resp = client.get(
-            "/api/v1/users/me", headers={"Authorization": "Bearer fake-token"}
-        )
+        resp = client.get("/api/v1/users/me", headers={"Authorization": "Bearer fake-token"})
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["tenants"] == []
-    # The rest of the identity payload is intact.
     assert body["email"] == "maria.bauer@contoso.onmicrosoft.com"
     assert body["role"] == "operator"
 
@@ -327,10 +300,10 @@ def test_users_me_admin_gets_memberships_possibly_empty():
     resolver = _FakeResolver(context=_context([]))
     client = _build_client(resolver)
 
-    with patch("core.security_entra.verify_entra_token", return_value=_claims("Platform.Admin", oid="lars-oid")):
-        resp = client.get(
-            "/api/v1/users/me", headers={"Authorization": "Bearer fake-token"}
-        )
+    with patch(
+        "core.security_entra.verify_entra_token", return_value=_claims("Platform.Admin", oid="lars-oid")
+    ):
+        resp = client.get("/api/v1/users/me", headers={"Authorization": "Bearer fake-token"})
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -341,11 +314,10 @@ def test_users_me_admin_gets_memberships_possibly_empty():
 def test_users_me_dev_auth_includes_tenants(monkeypatch):
     """The dev-auth branch resolves tenants too (patched resolver; no token)."""
     monkeypatch.setenv("USE_DEV_AUTH", "True")
+    monkeypatch.setenv("REGISTRY_IN_MEMORY", "true")
+    monkeypatch.setenv("GRAPH_IN_MEMORY", "true")
 
-    import sys
-    for mod in list(sys.modules):
-        if mod.startswith("core.") or mod.startswith("api.") or mod == "main":
-            sys.modules.pop(mod, None)
+    evict_the_app()
 
     tenants = [_tenant(id="ten-dev", name="DevTenant")]
     resolver = _FakeResolver(context=_context(tenants))

@@ -1,65 +1,26 @@
-// McpConnectedAgentsTab — the MCP detail "Connected Agents" tab (Epic 7, T-FE-MCP-ACCESS).
-//
-// The MCP-side mirror of E6's AccessTab: a dense, scannable table of the
-// principals granted access to this MCP server — except here the principals are
-// AGENTS (service principals from our registry) and the resource is the MCP.
-// This is the visual proof that "agent→MCP is the same grant as user→agent":
-// the same live Entra app-role-assignment plumbing (read straight from Graph via
-// mcpGrantsApi, no DynamoDB), the same optimistic-add/remove with a reconciling
-// refetch to absorb Graph's eventual consistency, and the same unprovisioned
-// status banners.
-//
-// Cloned structure-for-structure from AccessTab so the two tabs stay visually
-// and behaviourally identical; the swaps are: grantsApi→mcpGrantsApi, the
-// resource id is mcp.id, the picker opens in agent mode, and the grant POST
-// carries principal_type:'agent' (Graph returns the assignment as a
-// 'ServicePrincipal' on the read side).
-
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import client, { mcpGrantsApi } from '../../api/client';
-import type { Grant, McpServer, PrincipalHit } from '../../api/client';
+import type { McpGrantRead, McpServer } from '../../api/client';
+import { useLoad } from '../../api/useLoad';
 import { AgentAvatar } from './agentUi';
-import PrincipalPicker from './PrincipalPicker';
+import PrincipalPicker, { type PickerHit } from './PrincipalPicker';
+import { mcpRepoActions } from './mcpRepoOwnership';
+import { REPLICATION_RECONCILE_MS, STALE_PENDING_MS } from './accessTiming';
+import { useReturnFocus } from '../shared/useReturnFocus';
 
-// Card chrome — identical to McpServerDetail's CARD so the tab body sits in the
-// same surface family as Overview/Tools.
 const CARD = 'bg-white/70 backdrop-blur rounded-xl border border-slate-200/60 shadow-sm';
 
-// A pending identity older than this is treated as stranded (a mid-provision
-// crash with no other recovery path), unlocking the Re-provision button.
-// Mirrors AccessTab's STALE_PENDING_MS exactly.
-const STALE_PENDING_MS = 2.5 * 60 * 1000;
-
-// Graph app-role assignments are eventually consistent: a just-written grant
-// may not show on an immediate re-list. After a mutate we wait this long, then
-// refetch to reconcile the optimistic state with Graph's truth. Mirrors
-// AccessTab's REPLICATION_RECONCILE_MS.
-const REPLICATION_RECONCILE_MS = 1200;
-
-// principalType is capitalized in the READ shape ('ServicePrincipal' for an
-// agent). Every grant in this tab is an agent (indigo — same tint as the
-// 'Agent' pill in AccessTab's principalTypeBadge + the picker).
 function agentTypeBadge(): { cls: string; label: string } {
   return { cls: 'bg-indigo-50 text-indigo-700', label: 'Agent' };
 }
 
-// Invoker=slate (the common case), Admin=amber (elevated — reads as the
-// noteworthy one without alarming like red). Copied verbatim from AccessTab.
-function roleBadge(role: 'Invoker' | 'Admin'): { cls: string; label: string } {
+function roleBadge(role: string): { cls: string; label: string } {
   return role === 'Admin'
     ? { cls: 'bg-amber-50 text-amber-700', label: 'Admin' }
     : { cls: 'bg-slate-100 text-slate-600', label: 'Invoker' };
 }
 
-// Whether a `pending` identity has been pending long enough to look stranded.
-function isPendingStranded(updatedAt: string): boolean {
-  const t = new Date(updatedAt).getTime();
-  if (Number.isNaN(t)) return false; // unparseable → don't offer recovery yet
-  return Date.now() - t > STALE_PENDING_MS;
-}
-
-// A small CSS-only spinner (no icon library) — slate ring with a blue arc.
-// Copied verbatim from AccessTab's Spinner.
 function Spinner() {
   return (
     <span
@@ -69,24 +30,34 @@ function Spinner() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Status banner (shown when identity_status !== 'provisioned')
-// ---------------------------------------------------------------------------
+function RebuildInstead({ repoHref }: { repoHref: string }) {
+  return (
+    <p className="mt-3 text-sm text-slate-600">
+      This MCP server is managed by a repository.{' '}
+      <Link to={repoHref} className="text-blue-700 font-medium hover:underline">
+        Rebuild the repository instead
+      </Link>
+      .
+    </p>
+  );
+}
 
 function StatusBanner({
   mcp,
+  stranded,
   canManage,
   onReprovision,
+  repoHref,
 }: {
   mcp: McpServer;
+  stranded: boolean;
   canManage: boolean;
   onReprovision: () => void;
+  repoHref: string | null;
 }) {
   const status = mcp.identity_status;
+  const { reprovision } = mcpRepoActions(repoHref !== null);
 
-  // none → metadata-only MCP server; the grants UI is hidden entirely (no
-  // identity to assign roles against). A standard MCP server with no provisioned
-  // identity lands here too.
   if (status === 'none') {
     return (
       <div className={`${CARD} p-6`}>
@@ -99,7 +70,6 @@ function StatusBanner({
     );
   }
 
-  // failed → red banner + Re-provision (Operator+).
   if (status === 'failed') {
     return (
       <div className={`${CARD} border-red-200/70 p-6`}>
@@ -108,7 +78,8 @@ function StatusBanner({
           The Entra identity for this MCP server could not be provisioned. Connected-agent grants
           are unavailable until provisioning succeeds.
         </p>
-        {canManage && (
+        {repoHref && <RebuildInstead repoHref={repoHref} />}
+        {reprovision && canManage && (
           <button
             type="button"
             onClick={onReprovision}
@@ -121,9 +92,18 @@ function StatusBanner({
     );
   }
 
-  // pending → spinner + "provisioning…"; if it looks stranded, also offer
-  // Re-provision (the only recovery path for a mid-provision crash).
-  const stranded = isPendingStranded(mcp.updated_at);
+  if (repoHref) {
+    return (
+      <div className={`${CARD} p-6`}>
+        <h2 className="text-sm font-semibold text-slate-800">Waiting for the repository build</h2>
+        <p className="text-sm text-slate-500 mt-1">
+          This MCP server's gateway is built by its repository. Connected-agent grants will be
+          available once a build succeeds.
+        </p>
+        <RebuildInstead repoHref={repoHref} />
+      </div>
+    );
+  }
   return (
     <div className={`${CARD} p-6`}>
       <div className="flex items-center gap-2.5">
@@ -140,7 +120,7 @@ function StatusBanner({
             This has been pending for a while. If provisioning stalled, you can re-provision to
             recover.
           </p>
-          {canManage && (
+          {reprovision && canManage && (
             <button
               type="button"
               onClick={onReprovision}
@@ -155,53 +135,32 @@ function StatusBanner({
   );
 }
 
-// ---------------------------------------------------------------------------
-// McpConnectedAgentsTab
-// ---------------------------------------------------------------------------
-
 export default function McpConnectedAgentsTab({
   mcp,
   canManage,
+  repoHref = null,
 }: {
   mcp: McpServer;
   canManage: boolean;
+  repoHref?: string | null;
 }) {
-  // The dispatch contract passes only { mcp, canManage } (no parent refresh
-  // callback, unlike E6's AccessTab which receives onReprovision). So this tab
-  // owns a local copy of the server's identity fields, seeded from the prop and
-  // refreshed in place after a re-provision, so the banner's identity_status /
-  // updated_at reflect the now-pending re-config without a page reload.
-  const [serverIdentity, setServerIdentity] = useState<McpServer>(mcp);
-  // Resync the local copy whenever the parent prop changes (e.g. a lifecycle
-  // action upstream re-fetched the server).
-  useEffect(() => {
-    setServerIdentity(mcp);
-  }, [mcp]);
+  const [reprovisioned, setReprovisioned] = useState<{ from: McpServer; to: McpServer } | null>(null);
+  const serverIdentity = reprovisioned !== null && reprovisioned.from === mcp ? reprovisioned.to : mcp;
 
-  const [grants, setGrants] = useState<Grant[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-
-  // Mutation (add/remove/reprovision) UI state — mirrors AccessTab's
-  // actionPending / actionError idiom so the two tabs behave identically.
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const [picking, setPicking] = useState(false);
 
-  // Ref on the "+ Grant agent access" trigger so focus returns there when the
-  // picker closes (both via the ✕ close and after a successful grant),
-  // preventing focus from dropping to document start. Mirrors AccessTab.
   const addTriggerRef = useRef<HTMLButtonElement>(null);
+  const returnFocus = useReturnFocus(addTriggerRef);
 
   const closePicker = useCallback(() => {
     setPicking(false);
     setActionError(null);
-    // Return focus to the trigger that opened the picker.
-    window.setTimeout(() => addTriggerRef.current?.focus(), 0);
-  }, []);
+    returnFocus();
+  }, [returnFocus]);
 
-  // Close picker on Escape while it is open.
   useEffect(() => {
     if (!picking) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -217,8 +176,6 @@ export default function McpConnectedAgentsTab({
   const provisioned = serverIdentity.identity_status === 'provisioned';
   const mcpId = serverIdentity.id;
 
-  // Guards against setState after unmount (the reconcile refetch fires on a
-  // timer, so it can land after the user navigates away).
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -227,75 +184,39 @@ export default function McpConnectedAgentsTab({
     };
   }, []);
 
-  // Stranded-pending timer (mirrors AccessTab FIX 3): isPendingStranded() only
-  // re-evaluates on render, so if the tab is already open when the ~2.5-min
-  // threshold passes the Re-provision affordance would never appear without a
-  // user-triggered re-render. Schedule a one-shot timeout for exactly when the
-  // threshold crosses and bump a nonce to force one re-render at that moment.
-  const [, setStaleNonce] = useState(0);
+  const [strandedAt, setStrandedAt] = useState<string | null>(null);
   useEffect(() => {
     if (serverIdentity.identity_status !== 'pending') return;
-    const elapsed = Date.now() - new Date(serverIdentity.updated_at).getTime();
-    if (Number.isNaN(elapsed) || elapsed >= STALE_PENDING_MS) return; // already stranded or unparseable
-    const remaining = STALE_PENDING_MS - elapsed;
+    const updatedAt = serverIdentity.updated_at;
+    const elapsed = Date.now() - new Date(updatedAt).getTime();
+    if (Number.isNaN(elapsed)) return;
     const handle = window.setTimeout(() => {
-      if (mountedRef.current) setStaleNonce((n) => n + 1);
-    }, remaining);
+      if (mountedRef.current) setStrandedAt(updatedAt);
+    }, Math.max(0, STALE_PENDING_MS - elapsed));
     return () => window.clearTimeout(handle);
   }, [serverIdentity.identity_status, serverIdentity.updated_at]);
+  const stranded =
+    serverIdentity.identity_status === 'pending' && strandedAt === serverIdentity.updated_at;
 
-  // Silent reconcile fetch — used after mutate (to absorb Graph replication
-  // lag); not surfaced as the blocking load spinner. Mirrors AccessTab.
-  const reconcile = useCallback(async () => {
-    try {
-      const fresh = await mcpGrantsApi.list(mcpId);
-      if (mountedRef.current) setGrants(fresh);
-    } catch {
-      // A failed reconcile leaves the optimistic state in place — the next
-      // explicit action or remount will resync. Don't clobber the UI with a
-      // background-refetch error.
-    }
-  }, [mcpId]);
+  const { state: grantsState, patch: patchGrants } = useLoad(
+    () => (provisioned ? mcpGrantsApi.list(mcpId) : Promise.resolve<McpGrantRead[]>([])),
+    [mcpId, provisioned],
+    'Failed to load grants.',
+  );
+  const grants = grantsState.data ?? [];
 
-  // Initial load (and on mcp/provisioned change). Skipped when unprovisioned —
-  // there's nothing to list until an identity exists.
-  useEffect(() => {
-    if (!provisioned) {
-      setLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setLoading(true);
-    setLoadError(null);
-    mcpGrantsApi
-      .list(mcpId)
-      .then((res) => {
-        if (!cancelled) setGrants(res);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : 'Failed to load grants.');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [mcpId, provisioned]);
+  const reconcile = async () => {
+    const fresh = await mcpGrantsApi.list(mcpId).catch(() => null);
+    if (fresh === null || !mountedRef.current) return;
+    patchGrants(() => fresh);
+  };
 
-  // -- mutations ------------------------------------------------------------
-
-  // Re-provision the MCP server's Entra identity (Epic 7, T-ROUTES owns the
-  // route). Mirrors AgentDetail.handleReprovision: call POST /reprovision via
-  // the shared axios instance (the response interceptor unwraps the backend
-  // `detail` into err.message), then re-fetch the server so the local
-  // identity_status flips to pending and the banner updates in place.
   const handleReprovision = async () => {
     setActionPending(true);
     setActionError(null);
     try {
       const { data } = await client.post<McpServer>(`/api/v1/mcp-servers/${mcpId}/reprovision`);
-      if (mountedRef.current) setServerIdentity(data);
+      if (mountedRef.current) setReprovisioned({ from: mcp, to: data });
     } catch (err: unknown) {
       if (mountedRef.current) {
         setActionError(err instanceof Error ? err.message : 'Re-provision failed.');
@@ -305,34 +226,23 @@ export default function McpConnectedAgentsTab({
     }
   };
 
-  const handlePick = async (hit: PrincipalHit, role: 'Invoker' | 'Admin') => {
-    // Belt-and-suspenders re-entry guard (the picker button is also disabled via
-    // the `pending` prop). Mirrors AccessTab.
+  const handlePick = async (hit: PickerHit, role: 'Invoker' | 'Admin') => {
     if (actionPending) return;
-    // This (E7 agent→MCP) flow only ever surfaces agent principals; user/group
-    // belong to the E6 user→agent flow and are unreachable here.
     if (hit.type !== 'agent') return;
     setActionPending(true);
     setActionError(null);
     try {
       const created = await mcpGrantsApi.add(mcpId, {
-        principal_id: hit.id, // the agent's entra_sp_id (design-decision #6)
+        principal_id: hit.id,
         principal_type: 'agent',
         role,
       });
       if (!mountedRef.current) return;
-      // Optimistically insert the authoritative grant the server returned
-      // (carries the real assignment_id + capitalized principal_type).
-      setGrants((prev) => {
-        // De-dupe in case a prior reconcile already pulled it in.
+      patchGrants((prev) => {
         if (prev.some((g) => g.assignment_id === created.assignment_id)) return prev;
         return [...prev, created];
       });
-      // closePicker focuses the trigger and clears actionError, so the user
-      // lands back at the "+ Grant agent access" button with the new row visible.
       closePicker();
-      // Graph is eventually consistent — reconcile shortly after so the row set
-      // matches the source of truth (and de-dupes any lag artifacts).
       window.setTimeout(() => {
         void reconcile();
       }, REPLICATION_RECONCILE_MS);
@@ -345,22 +255,19 @@ export default function McpConnectedAgentsTab({
     }
   };
 
-  const handleRemove = async (grant: Grant) => {
+  const handleRemove = async (grant: McpGrantRead) => {
     setActionPending(true);
     setActionError(null);
-    // Optimistically drop the row; restore it if the call fails.
     const prevGrants = grants;
-    setGrants((prev) => prev.filter((g) => g.assignment_id !== grant.assignment_id));
+    patchGrants((prev) => prev.filter((g) => g.assignment_id !== grant.assignment_id));
     try {
       await mcpGrantsApi.remove(mcpId, grant.assignment_id);
-      // Reconcile after replication settles (a removed assignment can briefly
-      // still appear on an immediate re-list).
       window.setTimeout(() => {
         void reconcile();
       }, REPLICATION_RECONCILE_MS);
     } catch (err: unknown) {
       if (mountedRef.current) {
-        setGrants(prevGrants); // rollback
+        patchGrants(() => prevGrants);
         setActionError(err instanceof Error ? err.message : 'Failed to remove access.');
       }
     } finally {
@@ -368,11 +275,16 @@ export default function McpConnectedAgentsTab({
     }
   };
 
-  // -- render ---------------------------------------------------------------
-
-  // Unprovisioned → banner instead of the grants UI.
   if (!provisioned) {
-    return <StatusBanner mcp={serverIdentity} canManage={canManage} onReprovision={handleReprovision} />;
+    return (
+      <StatusBanner
+        mcp={serverIdentity}
+        stranded={stranded}
+        canManage={canManage}
+        onReprovision={handleReprovision}
+        repoHref={repoHref}
+      />
+    );
   }
 
   const tBadge = agentTypeBadge();
@@ -380,7 +292,6 @@ export default function McpConnectedAgentsTab({
   return (
     <div className="space-y-4">
       <div className={`${CARD} overflow-hidden`}>
-        {/* Card header: title + Add. */}
         <div className="flex items-center justify-between gap-3 px-5 py-4 border-b border-slate-200/60">
           <div>
             <h2 className="text-sm font-semibold text-slate-800">Agents with access</h2>
@@ -403,7 +314,6 @@ export default function McpConnectedAgentsTab({
           )}
         </div>
 
-        {/* Picker (inline, above the table) — opened in agent mode. */}
         {picking && (
           <div className="px-5 py-4 border-b border-slate-200/60 bg-slate-50/50">
             <PrincipalPicker
@@ -415,19 +325,17 @@ export default function McpConnectedAgentsTab({
           </div>
         )}
 
-        {/* Mutation error (e.g. 409 already-assigned) — non-blocking. */}
         {actionError && (
           <p className="px-5 pt-3 text-sm text-red-600" role="alert">{actionError}</p>
         )}
 
-        {/* Body: loading / error / empty / table. */}
-        {loading ? (
+        {grantsState.kind === 'loading' ? (
           <div className="px-5 py-8 text-center">
             <p className="text-sm text-slate-400">Loading access…</p>
           </div>
-        ) : loadError ? (
+        ) : grantsState.kind === 'error' ? (
           <div className="px-5 py-8 text-center">
-            <p className="text-sm text-red-600" role="alert">{loadError}</p>
+            <p className="text-sm text-red-600" role="alert">{grantsState.message}</p>
           </div>
         ) : grants.length === 0 ? (
           <div className="px-5 py-10 text-center">
@@ -456,17 +364,14 @@ export default function McpConnectedAgentsTab({
                     </div>
                   </div>
 
-                  {/* Type pill (Agent). */}
                   <span className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${tBadge.cls}`}>
                     {tBadge.label}
                   </span>
 
-                  {/* Role pill (Invoker / Admin). */}
                   <span className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${rBadge.cls}`}>
                     {rBadge.label}
                   </span>
 
-                  {/* Remove ✕ (Operator+). */}
                   {canManage && (
                     <button
                       type="button"

@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react';
-import type { ContentFilterConfig, PiiEntityConfig, DeniedTopic, WordFilterConfig, ContextualGroundingConfig } from '../../types';
+import type { ContentFilterConfigOutput, PiiEntityConfigOutput, DeniedTopicOutput, WordFilterConfigOutput, ContextualGroundingConfigOutput } from '../../api/client';
 
 interface Props {
-  contentFilters: ContentFilterConfig[];
-  piiEntities: PiiEntityConfig[];
-  deniedTopics: DeniedTopic[];
-  wordFilter?: WordFilterConfig;
-  contextualGrounding?: ContextualGroundingConfig;
+  contentFilters: ContentFilterConfigOutput[];
+  piiEntities: PiiEntityConfigOutput[];
+  deniedTopics: DeniedTopicOutput[];
+  wordFilter?: WordFilterConfigOutput;
+  contextualGrounding?: ContextualGroundingConfigOutput;
 }
 
 interface Stage {
@@ -81,10 +81,9 @@ export default function DataFlowVisualizer({ contentFilters, piiEntities, denied
     );
   }
 
-  // Calculate which stage the particle is at
-  const segmentSize = 10; // frames per segment
-  const particleSegment = Math.floor(particlePos / segmentSize);
-  const segmentProgress = (particlePos % segmentSize) / segmentSize;
+  const framesPerSegment = 10;
+  const particleSegment = Math.floor(particlePos / framesPerSegment);
+  const segmentProgress = (particlePos % framesPerSegment) / framesPerSegment;
 
   return (
     <div className="p-5 bg-gradient-to-r from-slate-50 to-blue-50/30 rounded-xl border border-slate-200">
@@ -98,9 +97,7 @@ export default function DataFlowVisualizer({ contentFilters, piiEntities, denied
         </button>
       </div>
 
-      {/* Pipeline visualization */}
       <div className="relative flex items-center gap-0 overflow-hidden py-4">
-        {/* Input node */}
         <div className="flex-shrink-0 flex flex-col items-center gap-1">
           <div className={`w-10 h-10 rounded-xl flex items-center justify-center border-2 transition-all ${
             particleSegment === 0 ? 'border-blue-400 bg-blue-50 shadow-sm shadow-blue-200' : 'border-slate-200 bg-white'
@@ -112,7 +109,6 @@ export default function DataFlowVisualizer({ contentFilters, piiEntities, denied
           <span className="text-[9px] text-slate-500 font-medium">Input</span>
         </div>
 
-        {/* Connector + stages */}
         {activeStages.map((stage, idx) => {
           const stageSegment = idx + 1;
           const isActive = particleSegment === stageSegment;
@@ -120,7 +116,6 @@ export default function DataFlowVisualizer({ contentFilters, piiEntities, denied
 
           return (
             <div key={stage.id} className="flex items-center flex-1 min-w-0">
-              {/* Connector line */}
               <div className="flex-1 h-0.5 relative mx-1">
                 <div className="absolute inset-0 bg-slate-200 rounded-full" />
                 <div
@@ -133,7 +128,6 @@ export default function DataFlowVisualizer({ contentFilters, piiEntities, denied
                 />
               </div>
 
-              {/* Stage node */}
               <div className="flex-shrink-0 flex flex-col items-center gap-1">
                 <div
                   className={`w-10 h-10 rounded-xl flex items-center justify-center border-2 transition-all duration-200 ${
@@ -159,7 +153,6 @@ export default function DataFlowVisualizer({ contentFilters, piiEntities, denied
           );
         })}
 
-        {/* Final connector + output */}
         <div className="flex items-center flex-shrink-0">
           <div className="w-6 h-0.5 mx-1 relative">
             <div className="absolute inset-0 bg-slate-200 rounded-full" />
@@ -181,7 +174,6 @@ export default function DataFlowVisualizer({ contentFilters, piiEntities, denied
         </div>
       </div>
 
-      {/* Legend */}
       <div className="flex flex-wrap gap-3 mt-3 pt-3 border-t border-slate-200/60">
         {activeStages.map((stage) => (
           <div key={stage.id} className="flex items-center gap-1.5">

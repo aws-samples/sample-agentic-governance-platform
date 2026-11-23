@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Stamp ONE ``owner`` role per EXISTING project (E27/T6) — the pre-E27 backfill.
+"""Stamp ONE ``owner`` role per EXISTING project: the backfill for projects that predate roles.
 
-E27 makes every project GOVERNED by per-project roles. Projects created BEFORE E27 hold
-no role row at all, so they fall through to the design-§3 "ungoverned project" fallback
-forever. This one-shot migration closes that gap: for each existing project it resolves
+Every project is GOVERNED by per-project roles. Projects created before roles existed hold
+no role row at all, so they fall through to the "ungoverned project" fallback forever.
+This one-shot migration closes that gap: for each existing project it resolves
 the recorded creator to an Entra principal and grants them ``owner``, so the project
 becomes governed by a real, named principal instead of relying on the fallback.
 
@@ -47,13 +47,14 @@ because an unresolved project stays ungoverned and needs a manual
 ``POST /projects/{id}/roles``. A ``--dry-run`` is a PLAN and always exits 0.
 
 Runtime config comes from the INFRASTRUCTURE folder (the source of truth), resolved with
-``seed_default_tenant``'s own helpers so the precedence is identical: CLI flag > infra
-``.env`` > ``terraform.tfvars`` (with tfvars winning for the PROJECT_NAME/ENVIRONMENT
-name-prefix derivation inputs) > derivation (account via STS ``get-caller-identity``;
-table name via Terraform's ``<PROJECT_NAME>-cp-<ENVIRONMENT>-<last-6-of-account>-projects``
-rule) > a hard error naming the sources tried. There are NO hardcoded AWS account ids or
-regions anywhere. Only the ``projects`` table is needed — project ROLES are a third
-partition in that same table (E27/T1), so there is no second table and no new env var.
+``seed_default_tenant``'s own helpers so the precedence is identical: CLI flag >
+``terraform.tfvars`` scalars > derivation (account via STS ``get-caller-identity``; table
+name via Terraform's ``<PROJECT_NAME>-cp-<ENVIRONMENT>-<last-6-of-account>-projects`` rule)
+> a hard error naming the sources tried. There are NO hardcoded AWS account ids or regions
+anywhere. Only the ``projects`` table is needed — project ROLES are a third partition in
+that same table, so there is no second table and no new env var. The account is resolved
+for real in both modes, never the dry-run placeholder: this migration reads DynamoDB in
+both modes, and a placeholder would derive a table name that does not exist.
 
 The Entra values the Graph client needs (tenant id, backend client id, login/Graph bases)
 come from the backend ``settings`` — the same source ``api/routes/grants.py`` builds its
@@ -91,55 +92,39 @@ import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-# The seed script lives beside this one in scripts/. Put the scripts dir on sys.path so
-# ``import seed_default_tenant`` resolves both when this file is run directly AND when a
-# test imports it as ``scripts.migrate_e26_project_owners`` (same shim as
-# migrate_to_e25b.py). seed_default_tenant is stdlib-only at import top, so importing it
-# is import-safe.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-import seed_default_tenant as seed  # noqa: E402 — after the sys.path shim
+import seed_default_tenant as seed  # noqa: E402 — the sibling resolves only after the sys.path shim above; expires 2027-10-23; added E49A-50A/T17
 
 logger = logging.getLogger("migrate_e26_project_owners")
 
-# Project roles live in a THIRD partition of the EXISTING projects table (E27/T1) — the
-# only table this migration needs.
 PROJECTS_TABLE_SUFFIX = seed.PROJECTS_TABLE_SUFFIX
-
-# ``granted_by`` on the written row. There is no calling Principal in a migration, so the
-# provenance recorded is the migration itself — never a guessed operator identity.
 GRANTED_BY = "migration:e26-project-owners"
-
-# Reported in place of an empty ``created_by`` so a blank creator is visible in the
-# summary instead of an empty string nobody notices.
 BLANK_CREATOR = "(blank)"
-
-# Canonical Entra object-id shape (8-4-4-4-12 hex). Deliberately strict: braced/urn UUID
-# forms are NOT accepted, so anything unusual falls through to the email path rather than
-# being written as a principal id.
-_OID_RE = re.compile(
-    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
-)
-
-# The Graph hit keys that carry an ACTUAL address — only one of these comparing equal is
-# evidence that the hit IS the recorded creator (a displayName match never is).
+_OID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 _EXACT_MATCH_KEYS = ("mail", "userPrincipalName")
 
 
 @dataclass
 class MigrationResult:
     """What one pass did (or would do). ``granted``/``would_grant`` are mutually
-    exclusive by mode: an ``--apply`` pass fills ``granted``, a dry run ``would_grant``."""
+    exclusive by mode: an ``--apply`` pass fills ``granted``, a dry run ``would_grant``.
 
-    total: int = 0                          # projects considered (after --project filter)
-    granted: int = 0                        # owner rows actually written
-    would_grant: int = 0                    # owner rows a dry run WOULD have written
-    skipped_governed: int = 0               # already held a role row — untouched
-    failures: int = 0                       # grant raised; project left ungoverned
-    unresolved: List[str] = field(default_factory=list)         # creators we refused to guess
-    used_oid_directly: List[str] = field(default_factory=list)   # created_by was already an oid
+    ``total`` counts the projects considered after the ``--project`` filter;
+    ``skipped_governed`` the ones that already held a role row; ``failures`` the grants
+    that raised (the project stays ungoverned); ``unresolved`` lists the creators the
+    migration refused to guess, ``used_oid_directly`` the ``created_by`` values that
+    were already an Entra object id."""
+
+    total: int = 0
+    granted: int = 0
+    would_grant: int = 0
+    skipped_governed: int = 0
+    failures: int = 0
+    unresolved: List[str] = field(default_factory=list)
+    used_oid_directly: List[str] = field(default_factory=list)
 
 
 async def migrate(
@@ -165,15 +150,14 @@ async def migrate(
         result.total += 1
         creator = (getattr(project, "created_by", "") or "").strip()
 
-        # 1) Already governed? STRICT read — an unreadable partition is UNKNOWN, not empty.
         try:
             if roles.has_role_rows(pid):
                 result.skipped_governed += 1
                 logger.info("  %s: already governed — skipping.", pid)
                 continue
-        except Exception as exc:  # noqa: BLE001 — unverified governance ⇒ never grant
+        except Exception as exc:
             result.unresolved.append(creator or BLANK_CREATOR)
-            logger.error(
+            logger.exception(
                 "  %s: could not verify whether it is already governed (%s) — skipping "
                 "WITHOUT granting; re-run once the role partition is readable.",
                 pid,
@@ -181,7 +165,6 @@ async def migrate(
             )
             continue
 
-        # 2) Resolve the creator to an Entra principal (or refuse to).
         resolved = await _resolve_creator(creator, graph, project_id=pid)
         if resolved is None:
             result.unresolved.append(creator or BLANK_CREATOR)
@@ -190,23 +173,18 @@ async def migrate(
         if from_oid:
             result.used_oid_directly.append(principal_id)
 
-        # 3) Grant (or plan to).
         if not apply:
             result.would_grant += 1
-            print(
-                f"  [dry-run] would grant owner on project {pid!r} to "
-                f"{principal_id} ({display})"
-            )
+            print(f"  [dry-run] would grant owner on project {pid!r} to {principal_id} ({display})")
             continue
         try:
             roles.grant(pid, _owner_grant(principal_id, display), granted_by=GRANTED_BY)
             result.granted += 1
             logger.info("  %s: granted owner to %s (%s).", pid, principal_id, display)
-        except Exception as exc:  # noqa: BLE001 — log + continue, don't abort the migration
+        except Exception as exc:
             result.failures += 1
-            logger.error(
-                "  %s: failed to grant owner to %s: %s — continuing (project stays "
-                "ungoverned).",
+            logger.exception(
+                "  %s: failed to grant owner to %s: %s — continuing (project stays ungoverned).",
                 pid,
                 principal_id,
                 exc,
@@ -220,10 +198,13 @@ async def _resolve_creator(creator: str, graph, *, project_id: str):
     """Resolve a ``created_by`` value to ``(principal_id, display, from_oid)``, or ``None``
     when it cannot be resolved to EXACTLY one principal (the caller reports + skips).
 
-    Three shapes, none of which may crash: blank ⇒ ``None``; a uuid-shaped Entra oid ⇒
-    used directly (no Graph call — the value already IS the principal id); anything else
-    is treated as an email and looked up, accepting only an exact ``mail`` /
-    ``userPrincipalName`` match. Zero, several, or only non-exact hits ⇒ ``None``.
+    Three shapes, none of which may crash: blank ⇒ ``None``; a canonical 8-4-4-4-12 Entra
+    oid ⇒ used directly (no Graph call — the value already IS the principal id; braced or
+    urn UUID forms fall through to the email path rather than being written as a principal
+    id); anything else is treated as an email and looked up, accepting only an exact
+    ``mail`` / ``userPrincipalName`` match (a ``displayName`` match never is). The resolver
+    returns at most one user, but a list is tolerated so ``_exact_matches`` stays the one
+    place that decides what is acceptable. Zero, several, or only non-exact hits ⇒ ``None``.
     """
     if not creator:
         logger.error(
@@ -236,16 +217,15 @@ async def _resolve_creator(creator: str, graph, *, project_id: str):
 
     if _OID_RE.match(creator):
         logger.info(
-            "  %s: created_by is already an Entra object id — using it directly (no "
-            "Graph lookup).",
+            "  %s: created_by is already an Entra object id — using it directly (no Graph lookup).",
             project_id,
         )
         return creator, creator, True
 
     try:
         found = await graph.resolve_user_by_email(creator)
-    except Exception as exc:  # noqa: BLE001 — a Graph blip must not abort the migration
-        logger.error(
+    except Exception as exc:
+        logger.exception(
             "  %s: Graph lookup for %r failed (%s) — skipping WITHOUT granting.",
             project_id,
             creator,
@@ -253,9 +233,6 @@ async def _resolve_creator(creator: str, graph, *, project_id: str):
         )
         return None
 
-    # The resolver returns at most ONE user (or ``None``). A LIST is still tolerated so
-    # ``_exact_matches`` stays the single place that decides what is acceptable — this
-    # script must not depend on a collaborator narrowing the result for it.
     hits = [found] if isinstance(found, dict) else list(found or [])
     exact = _exact_matches(hits, creator)
     if len(exact) == 1:
@@ -264,16 +241,14 @@ async def _resolve_creator(creator: str, graph, *, project_id: str):
 
     if not exact:
         logger.error(
-            "  %s: no Entra user has the exact address %r (%d unusable hit(s)) "
-            "— reporting, NOT guessing.",
+            "  %s: no Entra user has the exact address %r (%d unusable hit(s)) — reporting, NOT guessing.",
             project_id,
             creator,
             len(hits),
         )
     else:
         logger.error(
-            "  %s: %d Entra users share the address %r — ambiguous, reporting, NOT "
-            "guessing (ids: %s).",
+            "  %s: %d Entra users share the address %r — ambiguous, reporting, NOT guessing (ids: %s).",
             project_id,
             len(exact),
             creator,
@@ -289,17 +264,16 @@ def _exact_matches(hits, email: str) -> list:
     This is belt-and-braces: the resolver is already an exact ``$filter``, but this
     script must not hand out ownership on a collaborator's promise. A hit with no id, a
     non-``user`` hit, or one whose addresses do not actually equal ``email`` is dropped.
+    Only a USER may be granted: the row is written ``principal_type="user"``, and a group
+    oid in it would grant OWNER to every member while misreporting the blast radius
+    (mail-enabled groups do share addresses with users). A hit with no ``type`` at all is
+    accepted.
     """
     wanted = email.strip().lower()
     matched: dict = {}
     for hit in hits:
         if not isinstance(hit, dict) or not hit.get("id"):
             continue
-        # Only a USER may be granted here — the row is written with
-        # principal_type="user", and a group oid in that row would grant OWNER to every
-        # member while misreporting the blast radius. Groups DO carry ``mail`` in Entra,
-        # so a mail-enabled group sharing an address with a user is a real shape. ``None``
-        # is accepted so a hit that carries no ``type`` at all still works.
         if hit.get("type") not in (None, "user"):
             continue
         for key in _EXACT_MATCH_KEYS:
@@ -357,12 +331,13 @@ def _print_summary(result: MigrationResult, *, apply: bool) -> None:
 
 def _resolve_projects_table(args) -> dict:
     """Resolve the region + projects table this migration needs, using the seed's own
-    helpers so the precedence is IDENTICAL (CLI > infra ``.env`` > ``terraform.tfvars``,
-    with tfvars winning for the PROJECT_NAME/ENVIRONMENT derivation inputs > derivation
-    via STS + Terraform's naming rule > hard error naming the sources tried).
+    helpers so the precedence is IDENTICAL (CLI > ``terraform.tfvars`` > derivation via STS
+    + Terraform's naming rule > hard error naming the sources tried). The account is
+    resolved for real in both modes: this migration reads DynamoDB in a dry run too, and
+    the placeholder would derive a table name that does not exist.
 
-    Only the projects table is resolved — role rows are a third partition IN it (E27/T1).
-    The seed's whole-config resolver is deliberately not reused: it also REQUIRES an agent
+    Only the projects table is resolved — role rows are a third partition IN it. The
+    seed's whole-config resolver is deliberately not reused: it also REQUIRES an agent
     registry id, which this migration never touches.
     """
     from pathlib import Path
@@ -377,8 +352,6 @@ def _resolve_projects_table(args) -> dict:
             f"{infra_dir / '.env'}, aws_region in {infra_dir / 'terraform.tfvars'}."
         )
 
-    # dry_run=False: this migration READS DynamoDB in both modes, so it needs the REAL
-    # account (the placeholder would derive a table name that does not exist).
     account_id = seed._resolve_account_id(args.account_id, dry_run=False)
     projects_table = args.projects_table or seed._derive_table_name(
         infra, account_id, PROJECTS_TABLE_SUFFIX, infra_dir=infra_dir
@@ -409,9 +382,7 @@ def _build_collaborators(config: dict):
         connection_service=None,
         region=config["region"],
     )
-    roles = ProjectRoleService(
-        table_name=config["projects_table"], region=config["region"]
-    )
+    roles = ProjectRoleService(table_name=config["projects_table"], region=config["region"])
     graph = GraphService(
         tenant_id=settings.ENTRA_TENANT_ID,
         backend_client_id=settings.ENTRA_BACKEND_CLIENT_ID,
@@ -507,8 +478,6 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # --dry-run and --apply together is an ambiguous instruction about WRITING, so refuse
-    # rather than silently picking one.
     if args.apply and args.dry_run:
         logger.error("--apply and --dry-run are mutually exclusive — pass one.")
         return 2
@@ -525,8 +494,8 @@ def main(argv=None) -> int:
                 project_id=args.project,
             )
         )
-    except Exception as exc:  # noqa: BLE001 — surface a clean, actionable message
-        logger.error("E27 project-owner backfill failed: %s", exc)
+    except Exception as exc:
+        logger.exception("E27 project-owner backfill failed: %s", exc)
         logger.error(
             "Runtime config comes from the INFRASTRUCTURE folder (--infra-dir, default "
             "%s), not the backend .env. Check that: (1) AWS credentials are configured "
@@ -541,7 +510,7 @@ def main(argv=None) -> int:
         return 1
 
     if not args.apply:
-        return 0  # a dry run is a PLAN — never a nonzero verdict
+        return 0
     return 1 if (result.failures or result.unresolved) else 0
 
 

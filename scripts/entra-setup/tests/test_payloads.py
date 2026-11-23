@@ -16,20 +16,10 @@ import sys
 import uuid
 from pathlib import Path
 
-# The script is a standalone single file, not an installed package: put its
-# directory on the import path so the tests run the same way regardless of the
-# working directory pytest was invoked from.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import setup_entra  # noqa: E402  (import follows the sys.path bootstrap above)
+import setup_entra
 
-
-# The six application-permission identifiers, transcribed a SECOND time — from the
-# published Microsoft Graph permission table's "Application" column, not from the
-# module. Two independent transcriptions of the same source is the entire value
-# here: a slip has to be made twice, in two files, to reach a tenant. Comparing
-# the payload against the module's own table (which the rest of this file does)
-# cannot catch a wrong identifier, because the payload is built from that table.
 GRAPH_APPLICATION_PERMISSION_IDS = {
     "Application.ReadWrite.All": "1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9",
     "AppRoleAssignment.ReadWrite.All": "06b708a9-e830-4db3-a914-8e69da51d44f",
@@ -39,21 +29,14 @@ GRAPH_APPLICATION_PERMISSION_IDS = {
     "Directory.Read.All": "7ab1d382-f21e-4acd-a863-ba3e13f7da61",
 }
 
-# The DELEGATED identifiers for those same six permissions, from the other column
-# of that table. They are here to be excluded: the realistic slip is reading
-# across the row and taking a permission's delegated identifier for its
-# application one, which leaves all six names correct and all six values distinct
-# — so neither the name assertion nor the distinctness assertion below can see it.
-DELEGATED_PERMISSION_IDS = frozenset(
-    {
-        "bdfbf15f-ee85-4955-8675-146e8e5296b5",  # Application.ReadWrite.All
-        "84bccea3-f856-4a8a-967b-dbe0a3d53a64",  # AppRoleAssignment.ReadWrite.All
-        "41ce6ca6-6826-4807-84f1-1c82854f7ee5",  # DelegatedPermissionGrant.ReadWrite.All
-        "a154be20-db9c-4678-8ab7-66f6cc099a59",  # User.Read.All
-        "5f8c59db-677d-491f-a6b8-5f174b11ec1d",  # Group.Read.All
-        "06da0dbc-49e2-44d2-8312-53f166ab848a",  # Directory.Read.All
-    }
-)
+DELEGATED_PERMISSION_IDS = {
+    "Application.ReadWrite.All": "bdfbf15f-ee85-4955-8675-146e8e5296b5",
+    "AppRoleAssignment.ReadWrite.All": "84bccea3-f856-4a8a-967b-dbe0a3d53a64",
+    "DelegatedPermissionGrant.ReadWrite.All": "41ce6ca6-6826-4807-84f1-1c82854f7ee5",
+    "User.Read.All": "a154be20-db9c-4678-8ab7-66f6cc099a59",
+    "Group.Read.All": "5f8c59db-677d-491f-a6b8-5f174b11ec1d",
+    "Directory.Read.All": "06da0dbc-49e2-44d2-8312-53f166ab848a",
+}
 
 SCOPE_ID = "aaaaaaaa-0000-0000-0000-000000000001"
 BACKEND_APP_ID = "bbbbbbbb-0000-0000-0000-000000000002"
@@ -74,9 +57,6 @@ def backend_payload() -> dict:
     )
 
 
-# ===========================================================================
-# Shared identity constants
-# ===========================================================================
 def test_six_graph_application_permissions_are_declared() -> None:
     """The backend needs exactly these six application permissions, and every
     GUID is a distinct one — a copy-paste slip here grants the wrong permission
@@ -102,10 +82,13 @@ def test_graph_application_permission_identifiers_match_the_published_table() ->
     it validates the format, not the intent — and it goes into the ONE create call
     that is never repaired afterwards, so the registration ends up declaring a
     permission nobody asked for and the consent step then grants it tenant-wide.
+
+    The delegated identifiers of the same six permissions are excluded too: reading across the
+    published table's row leaves every name right and every value distinct, which neither of the
+    other assertions can see.
     """
     assert setup_entra.GRAPH_APP_PERMISSIONS == GRAPH_APPLICATION_PERMISSION_IDS
-    # None of the six is a delegated identifier wearing an application name.
-    assert not set(setup_entra.GRAPH_APP_PERMISSIONS.values()) & DELEGATED_PERMISSION_IDS
+    assert not set(setup_entra.GRAPH_APP_PERMISSIONS.values()) & set(DELEGATED_PERMISSION_IDS.values())
 
 
 def test_new_guid_mints_a_fresh_random_identifier() -> None:
@@ -116,9 +99,6 @@ def test_new_guid_mints_a_fresh_random_identifier() -> None:
     assert uuid.UUID(first).version == 4
 
 
-# ===========================================================================
-# Backend application
-# ===========================================================================
 def test_backend_payload_requests_version_two_tokens() -> None:
     """``requestedAccessTokenVersion: 2`` must ride along in the CREATE body.
 
@@ -142,7 +122,6 @@ def test_backend_payload_exposes_the_delegated_scope() -> None:
     scope = scopes[0]
     assert scope["id"] == SCOPE_ID
     assert scope["value"] == setup_entra.SCOPE_NAME == "Access.Default"
-    # "User" is the portal's "Admins and users"; "Admin" would lock users out.
     assert scope["type"] == "User"
     assert scope["isEnabled"] is True
 
@@ -160,7 +139,6 @@ def test_backend_payload_declares_all_three_platform_roles() -> None:
     }
     for role in roles:
         assert role["id"] == ROLE_IDS[role["value"]]
-        # "User" is the portal's "Users/Groups": these roles are assigned to people.
         assert role["allowedMemberTypes"] == ["User"]
         assert role["isEnabled"] is True
         assert role["displayName"]
@@ -177,9 +155,7 @@ def test_backend_payload_requests_six_application_permissions() -> None:
     entries = resource_access[0]["resourceAccess"]
     assert len(entries) == 6
     assert all(entry["type"] == "Role" for entry in entries)
-    assert {entry["id"] for entry in entries} == set(
-        setup_entra.GRAPH_APP_PERMISSIONS.values()
-    )
+    assert {entry["id"] for entry in entries} == set(setup_entra.GRAPH_APP_PERMISSIONS.values())
 
 
 def test_backend_payload_uses_resolved_permission_guids_when_supplied() -> None:
@@ -212,11 +188,8 @@ def test_backend_payload_asks_for_the_secret_inline() -> None:
     assert "endDateTime" not in credentials[0]
 
 
-# ===========================================================================
-# Single-page application
-# ===========================================================================
 def test_spa_payload_registers_the_spa_platform_explicitly() -> None:
-    """The empty ``spa`` object is load-bearing, not a placeholder.
+    """The empty ``spa`` object registers the SPA platform; it is not a placeholder.
 
     It selects the authorization-code-with-PKCE flow and the no-secret client
     that the frontend needs. Omitting it leaves the registration with no platform

@@ -4,69 +4,82 @@ import {
   buildSubscribeBody,
   datasheetChips,
   declaredList,
-  eligibleAgents,
   relativeTime,
 } from './marketplaceForm';
-import type { Agent, ProductCard } from '../../../api/client';
+import type { ProductCard } from '../../../api/client';
 
-const card = (over: Partial<ProductCard> = {}): ProductCard => ({
-  product_type: 'agent',
-  product_id: 'bp-fnol',
-  name: 'FNOL Agent',
-  capabilities: [],
-  available: true,
-  auto_approve: false,
-  my_status: null,
-  ...over,
-});
-
-const agent = (over: Partial<Agent> = {}): Agent => ({
-  id: 'agent-1',
-  name: 'Contact Center Agent',
-  mcp_server_ids: [],
-  origin: 'Registered',
-  identity_status: 'provisioned',
-  entra_sp_id: 'sp-a',
-  lifecycle_state: 'approved',
-  auth_type: 'entra',
-  created_at: '2026-06-07T00:00:00Z',
-  updated_at: '2026-06-07T00:00:00Z',
-  ...over,
-});
+function productCard(overrides: Partial<ProductCard> = {}): ProductCard {
+  return {
+    product_type: 'agent',
+    product_id: 'bp-fnol',
+    name: 'FNOL Agent',
+    pitch: null,
+    category: null,
+    capabilities: [],
+    icon: null,
+    available: true,
+    auto_approve: false,
+    kind: null,
+    owner_email: null,
+    business_unit: null,
+    data_classification: null,
+    region: null,
+    version: null,
+    created_at: null,
+    updated_at: null,
+    tenant_id: null,
+    tenant_name: null,
+    published: false,
+    shared: false,
+    owner_team: null,
+    support_contact: null,
+    sla_tier: null,
+    support_hours: null,
+    lifecycle: null,
+    declared_at: null,
+    consumers: null,
+    compliance: [],
+    guardrails: [],
+    my_status: null,
+    my_subscription_id: null,
+    my_agent_id: null,
+    ...overrides,
+  };
+}
 
 describe('ctaFor', () => {
   it('no status → subscribe', () => {
-    expect(ctaFor(card({ my_status: null }))).toBe('subscribe');
+    expect(ctaFor(productCard({ my_status: null }))).toBe('subscribe');
   });
 
   it('pending → pending', () => {
-    expect(ctaFor(card({ my_status: 'pending' }))).toBe('pending');
+    expect(ctaFor(productCard({ my_status: 'pending' }))).toBe('pending');
   });
 
   it('agent + approved → deploy', () => {
-    expect(ctaFor(card({ product_type: 'agent', my_status: 'approved' }))).toBe('deploy');
+    expect(ctaFor(productCard({ product_type: 'agent', my_status: 'approved' }))).toBe('deploy');
   });
 
   it('mcp + approved → subscribed', () => {
-    expect(ctaFor(card({ product_type: 'mcp', my_status: 'approved' }))).toBe('subscribed');
+    expect(ctaFor(productCard({ product_type: 'mcp', my_status: 'approved' }))).toBe('subscribed');
   });
 
   it('rejected → subscribe (can re-request)', () => {
-    expect(ctaFor(card({ my_status: 'rejected' }))).toBe('subscribe');
+    expect(ctaFor(productCard({ my_status: 'rejected' }))).toBe('subscribe');
   });
 
   it('failed → subscribe (can re-request)', () => {
-    expect(ctaFor(card({ my_status: 'failed' }))).toBe('subscribe');
+    expect(ctaFor(productCard({ my_status: 'failed' }))).toBe('subscribe');
   });
 
   it('revoked → subscribe (can re-subscribe after an admin revoke)', () => {
-    expect(ctaFor(card({ my_status: 'revoked' }))).toBe('subscribe');
+    expect(ctaFor(productCard({ my_status: 'revoked' }))).toBe('subscribe');
   });
 });
 
 describe('buildSubscribeBody', () => {
   it('agent card sends agent_id null', () => {
-    const body = buildSubscribeBody(card({ product_type: 'agent', product_id: 'bp-fnol' }), {
+    const body = buildSubscribeBody(productCard({ product_type: 'agent', product_id: 'bp-fnol' }), {
       agentId: 'agent-1',
       message: 'please',
     });
@@ -79,7 +92,7 @@ describe('buildSubscribeBody', () => {
   });
 
   it('mcp card sends the passed agentId and message', () => {
-    const body = buildSubscribeBody(card({ product_type: 'mcp', product_id: 'm1' }), {
+    const body = buildSubscribeBody(productCard({ product_type: 'mcp', product_id: 'm1' }), {
       agentId: 'agent-9',
       message: 'on behalf of',
     });
@@ -92,20 +105,9 @@ describe('buildSubscribeBody', () => {
   });
 
   it('mcp card without agentId sends agent_id null; missing message → null', () => {
-    const body = buildSubscribeBody(card({ product_type: 'mcp', product_id: 'm1' }), {});
+    const body = buildSubscribeBody(productCard({ product_type: 'mcp', product_id: 'm1' }), {});
     expect(body.agent_id).toBeNull();
     expect(body.message).toBeNull();
-  });
-});
-
-describe('eligibleAgents', () => {
-  it('keeps only provisioned agents with an entra_sp_id', () => {
-    const provisioned = agent({ id: 'a1', identity_status: 'provisioned', entra_sp_id: 'sp-a' });
-    const notProvisioned = agent({ id: 'a2', identity_status: 'pending', entra_sp_id: null });
-    const noSpId = agent({ id: 'a3', identity_status: 'provisioned', entra_sp_id: null });
-
-    const result = eligibleAgents([provisioned, notProvisioned, noSpId], 'caller-oid');
-    expect(result.map((a) => a.id)).toEqual(['a1']);
   });
 });
 
@@ -127,51 +129,45 @@ describe('declaredList', () => {
 
 describe('datasheetChips', () => {
   it('a card with no declared sla/compliance → no chips (omit-empty, no "—")', () => {
-    expect(datasheetChips(card())).toEqual([]);
-    expect(datasheetChips(card({ sla_tier: '  ', compliance: [] }))).toEqual([]);
+    expect(datasheetChips(productCard())).toEqual([]);
+    expect(datasheetChips(productCard({ sla_tier: '  ', compliance: [] }))).toEqual([]);
   });
 
   it('sla tier first, then one chip per compliance framework', () => {
-    const chips = datasheetChips(card({ sla_tier: 'Gold', compliance: ['GDPR', 'SOC 2'] }));
+    const chips = datasheetChips(productCard({ sla_tier: 'Gold', compliance: ['GDPR', 'SOC 2'] }));
     expect(chips.map((c) => c.label)).toEqual(['SLA: Gold', 'GDPR', 'SOC 2']);
     expect(chips.map((c) => c.key)).toEqual(['sla', 'compliance:GDPR', 'compliance:SOC 2']);
   });
 
-  it('the sla chip label visibly says it is an SLA, not only its tooltip', () => {
-    // The chips share one neutral tint, and `title` is unavailable on touch and
-    // unreliable for assistive tech — so the distinction must be in the label.
-    const chips = datasheetChips(card({ sla_tier: 'Gold', compliance: ['Gold'] }));
+  it('the sla chip label visibly says it is an SLA, not only its tooltip: the chips share one neutral tint, and a title is unavailable on touch and unreliable for assistive tech', () => {
+    const chips = datasheetChips(productCard({ sla_tier: 'Gold', compliance: ['Gold'] }));
     expect(chips[0].label).toBe('SLA: Gold');
     expect(chips[1].label).toBe('Gold');
   });
 
   it('every chip tooltip discloses the value as declared, never measured', () => {
-    const chips = datasheetChips(card({ sla_tier: 'Gold', compliance: ['GDPR'] }));
+    const chips = datasheetChips(productCard({ sla_tier: 'Gold', compliance: ['GDPR'] }));
     expect(chips.every((c) => c.title.includes('declared'))).toBe(true);
   });
 
   it('compliance chips inherit declaredList normalisation (trim/blank/dupe)', () => {
-    const chips = datasheetChips(card({ compliance: [' GDPR', 'GDPR', '', 'BaFin'] }));
+    const chips = datasheetChips(productCard({ compliance: [' GDPR', 'GDPR', '', 'BaFin'] }));
     expect(chips.map((c) => c.label)).toEqual(['GDPR', 'BaFin']);
   });
 
   it('sla tier alone renders without any compliance chips', () => {
-    const chips = datasheetChips(card({ sla_tier: 'Silver', compliance: null }));
+    const chips = datasheetChips(productCard({ sla_tier: 'Silver', compliance: [] }));
     expect(chips).toEqual([
       { key: 'sla', label: 'SLA: Silver', title: 'SLA tier (declared by the publisher)' },
     ]);
   });
 
-  // Amendment 1: publication is the only door for MCP servers too, so an MCP card carries a
-  // declared datasheet exactly like an agent card and MarketplaceCard renders these chips for
-  // both. The derivation must therefore be product-type AGNOSTIC — it was the CARD that used to
-  // gate the row on `product_type === 'mcp'`, throwing an approved declaration away.
   const mcpCard = (over: Partial<ProductCard> = {}): ProductCard =>
-    card({ product_type: 'mcp', product_id: 'mcp-1', name: 'Claims MCP', kind: 'gateway', ...over });
+    productCard({ product_type: 'mcp', product_id: 'mcp-1', name: 'Claims MCP', kind: 'gateway', ...over });
 
-  it('an MCP card yields the SAME chips as an agent card with the same declaration', () => {
+  it('an MCP card yields the same chips as an agent card with the same declaration: publication is the only door for MCP servers too, so the derivation is product-type agnostic', () => {
     const declaration = { sla_tier: 'Gold', compliance: ['GDPR', 'SOC 2'] };
-    expect(datasheetChips(mcpCard(declaration))).toEqual(datasheetChips(card(declaration)));
+    expect(datasheetChips(mcpCard(declaration))).toEqual(datasheetChips(productCard(declaration)));
     expect(datasheetChips(mcpCard(declaration)).map((c) => c.label)).toEqual([
       'SLA: Gold',
       'GDPR',
@@ -179,18 +175,13 @@ describe('datasheetChips', () => {
     ]);
   });
 
-  it('an MCP card with NO declared sla/compliance yields [] — no chip row, no dangling "Declared" label', () => {
-    // The card renders the row (and its visible "Declared" prefix) only when this list is
-    // non-empty, so [] is what keeps an undeclared card free of an empty labelled row.
+  it('an MCP card with no declared sla/compliance yields [], which is what keeps the card from rendering an empty row under a dangling "Declared" label', () => {
     expect(datasheetChips(mcpCard())).toEqual([]);
     expect(datasheetChips(mcpCard({ sla_tier: '   ', compliance: [] }))).toEqual([]);
-    expect(datasheetChips(mcpCard({ sla_tier: null, compliance: null }))).toEqual([]);
+    expect(datasheetChips(mcpCard({ sla_tier: null, compliance: [] }))).toEqual([]);
   });
 
-  it('declared fields the row does not own never invent a chip (owner_team / support_contact / declared_at / guardrails)', () => {
-    // These are projected onto both card types but belong to the header (owner_team) or the
-    // detail views — surfacing them here would produce a "Declared" row asserting more than
-    // the row is meant to carry.
+  it('declared fields the row does not own (owner_team, support_contact, declared_at, guardrails, support_hours) never invent a chip: they belong to the header or the detail views', () => {
     expect(
       datasheetChips(
         mcpCard({
@@ -206,7 +197,6 @@ describe('datasheetChips', () => {
 });
 
 describe('relativeTime', () => {
-  // `now` is injected so the helper is deterministic in tests.
   const now = new Date('2026-06-08T12:00:00Z');
 
   it('under a minute → "just now"', () => {

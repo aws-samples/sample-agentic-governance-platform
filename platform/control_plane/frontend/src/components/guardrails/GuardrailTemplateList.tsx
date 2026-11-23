@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { guardrailsApi } from '../../api/client';
-import type { GuardrailTemplate, GuardrailStatus } from '../../types';
+import { useLoad } from '../../api/useLoad';
+import type { GuardrailTemplate, GuardrailStatus } from '../../api/client';
 
 interface Props {
   onCreateNew: () => void;
@@ -17,25 +18,9 @@ const statusStyles: Record<GuardrailStatus, { bg: string; text: string; dot: str
 };
 
 export default function GuardrailTemplateList({ onCreateNew }: Props) {
-  const [templates, setTemplates] = useState<GuardrailTemplate[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { state, reload } = useLoad(() => guardrailsApi.list(), []);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-
-  useEffect(() => {
-    loadTemplates();
-  }, []);
-
-  const loadTemplates = async () => {
-    setLoading(true);
-    try {
-      const data = await guardrailsApi.list();
-      setTemplates(data.filter((t) => t.status !== 'deleted'));
-    } catch {
-      // API might not be deployed yet — show empty state
-    } finally {
-      setLoading(false);
-    }
-  };
+  const templates = (state.data ?? []).filter((t) => t.status !== 'deleted');
 
   const copyId = (id: string) => {
     navigator.clipboard.writeText(id);
@@ -45,10 +30,8 @@ export default function GuardrailTemplateList({ onCreateNew }: Props) {
 
   const handleDelete = async (templateId: string) => {
     if (!confirm('Delete this guardrail template? This will also remove the Bedrock resource.')) return;
-    try {
-      await guardrailsApi.delete(templateId);
-      loadTemplates();
-    } catch {}
+    const deleted = await guardrailsApi.delete(templateId).then(() => true, () => false);
+    if (deleted) reload();
   };
 
   const featureSummary = (t: GuardrailTemplate): string[] => {
@@ -61,7 +44,7 @@ export default function GuardrailTemplateList({ onCreateNew }: Props) {
     return features;
   };
 
-  if (loading) {
+  if (state.kind === 'loading') {
     return (
       <div className="flex items-center justify-center py-20">
         <div className="w-6 h-6 border-2 border-slate-200 border-t-blue-600 rounded-full animate-spin" />

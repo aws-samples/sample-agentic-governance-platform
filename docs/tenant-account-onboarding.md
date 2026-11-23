@@ -50,12 +50,24 @@ for you.
 - **A platform admin.** Only the platform admin role can create or change a tenant. Members cannot
   even list tenants. They receive their own memberships instead.
 
-Nothing verifies that any of this exists before the platform trusts it. It checks only the shape of
-what you type. The first evidence of a wrong name, a wrong address, or a well-formed ARN naming a
-role that is not there, is a failed deployment.
+The platform now probes what it can *reach*, though not what you named. At connect — and again any
+time you re-probe — it attempts an `sts:AssumeRole` against each stage's deploy role and push role,
+and records the result as a per-stage readiness badge on the tenant. A well-formed ARN naming a role
+the control plane cannot assume shows up as a red *deploy* badge at connect, not as a failed
+deployment weeks later. Everything else is still shape-only: the account id's twelve digits and the
+ARN's form are checked, but nothing confirms the account exists, the repository address resolves, or
+a name matches anything real. The first evidence of those is still a failed deployment.
 
-*Derived from `platform/control_plane/infrastructure/modules/{default_tenant, codebuild, agent_ecr}`
-and `backend/src/services/graph_service.py`.*
+A reach badge is honest about one thing only — whether AGP could make the hop — and it does not say
+which side is missing. Today the true answer for a genuinely cross-account tenant is *deploy role not
+assumable*, because that hop also needs the tenant account's trust policy to admit the platform's own
+backend task role, which is the onboarding step below. The probe's job is to say so at connect rather
+than let it surface as a deployment failure later. A stage that names no deploy role is
+deploy-in-place and is not probed at all — there is no hop to check.
+
+*Derived from `platform/control_plane/infrastructure/modules/{default_tenant, codebuild, agent_ecr}`,
+`backend/src/services/{graph_service, tenant_credentials}.py` and
+`backend/src/services/platform_adapters/aws.py`.*
 
 ## Create the tenant
 
@@ -69,7 +81,10 @@ and you use the steps below for every other tenant.
 3. Enter the name, the line of business, and an optional description. The name must be unique.
 4. Find the groups box. Search the directory by group name. Click each group you want to link. It
    appears as a chip you can remove. Link at least one group.
-5. Fill in both stages, `dev` and `prod`. Both are mandatory.
+5. Add your stages. A tenant needs at least one. `dev` is seeded for you and `prod` is offered as a
+   suggested second, but the names are open — add, remove or rename stages freely, and a tenant may
+   have just one. Keep a stage named `dev` unless you know that path is unused: the platform reads it
+   when it sets up a project's Git repository (see the warning below).
 6. For each stage, enter the AWS account id, the region, the repository address, and the deploy
    role's ARN. Add the CI push role's ARN as well, if that stage pushes images from GitHub. The
    account id must have 12 digits. A deploy role ARN must be a whole IAM role ARN —
@@ -89,6 +104,9 @@ Every deployment from then on uses that stage's account, region, repository and 
 **What it does.**
 
 - Stores the tenant, and uses it for every deployment.
+- Probes each stage's deploy and push roles at connect, and again whenever you re-probe, recording
+  a per-verb readiness the tenant page shows as badges. Re-probing is a button — it re-runs the
+  same reach check against the stored config and refreshes the badges, changing nothing else.
 - Resolves the tenant on the server, from the agent being deployed. A caller supplies only the
   stage, so nobody can aim a deployment at another tenant's account.
 - Creates the agent's runtime, its execution role and its tracing secret inside the tenant account.
@@ -104,16 +122,20 @@ Every deployment from then on uses that stage's account, region, repository and 
 - Set up the tenant account for you. It creates none of the prerequisites above: not the deploy
   role, not the repository, not the push role. It creates no group in the identity provider either.
   A group lives in the identity provider, never in the AWS account.
-- Check what you type, beyond the 12 digits of the account id and the shape of a deploy role ARN.
-  Neither check asks AWS whether the thing exists.
+- Verify the names and addresses you type. Beyond the twelve digits of the account id and the shape
+  of a deploy role ARN, nothing confirms an account, a repository or a role *name* is real. The
+  connect probe does now ask STS whether each deploy and push role is *assumable* — but that is the
+  one fact it checks, and a reachable role can still be the wrong one.
 - Offer a self-service flow. There is no request, no approval queue and no notification. A member
   who needs a tenant asks an admin.
 - Onboard an account. The Tenants tab is a form over the tenant, not a workflow. It cannot create
-  the deploy role, state the name and trust that role requires, or check that the role exists and is
-  assumable.
+  the deploy role or state the name and trust that role requires. It probes whether that role is
+  assumable and badges the result, but it does not fix a failed probe or walk you through the trust
+  policy the hop needs.
 
-*Derived from `platform/control_plane/backend/src/services/runtime_build_service.py`,
-`src/api/routes/tenants.py` and `infrastructure/modules/agentcore_runtime`.*
+*Derived from `platform/control_plane/backend/src/services/{runtime_build_service, tenant_service}.py`,
+`src/services/platform_adapters/aws.py`, `src/api/routes/tenants.py` and
+`infrastructure/modules/agentcore_runtime`.*
 
 ## Warnings
 
@@ -135,10 +157,11 @@ Every deployment from then on uses that stage's account, region, repository and 
   out survives, and a stage you do send replaces the stored one whole, every field included. So
   clearing a role ARN means sending that stage with the ARN blank, and dropping a stage altogether
   means a direct write to the table.
-- **The console edits exactly the two stages `dev` and `prod`.** Create any other stage set through
-  the API. The Tenants table shows those two columns and prints an em dash for a stage a tenant does
-  not have. Keep a stage named `dev` in every tenant. The platform reads that stage when it sets up
-  a project's Git repository. A tenant without it fails that step.
+- **The console edits an open set of stages.** `dev` is seeded and `prod` is suggested, but you can
+  add, remove or rename stages, and a tenant may have just one. The Tenants table renders a column
+  per stage present across your tenants and prints an em dash for a stage a given tenant does not
+  have. Keep a stage named `dev` in every tenant. The platform reads that stage when it sets up a
+  project's Git repository, and a tenant without it fails that step.
 
 *Derived from `platform/control_plane/backend/src/services/{project_service, agent_identity_service,
 tenant_service, tenant_credentials}.py`.*

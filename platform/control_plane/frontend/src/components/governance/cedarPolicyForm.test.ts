@@ -6,50 +6,55 @@ import {
   operatorsForType,
   displayOp,
   conditionLabel,
+  isContainmentRow,
+  isWholeGatewayDeny,
 } from './cedarPolicyForm';
+import { stripComments } from '../../rawSource';
+import cedarTabRaw from './CedarPoliciesTab.tsx?raw';
 import type { CedarPolicyRow, PrincipalHit } from '../../api/client';
+import { principalHit } from '../../test/wire';
 
-const userHit = (over: Partial<PrincipalHit> = {}): PrincipalHit => ({
-  id: 'eb3da-oid',
-  display_name: 'Lars Svensson',
-  type: 'user',
-  mail: 'lars@acme.com',
-  ...over,
-});
+const cedarTabSrc = stripComments(cedarTabRaw);
+
+const LARS: Partial<PrincipalHit> = { id: 'eb3da-oid', display_name: 'Lars Svensson', mail: 'lars@acme.com' };
 
 const row = (over: Partial<CedarPolicyRow> = {}): CedarPolicyRow => ({
   policy_id: 'pol-1',
   effect: 'allow',
   cedar_text: 'permit(...)',
+  user_oid: null,
+  user_label: null,
+  tool: null,
+  conditions: [],
+  managed: false,
+  kind: null,
+  agent_app_id: null,
   ...over,
 });
 
 describe('buildAddPolicyBody', () => {
-  it('specific tool passes the tool through', () => {
-    const body = buildAddPolicyBody(userHit(), 'T___get_claim', false);
+  it('specific tool passes the tool through, with effect allow and no conditions by default', () => {
+    const body = buildAddPolicyBody(principalHit(LARS), 'T___get_claim', false);
     expect(body).toEqual({
       principal_oid: 'eb3da-oid',
       principal_label: 'Lars Svensson',
       tool_name: 'T___get_claim',
       all_tools: false,
-      effect: 'allow',       // defaulted (E10)
-      conditions: [],        // defaulted (E10)
+      effect: 'allow',
+      conditions: [],
     });
   });
 
-  it('all-tools forces tool_name null', () => {
-    // Even with a real tool name supplied, all_tools collapses it to null.
-    const body = buildAddPolicyBody(userHit(), 'T___get_claim', true);
+  it('all-tools forces tool_name null even when a real tool name is supplied, so the wire shape is unambiguous', () => {
+    const body = buildAddPolicyBody(principalHit(LARS), 'T___get_claim', true);
     expect(body.tool_name).toBeNull();
     expect(body.all_tools).toBe(true);
   });
 
-  it('falls back to mail then id for label', () => {
-    // No display_name → label is the mail.
-    const noName = buildAddPolicyBody(userHit({ display_name: '' }), null, false);
+  it('labels the principal by display_name, then mail, then the id (the Entra oid)', () => {
+    const noName = buildAddPolicyBody(principalHit({ ...LARS, display_name: '' }), null, false);
     expect(noName.principal_label).toBe('lars@acme.com');
-    // No display_name and no mail → label is the id (the oid).
-    const idOnly = buildAddPolicyBody(userHit({ display_name: '', mail: null }), null, false);
+    const idOnly = buildAddPolicyBody(principalHit({ ...LARS, display_name: '', mail: null }), null, false);
     expect(idOnly.principal_label).toBe('eb3da-oid');
   });
 });
@@ -61,8 +66,6 @@ describe('policyToolLabel', () => {
     expect(policyToolLabel(row({ tool: 'X___y' }))).toBe('X___y');
   });
 });
-
-// Epic 10 — conditional Cedar policies (parameter conditions + Deny).
 
 describe('paramsFromSchema', () => {
   it('parses top-level properties into coarse types', () => {
@@ -131,7 +134,7 @@ describe('conditionLabel', () => {
 
 describe('buildAddPolicyBody — effect + conditions', () => {
   it('carries a per-user deny with one condition', () => {
-    const body = buildAddPolicyBody(userHit(), 'transfer', false, 'deny', [
+    const body = buildAddPolicyBody(principalHit(LARS), 'transfer', false, 'deny', [
       { param: 'amount', op: '>', value: '10000', type: 'number' },
     ]);
     expect(body.principal_oid).toBe('eb3da-oid');
@@ -149,12 +152,46 @@ describe('buildAddPolicyBody — effect + conditions', () => {
     expect(body.principal_label).toBe('Everyone');
   });
 
-  it('drops conditions for all-tools', () => {
-    const body = buildAddPolicyBody(userHit(), 'transfer', true, 'allow', [
+  it('drops conditions for all-tools, since a condition needs a specific tool whose param schema is known', () => {
+    const body = buildAddPolicyBody(principalHit(LARS), 'transfer', true, 'allow', [
       { param: 'amount', op: '>', value: '10000', type: 'number' },
     ]);
     expect(body.tool_name).toBeNull();
     expect(body.conditions).toEqual([]);
     expect(body.all_tools).toBe(true);
+  });
+});
+
+describe('isWholeGatewayDeny', () => {
+  const amount = { param: 'amount', op: '>', value: '10000', type: 'number' } as const;
+
+  it('refuses an unconditional all-users all-tools Deny, which would block the whole gateway', () => {
+    expect(isWholeGatewayDeny('deny', true, true, [])).toBe(true);
+  });
+
+  it('lets through every Deny that names a user, a tool or a condition, and every Allow', () => {
+    expect(isWholeGatewayDeny('deny', false, true, [])).toBe(false);
+    expect(isWholeGatewayDeny('deny', true, false, [])).toBe(false);
+    expect(isWholeGatewayDeny('deny', true, true, [amount])).toBe(false);
+    expect(isWholeGatewayDeny('allow', true, true, [])).toBe(false);
+  });
+});
+
+describe('agent-containment rows', () => {
+  const row = (over: Partial<CedarPolicyRow> = {}): CedarPolicyRow => ({
+    policy_id: 'p-1', effect: 'deny', tool: null, managed: true, cedar_text: 'forbid(...)',
+    user_oid: null, user_label: null, conditions: [], kind: null, agent_app_id: null, ...over,
+  });
+
+  it('recognises only kind "contain"', () => {
+    expect(isContainmentRow(row({ kind: 'contain', agent_app_id: 'app-1' }))).toBe(true);
+    expect(isContainmentRow(row({ kind: null }))).toBe(false);
+    expect(isContainmentRow(row())).toBe(false);
+  });
+
+  it('renders as "Agent containment" with no Remove button and a hint to restore: the forbid is owned by the containment and only Restore removes it', () => {
+    expect(cedarTabSrc).toContain('Agent containment');
+    expect(cedarTabSrc).toContain('Restore the agent on its Containment tab');
+    expect(cedarTabSrc).toMatch(/canManage && !isContain && \(/);
   });
 });

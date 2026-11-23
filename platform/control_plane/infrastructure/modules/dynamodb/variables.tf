@@ -13,3 +13,9 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "ephemeral" {
+  description = "Turn off deletion protection on the containment and audit tables so terraform destroy can remove them"
+  type        = bool
+  default     = false
+}

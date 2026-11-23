@@ -1,69 +1,66 @@
-"""Platform Users admin (Epic 16) — list/add/change-role/remove platform access.
+"""Platform users admin: list, add, change the role of, and remove the platform's role-holders.
 
-Entra/Graph is the system of record: the platform role-holders are the
-``appRoleAssignedTo`` entries on the PLATFORM application's service principal
-(the BACKEND app reg, which defines Platform.Admin/Operator/Viewer and is the
-``aud`` of inbound user tokens — see ``_platform_app_client_id`` for why). This
-module is a thin admin-gated pass-through over GraphService, mirroring grants.py's
-RBAC + GraphError→HTTP idiom and reusing the ONE GraphService singleton.
+Entra is the system of record: the role-holders are the ``appRoleAssignedTo`` entries on the
+platform application's service principal, the backend app registration that defines
+Platform.Admin, Platform.Operator and Platform.Viewer and is the ``aud`` of inbound user tokens
+(``_platform_app_client_id`` says why). The routes own RBAC and the wire shapes, whose ``Literal``
+role fields make an unknown token a 422; the Graph sequences and their failure meanings are the
+``platform_role_holders`` family in :mod:`services.graph_platform_users`, whose ``PlatformUsersError``
+kinds the one ``AppError`` handler renders.
 
-Role vocabulary: the API speaks the short token "admin"/"operator"/"viewer";
-Entra speaks the appRole `value` (settings.ENTRA_ROLE_*). We map between them via
-config (never hardcode "Platform.*"). We only ever read/assign/revoke the three
-Platform.* roles — assignments with any other appRoleId are left untouched.
+Role vocabulary: the API speaks the short tokens "admin", "operator" and "viewer"; Entra speaks the
+appRole value from ``settings.ENTRA_ROLE_*``. The mapping comes from configuration, never a
+hardcoded "Platform.*", and only those three roles are ever read, assigned or revoked: an
+assignment with any other appRoleId is left untouched.
 """
 
-import logging
-from typing import List
+from typing import List, Literal
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Response
 from fastapi import Depends as RBACDepends
-from pydantic import BaseModel
+from pydantic import Field
 
 from core.config import settings
 from core.rbac import Principal, Role, current_principal, require_role
-from services.graph_service import GraphError
-
-logger = logging.getLogger(__name__)
+from models.base import WireModel
+from services.graph_platform_users import (
+    assign_platform_role,
+    platform_role_holders,
+    replace_platform_role,
+    revoke_platform_roles,
+)
 
 router = APIRouter(prefix="/admin/users", tags=["users-admin"])
 
-# admin > operator > viewer — used to surface the highest role a principal holds.
 _ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
 
+PlatformRole = Literal["admin", "operator", "viewer", ""]
 
-# --- models ------------------------------------------------------------------
 
-class PlatformUser(BaseModel):
+class PlatformUser(WireModel):
     principal_id: str
     display_name: str
-    principal_type: str   # Graph's principalType: "User" | "Group" | "ServicePrincipal"
-    role: str             # "admin" | "operator" | "viewer"
+    principal_type: str = Field(description="Graph's principalType: 'User', 'Group' or 'ServicePrincipal'.")
+    role: PlatformRole = Field(description="The highest platform role held: 'admin', 'operator' or 'viewer'.")
 
 
-class RoleAssignmentCreate(BaseModel):
+class RoleAssignmentCreate(WireModel):
     principal_id: str
-    role: str             # "admin" | "operator" | "viewer"
+    role: Literal["admin", "operator", "viewer"] = Field(description="'admin', 'operator' or 'viewer'.")
 
 
-class RoleChange(BaseModel):
-    role: str             # "admin" | "operator" | "viewer"
+class RoleChange(WireModel):
+    role: Literal["admin", "operator", "viewer"] = Field(description="'admin', 'operator' or 'viewer'.")
 
-
-# --- config-derived maps + helpers (pure) ------------------------------------
 
 def _platform_app_client_id() -> str:
-    """The app reg client id whose SP holds the Platform.* assignments.
+    """The app registration client id whose SP holds the Platform.* assignments.
 
-    Resolution: explicit override (ENTRA_PLATFORM_APP_CLIENT_ID) first, then the
-    BACKEND app, then the SPA app as a last resort.
-
-    WHY backend before SPA: the inbound user JWT's ``aud`` is the BACKEND app, and
-    Entra sources the token's ``roles`` claim from the app-role assignments on the
-    SP of the token-audience app. So a Platform.* role only reaches the user's token
-    if it is assigned on the BACKEND app's service principal — assigning it on the
-    SPA app's SP is a silent no-op (the SPA app is merely the OAuth client / ``azp``).
-    The panel must therefore manage assignments on the backend app.
+    The explicit ``ENTRA_PLATFORM_APP_CLIENT_ID`` first, then the backend app, then the SPA app as
+    a last resort. Backend before SPA because the inbound user JWT's ``aud`` is the backend app and
+    Entra sources the token's ``roles`` claim from the assignments on the token-audience app's SP:
+    a Platform.* role assigned on the SPA app's SP never reaches the user's token, the SPA app being
+    only the OAuth client.
     """
     return (
         settings.ENTRA_PLATFORM_APP_CLIENT_ID
@@ -73,11 +70,7 @@ def _platform_app_client_id() -> str:
 
 
 def _platform_role_maps() -> tuple[dict, dict]:
-    """(token_to_value, value_to_token) from settings.ENTRA_ROLE_*.
-
-    e.g. token_to_value = {"admin": "Platform.Admin", ...};
-         value_to_token = {"Platform.Admin": "admin", ...}.
-    """
+    """``(token_to_value, value_to_token)`` from ``settings.ENTRA_ROLE_*``."""
     token_to_value = {
         "admin": settings.ENTRA_ROLE_ADMIN,
         "operator": settings.ENTRA_ROLE_OPERATOR,
@@ -87,16 +80,16 @@ def _platform_role_maps() -> tuple[dict, dict]:
 
 
 def group_platform_users(assignments: list, role_id_to_token: dict) -> list:
-    """Group appRoleAssignedTo entries by principal, keep only those whose appRoleId
-    maps to a known platform role token, surface the HIGHEST role, sort by name.
+    """Group assignments by principal, keep the platform roles, surface the highest, sort by name.
 
-    Returns [{principal_id, display_name, principal_type, role}].
+    Returns ``[{principal_id, display_name, principal_type, role}]``; an assignment whose appRoleId
+    maps to no platform role token is left out.
     """
     best: dict[str, dict] = {}
     for a in assignments:
         token = role_id_to_token.get(a.get("appRoleId"))
         if token is None:
-            continue  # foreign / default-access role — not a platform role
+            continue
         pid = a.get("principalId") or ""
         cur = best.get(pid)
         if cur is None or _ROLE_RANK[token] > _ROLE_RANK[cur["role"]]:
@@ -109,35 +102,9 @@ def group_platform_users(assignments: list, role_id_to_token: dict) -> list:
     return sorted(best.values(), key=lambda u: u["display_name"].lower())
 
 
-def platform_assignment_ids_for(
-    assignments: list,
-    principal_id: str,
-    role_id_to_token: dict,
-    exclude_app_role_id: str | None = None,
-) -> list:
-    """All Platform.* appRoleAssignment ids held by ``principal_id`` (foreign roles excluded).
-
-    When ``exclude_app_role_id`` is given, assignments for that appRoleId are skipped — used
-    by change-role to revoke the principal's OTHER platform roles while keeping the one just
-    assigned.
-    """
-    return [
-        a["id"]
-        for a in assignments
-        if a.get("principalId") == principal_id
-        and a.get("appRoleId") in role_id_to_token
-        and a.get("appRoleId") != exclude_app_role_id
-        and a.get("id")
-    ]
-
-
 def _role_id_to_token(role_id_by_value: dict, value_to_token: dict) -> dict:
-    """Invert resolve_platform_sp's {value: id} into {id: token} for known roles."""
-    return {
-        rid: value_to_token[value]
-        for value, rid in role_id_by_value.items()
-        if value in value_to_token
-    }
+    """Invert ``resolve_platform_sp``'s ``{value: id}`` into ``{id: token}`` for the known roles."""
+    return {rid: value_to_token[value] for value, rid in role_id_by_value.items() if value in value_to_token}
 
 
 def _platform_user_from_assignment(assignment: dict, role_id_to_token: dict) -> PlatformUser:
@@ -149,27 +116,19 @@ def _platform_user_from_assignment(assignment: dict, role_id_to_token: dict) -> 
     )
 
 
-# --- routes ------------------------------------------------------------------
-
 @router.get("", response_model=List[PlatformUser])
 async def list_platform_users(
     principal: Principal = RBACDepends(current_principal),
     _=RBACDepends(require_role(Role.ADMIN)),
 ):
-    """List the platform's role-holders (Platform.* assignments on the platform SP)."""
+    """List the platform's role-holders: the Platform.* assignments on the platform SP."""
     from api.routes.grants import get_graph_service
 
     _, value_to_token = _platform_role_maps()
-    try:
-        sp_id, role_id_by_value = await get_graph_service().resolve_platform_sp(
-            _platform_app_client_id()
-        )
-        assignments = await get_graph_service().list_assignments(sp_id)
-    except GraphError:
-        raise HTTPException(status_code=502, detail="Failed to read platform users")
-
-    role_id_to_token = _role_id_to_token(role_id_by_value, value_to_token)
-    return group_platform_users(assignments, role_id_to_token)
+    role_id_by_value, assignments = await platform_role_holders(
+        get_graph_service(), _platform_app_client_id()
+    )
+    return group_platform_users(assignments, _role_id_to_token(role_id_by_value, value_to_token))
 
 
 @router.post("", response_model=PlatformUser, status_code=201)
@@ -182,24 +141,9 @@ async def add_platform_user(
     from api.routes.grants import get_graph_service
 
     token_to_value, value_to_token = _platform_role_maps()
-    if body.role not in token_to_value:
-        raise HTTPException(status_code=400, detail="role must be 'admin', 'operator', or 'viewer'")
-
-    try:
-        sp_id, role_id_by_value = await get_graph_service().resolve_platform_sp(
-            _platform_app_client_id()
-        )
-        app_role_id = role_id_by_value.get(token_to_value[body.role])
-        if not app_role_id:
-            raise HTTPException(status_code=502, detail="Platform role is not configured")
-        assignment = await get_graph_service().assign_app_role(
-            sp_id, body.principal_id, app_role_id
-        )
-    except GraphError as err:
-        if err.status in (400, 409):
-            raise HTTPException(status_code=409, detail="principal already has a platform role")
-        raise HTTPException(status_code=502, detail="Failed to assign the platform role")
-
+    assignment, role_id_by_value = await assign_platform_role(
+        get_graph_service(), _platform_app_client_id(), body.principal_id, token_to_value[body.role]
+    )
     return _platform_user_from_assignment(assignment, _role_id_to_token(role_id_by_value, value_to_token))
 
 
@@ -210,43 +154,22 @@ async def change_platform_role(
     principal: Principal = RBACDepends(current_principal),
     _=RBACDepends(require_role(Role.ADMIN)),
 ):
-    """Set a principal's platform role to EXACTLY one: ASSIGN the new role first, THEN revoke
-    the principal's OTHER Platform.* assignments.
+    """Set a principal's platform role to exactly one: assign the new role, then revoke the others.
 
-    Assign-first is the strictly-safer ordering: a failure AFTER the assign leaves the principal
-    with the new role plus possibly a stale older role (harmless — ``group_platform_users``
-    surfaces the highest; re-issuing the change converges), but NEVER zero access. If the
-    principal already holds the target role, the assign surfaces a 409 (same fixed-detail idiom
-    as onboarding) — a clean signal for an already-set role.
+    The ordering and its failure meanings are ``replace_platform_role``'s; a principal that already
+    holds the target role answers the same 409 as onboarding.
     """
     from api.routes.grants import get_graph_service
 
     token_to_value, value_to_token = _platform_role_maps()
-    if body.role not in token_to_value:
-        raise HTTPException(status_code=400, detail="role must be 'admin', 'operator', or 'viewer'")
-
-    try:
-        sp_id, role_id_by_value = await get_graph_service().resolve_platform_sp(
-            _platform_app_client_id()
-        )
-        role_id_to_token = _role_id_to_token(role_id_by_value, value_to_token)
-        app_role_id = role_id_by_value.get(token_to_value[body.role])
-        if not app_role_id:
-            raise HTTPException(status_code=502, detail="Platform role is not configured")
-        # Assign FIRST so a mid-sequence failure never strips all access.
-        assignment = await get_graph_service().assign_app_role(sp_id, principal_id, app_role_id)
-        # Then revoke the principal's OTHER Platform.* roles (never the one just assigned).
-        assignments = await get_graph_service().list_assignments(sp_id)
-        for aid in platform_assignment_ids_for(
-            assignments, principal_id, role_id_to_token, exclude_app_role_id=app_role_id
-        ):
-            await get_graph_service().revoke_app_role(sp_id, aid)
-    except GraphError as err:
-        if err.status in (400, 409):
-            raise HTTPException(status_code=409, detail="principal already has a platform role")
-        raise HTTPException(status_code=502, detail="Failed to change the platform role")
-
-    return _platform_user_from_assignment(assignment, role_id_to_token)
+    assignment, role_id_by_value = await replace_platform_role(
+        get_graph_service(),
+        _platform_app_client_id(),
+        principal_id,
+        token_to_value[body.role],
+        value_to_token,
+    )
+    return _platform_user_from_assignment(assignment, _role_id_to_token(role_id_by_value, value_to_token))
 
 
 @router.delete("/{principal_id}", status_code=204)
@@ -255,22 +178,9 @@ async def remove_platform_user(
     principal: Principal = RBACDepends(current_principal),
     _=RBACDepends(require_role(Role.ADMIN)),
 ):
-    """Revoke ALL of a principal's Platform.* assignments → 204. None held → 404."""
+    """Revoke every Platform.* assignment the principal holds, answering 204; none held is a 404."""
     from api.routes.grants import get_graph_service
 
     _, value_to_token = _platform_role_maps()
-    try:
-        sp_id, role_id_by_value = await get_graph_service().resolve_platform_sp(
-            _platform_app_client_id()
-        )
-        role_id_to_token = _role_id_to_token(role_id_by_value, value_to_token)
-        assignments = await get_graph_service().list_assignments(sp_id)
-        ids = platform_assignment_ids_for(assignments, principal_id, role_id_to_token)
-        if not ids:
-            raise HTTPException(status_code=404, detail="user has no platform role to remove")
-        for aid in ids:
-            await get_graph_service().revoke_app_role(sp_id, aid)
-    except GraphError:
-        raise HTTPException(status_code=502, detail="Failed to remove platform access")
-
+    await revoke_platform_roles(get_graph_service(), _platform_app_client_id(), principal_id, value_to_token)
     return Response(status_code=204)

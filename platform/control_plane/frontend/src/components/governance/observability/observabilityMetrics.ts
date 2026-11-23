@@ -1,14 +1,5 @@
-// Pure metrics→chart-series shaping for the Observability dashboard (Epic 26 /
-// Task 8). Framework-free so vitest (src/**/*.test.ts only) can unit-test it;
-// the ObservabilityDashboard component keeps its JSX thin and delegates the
-// snake_case→camelCase + palette + empty-state logic here.
-//
-// Input is the C4 /observability/metrics payload (ScopeMetrics = AgentMetrics ⊕
-// by_agent[]). Everything is null-tolerant: a not-configured / no-data scope
-// (or a null fetch result) yields empty arrays + zeroed totals + isEmpty, never
-// throws — so the caller can render a calm empty-state instead of an error.
-import type { ScopeMetrics } from '../../../types';
-import { CHART_COLORS } from '../../govern/mockData';
+import type { ScopeMetrics } from '../../../api/client';
+import { CHART_COLORS } from '../../shared/chartTheme';
 
 export interface TimeseriesPoint {
   date: string; // YYYY-MM-DD
@@ -38,12 +29,19 @@ export interface DashboardSeries {
   byModel: ModelSlice[];
   byAgent: AgentRow[];
   totals: { traces: number; cost: number; tokens: number };
-  /** True when the scope carries no traces, no cost, no tokens and no agents —
-   *  the signal to render a calm "no data yet" card rather than empty charts. */
   isEmpty: boolean;
 }
 
-export function buildDashboardSeries(scope: ScopeMetrics | null | undefined): DashboardSeries {
+/** Inclusive window, both ends as YYYY-MM-DD. */
+export interface DateRange {
+  dateFrom: string;
+  dateTo: string;
+}
+
+export function buildDashboardSeries(
+  scope: ScopeMetrics | null | undefined,
+  range?: DateRange,
+): DashboardSeries {
   const daily = scope?.daily ?? [];
   const models = scope?.by_model ?? [];
   const agents = scope?.by_agent ?? [];
@@ -54,7 +52,13 @@ export function buildDashboardSeries(scope: ScopeMetrics | null | undefined): Da
     tokens: scope?.totals?.tokens ?? 0,
   };
 
-  const timeseries: TimeseriesPoint[] = daily.map((d) => ({
+  // Langfuse's daily read can return a bucket dated 1970-01-01 for an observation with no usable timestamp.
+  const inRange = (date: string) => {
+    if (!range) return true;
+    const day = (date ?? '').slice(0, 10);
+    return day >= range.dateFrom && day <= range.dateTo;
+  };
+  const timeseries: TimeseriesPoint[] = daily.filter((d) => inRange(d.date)).map((d) => ({
     date: d.date,
     traces: d.traces,
     cost: d.cost_usd,
@@ -87,9 +91,6 @@ export function buildDashboardSeries(scope: ScopeMetrics | null | undefined): Da
   return { timeseries, byModel, byAgent, totals, isEmpty };
 }
 
-// defaultDateRange — a `days`-wide inclusive window ending "today", formatted as
-// YYYY-MM-DD in UTC (the wire format the Langfuse metrics API expects). Default
-// 30 days. `now` is injectable so the range is deterministic under test.
 export function defaultDateRange(now: Date = new Date(), days = 30): { dateFrom: string; dateTo: string } {
   const fmt = (d: Date) => d.toISOString().slice(0, 10);
   const from = new Date(now.getTime());

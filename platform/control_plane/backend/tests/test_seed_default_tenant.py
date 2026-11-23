@@ -1,13 +1,13 @@
-"""Offline tests for ``scripts/seed_default_tenant.py`` (E24/T9).
+"""Offline tests for ``scripts/seed_default_tenant.py``.
 
-Pure-logic tests via injected in-memory fakes (NO moto, NO boto3 — research §10):
-the script's ``run()`` takes the four services as parameters, so no AWS client is
-ever constructed here. Every test injects an explicit ``account_id``/``region`` so
-STS is NEVER called (there is no hardcoded account anywhere — the real run derives
-it from the caller's credentials). Mirrors the ``test_demo_use_cases.py`` idiom of
-putting the backend dir on ``sys.path`` so ``import scripts.<mod>`` resolves.
+Pure-logic tests via injected in-memory fakes (no moto, no boto3): the script's
+``run()`` takes the four services as parameters, so no AWS client is ever constructed
+here. Every test injects an explicit ``account_id``/``region`` so STS is never called
+(there is no hardcoded account anywhere — the real run derives it from the caller's
+credentials). The backend dir goes on ``sys.path`` so ``import scripts.<mod>`` resolves,
+as in ``test_demo_use_cases.py``.
 
-Coverage (task brief Step 1):
+Coverage:
   1. Seeding creates the ``default`` tenant exactly once, with the contract fields
      (name/LoB/groups/injected accounts/region); the CLI account override wins
      over STS.
@@ -21,30 +21,24 @@ Coverage (task brief Step 1):
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from botocore.exceptions import NoCredentialsError, ProfileNotFound
 
-# The backend dir on sys.path makes `scripts` importable as a namespace package
-# (same shim as tests/test_demo_use_cases.py). The script itself is import-safe:
-# stdlib-only at module top, everything else lazily imported.
 _BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-import scripts.seed_default_tenant as seed  # noqa: E402 — after sys.path shim
+seed = importlib.import_module("scripts.seed_default_tenant")
 
 GROUP_ID = "11111111-2222-3333-4444-555555555555"
-# Injected account/region — arbitrary test values, NOT any real environment's.
 ACCOUNT_ID = "111122223333"
 REGION = "eu-central-1"
-
-
-# ---------------------------------------------------------------------------
-# In-memory fakes (no AWS, no moto)
-# ---------------------------------------------------------------------------
 
 
 class FakeTenantService:
@@ -105,7 +99,7 @@ def _services(agents=(), mcps=(), projects=(), tenants=()):
     }
 
 
-def _run(svcs, *, dry_run=False, account_id=ACCOUNT_ID, region=REGION, **wiring):
+def _run(svcs, *, dry_run=False, account_id: str | None = ACCOUNT_ID, region: str | None = REGION, **wiring):
     """Drive ``run()`` with an injected account/region (the ``--account-id`` /
     ``--region`` CLI path) so tests never resolve anything via STS or env. Extra
     ``**wiring`` kwargs (``dev_ecr_uri``/``*_role_arn`` …) pass through to ``run()``."""
@@ -119,11 +113,6 @@ def _run(svcs, *, dry_run=False, account_id=ACCOUNT_ID, region=REGION, **wiring)
     )
 
 
-# ---------------------------------------------------------------------------
-# 1. Default tenant creation
-# ---------------------------------------------------------------------------
-
-
 def test_seed_creates_default_tenant_with_contract_fields():
     svcs = _services()
     rc = _run(svcs)
@@ -134,7 +123,6 @@ def test_seed_creates_default_tenant_with_contract_fields():
     assert tenant.name == "Default-Platform"
     assert tenant.line_of_business == "Platform"
     assert tenant.entra_group_ids == [GROUP_ID]
-    # E25 nested shape: both stages point at the injected account/region.
     assert tenant.stages["dev"].account_id == ACCOUNT_ID
     assert tenant.stages["prod"].account_id == ACCOUNT_ID
     assert tenant.stages["dev"].region == REGION
@@ -148,15 +136,15 @@ def test_cli_account_override_wins_over_sts(monkeypatch):
     up, yet the run succeeds with the injected account."""
 
     class _PoisonedBoto3:
-        def client(self, *args, **kwargs):  # pragma: no cover — must not run
+        def client(self, *args, **kwargs):
             raise AssertionError("STS must not be called when --account-id is given")
 
-        def __getattr__(self, name):  # pragma: no cover — must not run
+        def __getattr__(self, name):
             raise AssertionError("boto3 must not be touched when --account-id is given")
 
     monkeypatch.setitem(sys.modules, "boto3", _PoisonedBoto3())
     svcs = _services()
-    rc = _run(svcs)  # _run always injects account_id → the STS branch is bypassed
+    rc = _run(svcs)
 
     assert rc == 0
     tenant = svcs["tenant_service"].store["default"]
@@ -176,7 +164,7 @@ def test_explicit_account_id_reaches_both_stages():
 
 
 def test_wiring_values_land_on_stage_configs():
-    """The E25 ECR/role-ARN wiring kwargs land on the matching per-stage config."""
+    """The ECR/role-ARN wiring kwargs land on the matching per-stage config."""
     svcs = _services()
     rc = _run(
         svcs,
@@ -200,7 +188,7 @@ def test_wiring_values_land_on_stage_configs():
 
 def test_build_default_tenant_yields_nested_stages():
     """Unit-level: ``_build_default_tenant`` returns nested stages with the passed
-    ecr/role values (task brief Step 1 assertion)."""
+    ecr/role values."""
     tenant = seed._build_default_tenant(
         GROUP_ID,
         account_id=ACCOUNT_ID,
@@ -224,7 +212,7 @@ def test_second_run_does_not_recreate_tenant():
     rc = _run(svcs)
 
     assert rc == 0
-    assert svcs["tenant_service"].upsert_calls == 1  # created ONCE
+    assert svcs["tenant_service"].upsert_calls == 1
     assert list(svcs["tenant_service"].store) == ["default"]
 
 
@@ -238,14 +226,6 @@ def test_pre_existing_default_tenant_is_not_rewritten():
     assert svcs["tenant_service"].store["default"] is existing
 
 
-# ---------------------------------------------------------------------------
-# 1b. Wire-when-empty — the I3 fix: an UPGRADED install has an existing but
-#     UNWIRED default tenant. A run that carries wiring values re-wires it in
-#     place; an already-wired (operator-touched) tenant is never clobbered; a
-#     run with no wiring values stays a no-op on an existing tenant.
-# ---------------------------------------------------------------------------
-
-
 def test_run_wires_existing_unwired_tenant(capsys):
     """Exists + UNWIRED (empty ecr/deploy-role on both stages) + this run carries
     wiring ⇒ RE-WIRE in place; status 'wired'. Identity is preserved: with
@@ -256,8 +236,8 @@ def test_run_wires_existing_unwired_tenant(capsys):
 
     rc = _run(
         svcs,
-        account_id=None,  # not supplied → preserve the existing tenant's account
-        region=None,      # not supplied → preserve the existing tenant's region
+        account_id=None,
+        region=None,
         dev_ecr_uri="dev-ecr",
         prod_ecr_uri="prod-ecr",
         dev_deploy_role_arn="arn:dev-deploy",
@@ -267,20 +247,36 @@ def test_run_wires_existing_unwired_tenant(capsys):
     )
 
     assert rc == 0
-    assert svcs["tenant_service"].upsert_calls == 1  # re-wired exactly once
+    assert svcs["tenant_service"].upsert_calls == 1
     tenant = svcs["tenant_service"].store["default"]
-    # Wiring landed on both stages.
     assert tenant.stages["dev"].ecr_repo_uri == "dev-ecr"
     assert tenant.stages["prod"].ecr_repo_uri == "prod-ecr"
     assert tenant.stages["dev"].deploy_role_arn == "arn:dev-deploy"
     assert tenant.stages["prod"].deploy_role_arn == "arn:prod-deploy"
     assert tenant.stages["dev"].push_role_arn == "arn:dev-push"
     assert tenant.stages["prod"].push_role_arn == "arn:prod-push"
-    # Identity preserved (account/region/group carried over from the existing tenant).
     assert tenant.stages["dev"].account_id == ACCOUNT_ID
     assert tenant.stages["dev"].region == REGION
     assert tenant.entra_group_ids == [GROUP_ID]
     assert "tenant=wired" in capsys.readouterr().out
+
+
+def test_rewiring_a_tenant_with_no_identity_to_preserve_is_a_clear_error():
+    """An unwired tenant whose dev stage carries no account or region, with no overrides on
+    the command line, cannot be re-wired: the run names the flags instead of handing
+    ``None`` to the tenant model."""
+    existing = SimpleNamespace(
+        id="default",
+        stages={"dev": SimpleNamespace(deploy_role_arn="", ecr_repo_uri=""), "prod": SimpleNamespace()},
+        entra_group_ids=[],
+    )
+    svcs = _services(tenants=[existing])
+
+    with pytest.raises(RuntimeError) as exc:
+        seed.run(group_id="", dry_run=False, account_id=None, region=None, dev_ecr_uri="dev-ecr", **svcs)
+
+    assert "--account-id" in str(exc.value)
+    assert svcs["tenant_service"].upsert_calls == 0
 
 
 def test_run_leaves_wired_tenant_untouched(capsys):
@@ -307,9 +303,9 @@ def test_run_leaves_wired_tenant_untouched(capsys):
     )
 
     assert rc == 0
-    assert svcs["tenant_service"].upsert_calls == 0  # NOT rewritten
+    assert svcs["tenant_service"].upsert_calls == 0
     tenant = svcs["tenant_service"].store["default"]
-    assert tenant is existing  # the exact same object, untouched
+    assert tenant is existing
     assert tenant.stages["dev"].ecr_repo_uri == "orig-dev-ecr"
     assert tenant.stages["dev"].deploy_role_arn == "arn:orig-dev-deploy"
     assert "tenant=exists" in capsys.readouterr().out
@@ -321,19 +317,14 @@ def test_run_no_wiring_values_is_noop_on_existing(capsys):
     existing = seed._build_default_tenant(GROUP_ID, account_id=ACCOUNT_ID, region=REGION)
     svcs = _services(tenants=[existing])
 
-    rc = _run(svcs)  # no wiring flags
+    rc = _run(svcs)
 
     assert rc == 0
     assert svcs["tenant_service"].upsert_calls == 0
     tenant = svcs["tenant_service"].store["default"]
     assert tenant is existing
-    assert tenant.stages["dev"].ecr_repo_uri == ""  # still unwired
+    assert tenant.stages["dev"].ecr_repo_uri == ""
     assert "tenant=exists" in capsys.readouterr().out
-
-
-# ---------------------------------------------------------------------------
-# 2. Bulk stamping — missing tenant_id gets "default"
-# ---------------------------------------------------------------------------
 
 
 def test_unstamped_records_get_stamped_default():
@@ -345,13 +336,10 @@ def test_unstamped_records_get_stamped_default():
     rc = _run(svcs)
 
     assert rc == 0
-    # Agents: only a1 was missing — stamped via persist_identity.
     assert [r.id for r in svcs["agent_service"].persist_calls] == ["a1"]
     assert agents[0].tenant_id == "default"
-    # MCP servers: m1 stamped via persist_identity.
     assert [r.id for r in svcs["mcp_server_service"].persist_calls] == ["m1"]
     assert mcps[0].tenant_id == "default"
-    # Projects: both stamped via _save_project.
     assert [r.id for r in svcs["project_service"].save_calls] == ["p1", "p2"]
     assert all(p.tenant_id == "default" for p in projects)
 
@@ -368,13 +356,8 @@ def test_already_stamped_records_are_untouched():
     assert svcs["agent_service"].persist_calls == []
     assert svcs["mcp_server_service"].persist_calls == []
     assert svcs["project_service"].save_calls == []
-    assert agents[0].tenant_id == "ten-claims"  # never rewritten to "default"
+    assert agents[0].tenant_id == "ten-claims"
     assert mcps[0].tenant_id == "ten-uw"
-
-
-# ---------------------------------------------------------------------------
-# 3. Idempotency — second run writes nothing
-# ---------------------------------------------------------------------------
 
 
 def test_second_run_performs_zero_writes():
@@ -396,12 +379,7 @@ def test_second_run_performs_zero_writes():
         len(svcs["mcp_server_service"].persist_calls),
         len(svcs["project_service"].save_calls),
     )
-    assert second == first  # NOTHING new was written
-
-
-# ---------------------------------------------------------------------------
-# 4. --dry-run — pure listing, zero writes, zero mutation
-# ---------------------------------------------------------------------------
+    assert second == first
 
 
 def test_dry_run_writes_nothing_and_mutates_nothing(capsys):
@@ -418,11 +396,9 @@ def test_dry_run_writes_nothing_and_mutates_nothing(capsys):
     assert svcs["agent_service"].persist_calls == []
     assert svcs["mcp_server_service"].persist_calls == []
     assert svcs["project_service"].save_calls == []
-    # No in-place mutation either — the records still miss tenant_id.
     assert agents[0].tenant_id is None
     assert mcps[0].tenant_id is None
     assert projects[0].tenant_id is None
-    # Would-stamp counts are reported.
     out = capsys.readouterr().out
     assert "agents=1/2" in out
     assert "mcp_servers=1/1" in out
@@ -438,11 +414,6 @@ def test_summary_counts_printed(capsys):
     assert "agents=2/2" in out
     assert "mcp_servers=0/0" in out
     assert "projects=0/1" in out
-
-
-# ---------------------------------------------------------------------------
-# 5. Defensive behavior
-# ---------------------------------------------------------------------------
 
 
 def test_unconfigured_service_is_skipped():
@@ -470,8 +441,7 @@ def test_stamp_failure_continues_and_returns_nonzero():
 
     rc = _run(svcs)
 
-    assert rc == 1  # failure surfaced in the exit code
-    # ... but the second record was still stamped (log-and-continue).
+    assert rc == 1
     assert [r.id for r in svcs["agent_service"].persist_calls] == ["a2"]
 
 
@@ -482,24 +452,14 @@ def test_main_requires_group_id(monkeypatch):
     assert seed.main(["--dry-run"]) == 2
 
 
-# ---------------------------------------------------------------------------
-# 6. Infra config parsing — terraform.tfvars under tmp_path (E24 fix, E34/T10)
-#    Never touches the REAL infrastructure dir, terraform, or STS.
-# ---------------------------------------------------------------------------
-
-# Every key the resolver reads, in ``terraform.tfvars`` syntax — the only config file
-# this script reads. The account is NOT among them: it comes from the caller's
-# credentials (see §7b), so tests that need one fake an STS identity instead.
 _FULL_TFVARS = (
     'aws_region   = "us-east-1"\n'
     'project_name = "agp"\n'
-    'environment  = "dev"\n'
+    'environment  = "test-fixture"\n'
     'agent_registry_id = "RegAgents"\n'
     'mcp_registry_id   = "RegMcp"\n'
 )
 
-# The same shape as a phantom ``infrastructure/.env`` — nothing reads it any more
-# (E34/T10 removed the ``.env`` leg), so writing it must never change an outcome.
 _STRAY_ENV = (
     "AWS_REGION=eu-west-1\n"
     "PROJECT_NAME=stray\n"
@@ -543,16 +503,12 @@ def test_parse_tfvars_scalars_skip_blocks_and_inline_comments(tmp_path):
         ),
     )
     cfg = seed._load_infra_config(infra)
-    # Keys are normalized to UPPER_SNAKE.
     assert cfg["AWS_REGION"] == "us-east-1"
     assert cfg["ENVIRONMENT"] == "dev"
     assert cfg["PROJECT_NAME"] == "agp"
     assert cfg["AGENT_REGISTRY_ID"] == "RegBBBB"
     assert cfg["MCP_REGISTRY_ID"] == "RegCCCC"
-    # Inline comment after a bare number is dropped.
     assert cfg["ECS_TASK_CPU"] == "512"
-    # Empty string, list, and the tags block are skipped gracefully — critically,
-    # the keys INSIDE the tags block (Project/ManagedBy) never leak out.
     assert "HOSTED_ZONE_ID" not in cfg
     assert "AVAILABILITY_ZONES" not in cfg
     assert "TAGS" not in cfg
@@ -573,10 +529,10 @@ def test_a_stray_env_file_is_ignored_entirely(tmp_path):
     cfg = seed._load_infra_config(infra)
     assert cfg["AWS_REGION"] == "us-east-1"
     assert cfg["PROJECT_NAME"] == "agp"
-    assert cfg["ENVIRONMENT"] == "dev"
+    assert cfg["ENVIRONMENT"] == "test-fixture"
     assert cfg["AGENT_REGISTRY_ID"] == "RegAgents"
     assert cfg["MCP_REGISTRY_ID"] == "RegMcp"
-    assert "VPC_ID" not in cfg  # a key ONLY the stray .env carries never appears
+    assert "VPC_ID" not in cfg
 
 
 def test_a_stray_env_file_alone_yields_an_empty_config(tmp_path):
@@ -588,8 +544,8 @@ def test_a_stray_env_file_alone_yields_an_empty_config(tmp_path):
 
 def test_the_env_parser_no_longer_exists():
     """Guard against the ``.env`` leg being reintroduced by a future copy-paste: the
-    parser itself is gone from both clone scripts (E34/T10), and with a single config
-    file there is no per-key precedence left to encode."""
+    parser itself is gone from both clone scripts, and with a single config file there is
+    no per-key precedence left to encode."""
     assert not hasattr(seed, "_parse_env_file")
     assert not hasattr(seed, "DERIVATION_KEYS")
 
@@ -600,11 +556,6 @@ def test_missing_infra_files_yield_empty_config(tmp_path):
     assert seed._load_infra_config(infra) == {}
 
 
-# ---------------------------------------------------------------------------
-# 7. Runtime config resolution — CLI > terraform.tfvars > derivation > hard error
-# ---------------------------------------------------------------------------
-
-
 class _StsBoto3:
     """Minimal ``boto3`` stand-in: ``client("sts").get_caller_identity()`` returns the
     configured account. Injected into ``sys.modules`` so the script's lazy ``import boto3``
@@ -613,17 +564,17 @@ class _StsBoto3:
     def __init__(self, account: str) -> None:
         self._account = account
 
-    def client(self, service):
+    def client(self, service, **kwargs):
         assert service == "sts"
         return SimpleNamespace(get_caller_identity=lambda: {"Account": self._account})
 
 
 class _UnreachableBoto3:
     """``boto3`` stand-in whose STS client cannot be built — models "no credentials / no
-    network"; the script treats ANY such failure as "the account cannot be derived"."""
+    network"; the script treats a botocore failure as "the account cannot be derived"."""
 
-    def client(self, service):
-        raise RuntimeError("Unable to locate credentials")
+    def client(self, service, **kwargs):
+        raise NoCredentialsError()
 
 
 def _fake_sts(monkeypatch, account: str) -> None:
@@ -638,7 +589,7 @@ def _unreachable_sts(monkeypatch) -> None:
 
 def _args(infra_dir, **overrides):
     """A parse_args-shaped namespace with every config flag defaulted to None."""
-    base = dict(
+    base: dict[str, Any] = dict(
         infra_dir=str(infra_dir),
         region=None,
         account_id=None,
@@ -686,9 +637,8 @@ def test_resolution_tfvars_beats_derivation(tmp_path, monkeypatch):
     assert cfg["account_id"] == "111122223333"
     assert cfg["agent_registry_id"] == "RegAgents"
     assert cfg["mcp_registry_id"] == "RegMcp"
-    # Derived table names use Terraform's rule with the last 6 account digits.
-    assert cfg["tenants_table"] == "agp-cp-dev-223333-tenants"
-    assert cfg["projects_table"] == "agp-cp-dev-223333-projects"
+    assert cfg["tenants_table"] == "agp-cp-test-fixture-223333-tenants"
+    assert cfg["projects_table"] == "agp-cp-test-fixture-223333-projects"
 
 
 def test_resolution_derived_tables_use_injected_sts_account(tmp_path, monkeypatch):
@@ -699,58 +649,48 @@ def test_resolution_derived_tables_use_injected_sts_account(tmp_path, monkeypatc
         tfvars_text=(
             'aws_region   = "us-east-1"\n'
             'project_name = "agp"\n'
-            'environment  = "dev"\n'
+            'environment  = "test-fixture"\n'
             'agent_registry_id = "RegAgents"\n'
         ),
     )
     cfg = seed._resolve_runtime_config(_args(infra))
     assert cfg["account_id"] == "444455556666"
-    assert cfg["tenants_table"] == "agp-cp-dev-556666-tenants"
-    assert cfg["projects_table"] == "agp-cp-dev-556666-projects"
-    assert cfg["mcp_registry_id"] is None  # optional — resolves to None, no error
+    assert cfg["tenants_table"] == "agp-cp-test-fixture-556666-tenants"
+    assert cfg["projects_table"] == "agp-cp-test-fixture-556666-projects"
+    assert cfg["mcp_registry_id"] is None
 
 
 def test_resolution_derived_tables_ignore_a_stray_env_file(tmp_path, monkeypatch):
-    """E24's bug fix, restated for the post-.env contract: Terraform only ever read the
-    TFVARS project_name/environment for name_prefix, so the REAL tables are
-    agp-cp-dev-…. A stray ``.env`` claiming PROJECT_NAME=stray/ENVIRONMENT=prod cannot
+    """Terraform only ever read the TFVARS project_name/environment for name_prefix, so the
+    REAL tables are
+    agp-cp-test-fixture-…. A stray ``.env`` claiming PROJECT_NAME=stray/ENVIRONMENT=prod cannot
     skew the derivation onto tables that do not exist — nor can it move the region."""
     _fake_sts(monkeypatch, "111122223333")
     infra = _write_infra(
         tmp_path,
         tfvars_text=(
             'project_name = "agp"\n'
-            'environment  = "dev"\n'
+            'environment  = "test-fixture"\n'
             'aws_region   = "us-east-1"\n'
             'agent_registry_id = "RegAgents"\n'
         ),
         stray_env_text=_STRAY_ENV,
     )
     cfg = seed._resolve_runtime_config(_args(infra))
-    assert cfg["region"] == "us-east-1"  # not the stray .env's eu-west-1
-    assert cfg["agent_registry_id"] == "RegAgents"  # not RegFromStrayEnv
-    assert cfg["tenants_table"] == "agp-cp-dev-223333-tenants"
-    assert cfg["projects_table"] == "agp-cp-dev-223333-projects"
-
-
-# ---------------------------------------------------------------------------
-# 7b. The account comes from the CREDENTIALS, not from any file.
-#
-#     The script runs with AWS credentials, and those credentials already say which
-#     account it is acting on — so the account is resolved from --account-id, else STS
-#     get-caller-identity, and NEVER from the infra files. That matters because the
-#     account both DERIVES the DynamoDB table names
-#     (<project>-cp-<env>-<last-6-of-account>-{tenants,projects}) and is stamped onto
-#     the seeded tenant's stages.dev/prod.account_id: a checked-in copy of it is a
-#     second answer that can silently disagree with the live one.
-# ---------------------------------------------------------------------------
+    assert cfg["region"] == "us-east-1"
+    assert cfg["agent_registry_id"] == "RegAgents"
+    assert cfg["tenants_table"] == "agp-cp-test-fixture-223333-tenants"
+    assert cfg["projects_table"] == "agp-cp-test-fixture-223333-projects"
 
 
 def test_account_comes_from_sts_and_ignores_the_infra_files(tmp_path, monkeypatch):
     """An account id left in the infra files has NO effect: the caller's STS account is
-    what resolves and what the table names derive from. This is the regression guard — that
-    key used to outrank the live credentials, so a stale value derived table names for an
-    account the caller cannot even reach and died on a bare ResourceNotFoundException."""
+    what resolves and what the table names derive from. The credentials already say which
+    account the script acts on, and that account both derives the table names and is
+    stamped onto the tenant's stages, so a checked-in copy is a second answer that can
+    silently disagree with the live one. This is the regression guard — that key used to
+    outrank the live credentials, so a stale value derived table names for an account the
+    caller cannot even reach and died on a bare ResourceNotFoundException."""
     _fake_sts(monkeypatch, "444455556666")
     infra = _write_infra(
         tmp_path,
@@ -760,9 +700,9 @@ def test_account_comes_from_sts_and_ignores_the_infra_files(tmp_path, monkeypatc
 
     cfg = seed._resolve_runtime_config(_args(infra))
 
-    assert cfg["account_id"] == "444455556666"  # the credentials', not the file's
-    assert cfg["tenants_table"] == "agp-cp-dev-556666-tenants"
-    assert cfg["projects_table"] == "agp-cp-dev-556666-projects"
+    assert cfg["account_id"] == "444455556666"
+    assert cfg["tenants_table"] == "agp-cp-test-fixture-556666-tenants"
+    assert cfg["projects_table"] == "agp-cp-test-fixture-556666-projects"
 
 
 def test_cli_account_flag_beats_sts(tmp_path, monkeypatch):
@@ -771,10 +711,10 @@ def test_cli_account_flag_beats_sts(tmp_path, monkeypatch):
     STS touch blows up, yet the run resolves the flag's account."""
 
     class _PoisonedBoto3:
-        def client(self, *args, **kwargs):  # pragma: no cover — must not run
+        def client(self, *args, **kwargs):
             raise AssertionError("STS must not be consulted when --account-id is given")
 
-        def __getattr__(self, name):  # pragma: no cover — must not run
+        def __getattr__(self, name):
             raise AssertionError("boto3 must not be touched when --account-id is given")
 
     monkeypatch.setitem(sys.modules, "boto3", _PoisonedBoto3())
@@ -783,7 +723,7 @@ def test_cli_account_flag_beats_sts(tmp_path, monkeypatch):
     cfg = seed._resolve_runtime_config(_args(infra, account_id="999988887777"))
 
     assert cfg["account_id"] == "999988887777"
-    assert cfg["tenants_table"] == "agp-cp-dev-887777-tenants"
+    assert cfg["tenants_table"] == "agp-cp-test-fixture-887777-tenants"
 
 
 def test_unreachable_sts_degrades_to_the_placeholder_in_dry_run(tmp_path, monkeypatch):
@@ -796,9 +736,7 @@ def test_unreachable_sts_degrades_to_the_placeholder_in_dry_run(tmp_path, monkey
         tfvars_text='aws_region = "us-east-1"\nagent_registry_id = "RegAgents"\n',
     )
 
-    cfg = seed._resolve_runtime_config(
-        _args(infra, dry_run=True, tenants_table="t", projects_table="p")
-    )
+    cfg = seed._resolve_runtime_config(_args(infra, dry_run=True, tenants_table="t", projects_table="p"))
 
     assert cfg["account_id"] == seed.ACCOUNT_PLACEHOLDER
 
@@ -821,7 +759,7 @@ def test_unreachable_sts_raises_in_a_real_run(tmp_path, monkeypatch):
 def test_malformed_account_flag_is_rejected(tmp_path, monkeypatch):
     """The 12-digit rule applies to the flag too, and in --dry-run as well: a malformed
     --account-id is a caller error, and previewing a plan built on it is pointless."""
-    _unreachable_sts(monkeypatch)  # must never be reached — the flag is checked first
+    _unreachable_sts(monkeypatch)
     infra = _write_infra(tmp_path, tfvars_text=_FULL_TFVARS)
 
     with pytest.raises(RuntimeError) as exc:
@@ -842,24 +780,53 @@ def test_malformed_sts_account_is_rejected(tmp_path, monkeypatch):
     assert "12-digit" in str(exc.value)
 
 
+def test_resolve_region_without_any_source_degrades_only_in_dry_run(monkeypatch):
+    """No --region, no AWS_REGION/AWS_DEFAULT_REGION and a boto3 session with no region:
+    dry-run continues with the placeholder, a real run refuses to guess."""
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.setitem(
+        sys.modules, "boto3", SimpleNamespace(Session=lambda: SimpleNamespace(region_name=None))
+    )
+
+    assert seed._resolve_region(None, dry_run=True) == seed.REGION_PLACEHOLDER
+    with pytest.raises(RuntimeError) as exc:
+        seed._resolve_region(None, dry_run=False)
+    assert "--region" in str(exc.value)
+
+
+def test_resolve_region_treats_a_broken_boto3_profile_as_unresolved(monkeypatch):
+    """A botocore failure while building the session (a missing profile) is "no region
+    configured", not a crash."""
+
+    def _broken_session():
+        raise ProfileNotFound(profile="missing")
+
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(Session=_broken_session))
+
+    assert seed._resolve_region(None, dry_run=True) == seed.REGION_PLACEHOLDER
+
+
 def test_resolution_missing_region_is_clear_error(tmp_path):
     infra = _write_infra(
         tmp_path,
         tfvars_text='project_name = "agp"\nenvironment = "dev"\n',
-        stray_env_text="AWS_REGION=eu-west-1\n",  # phantom file: no effect
+        stray_env_text="AWS_REGION=eu-west-1\n",
     )
     with pytest.raises(RuntimeError) as exc:
         seed._resolve_runtime_config(_args(infra))
     msg = str(exc.value)
     assert "--region" in msg
     assert "terraform.tfvars" in msg
-    # No source that does not exist is named — the phantom .env is gone.
     assert ".env" not in msg
 
 
 def test_resolution_missing_agent_registry_is_clear_error(tmp_path, monkeypatch):
-    # The account resolves before the registry check, so give the caller an STS identity —
-    # otherwise an unreachable-STS error would abort first and mask the error under test.
+    """The account resolves before the registry check, so the caller gets an STS identity.
+    ``terraform.tfvars`` is not named as a source: the root variable no longer exists, so
+    setting an id there only draws an undeclared-variable warning from Terraform."""
     _fake_sts(monkeypatch, "111122223333")
     infra = _write_infra(tmp_path, tfvars_text='aws_region = "us-east-1"\n')
     with pytest.raises(RuntimeError) as exc:
@@ -867,6 +834,7 @@ def test_resolution_missing_agent_registry_is_clear_error(tmp_path, monkeypatch)
     msg = str(exc.value)
     assert "--agent-registry-id" in msg
     assert "resolves the registry by NAME at runtime" in msg
+    assert "terraform.tfvars" not in msg
     assert ".env" not in msg
 
 
@@ -894,8 +862,6 @@ def test_explicit_table_overrides_skip_derivation(tmp_path, monkeypatch):
         tmp_path,
         tfvars_text='aws_region = "us-east-1"\nagent_registry_id = "RegAgents"\n',
     )
-    cfg = seed._resolve_runtime_config(
-        _args(infra, tenants_table="my-tenants", projects_table="my-projects")
-    )
+    cfg = seed._resolve_runtime_config(_args(infra, tenants_table="my-tenants", projects_table="my-projects"))
     assert cfg["tenants_table"] == "my-tenants"
     assert cfg["projects_table"] == "my-projects"

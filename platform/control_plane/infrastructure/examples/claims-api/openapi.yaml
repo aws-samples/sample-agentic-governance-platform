@@ -1,0 +1,105 @@
+openapi: 3.0.3
+info:
+  title: Claims API
+  version: 1.0.0
+  description: Demo insurance claims API (policies and claims), fronted by an AgentCore Gateway.
+servers:
+  # Replace with this fixture's `invoke_url` output before committing to a gateway repo.
+  - url: https://REPLACE-ME.example.com
+security:
+  - apiKey: []
+paths:
+  /policies/{policyId}:
+    get:
+      operationId: getPolicy
+      summary: Get an insurance policy (holder, product, status, coverage) by its id
+      parameters:
+        - name: policyId
+          in: path
+          required: true
+          description: Policy id, e.g. POL-1001
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The policy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policyId: { type: string }
+                  holder: { type: string }
+                  product: { type: string }
+                  status: { type: string }
+                  coverage: { type: object }
+        "404":
+          description: No policy with that id
+  /claims:
+    post:
+      operationId: openClaim
+      summary: Open a new claim against a policy; returns the new claim id with status "received"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [policyId, description]
+              properties:
+                policyId:
+                  type: string
+                  description: Policy the claim is filed against
+                description:
+                  type: string
+                  description: What happened
+                incidentDate:
+                  type: string
+                  format: date
+                  description: Date of the incident (YYYY-MM-DD), optional
+      responses:
+        "201":
+          description: The claim was received
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claimId: { type: string }
+                  policyId: { type: string }
+                  description: { type: string }
+                  incidentDate: { type: string }
+                  status: { type: string }
+        "400":
+          description: Invalid request body
+        "404":
+          description: No policy with that id
+  /claims/{claimId}:
+    get:
+      operationId: getClaimStatus
+      summary: Get the status of a claim by its id
+      parameters:
+        - name: claimId
+          in: path
+          required: true
+          description: Claim id, e.g. CLM-2026-0001
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The claim status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claimId: { type: string }
+                  status: { type: string }
+        "404":
+          description: No claim with that id
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: x-api-key

@@ -22,9 +22,17 @@ name: build
 # `concurrency` is load-bearing, not hygiene. The platform build runs `terraform apply`
 # against ONE state per agent, and a live test saw two builds start 11 seconds apart, race
 # that state lock, and leave the loser failed while the winner deployed a stale image — with
-# the platform's own record claiming success. Keying the group on the ref makes a second push
-# QUEUE instead of race. `cancel-in-progress: false` because a deploy already in flight must
-# be allowed to FINISH: killing it halfway abandons the lock and half-applies the runtime.
+# the platform's own record claiming success. Keying the group on the ref queues a second
+# WORKFLOW RUN, but that alone is NOT the fix (LIVEFIX, E30 dev deploy): a workflow run is
+# "done" the instant this job's `fetch` returns, seconds after AGP answers 202 — long before
+# CodeBuild's async `terraform apply` actually finishes. So the next queued run's `trigger`
+# job could still fire while the previous apply was running. The real serialization is AGP's:
+# `POST /builds/runtime` now answers 409 while a build for this agent+stage is in flight, and
+# the script below polls on that 409 until it clears (or the job's own timeout). `concurrency`
+# still matters — it stops two trigger jobs for the same ref from both polling at once — but it
+# is not what makes the applies serialize; the 409 retry loop is. `cancel-in-progress: false`
+# because a deploy already in flight must be allowed to FINISH: killing it halfway abandons the
+# lock and half-applies the runtime.
 #
 # What AGP is told is the image DIGEST, not just the tag. A tag is mutable and can be
 # overwritten between the build that tested it and the deploy that ships it; a digest names
@@ -79,7 +87,7 @@ jobs:
           # (which audits the whole environment) doesn't hard-fail on a setuptools/pip
           # CVE the agent never declares. Pins forward past PYSEC-2026-3447.
           pip install --upgrade 'setuptools>=83.0.0'
-          pip install -e ".[dev]"
+          pip install -c constraints.txt -e ".[dev]"
 
       - name: Lint (ruff)
         run: ruff check src tests
@@ -176,7 +184,6 @@ jobs:
           IMAGE_DIGEST: ${{ needs.build.outputs.image_digest }}
         with:
           script: |
-            const token = await core.getIDToken('agp-runtime-build');
             // The digest is what AGP deploys and what it records for a later promotion; the
             // tag rides along as a human-readable label and for pre-digest readers.
             const body = {
@@ -191,15 +198,39 @@ jobs:
               core.setFailed(`Refusing to POST an unusable image digest: ${body.image_digest}`);
               return;
             }
-            const resp = await fetch('${{ vars.AGP_API_URL }}/builds/runtime', {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify(body),
-            });
-            const text = await resp.text();
+            // LIVEFIX (E30 dev deploy): AGP answers 409 (not 202) while a build for this
+            // agent+stage is already running — see builds.py's start_runtime_build route. Poll
+            // on that 409 instead of failing the job, so a second push genuinely WAITS for the
+            // first apply to finish rather than racing its terraform state lock. Bounded so a
+            // stuck prior build fails this job eventually instead of hanging forever.
+            const maxWaitMs = 20 * 60 * 1000;
+            const pollMs = 20 * 1000;
+            const started = Date.now();
+            let resp;
+            let text;
+            while (true) {
+              // Minted INSIDE the loop, not once before it: OIDC tokens expire ~5 min in,
+              // the backend checks expiry with 60s leeway (security_github_oidc.py), and
+              // this poll can legitimately run up to maxWaitMs (20 min) — a token fetched
+              // before the loop would be stale and 401 on any wait past ~4 min.
+              const token = await core.getIDToken('agp-runtime-build');
+              resp = await fetch('${{ vars.AGP_API_URL }}/builds/runtime', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
+              });
+              text = await resp.text();
+              if (resp.status !== 409) break;
+              if (Date.now() - started > maxWaitMs) {
+                core.setFailed(`AGP still reports a build in progress for this agent+stage after ${maxWaitMs / 1000}s: ${text}`);
+                return;
+              }
+              core.info(`AGP reports a build already in progress for this agent+stage (409) — waiting ${pollMs / 1000}s and retrying...`);
+              await new Promise((r) => setTimeout(r, pollMs));
+            }
             core.info(`AGP responded ${resp.status}: ${text}`);
             if (!resp.ok) {
               core.setFailed(`AGP build-trigger failed (${resp.status}): ${text}`);

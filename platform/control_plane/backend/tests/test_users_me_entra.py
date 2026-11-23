@@ -1,38 +1,21 @@
 """Integration test for /users/me under AUTH_PROVIDER=entra."""
 
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
-
-@pytest.fixture(autouse=True)
-def reset_modules(monkeypatch):
-    """Configure Entra mode and reload all modules so settings.AUTH_PROVIDER='entra' takes effect."""
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("DEBUG", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
-
-    import sys
-    for mod in list(sys.modules):
-        if mod.startswith("core.") or mod.startswith("api.") or mod == "main":
-            sys.modules.pop(mod, None)
-    yield
+pytestmark = pytest.mark.usefixtures("app_evicted_under_entra")
 
 
 def _build_app():
-    """Spin up the FastAPI app fresh after env is set."""
-    from main import app
-
-    # E24/T4: /users/me now resolves tenants. Stub the resolver singleton so these
-    # identity tests stay hermetic (no live Graph/token HTTP) — tenant behavior is
-    # covered in test_users_me_tenants.py.
+    """The FastAPI app fresh after the env is set, with the tenant resolver singleton stubbed so these
+    identity tests stay hermetic; tenant behaviour is covered in test_users_me_tenants.py."""
     import api.routes.users as users_module
+    from main import app
     from services.tenant_resolver import TenantContext
 
     class _EmptyResolver:
@@ -41,6 +24,10 @@ def _build_app():
 
     users_module._tenant_resolver = _EmptyResolver()
     return app
+
+
+def _request(authorization: str) -> Request:
+    return cast(Request, SimpleNamespace(headers={"Authorization": authorization}))
 
 
 def test_users_me_returns_maria_as_operator():
@@ -67,7 +54,6 @@ def test_users_me_returns_maria_as_operator():
     assert body["role"] == "operator"
     assert body["role_level"] == 1
     assert body["can_deploy"] is True
-    # The sidebar footer shows the human name from the token's `name` claim.
     assert body["name"] == "Maria Bauer"
 
 
@@ -97,7 +83,7 @@ def test_users_me_returns_name_none_when_claim_absent():
 def test_users_me_returns_oid():
     """Entra-authenticated caller: /users/me echoes the token's `oid` claim
     (the stable principal id the FE compares against app-role-assignment
-    principals for E6 user→agent grants)."""
+    principals for user-to-agent grants)."""
     app = _build_app()
     client = TestClient(app)
 
@@ -195,11 +181,6 @@ def test_users_me_returns_401_with_invalid_token():
     assert "signature" in response.json()["detail"].lower() or "invalid" in response.json()["detail"].lower()
 
 
-# ===========================================================================
-# E36/T18 — /users/me and current_principal read ONE precedence
-# ===========================================================================
-
-
 def test_users_me_and_current_principal_agree_on_the_same_claims():
     """The defect was their disagreement, so pin the agreement itself.
 
@@ -222,15 +203,14 @@ def test_users_me_and_current_principal_agree_on_the_same_claims():
         "roles": ["Platform.Operator"],
     }
 
-    class _FakeRequest:
-        headers = {"Authorization": "Bearer fake-token-twoclaims"}
+    fake_request = _request("Bearer fake-token-twoclaims")
 
     with patch("core.security_entra.verify_entra_token", return_value=fake_claims):
         response = client.get(
             "/api/v1/users/me",
             headers={"Authorization": "Bearer fake-token-twoclaims"},
         )
-        principal = current_principal(_FakeRequest())
+        principal = current_principal(fake_request)
 
     assert response.status_code == 200, response.text
     displayed = response.json()["email"]

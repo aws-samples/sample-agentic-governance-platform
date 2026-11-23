@@ -1,18 +1,5 @@
-// SubscribeModal — the subscribe dialog for a Marketplace product (Epic 9, T8).
-//
-// Two variants behind one component:
-//   • published agent → just an optional message + Confirm (E33: a product is a
-//                       REGISTRY agent with an approved datasheet, not a blueprint).
-//   • gateway MCP     → a REQUIRED agent <select> (the SP the grant lands on) +
-//                       an optional message; Confirm is disabled until an agent
-//                       is chosen.
-// The async-submit idiom is cloned from CedarPoliciesTab: an actionPending /
-// actionError pair, a mountedRef unmount guard, Escape-to-close, and
-// focus-return-on-close. The error surfaces the api Error.message inline (the
-// axios interceptor maps the backend `detail` into Error.message).
-
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { EligibleAgent, ProductCard } from '../../../api/client';
+import type { AgentLite, ProductCard } from '../../../api/client';
 import { AgentAvatar } from '../agentUi';
 
 export default function SubscribeModal({
@@ -22,7 +9,7 @@ export default function SubscribeModal({
   onClose,
 }: {
   card: ProductCard;
-  eligibleAgents: EligibleAgent[];
+  eligibleAgents: AgentLite[];
   onSubmit: (opts: { agentId?: string; message?: string }) => Promise<void>;
   onClose: () => void;
 }) {
@@ -33,7 +20,6 @@ export default function SubscribeModal({
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // Unmount guard — onSubmit resolves async and can land after the modal closes.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -42,7 +28,6 @@ export default function SubscribeModal({
     };
   }, []);
 
-  // Close on Escape (mirrors CedarPoliciesTab's picker Escape handling).
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -54,7 +39,6 @@ export default function SubscribeModal({
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
 
-  // For MCP the agent picker is required; for agents it is irrelevant.
   const canSubmit = !isMcp || agentId !== '';
 
   const handleSubmit = useCallback(async () => {
@@ -66,7 +50,6 @@ export default function SubscribeModal({
         agentId: isMcp ? agentId : undefined,
         message: message.trim() ? message.trim() : undefined,
       });
-      // Parent closes the modal + refetches on success; nothing to do here.
     } catch (err: unknown) {
       if (mountedRef.current) {
         setActionError(err instanceof Error ? err.message : 'Failed to subscribe.');
@@ -83,12 +66,10 @@ export default function SubscribeModal({
       aria-modal="true"
       aria-label={`Subscribe to ${card.name}`}
       onMouseDown={(e) => {
-        // Click on the backdrop (not the panel) closes — unless mid-submit.
         if (e.target === e.currentTarget && !actionPending) onClose();
       }}
     >
       <div className="w-full max-w-lg bg-white rounded-2xl border border-slate-200 shadow-xl">
-        {/* Header. */}
         <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-slate-200/60">
           <div className="flex items-start gap-3 min-w-0">
             <AgentAvatar name={card.name} size="md" />
@@ -114,9 +95,7 @@ export default function SubscribeModal({
           </button>
         </div>
 
-        {/* Body. */}
         <div className="px-5 py-4 space-y-4">
-          {/* MCP variant: required agent picker. */}
           {isMcp && (
             <div>
               <label
@@ -148,7 +127,6 @@ export default function SubscribeModal({
             </div>
           )}
 
-          {/* Message (both variants). */}
           <div>
             <label
               htmlFor="subscribe-message"
@@ -173,7 +151,6 @@ export default function SubscribeModal({
           )}
         </div>
 
-        {/* Footer actions. */}
         <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-200/60">
           <button
             type="button"

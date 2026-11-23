@@ -11,8 +11,11 @@ from src.mcp_runtime import namespace_tool_name, parse_mcp_servers
 
 
 def test_parse_reads_mcp_servers_json():
-    env = {"MCP_SERVERS": json.dumps([
-        {"id": "A", "audience": "api://agp-mcp-A", "gateway_url": "https://a/mcp", "label": "alpha"}])}
+    env = {
+        "MCP_SERVERS": json.dumps(
+            [{"id": "A", "audience": "api://agp-mcp-A", "gateway_url": "https://a/mcp", "label": "alpha"}]
+        )
+    }
     out = parse_mcp_servers(env)
     assert len(out) == 1 and out[0]["label"] == "alpha"
 
@@ -64,6 +67,7 @@ class _StubAgent:
 
     def __init__(self):
         self.messages: list = []
+        self.model = None  # a rebuild reuses this; None = build a fresh (stubbed-stream) model
 
     async def stream_async(self, _prompt):
         yield {"data": "answered"}
@@ -129,8 +133,12 @@ def test_missing_credential_provider_degrades_to_no_tools(monkeypatch):
 
 
 def test_unreachable_mcp_is_dropped_and_the_agent_still_answers(monkeypatch):
-    """A refused token / dead gateway drops that MCP; the invoke still returns an answer."""
+    """A refused token / dead gateway drops that MCP; the invoke still returns an answer.
+
+    The refusal rebuilds the agent (its note goes into that invoke's prompt), so the model is stubbed.
+    """
     monkeypatch.setattr(main_module, "agent", _StubAgent())
+    monkeypatch.setattr(main_module.BedrockModel, "stream", _one_word_model_stream)
     monkeypatch.setattr(main_module.config, "MCP_SERVERS", _ONE_SERVER)
     monkeypatch.setattr(main_module.config, "CREDENTIAL_PROVIDER_NAME", "agp-provider")
     monkeypatch.setattr(
@@ -146,7 +154,8 @@ def test_unreachable_mcp_is_dropped_and_the_agent_still_answers(monkeypatch):
 
     with contextlib.ExitStack() as stack:
         assert main_module._mcp_tools(stack) == []
-    assert [c["message"] for c in _drain() if "message" in c] == [_TERMINAL_MESSAGE]
+    terminal = [c["message"] for c in _drain() if "message" in c]
+    assert [p["text"] for p in terminal[-1]["content"] if "text" in p] == ["hi"]
 
 
 def test_wired_mcp_tools_are_namespaced_for_the_model_not_the_wire(monkeypatch):
@@ -210,17 +219,26 @@ def test_wired_mcp_tools_rebuild_the_agent_and_continue_the_conversation(monkeyp
     stub = _StubAgent()
     prior_turn = {"role": "user", "content": [{"text": "earlier"}]}
     stub.messages.append(prior_turn)
+    stub.model = main_module._build_agent().model
     monkeypatch.setattr(main_module, "agent", stub)
     # Exactly what `_mcp_tools` returns on the wired path (test above), minus the live connection.
     wired_tool = main_module._namespaced_tool(_mcp_agent_tool(None), "alpha")
-    monkeypatch.setattr(main_module, "_mcp_tools", lambda _stack: [wired_tool])
+    monkeypatch.setattr(main_module, "_mcp_tools", lambda _stack, _refused: [wired_tool])
     monkeypatch.setattr(main_module.BedrockModel, "stream", _one_word_model_stream)
 
     built: list = []
     real_build = main_module._build_agent
 
-    def _spy_build(extra_tools=(), messages=None):
-        built.append(real_build(extra_tools, messages=messages))
+    def _spy_build(extra_tools=(), messages=None, trace_attributes=None, model=None, system_prompt=None):
+        built.append(
+            real_build(
+                extra_tools,
+                messages=messages,
+                trace_attributes=trace_attributes,
+                model=model,
+                system_prompt=system_prompt,
+            )
+        )
         return built[-1]
 
     monkeypatch.setattr(main_module, "_build_agent", _spy_build)
@@ -232,9 +250,32 @@ def test_wired_mcp_tools_rebuild_the_agent_and_continue_the_conversation(monkeyp
     assert rebuilt is not stub
     # Reference-shared, not copied: strands appends to this very list, so the next turn continues.
     assert rebuilt.messages is stub.messages
+    assert rebuilt.model is stub.model, "a rebuild must reuse the module model, not a new Bedrock client"
     assert stub.messages[0] is prior_turn, "the earlier turn must survive the rebuild"
-    assert sorted(rebuilt.tool_names) == ["alpha__raw-tool", "calculator", "get_current_datetime"]
+    # A superset: a repo with a skills/ folder also gets the `skills` tool.
+    assert {"alpha__raw-tool", "calculator", "get_current_datetime"} <= set(rebuilt.tool_names)
     # And it still answers, in both event shapes the response contract requires.
     assert [c["data"] for c in chunks if c.get("type") == "content"] == ["hi"]
     terminal = [c["message"] for c in chunks if "message" in c][-1]
     assert "".join(p["text"] for p in terminal["content"] if "text" in p) == "hi"
+
+
+# Bedrock's ConverseStream rejects a tool name over 64 chars (ValidationException), and a
+# gateway advertises every tool as "<target>___<tool>" — so the plain prefix overflowed live.
+LIVE = ("acme_contact_center_mcp", "agp-contact-center-mcp-target___create_support_ticket")
+
+
+def test_short_names_are_unchanged():
+    assert namespace_tool_name("alpha", "lookup") == "alpha__lookup"
+
+
+def test_a_long_gateway_name_drops_the_target_prefix():
+    assert namespace_tool_name(*LIVE) == "acme_contact_center_mcp__create_support_ticket"
+
+
+def test_names_never_exceed_bedrock_limit_and_stay_unique():
+    a = namespace_tool_name("l" * 40, "t" * 40 + "_a")
+    b = namespace_tool_name("l" * 40, "t" * 40 + "_b")
+    assert len(a) <= 64 and len(b) <= 64
+    assert a != b
+    assert a == namespace_tool_name("l" * 40, "t" * 40 + "_a")  # stable across restarts

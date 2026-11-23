@@ -47,14 +47,7 @@ terraform {
     }
   }
 
-  # Uncomment for remote state management
-  # backend "s3" {
-  #   bucket         = "agp-terraform-state"
-  #   key            = "control-plane/terraform.tfstate"
-  #   region         = "us-east-1"
-  #   encrypt        = true
-  #   dynamodb_table = "terraform-state-lock"
-  # }
+  backend "s3" {}
 }
 
 provider "aws" {
@@ -71,9 +64,15 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 
+data "aws_ssm_parameter" "backend_image" {
+  count = var.container_image == "" ? 1 : 0
+  name  = "/agp/${var.environment}/backend-image"
+}
+
 locals {
   account_id_short = substr(data.aws_caller_identity.current.account_id, -6, 6)
-  name_prefix      = "${var.project_name}-cp-${var.environment}-${local.account_id_short}"
+  name_environment = coalesce(var.naming_environment, var.environment)
+  name_prefix      = "${var.project_name}-cp-${local.name_environment}-${local.account_id_short}"
 
   # Use existing VPC or create new
   use_existing_vpc = var.vpc_id != "" && length(var.public_subnet_ids) > 0 && length(var.private_subnet_ids) > 0
@@ -94,7 +93,7 @@ module "networking" {
   name_prefix        = local.name_prefix
   vpc_cidr           = var.vpc_cidr
   availability_zones = var.availability_zones
-  environment        = var.environment
+  environment        = local.name_environment
 
   tags = var.tags
 }
@@ -107,7 +106,8 @@ module "dynamodb" {
   source = "./modules/dynamodb"
 
   name_prefix = local.name_prefix
-  environment = var.environment
+  environment = local.name_environment
+  ephemeral   = var.ephemeral
 
   tags = var.tags
 }
@@ -120,8 +120,9 @@ module "s3" {
   source = "./modules/s3"
 
   name_prefix                    = local.name_prefix
-  environment                    = var.environment
+  environment                    = local.name_environment
   project_archive_retention_days = var.project_archive_retention_days
+  ephemeral                      = var.ephemeral
 
   tags = var.tags
 }
@@ -134,9 +135,61 @@ module "ecr" {
   source = "./modules/ecr"
 
   name_prefix = local.name_prefix
-  environment = var.environment
+  environment = local.name_environment
 
   tags = var.tags
+}
+
+resource "aws_ecr_repository" "branch_images" {
+  count                = var.create_shared_resources ? 1 : 0
+  name                 = "${var.project_name}-cp-${local.account_id_short}-branch-images"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "branch_images" {
+  count      = var.create_shared_resources ? 1 : 0
+  repository = aws_ecr_repository.branch_images[0].name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Expire untagged images after one day"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 2
+        description  = "Expire branch images after seven days"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["pr-"]
+          countType     = "sinceImagePushed"
+          countUnit     = "days"
+          countNumber   = 7
+        }
+        action = {
+          type = "expire"
+        }
+      }
+    ]
+  })
 }
 
 # ============================================================================
@@ -147,36 +200,26 @@ module "ecs" {
   source = "./modules/ecs"
 
   name_prefix        = local.name_prefix
-  environment        = var.environment
+  environment        = local.name_environment
   vpc_id             = local.vpc_id
   private_subnet_ids = local.private_subnet_ids
   public_subnet_ids  = local.public_subnet_ids
 
   # Task configuration
-  task_cpu      = var.ecs_task_cpu
-  task_memory   = var.ecs_task_memory
-  desired_count = var.ecs_desired_count
-  min_capacity  = var.ecs_min_capacity
-  max_capacity  = var.ecs_max_capacity
-  # Default is the bare ECR repo URL, which Docker resolves as :latest. That tag
-  # does not exist on a fresh account, so the ECS service comes up at 0 running
-  # tasks (the deployment circuit breaker rolls the deployment back) until the
-  # first backend image push — `terraform apply` still SUCCEEDS. See README
-  # §"Building and Deploying Backend Container". Left as the bare URL on purpose:
-  # spelling `:latest` explicitly is identical to Docker but forces a new ECS task
-  # definition revision on every already-deployed stack for zero behavior change.
-  container_image = var.container_image != "" ? var.container_image : module.ecr.repository_url
+  task_cpu        = var.ecs_task_cpu
+  task_memory     = var.ecs_task_memory
+  desired_count   = var.ecs_desired_count
+  min_capacity    = var.ecs_min_capacity
+  max_capacity    = var.ecs_max_capacity
+  container_image = var.container_image != "" ? var.container_image : data.aws_ssm_parameter.backend_image[0].insecure_value
 
   # DynamoDB tables
-  application_catalog_table_name = module.dynamodb.application_catalog_table_name
-  application_catalog_table_arn  = module.dynamodb.application_catalog_table_arn
-  deployment_metadata_table_name = module.dynamodb.deployment_metadata_table_name
-  deployment_metadata_table_arn  = module.dynamodb.deployment_metadata_table_arn
+  application_catalog_table_arn = module.dynamodb.application_catalog_table_arn
+  deployment_metadata_table_arn = module.dynamodb.deployment_metadata_table_arn
 
   # S3 buckets
   project_archives_bucket_name = module.s3.project_archives_bucket_name
   project_archives_bucket_arn  = module.s3.project_archives_bucket_arn
-  frontend_bucket_name         = module.s3.frontend_bucket_name
   frontend_bucket_arn          = module.s3.frontend_bucket_arn
 
   # Shared agent-image ECR (E21) — stamped onto materialized repos
@@ -188,7 +231,6 @@ module "ecs" {
   # env var is already correct by the time the object exists. See the GitHub block below.
   project_ecr_push_role_arn = local.agent_ecr_push_role_arn
 
-  app_factory_table_name = module.dynamodb.app_factory_table_name
   app_factory_table_arn  = module.dynamodb.app_factory_table_arn
   guardrails_table_name  = module.dynamodb.guardrails_table_name
   guardrails_table_arn   = module.dynamodb.guardrails_table_arn
@@ -200,6 +242,15 @@ module "ecs" {
   projects_table_arn     = module.dynamodb.projects_table_arn
   tenants_table_name     = module.dynamodb.tenants_table_name
   tenants_table_arn      = module.dynamodb.tenants_table_arn
+  # E42 evaluations: run-record bucket + index table (the log group lives in the ecs module)
+  evals_table_name       = module.dynamodb.evals_table_name
+  evals_table_arn        = module.dynamodb.evals_table_arn
+  evals_bucket_name      = module.s3.evals_bucket_name
+  evals_bucket_arn       = module.s3.evals_bucket_arn
+  containment_table_name = module.dynamodb.containment_table_name
+  containment_table_arn  = module.dynamodb.containment_table_arn
+  audit_table_name       = module.dynamodb.audit_table_name
+  audit_table_arn        = module.dynamodb.audit_table_arn
   codebuild_project_name = module.codebuild.project_name
   codebuild_project_arn  = module.codebuild.project_arn
   # E22 bugfix: AGP_API_URL repo var (incl. stage+prefix). Root var, not
@@ -237,8 +288,8 @@ module "ecs" {
 
   # Langfuse Observability (E26) — host + admin-secret NAME as plaintext backend env.
   # module.langfuse depends only on networking + vars (not on module.ecs), so no cycle.
-  langfuse_host              = module.langfuse.langfuse_host
-  langfuse_admin_secret_name = module.langfuse.langfuse_secret_name
+  langfuse_host              = local.langfuse_host
+  langfuse_admin_secret_name = local.langfuse_secret_name
 
   tags = var.tags
 }
@@ -251,7 +302,7 @@ module "api_gateway" {
   source = "./modules/api_gateway"
 
   name_prefix        = local.name_prefix
-  environment        = var.environment
+  environment        = local.name_environment
   vpc_id             = local.vpc_id
   private_subnet_ids = local.private_subnet_ids
   public_subnet_ids  = local.public_subnet_ids
@@ -277,7 +328,7 @@ module "codebuild" {
   source = "./modules/codebuild"
 
   name_prefix = local.name_prefix
-  environment = var.environment
+  environment = local.name_environment
 
   compute_type = var.codebuild_compute_type
 
@@ -305,7 +356,7 @@ module "codebuild" {
   # E26/T10: Langfuse host → LANGFUSE_HOST env for the agentcore_runtime branch, which passes it
   # (plus each agent's key secret NAME from the envelope) as runtime tfvars so every provisioned
   # agent is observable with zero manual wiring. NON-SECRET (a URL); empty until langfuse applies.
-  langfuse_host = module.langfuse.langfuse_host
+  langfuse_host = local.langfuse_host
 
 
   tags = var.tags
@@ -502,7 +553,7 @@ module "state_backend" {
   source = "./modules/state_backend"
 
   name_prefix = local.name_prefix
-  environment = var.environment
+  environment = local.name_environment
 
   bucket_name_prefix = var.state_backend_bucket_name_prefix
   lock_table_name    = var.state_backend_lock_table_name
@@ -521,8 +572,9 @@ module "state_backend" {
 module "secrets_manager" {
   source = "./modules/secrets_manager"
 
-  name_prefix  = "agp-${var.environment}"
+  name_prefix  = "agp-${local.name_environment}"
   secret_value = var.entra_backend_client_secret
+  ephemeral    = var.ephemeral
 
   tags = var.tags
 }
@@ -539,7 +591,7 @@ module "cloudfront" {
   }
 
   name_prefix         = local.name_prefix
-  environment         = var.environment
+  environment         = local.name_environment
   frontend_bucket_id  = module.s3.frontend_bucket_id
   frontend_bucket_arn = module.s3.frontend_bucket_arn
   domain_name         = var.domain_name
@@ -556,7 +608,7 @@ module "observability" {
   source = "./modules/observability"
 
   name_prefix = local.name_prefix
-  environment = var.environment
+  environment = local.name_environment
 
   # ECS monitoring
   ecs_cluster_name = module.ecs.cluster_name
@@ -566,13 +618,19 @@ module "observability" {
   api_gateway_id   = module.api_gateway.api_id
   api_gateway_name = module.api_gateway.api_name
 
+  # E42: CloudWatch Transaction Search — the account-wide switch that makes agent spans land
+  # in `aws/spans` (traces list + eval judges). Default on; see the variable's description for
+  # the cost and the no-op-on-delete caveat, and the module's main.tf for the full reasoning.
+  enable_transaction_search              = var.enable_transaction_search
+  transaction_search_indexing_percentage = var.transaction_search_indexing_percentage
+
   tags = var.tags
 }
 
 # ============================================================================
 # Langfuse Observability Module (E26)
 # ============================================================================
-# Langfuse v3 self-hosted (Aurora Postgres + ElastiCache + ClickHouse on ECS,
+# Langfuse v4 self-hosted (Aurora Postgres + ElastiCache + ClickHouse on ECS,
 # fronted by an INTERNET-FACING ALB + CloudFront with a Lambda@Edge auto-login).
 # `alb_scheme` defaults to "internet-facing" and no override is passed below, so the
 # ALB sits in the public subnets; what restricts it is the CloudFront prefix-list
@@ -592,6 +650,7 @@ module "observability" {
 # egress. See modules/langfuse/README.md.
 module "langfuse" {
   source = "./modules/langfuse"
+  count  = var.create_langfuse ? 1 : 0
 
   # Lambda@Edge (auto-login + strip-frame-headers) must be created in us-east-1
   # regardless of var.aws_region, or CloudFront rejects the association with
@@ -603,7 +662,7 @@ module "langfuse" {
   }
 
   name        = "${local.name_prefix}-langfuse"
-  environment = var.environment
+  environment = local.name_environment
 
   vpc_id             = local.vpc_id
   private_subnet_ids = local.private_subnet_ids
@@ -611,9 +670,20 @@ module "langfuse" {
 
   langfuse_init_user_email    = var.langfuse_admin_email
   langfuse_init_user_password = var.langfuse_admin_password
+  clickhouse_version          = var.clickhouse_version
 
   # No Cognito in the base stack (Entra ID is the sole IdP) — SSO stays off
   # (cognito_user_pool_id defaults to "") and Langfuse uses username/password
   # login for the seed admin. The module has no tags variable — it stamps its
   # own Name tags and inherits the provider default_tags.
+}
+
+moved {
+  from = module.langfuse
+  to   = module.langfuse[0]
+}
+
+locals {
+  langfuse_host        = var.create_langfuse ? module.langfuse[0].langfuse_host : ""
+  langfuse_secret_name = var.create_langfuse ? module.langfuse[0].langfuse_secret_name : ""
 }

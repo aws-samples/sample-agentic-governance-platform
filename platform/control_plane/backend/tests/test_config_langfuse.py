@@ -1,4 +1,4 @@
-"""Test that Langfuse-related settings (E26/C6) are declared and load from env vars."""
+"""Langfuse settings are declared and load from env vars; `bool(LANGFUSE_HOST)` is "configured"."""
 
 
 def _fresh_settings(**kwargs):
@@ -11,13 +11,11 @@ def _fresh_settings(**kwargs):
 
 
 def test_settings_has_langfuse_defaults():
-    """LANGFUSE_HOST and LANGFUSE_ADMIN_SECRET_NAME default to '' (not configured)."""
-    # _env_file=None disables loading from .env so the test exercises the pure
-    # code default, not whatever a developer's local env file says.
+    """LANGFUSE_HOST and LANGFUSE_ADMIN_SECRET_NAME default to '' (not configured); `_env_file=None`
+    keeps a developer's .env out of the default."""
     s = _fresh_settings(_env_file=None)
     assert s.LANGFUSE_HOST == ""
     assert s.LANGFUSE_ADMIN_SECRET_NAME == ""
-    # configured (per C6) = bool(settings.LANGFUSE_HOST) — False when unset.
     assert bool(s.LANGFUSE_HOST) is False
 
 
@@ -29,5 +27,4 @@ def test_settings_loads_langfuse_fields_from_env(monkeypatch):
     s = _fresh_settings()
     assert s.LANGFUSE_HOST == "https://example.cloudfront.net"
     assert s.LANGFUSE_ADMIN_SECRET_NAME == "agp/langfuse/admin"
-    # configured (per C6) = bool(settings.LANGFUSE_HOST) — True when set.
     assert bool(s.LANGFUSE_HOST) is True

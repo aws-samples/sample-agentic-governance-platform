@@ -1,8 +1,9 @@
 # Strands + AgentCore Agent Template
 
 A barebones Strands agent with tools and conversation memory, ready to deploy to
-Bedrock AgentCore Runtime. Build your agent from this scaffold: edit the tools and system
-prompt in `src/main.py`, and let the platform handle infra, deploy, and registration.
+Bedrock AgentCore Runtime. Build your agent from this scaffold: edit the system prompt in
+`prompt/system.md`, add skills under `skills/`, add tools in `src/main.py`, and let the platform
+handle infra, deploy, and registration.
 
 ## What It Does
 
@@ -22,7 +23,7 @@ A single agent that can:
 
 ```bash
 # Install dependencies (with dev extras for tests + lint)
-pip install -e ".[dev]"
+pip install -c constraints.txt -e ".[dev]"
 
 # Set environment variables (or copy .env.example)
 export MODEL_ID=us.anthropic.claude-sonnet-4-6
@@ -34,6 +35,14 @@ python -m src.main
 
 The agent starts on `http://localhost:8080` (AgentCore default port), serving
 `POST /invocations` and `GET /ping`.
+
+The `Dockerfile` and the CI quality job install the versions pinned in `constraints.txt`, so
+after editing `pyproject.toml` regenerate that file from this directory and commit both. The
+compile needs `uv`:
+
+```bash
+uv pip compile pyproject.toml --universal --python-version 3.11 --all-extras --no-emit-package setuptools --no-emit-package pip --no-emit-package wheel -o constraints.txt
+```
 
 ### Test the running agent
 
@@ -81,13 +90,27 @@ Two rules follow, and both are load-bearing:
 
 Errors are their own event: `data: {"type": "error", "data": "<message>"}`.
 
+On success the last line is `data: {"tool_calls": [{"name": "<tool>", "args": {...}}]}`: the
+tools this invoke called, in order (`[]` if none), read by the evaluation tool checks. It is
+neither message- nor result-shaped, so the buffering client's last-match still finds the answer.
+
 Both sides of this are tested. `tests/test_agent.py` pins the producer here; the platform asserts
 its parser against a body captured from **this** template, so the two cannot drift apart silently.
 
 ## What you can change
 
-**Behaviour lives in `src/main.py`** — the tools and the `SYSTEM_PROMPT`. That is the file to
-edit.
+**Behaviour lives in three places:**
+
+- `prompt/system.md` — the system prompt, the whole file. Edit it; do not delete it or the
+  `prompt/` folder, because the `Dockerfile` copies that folder and the build fails without it.
+  (The built-in default only applies to repos created before the file existed.)
+- `skills/<name>/SKILL.md` — [Agent Skills](https://agentskills.io), loaded with Strands'
+  `AgentSkills` plugin. Only each skill's name + description go into the prompt; the model loads
+  the body with the `skills` tool when it needs it. See `skills/README.md`.
+- `src/main.py` — the tools.
+
+When a configured MCP server refuses this agent (no grant yet, or unreachable), the agent is told
+so in that invoke's system prompt and says it cannot access it instead of guessing.
 
 **Per-agent settings are NOT in this repo.** `agent_name`, `framework` and `model_id` live on
 your agent's record in the platform's registry, which is where the build reads them from. There
@@ -103,6 +126,7 @@ container **when you run it locally**.
 ```python
 from strands import tool
 
+
 @tool
 def my_tool(query: str) -> str:
     """Description of what this tool does.
@@ -112,19 +136,73 @@ def my_tool(query: str) -> str:
     """
     return f"Result for {query}"
 
+
 # Add to the agent
 agent = Agent(tools=[calculator, get_current_datetime, my_tool])
 ```
 
+## Evaluations
+
+AGP evaluates this agent against a golden dataset that lives **in this repo**. You can edit the
+two files by hand or through the platform (Repo → Evaluations), which commits them to `main` and
+starts a dev build. A run invokes every item against the **dev** agent, scores it, and a passing
+run for the current build is what lets an Owner promote it to prod (or override, with a recorded
+reason).
+
+`evals/evals.yaml` sets the checks, the judges and the gate:
+
+```yaml
+version: 1
+dataset: evals/dataset.jsonl
+checks:
+  tools: in_order        # exact | in_order | any_order | off   (tool names)
+  args: subset           # exact | subset | off                  (tool arguments)
+  no_error: true         # the invoke must succeed
+judges:                  # AgentCore Evaluations built-in ids; [] = checks only
+  - Builtin.GoalSuccessRate
+  - Builtin.Correctness
+gate:
+  checks: all_pass       # every item must pass every enabled check
+  judge_min_mean: 0.8    # every judge's mean score across items must be >= this
+```
+
+`evals/dataset.jsonl` has one item per line and ships empty. Only `id` and `input` are required:
+
+```json
+{"id":"fnol-001","input":"My car was hit on the A40, policy P-1001","expected_output":"A claim is opened ...","assertions":["Opens a claim","Quotes the claim number"],"expected_tools":[{"name":"get_policy","args":{"policy_id":"P-1001"}},{"name":"open_claim"}],"source_trace_id":null,"tags":["happy-path"]}
+```
+
+| Field | Used by |
+|---|---|
+| `expected_tools[].name` | the `tools` check (exact = same sequence; in_order = these appear in this order, extras allowed; any_order = all present) |
+| `expected_tools[].args` | the `args` check. Subset = every listed key equals the actual value; exact = equal dicts. Omitting `args` skips argument checking for that call |
+| `expected_output` | `Builtin.Correctness` (reference answer) |
+| `assertions` | `Builtin.GoalSuccessRate` |
+
+**Where the scores come from.** The tool checks read the `tool_calls` this agent returns (see
+"Response contract"); the judges read this agent's spans from CloudWatch. `src/main.py` therefore
+exports every span to **both** Langfuse (when configured) and CloudWatch: a second span processor
+sends them to the X-Ray OTLP endpoint (`https://xray.{AWS_REGION}.amazonaws.com/v1/traces`),
+signed with SigV4 from the runtime role, and tags each span with the AgentCore session id as
+`session.id`. Set `AGP_CLOUDWATCH_TRACES=false` to turn the CloudWatch export off; if it cannot be
+set up, the agent logs a warning and runs without it.
+
 ## Project Structure
 
 ```
+prompt/
+└── system.md      # System prompt (whole file)
+skills/
+└── README.md      # How to add a skill (skills/<name>/SKILL.md)
 src/
 ├── __init__.py
 ├── config.py      # Environment-variable configuration
 └── main.py        # Agent definition, tools, and AgentCore entrypoint
 tests/
 └── test_agent.py  # Unit tests for tools + config
+evals/
+├── evals.yaml     # Evaluation checks, judges and gate (see "Evaluations")
+└── dataset.jsonl  # Golden dataset, one item per line (ships empty)
 Dockerfile         # linux/arm64 container image (CMD: python -m src.main)
 ```
 
@@ -146,18 +224,24 @@ if your project's trunk is not `main`, that is the one line to edit.)
 The narrowness is deliberate: there is exactly **one dev runtime per agent**, so if every feature
 branch deployed, N branches would race to overwrite the same deployment, last-push-wins.
 
-**Two pushes to the trunk QUEUE rather than race.** `concurrency` is keyed on the ref with
-`cancel-in-progress: false`, and that is load-bearing, not hygiene: the platform build runs
-`terraform apply` against ONE state per agent, and two builds 11 seconds apart once raced that
-state lock — the loser failed, the winner deployed a stale image, and the platform's own record
-claimed success. Never cancel either: a deploy already in flight must be allowed to finish, since
-killing it halfway abandons the lock and half-applies the runtime.
+**Two pushes to the trunk genuinely serialize — LIVEFIX, E30 dev deploy.** `concurrency`
+keyed on the ref queues a second WORKFLOW RUN, but that alone used to be cosmetic: the run is
+"done" the instant the `trigger` job's `fetch` returns, seconds after AGP answers 202 — long
+before CodeBuild's async `terraform apply` on the one state per agent actually finishes. Two
+builds 11 seconds apart once raced that lock — the loser failed, the winner deployed a stale
+image, and the platform's own record claimed success. The real fix is AGP's: `POST
+/builds/runtime` now answers 409 while a build for this agent+stage is in flight, and the
+`trigger` job polls on that 409 until it clears (bounded, so a stuck prior build fails the job
+instead of hanging forever). `concurrency` still matters — it stops two trigger jobs for the same
+ref from polling AGP at once — but the 409 retry loop is what makes the applies serialize. Never
+cancel either: a deploy already in flight must be allowed to finish, since killing it halfway
+abandons the lock and half-applies the runtime.
 
 Beyond that, no methodology is imposed. Landing on the trunk **nominates** an image for
 production; the prod deploy itself is a gated action in the platform, never a side effect of a
 merge. **There is no prod path in this workflow at all.**
 
-- **`quality`** (every PR + every trunk push): `pip install -e ".[dev]"` → `ruff check src tests`
+- **`quality`** (every PR + every trunk push): `pip install -c constraints.txt -e ".[dev]"` → `ruff check src tests`
   → `pytest tests/ -v` → `pip-audit`. Branch-agnostic, no environment.
 - **`build`** (trunk push, after `quality`): assumes an **ECR-push-only** OIDC role, then
   `docker buildx build --platform linux/arm64 -t <ECR_REPOSITORY>:<AGENT_ID>-<tree_sha> --push .`,
@@ -176,9 +260,8 @@ repository *content*. It is a convenient, human-readable label, and it is **not*
 deploys.
 
 A tag is a mutable pointer. The registry keeps tags mutable and this build is not
-byte-reproducible (a floating `python:3.11-slim` base, and version *ranges* in `pyproject.toml`
-which the `Dockerfile` installs from directly — `uv.lock` ships in this repository but the image
-build does not install from it), so the bytes behind one tag can differ between the moment
+byte-reproducible (the dependencies install from the pins in `constraints.txt`, but the
+`python:3.11-slim` base tag floats), so the bytes behind one tag can differ between the moment
 something is approved and the moment production deploys it. **The digest names the bytes themselves**, which is the only value an
 approval can honestly attest to.
 

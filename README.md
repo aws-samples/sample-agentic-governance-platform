@@ -54,7 +54,7 @@ AGP runs in an admin/tooling AWS account and governs agents running in the same 
 - **Frontend** — React 19, Vite, Tailwind, React Router 7, `@azure/msal-*` (Entra sign-in), `@xyflow/react` + dagre (governance graph), Recharts.
 - **Backend** — FastAPI, Pydantic v2, boto3, DynamoDB, `PyJWT[crypto]` for Entra token validation, `httpx` against Microsoft Graph. Cedar policy text is compiled here and evaluated by the AgentCore Policy Engine on the gateway — the backend runs no Cedar engine of its own.
 - **Identity** — Microsoft Entra ID: per-tenant app registrations, app roles, and Microsoft Graph as the system of record for access.
-- **Runtime & observability** — Amazon Bedrock AgentCore for agent runtimes; Langfuse v3 + OpenTelemetry for tracing.
+- **Runtime & observability** — Amazon Bedrock AgentCore for agent runtimes; Langfuse v4 + OpenTelemetry for tracing.
 
 ---
 
@@ -106,23 +106,20 @@ All of this must exist **before** you configure the repo. A single AWS account i
 **AWS**
 
 - An AWS account, with credentials configured such that `aws sts get-caller-identity` succeeds, and permission to create IAM roles, VPC/ECS/CloudFront resources, DynamoDB tables, and Secrets Manager secrets.
-- The region exported. The stack is built and tested against `us-east-1`; the account and region are taken from your ambient credentials, never from a file in the repo.
-
-  ```bash
-  export AWS_REGION=us-east-1
-  export AWS_DEFAULT_REGION=us-east-1
-  ```
+- The account comes from the credentials in play, never from a file in the repo. The region is the `aws_region` the environment's Terraform variables name (step 2); the stack is built and tested against `us-east-1`.
 
 **A Microsoft Entra ID tenant** in which you can create app registrations and **grant admin consent** for Microsoft Graph application permissions. A free Microsoft 365 developer tenant is sufficient.
 
 > **On identity providers:** Entra ID is the only identity provider AGP supports today, and the whole authorization model is built on Entra app-role assignments. Support for additional providers (Okta, for example) is on the roadmap — it is not implemented, and there is no date.
 
-**Tooling on the machine that runs the deploy**
+**Tooling**
+
+The list below is what the machine that runs the deploy needs; [Deploying](platform/control_plane/infrastructure/DEPLOYING.md) says which machine that is.
 
 - **AWS CLI v2 — and a recent one.** Not just any v2: the post-apply seed step in step 6 runs `aws agent-registry-control list-registries`, and AWS only split the Agent Registry into that service namespace on **2026-08-06** (`platform/control_plane/infrastructure/README.md` explains why there is still no Terraform resource for it). An older v2 does not have the command at all and answers `Invalid choice: 'agent-registry-control'`, which reads like a permissions or region problem and is neither. Check with `aws --version` and update if it is more than a few weeks old.
-- **Terraform >= 1.15** (the floor declared in `platform/control_plane/infrastructure/main.tf`).
-- **Node.js and npm** — the frontend is built locally and synced to S3.
-- **Docker or [finch](https://runfinch.com/), running.** Not optional: the Langfuse module mirrors container images from Docker Hub into your own ECR *during* `terraform apply`, so the apply fails partway through without a container engine. `deploy-full.sh` resolves docker-or-finch automatically; pass `--finch` to force finch.
+- **Terraform 1.15.7** — the version the pipeline runs, pinned in `platform/control_plane/infrastructure/.terraform-version` (`main.tf` requires >= 1.15).
+- **Node.js and npm** — the deploy builds the frontend from Terraform outputs and syncs it to S3.
+- **Docker or [finch](https://runfinch.com/), running.** Not optional: the Langfuse module mirrors container images from Docker Hub into your own ECR *during* `terraform apply`, so the apply fails partway through without a container engine. The deploy resolves docker-or-finch automatically; `CONTAINER_ENGINE=finch` in the environment forces finch.
 - **`jq` and `python3`.**
 - **The backend virtualenv, created before the first apply.** Terraform creates the two agent registries by running a bootstrap script through `../backend/venv/bin/python`, and a plan-time precondition fails with a named error if that interpreter is absent. The venv is gitignored, so a fresh clone does not have one:
 
@@ -131,7 +128,7 @@ All of this must exist **before** you configure the repo. A single AWS account i
   python3 -m venv venv && venv/bin/pip install -r requirements.txt
   ```
 
-`deploy-full.sh` re-checks AWS credentials, the container engine, Terraform, and Node before it does anything, and stops with a specific error if one is missing.
+`deploy-full.sh` stops before anything else when there are no AWS credentials; every other missing tool fails at the step that needs it.
 
 ---
 
@@ -141,9 +138,9 @@ Steps 1–3 are configuration, step 4 deploys, steps 5–7 finish the job. Steps
 
 ### 1. Create the Entra app registrations
 
-Nothing in this repo touches your tenant unless you choose to run the optional setup script — either way you create two app registrations, once, and copy their identifiers into the two config files in steps 2 and 3.
+Nothing in this repo touches your tenant unless you choose to run the optional setup script — either way you create two app registrations, once, and copy their identifiers into the environment's Terraform variables in step 2.
 
-**Two ways to get there.** Run [`scripts/entra-setup/setup_entra.py`](scripts/entra-setup/README.md): it creates both registrations with everything they carry, grants the admin consents, assigns you a platform role, and prints every **Entra** value steps 2 and 3 need. It requires the Azure CLI and an admin sign-in (`az login`), writes nothing to disk, and has a `--dry-run` mode to start with. Or follow the guide and click through the portal yourself — the values you come back with are the same either way.
+**Two ways to get there.** Run [`scripts/entra-setup/setup_entra.py`](scripts/entra-setup/README.md): it creates both registrations with everything they carry, grants the admin consents, assigns you a platform role, and prints every **Entra** value step 2 needs. It requires the Azure CLI and an admin sign-in (`az login`), writes nothing to disk, and has a `--dry-run` mode to start with. Or follow the guide and click through the portal yourself — the values you come back with are the same either way.
 
 **[`docs/entra-setup.md`](docs/entra-setup.md) is the manual walkthrough** — screen-by-screen, with fill-in templates for every value, plus a troubleshooting table for when sign-in misbehaves. What you come back with:
 
@@ -152,84 +149,71 @@ Nothing in this repo touches your tenant unless you choose to run the optional s
 | Value | Where it goes |
 |---|---|
 | Application (client) ID | `entra_backend_client_id` |
-| Client secret **value** | `entra_backend_client_secret` |
+| Client secret **value** | `TF_VAR_entra_backend_client_secret` |
 | Application ID URI, e.g. `api://agp` | `entra_audience` |
-| Exposed delegated scope, e.g. `Access.Default` | the scope half of `VITE_ENTRA_SPA_SCOPE` |
+| Exposed delegated scope, e.g. `Access.Default` | the scope half of `entra_spa_scope` |
 
 **b. From the SPA app registration** — the public MSAL client the browser signs in with:
 
 | Value | Where it goes |
 |---|---|
-| Application (client) ID | `entra_spa_client_id` and `VITE_ENTRA_SPA_CLIENT_ID` |
+| Application (client) ID | `entra_spa_client_id` |
 | A redirect URI | not knowable yet — **step 5** |
 
-**c. From the tenant itself** — the tenant ID (a GUID) for `entra_tenant_id` / `VITE_ENTRA_TENANT_ID`, and the tenant domain (`<something>.onmicrosoft.com`) for `VITE_ENTRA_TENANT_DOMAIN`.
+**c. From the tenant itself** — the tenant ID (a GUID) for `entra_tenant_id`, and the tenant domain (`<something>.onmicrosoft.com`) for `entra_tenant_domain`.
 
 Two things bite if skipped, and the guide covers both: the platform roles belong on the **backend** app registration — defined or assigned on the SPA one they are a silent no-op — and **at least one user must be assigned a platform role**, or that user's first sign-in ends in a refusal that looks like a platform bug and is not one.
 
 ### 2. Configure the infrastructure
 
-```bash
-cd platform/control_plane/infrastructure
-
-cp terraform.tfvars.example terraform.tfvars
-cp secrets.auto.tfvars.example secrets.auto.tfvars
-```
-
-`terraform.tfvars` ships with defaults that work as-is for a single-account dev deploy. Most people only touch `aws_region`, `environment`, `project_name`, and the optional `domain_name` / `hosted_zone_id` pair (leave `hosted_zone_id` empty and you get the CloudFront domain instead of a custom one).
-
-`secrets.auto.tfvars` is the file that carries your Entra values. Terraform **auto-loads any `*.auto.tfvars`** in this directory, so there is no `-var-file` flag to remember. Fill in:
+Every non-secret variable for an environment lives in one file, `platform/control_plane/infrastructure/env/<ENV_NAME>.tfvars`, which assigns **every** variable in `variables.tf` explicitly — including those with defaults, so a default change never silently reaches a deployed environment — except `environment` itself, which the deploy scripts pass as `-var environment=<ENV_NAME>` (one source for the name). [Deploying](platform/control_plane/infrastructure/DEPLOYING.md) says where that file comes from. Most people only touch `aws_region`, `project_name`, the optional `domain_name` / `hosted_zone_id` pair (leave `hosted_zone_id` empty and you get the CloudFront domain instead of a custom one), and the Entra values from step 1:
 
 | Key | Value |
 |---|---|
-| `auth_provider` | optional — `entra` is the only accepted value and also the default |
+| `auth_provider` | `entra` — the only accepted value |
 | `entra_tenant_id` | tenant GUID |
+| `entra_tenant_domain` | `<something>.onmicrosoft.com` |
 | `entra_audience` | the backend app's Application ID URI |
 | `entra_spa_client_id` | SPA app's client ID |
+| `entra_spa_scope` | `<application-id-uri>/<scope-name>`, e.g. `api://agp/Access.Default` |
 | `entra_backend_client_id` | backend app's client ID |
-| `entra_backend_client_secret` | backend app's client secret **value** |
-| `langfuse_admin_password` | seed password for the Langfuse admin user (letters, numbers, at least one special character) |
 | `langfuse_admin_email` | seed Langfuse admin login |
 
-`entra_backend_client_secret` is the **only root variable with no default.** Omit it and `terraform apply` stops on a bare interactive prompt that explains nothing. Both `*.tfvars` files are gitignored (`**/*.tfvars`); confirm with `git check-ignore -v secrets.auto.tfvars`.
+The two secrets are **never** in a file. `TF_VAR_entra_backend_client_secret` (the backend app's client secret **value**) and `TF_VAR_langfuse_admin_password` (seed password for the Langfuse admin user — letters, numbers, at least one special character) are read by Terraform as variables by name from the environment of whatever runs the deploy: export both in the shell, or set them as masked variables in a pipeline. `entra_backend_client_secret` is the **only root variable with no default**, and the scripts run Terraform with `-input=false`, so a missing value fails the plan with "No value for required variable" instead of stopping on a prompt.
 
-**The audience has to match in three places.** `entra_audience`, the Application ID URI in Entra, and the URI half of `VITE_ENTRA_SPA_SCOPE` must be byte-identical. The value itself is yours to pick; the examples use `api://agp`. When they disagree, every API call returns 401 and nothing in the response says which side is wrong.
+**The audience has to match in three places.** `entra_audience`, the Application ID URI in Entra, and the URI half of `entra_spa_scope` must be byte-identical. The value itself is yours to pick; the examples use `api://agp`. When they disagree, every API call returns 401 and nothing in the response says which side is wrong.
+
+The Terraform state bucket exists once per account, before the first apply; [Deploying](platform/control_plane/infrastructure/DEPLOYING.md) says what creates it. The SSM parameter naming the running backend image is not seeded: the first `apply.sh --image` writes it. That, the remote-state layout, init, plan and the post-apply steps are the Terraform half of this path — [`platform/control_plane/infrastructure/README.md`](platform/control_plane/infrastructure/README.md), not repeated here.
 
 ### 3. Configure the frontend
 
-```bash
-cd platform/control_plane/frontend
-cp .env.example .env
-```
-
-`.env` is the file to fill in, but it is not the file the production build reads. `deploy-full.sh` reads `.env` and regenerates `frontend/.env.production` from it, and `.env.production` is what Vite actually builds the bundle from. That distinction only bites once — in step 5, which says what to do about it. The SPA declares exactly seven variables, and reads six of them:
-
-| Variable | Value |
-|---|---|
-| `VITE_API_URL` | the deployed API Gateway URL — **from `terraform output` after step 4** |
-| `VITE_AUTH_PROVIDER` | `entra` — must match the backend's `AUTH_PROVIDER`; nothing in the SPA reads it |
-| `VITE_ENTRA_TENANT_ID` | tenant GUID |
-| `VITE_ENTRA_TENANT_DOMAIN` | `<something>.onmicrosoft.com` |
-| `VITE_ENTRA_SPA_CLIENT_ID` | SPA app's client ID |
-| `VITE_ENTRA_SPA_REDIRECT_URI` | **from step 5** |
-| `VITE_ENTRA_SPA_SCOPE` | `<application-id-uri>/<scope-name>`, e.g. `api://agp/Access.Default` |
-
-Fill in the five you already know now; the other two come from the first deploy. `VITE_ENTRA_TENANT_ID` and `VITE_ENTRA_SPA_CLIENT_ID` are not optional: the SPA throws at module load if either is missing or still an all-zero placeholder, because the alternative is a sign-in that completes against the wrong directory and then fails every API call.
+There is nothing to configure. The SPA's `VITE_*` values — API URL, tenant ID and domain, SPA client ID, scope, redirect URI — are baked at build time from Terraform outputs of the step-2 variables: the deploy writes `frontend/.env.production` from them and reads no hand-written file. The redirect URI is derived as `<frontend_url>/auth/callback`, which is why step 5 has only an Entra side. `VITE_ENTRA_TENANT_ID` and `VITE_ENTRA_SPA_CLIENT_ID` are still not optional — the SPA throws at module load if either is missing or an all-zero placeholder, and the deploy refuses to build a bundle from an empty or placeholder output — so the Entra GUIDs in step 2 must be real before the first deploy. `frontend/.env` (copied from `.env.example`) serves `npm run dev` against an already-deployed API and is never read by a deploy.
 
 ### 4. Deploy
 
+A deploy does the same thing wherever it runs: it builds the backend image and pushes it to ECR tagged with the short commit SHA (never `latest`), plans and applies Terraform with that image by digest, builds the frontend from Terraform outputs and syncs it to S3 + CloudFront, waits for the ECS rollout to reach steady state, and runs an unauthenticated smoke check against the deployed URL. After each successful apply the digest of the running backend image is recorded in an SSM parameter that Terraform reads back, so a plan or apply without a new image never rolls ECS to a different image by accident.
+
+**The commands are in [Deploying](platform/control_plane/infrastructure/DEPLOYING.md).**
+
+**`agp_api_url` takes a second pass on a from-zero deploy.** The agent and MCP registries are created by Terraform and resolved by *name* at runtime, so there is no registry id to read back or paste. The one value Terraform cannot derive is `agp_api_url`: the API Gateway URL plus `/api/v1`, which the backend writes to every agent repository as the `AGP_API_URL` Actions variable so GitHub can tell the platform an image is ready. The API Gateway depends on the ECS service that needs the URL, so no single apply can compute it. After the first apply, set `agp_api_url = "<api_endpoint>/api/v1"` in `env/<ENV_NAME>.tfvars` and deploy again; only the ECS task definition changes. Without it, creating an agent repository stops at the "Set repository CI variables" step with an error naming `agp_api_url`, so no image is ever built; before 2026-10-14 this was silent, and images landed in ECR with no runtime ever deployed.
+
+**Transaction Search is switched on for the account.** Agent traces only reach the `aws/spans` log group — what the Observability tab and the evaluation judges read — when CloudWatch Transaction Search is enabled, and a fresh account has it off. Terraform enables it by default (`enable_transaction_search = true` in `env/<ENV_NAME>.tfvars`). It is account-wide for the region, and every span is billed as CloudWatch Logs ingestion; set it to `false` to opt out, at the price of empty traces and evaluations. Check it took:
+
 ```bash
-cd platform/control_plane/infrastructure/scripts
-./deploy-full.sh          # add --finch to force the finch container engine
+aws xray get-trace-segment-destination   # expect "Destination": "CloudWatchLogs", "Status": "ACTIVE"
 ```
 
-Five stages: Terraform, backend image build + push to ECR, ECS rolling deploy, frontend build, frontend deploy to S3 + CloudFront. It **pauses after `terraform plan` and waits for you to type `yes`**, so you review the plan before anything is created.
+`ACTIVE` only proves the switch. Delivery is proven after the first agent invocation, when the log group exists:
 
-**One apply is enough.** The agent and MCP registries are created by Terraform and resolved by *name* at runtime, so there is no registry id to read back, paste anywhere, or re-apply for.
+```bash
+aws logs describe-log-groups --log-group-name-prefix aws/spans   # must list aws/spans
+```
 
 ### 5. Close the redirect-URI loop
 
-This is a genuine chicken-and-egg, and it is where sign-in silently breaks. The SPA's redirect URI is a CloudFront domain that does not exist until Terraform has run — so you deploy first, then repoint both sides:
+This is a genuine chicken-and-egg, and it is where sign-in silently breaks. The SPA's redirect URI is a CloudFront domain that does not exist until Terraform has run — so you deploy first, then register it.
+
+The apply prints `FRONTEND_URL` and `API_ENDPOINT` on its last lines. By hand, initialise against the remote state as the infrastructure README describes and read them back:
 
 ```bash
 cd platform/control_plane/infrastructure
@@ -238,28 +222,11 @@ terraform output -raw api_endpoint     # e.g. https://abc123.execute-api.us-east
 ```
 
 1. In the **SPA app registration**, add `<frontend_url>/auth/callback` as a redirect URI (platform: Single-page application).
-2. In `platform/control_plane/frontend/.env`, set `VITE_ENTRA_SPA_REDIRECT_URI` to that same `<frontend_url>/auth/callback`, and `VITE_API_URL` to the `api_endpoint` value. That is their durable home and the file `deploy-full.sh` reads.
-3. Ship them, one of two ways — **and read the note below before picking, because one obvious-looking route silently does nothing:**
+2. Nothing on the platform side: the deploy already baked that same URI into the bundle as `VITE_ENTRA_SPA_REDIRECT_URI`, derived from the `frontend_url` output. If `agp_api_url` is still empty, this is also the moment for the second pass from step 4: set it in `env/<ENV_NAME>.tfvars` and deploy again.
 
-   ```bash
-   cd platform/control_plane/infrastructure/scripts
-   ./deploy-full.sh        # re-reads .env, regenerates .env.production, redeploys everything
-   ```
+Until **both** sides carry the same URI, sign-in fails with no useful error. This repeats every time the CloudFront domain changes — for example after a destroy-and-recreate: the next deploy rebakes the frontend; the Entra registration is yours to update.
 
-   or, for a frontend-only redeploy, copy the same two values into `frontend/.env.production` as well and then:
-
-   ```bash
-   cd platform/control_plane/infrastructure/scripts
-   ./deploy-frontend.sh
-   ```
-
-Until **both** sides point at the same URI, sign-in fails with no useful error. This repeats every time the CloudFront domain changes — for example after a destroy-and-recreate.
-
-> **Which env file the build actually reads.** Step 4 wrote all seven variables into `frontend/.env.production`, and for a production build Vite ranks the env files in ascending priority `.env` → `.env.local` → `.env.production` → `.env.production.local`. So `.env.production` beats the `.env` you filled in at step 3.
->
-> `deploy-full.sh` handles that for you: for the five operator-supplied variables it deliberately reads `.env` *before* `.env.production` — because `.env.production` is its own previous output and a stale generated value must never beat a hand-edit — and then rewrites all seven keys. `deploy-frontend.sh` does not: it runs `npm run build` and generates nothing, so Vite's order applies unchanged.
->
-> **Editing only `.env` and then running `deploy-frontend.sh` therefore changes nothing, and reports nothing.** The build succeeds and ships the previous values. If you use a custom domain or a non-default callback path, that is the mistake that deploys a bundle nobody can sign in to. `.env.production` carries a "do not hand-edit" header for good reason — a later `deploy-full.sh` overwrites it from `.env` — which is why step 2 puts the values in `.env` first and `.env.production` is only the copy that makes the quick path work.
+> `frontend/.env.production` is written by every deploy from Terraform outputs and nothing else. A hand edit there is overwritten by the next deploy, and nothing in `frontend/.env` reaches a deployed bundle.
 
 ### 6. Seed the default tenant — and, optionally, demo data
 
@@ -283,7 +250,7 @@ cd platform/control_plane/backend
 
 Open the `frontend_url` from step 5, sign in through Microsoft Entra ID, and the platform loads with the role your Entra assignment gives you. From there: register agents, grant access, and author tool policies from the UI.
 
-`terraform destroy` from `platform/control_plane/infrastructure` tears the stack down, but teardown currently needs supervision and can leave resources behind on the first pass.
+Tearing a stack down is in [Deploying](platform/control_plane/infrastructure/DEPLOYING.md#teardown).
 
 > Deploy options, the Langfuse observability setup, and cross-account deployment are documented in [`platform/README.md`](platform/README.md).
 
@@ -308,15 +275,15 @@ PYTHONPATH=src venv/bin/python -m pytest -q
 ```bash
 npm ci
 npx tsc -b            # types
-npx vitest run        # 44 files, 1290 tests
+npx vitest run
 npm run build         # tsc -b + vite build
-npm run lint          # eslint — read the note below before reacting to the number
+npm run lint          # eslint — no baseline, fails on any error
 npm audit --omit=dev  # expects 0 vulnerabilities
 ```
 
 The Vitest suite is **node-environment only by design** (`include: ['src/**/*.test.ts']`) — there are no `.tsx` tests, no DOM, and no render harness. Component wiring is covered by `npm run build` and by deploying and clicking, not by unit tests.
 
-`npm run lint` reports **63 problems (59 errors, 4 warnings) and exits 1.** That is a known, accepted baseline rather than new debt — mostly `react-hooks/set-state-in-effect` and `react-refresh/only-export-components` in long-lived files, itemised rule by rule in the frontend README. Treat the number as the bar: a change should not raise it.
+`npm run lint` is a gate with no baseline: ESLint reports every finding, and any error-level one fails it. A new `eslint-disable` needs `-- <reason>; expires <YYYY-MM-DD>; added <origin>`, the origin being the epic and task (or hotfix) that added it, and one that no longer suppresses anything fails. The frontend README has the detail.
 
 ---
 

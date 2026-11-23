@@ -1,4 +1,4 @@
-"""Tests for EcrImageService (Epic 23, Task 3).
+"""Tests for EcrImageService.
 
 Strategy: no moto — inject a ``unittest.mock.MagicMock`` boto3 ECR client via
 the service constructor, mirroring the agent-registry / s3 service tests.
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from botocore.exceptions import ClientError
 
-from services.ecr_image_service import EcrImageService, EcrImageError
+from services.ecr_image_service import EcrImageError, EcrImageService
 
 
 def _client_error(code: str, op: str = "ListImages") -> ClientError:
@@ -63,7 +63,7 @@ def test_delete_images_idempotent_on_repo_not_found(fake_ecr):
     fake_ecr.list_images.side_effect = _client_error("RepositoryNotFoundException")
     svc = EcrImageService(repository="agp-agents", client=fake_ecr)
 
-    assert svc.delete_images("ag1") == 0  # must not raise
+    assert svc.delete_images("ag1") == 0
 
 
 def test_delete_images_raises_on_unexpected_client_error(fake_ecr):
@@ -97,7 +97,7 @@ def test_count_images_counts_matching_tag_prefix(fake_ecr):
     svc = EcrImageService(repository="agp-agents", client=fake_ecr)
 
     assert svc.count_images("ag1") == 2
-    fake_ecr.batch_delete_image.assert_not_called()  # count is READ-ONLY
+    fake_ecr.batch_delete_image.assert_not_called()
 
 
 def test_count_images_returns_zero_when_no_match(fake_ecr):
@@ -118,7 +118,7 @@ def test_count_images_idempotent_on_repo_not_found(fake_ecr):
     fake_ecr.list_images.side_effect = _client_error("RepositoryNotFoundException")
     svc = EcrImageService(repository="agp-agents", client=fake_ecr)
 
-    assert svc.count_images("ag1") == 0  # must not raise
+    assert svc.count_images("ag1") == 0
 
 
 def test_repository_uri_reduced_to_name(fake_ecr):
@@ -130,3 +130,14 @@ def test_repository_uri_reduced_to_name(fake_ecr):
     svc.delete_images("ag1")
 
     assert fake_ecr.list_images.call_args.kwargs["repositoryName"] == "agp-agents"
+
+
+def test_an_unexpected_ecr_failure_names_the_operation_and_not_the_ecr_error(fake_ecr):
+    fake_ecr.list_images.side_effect = _client_error("AccessDeniedException")
+    svc = EcrImageService(repository="agp-agents", client=fake_ecr)
+
+    with pytest.raises(EcrImageError) as exc:
+        svc.count_images("ag1")
+
+    assert exc.value.message == str(exc.value) == "ECR image count failed"
+    assert "AccessDenied" not in exc.value.message

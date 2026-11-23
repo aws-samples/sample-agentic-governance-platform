@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar,
 } from 'recharts';
-import { AUDIT_EVENTS, INCIDENT_SUMMARY, RISK_TREND_30D, tooltipStyle } from './mockData';
+import { AUDIT_EVENTS, INCIDENT_SUMMARY, RISK_TREND_30D } from './mockData';
+import { tooltipStyle } from '../shared/chartTheme';
 import { ComingSoonBanner } from '../shared/comingSoon';
 
 const catBg: Record<string, string> = {
@@ -75,7 +76,6 @@ export default function AuditIncidents() {
           </div>
         </div>
 
-        {/* Summary KPIs */}
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
           <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-4 shadow-sm">
             <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">Open Incidents</div>
@@ -104,7 +104,6 @@ export default function AuditIncidents() {
           </div>
         </div>
 
-        {/* Row 2: charts */}
         <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 mb-4">
           <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm">
             <div className="flex items-center justify-between mb-3">
@@ -150,7 +149,6 @@ export default function AuditIncidents() {
           </div>
         </div>
 
-        {/* Filters */}
         <div className="flex flex-wrap items-center gap-3 mb-4">
           <input
             type="text"
@@ -197,7 +195,6 @@ export default function AuditIncidents() {
           </div>
         </div>
 
-        {/* Timeline */}
         <div className="bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 shadow-sm overflow-hidden">
           <div className="divide-y divide-slate-100">
             {filtered.map(e => (
@@ -226,7 +223,6 @@ export default function AuditIncidents() {
           )}
         </div>
 
-        {/* Event detail drawer */}
         {selected && (
           <div className="fixed inset-0 z-50">
             <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-fade-in" onClick={() => setSelected(null)} />

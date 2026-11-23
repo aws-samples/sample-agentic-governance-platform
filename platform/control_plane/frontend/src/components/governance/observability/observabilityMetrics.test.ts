@@ -1,10 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import type { ScopeMetrics } from '../../../types';
-import { CHART_COLORS } from '../../govern/mockData';
+import type { ScopeMetrics } from '../../../api/client';
+import { CHART_COLORS } from '../../shared/chartTheme';
 import { buildDashboardSeries, defaultDateRange } from './observabilityMetrics';
 
-// A fully-populated scope payload (the shape C4 /observability/metrics returns:
-// AgentMetrics ⊕ by_agent[]). snake_case exactly as the backend emits.
 const POPULATED: ScopeMetrics = {
   totals: { traces: 30, cost_usd: 1.5, tokens: 4200 },
   daily: [
@@ -22,7 +20,6 @@ const POPULATED: ScopeMetrics = {
   ],
 };
 
-// A "configured but no data yet" scope — every scalar zeroed, every list empty.
 const EMPTY_SCOPE: ScopeMetrics = {
   totals: { traces: 0, cost_usd: 0, tokens: 0 },
   daily: [],
@@ -38,6 +35,17 @@ describe('buildDashboardSeries', () => {
       { date: '2026-07-01', traces: 10, cost: 0.5, tokens: 1400 },
       { date: '2026-07-02', traces: 20, cost: 1.0, tokens: 2800 },
     ]);
+  });
+
+  it('drops a daily bucket outside the requested window (the 1970-01-01 tick Langfuse dates an observation with no usable timestamp); totals stay the server\'s, and without a range nothing is filtered', () => {
+    const scope = {
+      ...POPULATED,
+      daily: [{ date: '1970-01-01', traces: 1, cost_usd: 0, tokens: 0 }, ...POPULATED.daily],
+    };
+    const series = buildDashboardSeries(scope, { dateFrom: '2026-07-01', dateTo: '2026-07-01' });
+    expect(series.timeseries.map((p) => p.date)).toEqual(['2026-07-01']);
+    expect(series.totals).toEqual(buildDashboardSeries(scope).totals);
+    expect(buildDashboardSeries(scope).timeseries).toHaveLength(3);
   });
 
   it('maps by_model into pie slices with a stable color per index', () => {

@@ -1,9 +1,3 @@
-// ObsEmptyCard — the calm empty/error state shared by the observability surfaces
-// (Epic 26). Lifted verbatim from the T8 ObservabilityDashboard's private
-// EmptyCard so the platform dashboard and the per-agent Traces/Cost tabs render
-// the identical "no data yet" / "couldn't load" affordance (DRY). `tone='amber'`
-// is the soft-error variant; the default slate tone is the not-configured /
-// no-data-in-window calm card.
 export function ObsEmptyCard({ title, body, tone = 'slate' }: { title: string; body: string; tone?: 'slate' | 'amber' }) {
   const wrap = tone === 'amber' ? 'card border-amber-200 bg-amber-50/30' : 'card border-slate-200 bg-slate-50/50';
   const iconBg = tone === 'amber' ? 'bg-amber-100' : 'bg-slate-100';

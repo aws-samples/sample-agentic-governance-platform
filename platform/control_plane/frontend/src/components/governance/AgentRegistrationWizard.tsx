@@ -1,47 +1,41 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { agentsApi, tenantsAdminApi } from '../../api/client';
+import { isApiFailure } from '../../api/failure';
 import type {
   Agent,
-  AuthType,
+  AgentAuthType,
   DataClassification,
-  DiscoveredAgent,
+  DiscoveredAgents,
   Origin,
-  TenantPlatform,
 } from '../../api/client';
-import { useUser } from '../../contexts/UserContext';
+import { useLoad } from '../../api/useLoad';
+import { useUser } from '../../contexts/useUser';
 import { resolveTenantName, tenantSelectOptions } from './tenantUi';
 import { useTenantDirectory } from './useTenantDirectory';
+import { maskArn } from '../shared/arnDisplay';
 import {
   DISCOVERY_EMPTY_COPY,
   EMPTY_DRAFT,
   PLATFORM_READONLY_HINT,
   buildPayload,
   canSubmit,
+  classifyAgentCreateRefusal,
+  createBlockedReason,
   defaultDiscoveryStage,
   discoveredRowState,
   discoveryStageNames,
   discoveryState,
   manualHandleError,
   manualHandleField,
+  platformStepWarning,
   resolvePlatform,
   selectedRow,
-  shouldAcceptDiscovery,
+  supportsAutoTraceDelivery,
   tenantPlatformLabel,
-  type DiscoveryScope,
   type Draft,
   type TenantLike,
 } from './agentRegistrationWizardModel';
-
-// ---------------------------------------------------------------------------
-// Select option tables (mirror the enum labels used in AgentsList / AgentDetail)
-//
-// E29/T8: the PLATFORM table is GONE. A platform is no longer something an operator types —
-// it is inferred from the (platform-typed, immutable) tenant, because the platform decides
-// which create body a registration becomes and an operator who picks the wrong one registers
-// an agent the invoke path can never reach. See `agentRegistrationWizardModel`, which owns
-// every decision on this page; this component binds and renders.
-// ---------------------------------------------------------------------------
 
 const DATA_CLASS_OPTIONS: { value: DataClassification; label: string }[] = [
   { value: 'Public', label: 'Public' },
@@ -57,13 +51,13 @@ const ORIGIN_OPTIONS: { value: Origin; label: string }[] = [
   { value: 'Deployed', label: 'Deployed (provisioned by the platform)' },
 ];
 
-const AUTH_TYPE_OPTIONS: { value: AuthType; label: string }[] = [
+const AUTH_TYPE_OPTIONS: { value: AgentAuthType; label: string }[] = [
   { value: 'none', label: 'None' },
   { value: 'entra', label: 'Microsoft Entra' },
   { value: 'api_key', label: 'API key' },
 ];
 
-const AUTH_TYPE_LABEL: Record<AuthType, string> = {
+const AUTH_TYPE_LABEL: Record<AgentAuthType, string> = {
   none: 'None',
   entra: 'Microsoft Entra',
   api_key: 'API key',
@@ -79,20 +73,13 @@ const STEPS = [
   { n: 5, label: 'Confirm' },
 ];
 
-// Shared field styling.
 const INPUT =
   'mt-1 w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500/40';
 const LABEL = 'text-xs uppercase tracking-wide text-slate-500 font-medium';
 
-// `Draft`, `EMPTY_DRAFT` and `buildPayload` now live in `agentRegistrationWizardModel` — the
-// draft shape and the payload mapping are DECISIONS (which platform, which handle field, what a
-// selected discovery row becomes), and the model is where decisions are testable.
-
 export default function AgentRegistrationWizard() {
   const navigate = useNavigate();
 
-  // Tenant select source (E24): the caller's memberships, or the full admin
-  // directory for role_level >= 2 (degrades to memberships while it loads).
   const { user } = useUser();
   const isAdmin = (user?.role_level ?? 0) >= 2;
   const tenantDirectory = useTenantDirectory(isAdmin);
@@ -101,14 +88,11 @@ export default function AgentRegistrationWizard() {
   const [step, setStep] = useState(1);
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
 
-  // Submission / result state.
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<Agent | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // A name-collision (409) error is surfaced inline on step 1.
   const [nameError, setNameError] = useState<string | null>(null);
 
-  // Post-create "submit for approval" state.
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -116,134 +100,55 @@ export default function AgentRegistrationWizard() {
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) =>
     setDraft((d) => ({ ...d, [key]: value }));
 
-  // -- the tenant, and everything inferred from it (E29/T8) -----------------
-  //
-  // The selected tenant record, from whichever directory knows the id. `findTenantAccount`'s
-  // sibling `resolveTenantName` is already used below for the same lookup on the name.
   const tenant: TenantLike | null =
     tenantOptions.find((t) => t.id === draft.tenant_id) ?? null;
   const stageNames = discoveryStageNames(tenant);
-  // Discovery is ADMIN-gated while agent creation is OPERATOR-gated, so a real operator may
-  // legitimately be unable to list. That is a STATE, not an error (see the model's union).
   const canDiscover = isAdmin;
 
   const [stage, setStage] = useState<string | null>(null);
-  const [rows, setRows] = useState<DiscoveredAgent[] | null>(null);
-  // C-3's envelope platform, held as state beside the rows because it is the AUTHORITATIVE
-  // answer: the route read it off the tenant RECORD, whereas `tenant` here comes from a directory
-  // that can be stale or (for a non-admin's `/users/me` memberships) carry no platform at all.
-  const [discoveredPlatform, setDiscoveredPlatform] = useState<TenantPlatform | null>(null);
-  const [discoveryLoading, setDiscoveryLoading] = useState(false);
-  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
 
-  // The platform is READ, never picked — from the discovery response when there is one, else
-  // inferred from the tenant (manual-entry-only flows). See `resolvePlatform` for the CRITICAL
-  // this ordering closes: an admin whose tenant directory has not loaded still discovers real
-  // Databricks rows, and inferring `aws` from the absent key posted the app URL into `agent_arn`.
-  const tenantPlatform = resolvePlatform(tenant, discoveredPlatform);
-
-  // The stage follows the tenant: a stage name from the previous tenant is meaningless on this
-  // one (and would 400), so it is re-derived from the tenant's OWN stage map — never a literal
-  // (contract C5). `null` when the tenant carries none, which suppresses the request entirely.
   const stageKey = stageNames.join('|');
-  useEffect(() => {
+  const [prevScope, setPrevScope] = useState({ tenantId: draft.tenant_id, stageKey });
+  if (prevScope.tenantId !== draft.tenant_id || prevScope.stageKey !== stageKey) {
+    setPrevScope({ tenantId: draft.tenant_id, stageKey });
     setStage(defaultDiscoveryStage(tenant));
-    setRows(null);
-    // Cleared with the rows: a platform proven for the PREVIOUS tenant says nothing about this
-    // one, and keeping it would let a stale `databricks` build this tenant's payload.
-    setDiscoveredPlatform(null);
-    setDiscoveryError(null);
-    // The selection is cleared too, and that is load-bearing rather than tidiness: a handle
-    // picked on the previous tenant is not a row on this one, and leaving it would make the
-    // Confirm step show a handle the new tenant's list never offered.
     setDraft((d) => ({ ...d, selected_handle: '' }));
-    // `stageKey` (not `tenant`) so a re-rendered but unchanged tenant does not reset the
-    // operator's stage pick. Keyed on the tenant id as well, since two tenants can share a
-    // stage-name set.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft.tenant_id, stageKey]);
+  }
 
-  // What the form is showing RIGHT NOW, readable from inside a settled promise. A ref rather than
-  // the closure's own variables because that is the whole problem being solved: `runDiscovery`
-  // closes over the tenant/stage it was created with, so after an await those values describe the
-  // request, not the form. `shouldAcceptDiscovery` compares the two.
-  const scopeRef = useRef<{ tenantId: string; stage: string | null }>({
-    tenantId: draft.tenant_id,
-    stage,
-  });
-  scopeRef.current = { tenantId: draft.tenant_id, stage };
+  const discoveryLoad = useLoad<DiscoveredAgents | null>(
+    () =>
+      canDiscover && draft.tenant_id && stage
+        ? tenantsAdminApi.discoveredAgents(draft.tenant_id, stage)
+        : Promise.resolve(null),
+    [draft.tenant_id, stage, canDiscover],
+    'Discovery failed.',
+  );
+  const discovered = discoveryLoad.state.kind === 'ready' ? discoveryLoad.state.data : null;
+  const rows = discovered?.agents ?? null;
 
-  const runDiscovery = useCallback(async () => {
-    if (!draft.tenant_id || !stage || !canDiscover) return;
-    // Captured BEFORE the await — what this request is about (see `shouldAcceptDiscovery`).
-    const snapshot: DiscoveryScope = { tenantId: draft.tenant_id, stage };
-    setDiscoveryLoading(true);
-    setDiscoveryError(null);
-    try {
-      const res = await tenantsAdminApi.discoveredAgents(snapshot.tenantId, snapshot.stage);
-      // A response for a tenant/stage the operator has already left is DISCARDED, not rendered:
-      // out-of-order settling would otherwise paint tenant A's rows and platform onto tenant B's
-      // form, and `buildPayload` would post B's id with A's handle.
-      if (!shouldAcceptDiscovery(snapshot, scopeRef.current)) return;
-      setRows(res.agents);
-      // Taken from the SAME response as the rows, so the platform and the handles an operator
-      // picks from can never come from different readings of the tenant.
-      setDiscoveredPlatform(res.platform);
-    } catch (err: unknown) {
-      // A stale FAILURE is discarded on the same rule. Showing tenant A's 502 on tenant B's form
-      // sends the operator to debug a platform that was never asked about.
-      if (!shouldAcceptDiscovery(snapshot, scopeRef.current)) return;
-      // The message is SHOWN rather than flattened to "discovery failed": the route's 400
-      // (this tenant has no such stage) and 502 (the platform could not be reached, with a safe
-      // code) are different problems with different fixes, and the detail is already redacted
-      // server-side.
-      setDiscoveryError(err instanceof Error ? err.message : 'Discovery failed.');
-      setRows(null);
-      // A failed discovery proves nothing about the platform, so the claim is dropped and the
-      // tenant-derived inference takes over — never a stale value from an earlier stage.
-      setDiscoveredPlatform(null);
-    } finally {
-      // The spinner is cleared ONLY by the request that still owns the scope. A stale request
-      // clearing it would report "done" while the live request is still in flight.
-      if (shouldAcceptDiscovery(snapshot, scopeRef.current)) setDiscoveryLoading(false);
-    }
-  }, [draft.tenant_id, stage, canDiscover]);
-
-  // Fetch when a tenant + stage are in hand and the caller may discover. Re-running on the
-  // stage is the point: switching environments must re-ask the platform, not re-filter a
-  // cached list from another workspace.
-  useEffect(() => {
-    void runDiscovery();
-  }, [runDiscovery]);
+  const tenantPlatform = resolvePlatform(tenant, discovered?.platform);
 
   const discovery = discoveryState({
     tenant,
     canDiscover,
     stage,
-    loading: discoveryLoading,
-    error: discoveryError,
+    loading: discoveryLoad.state.kind === 'loading',
+    error: discoveryLoad.state.kind === 'error' ? discoveryLoad.state.message : null,
     rows,
   });
   const chosenRow = selectedRow(draft, rows);
   const handleField = manualHandleField(tenantPlatform);
-  // Gated on `handle_source`, matching `canSubmit`. Ungated, a stale value left in the manual box
-  // before the operator switched back to the discovery list blocked Create while `canSubmit`
-  // (which DOES check the source) still enabled the button — and the message had no field on
-  // screen to attach to. The two gates must agree or the form dead-ends.
   const handleFieldError =
     draft.handle_source === 'manual'
       ? manualHandleError(tenantPlatform, draft[handleField.key])
       : null;
 
   const nameValid = draft.name.trim().length > 0;
-  // tenant_id is REQUIRED by the backend since E24 — gate the Classification step.
   const tenantValid = draft.tenant_id.length > 0;
   const submitOk = canSubmit(draft, tenantPlatform);
+  const blockedReason = createBlockedReason(draft, tenantPlatform);
+  const platformStepInvalid = handleFieldError !== null;
 
-  // The body that WOULD be posted. Derived rather than described, so the read-only fields and the
-  // Confirm summary cannot drift from what `handleCreate` actually sends — the failure mode being
-  // a summary that says "None" while the payload says "entra" (or the reverse), which teaches an
-  // operator the wrong thing about a governance record.
   const preview = buildPayload(draft, tenantPlatform, chosenRow);
 
   const next = () => {
@@ -251,6 +156,7 @@ export default function AgentRegistrationWizard() {
       setNameError('A name is required.');
       return;
     }
+    if (step === 4 && platformStepInvalid) return;
     setNameError(null);
     setStep((s) => Math.min(5, s + 1));
   };
@@ -267,9 +173,6 @@ export default function AgentRegistrationWizard() {
       setStep(3);
       return;
     }
-    // A manual handle that fails its platform's rule is refused HERE rather than posted: the
-    // backend's invoke-time guard would reject it too, but only at the first invoke — long after
-    // the operator left this page believing the registration was sound.
     if (handleFieldError) {
       setError(handleFieldError);
       setStep(4);
@@ -283,9 +186,7 @@ export default function AgentRegistrationWizard() {
       setCreated(agent);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to create the agent.';
-      // A duplicate name surfaces as a 409 → its detail message. Send the user back
-      // to step 1 with the message on the name field so they can rename.
-      if (/already|exist|taken|409|duplicate/i.test(msg)) {
+      if (isApiFailure(err) && classifyAgentCreateRefusal(err) === 'name_taken') {
         setNameError(msg);
         setStep(1);
       } else {
@@ -309,8 +210,6 @@ export default function AgentRegistrationWizard() {
       setSubmitting(false);
     }
   };
-
-  // -- success state --------------------------------------------------------
 
   if (created) {
     return (
@@ -368,8 +267,6 @@ export default function AgentRegistrationWizard() {
     );
   }
 
-  // -- wizard ---------------------------------------------------------------
-
   return (
     <div className="min-h-[calc(100vh-4rem)] relative">
       <div className="relative max-w-2xl mx-auto px-6 py-10">
@@ -384,11 +281,12 @@ export default function AgentRegistrationWizard() {
           Bring an agent under governance — give it an owner, a classification, and a home platform.
         </p>
 
-        {/* Step indicator */}
         <nav aria-label="Progress" className="mt-6 mb-6">
           <ol className="flex items-center gap-2">
             {STEPS.map((s, i) => {
-              const state = step === s.n ? 'current' : step > s.n ? 'done' : 'upcoming';
+              const stepInvalid = s.n === 4 && platformStepInvalid;
+              const state =
+                step === s.n ? 'current' : step > s.n ? (stepInvalid ? 'invalid' : 'done') : 'upcoming';
               return (
                 <li key={s.n} className="flex items-center gap-2">
                   <span
@@ -398,10 +296,12 @@ export default function AgentRegistrationWizard() {
                         ? 'bg-blue-600 text-white'
                         : state === 'done'
                           ? 'bg-emerald-100 text-emerald-700'
-                          : 'bg-slate-100 text-slate-400'
+                          : state === 'invalid'
+                            ? 'bg-red-100 text-red-700'
+                            : 'bg-slate-100 text-slate-400'
                     }`}
                   >
-                    {state === 'done' ? '✓' : s.n}
+                    {state === 'done' ? '✓' : state === 'invalid' ? '!' : s.n}
                   </span>
                   <span
                     className={`hidden sm:inline text-xs font-medium ${
@@ -418,7 +318,6 @@ export default function AgentRegistrationWizard() {
         </nav>
 
         <div className={`${CARD} p-6`}>
-          {/* Step 1 — Name + purpose */}
           {step === 1 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Identity</h2>
@@ -457,7 +356,6 @@ export default function AgentRegistrationWizard() {
             </div>
           )}
 
-          {/* Step 2 — Sponsor */}
           {step === 2 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Sponsor</h2>
@@ -494,7 +392,6 @@ export default function AgentRegistrationWizard() {
             </div>
           )}
 
-          {/* Step 3 — Business unit + region + data classification */}
           {step === 3 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Classification</h2>
@@ -576,12 +473,10 @@ export default function AgentRegistrationWizard() {
             </div>
           )}
 
-          {/* Step 4 — Platform + framework + origin */}
           {step === 4 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Platform</h2>
 
-              {/* Read-only platform — inferred from the tenant, not chosen here. */}
               <div>
                 <span className={LABEL}>Platform</span>
                 <p className="mt-1 text-sm font-medium text-slate-800">
@@ -592,9 +487,13 @@ export default function AgentRegistrationWizard() {
                   )}
                 </p>
                 <p className="mt-1 text-xs text-slate-400">{PLATFORM_READONLY_HINT}</p>
+                {tenantValid && platformStepWarning(tenantPlatform) && (
+                  <p className="mt-2 text-xs text-amber-600" role="status">
+                    {platformStepWarning(tenantPlatform)}
+                  </p>
+                )}
               </div>
 
-              {/* Runtime — the discovery list, or manual entry as the documented fallback. */}
               <div className="pt-2 border-t border-slate-200/70 space-y-4">
                 <div className="flex items-start justify-between gap-4">
                   <div>
@@ -618,8 +517,6 @@ export default function AgentRegistrationWizard() {
 
                 {draft.handle_source === 'discovery' ? (
                   <div className="space-y-3">
-                    {/* Stage picker — only when the tenant has more than one, and always from
-                        the tenant's own stage map (never a hardcoded name, contract C5). */}
                     {stageNames.length > 1 && (
                       <div>
                         <label htmlFor="discovery-stage" className={LABEL}>
@@ -644,8 +541,6 @@ export default function AgentRegistrationWizard() {
                       </div>
                     )}
 
-                    {/* Four honest states. An empty list is NEVER rendered as silence: a 502,
-                        a not-yet-asked panel and a genuinely empty platform each say so. */}
                     {discovery.kind === 'loading' && (
                       <p className="text-sm text-slate-500" role="status">
                         Asking {tenantPlatformLabel(tenantPlatform)} what this tenant is running…
@@ -658,7 +553,7 @@ export default function AgentRegistrationWizard() {
                         <div className="mt-2 flex flex-wrap items-center gap-3">
                           <button
                             type="button"
-                            onClick={() => void runDiscovery()}
+                            onClick={discoveryLoad.reload}
                             className="text-xs font-medium text-red-700 underline hover:no-underline"
                           >
                             Try again
@@ -726,29 +621,21 @@ export default function AgentRegistrationWizard() {
                                     >
                                       {r.name}
                                     </span>
-                                    <span className="block text-xs text-slate-400 truncate">
-                                      {r.runtime_handle}
+                                    <span className="block text-xs text-slate-400 truncate" title={r.runtime_handle}>
+                                      {maskArn(r.runtime_handle)}
                                     </span>
                                   </span>
-                                  {/* The platform's RAW state string — display-only, never
-                                      mapped onto AGP's runtime-status union (C-3). */}
                                   {r.state && (
                                     <span className="shrink-0 text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">
                                       {r.state}
                                     </span>
                                   )}
                                 </span>
-                                {/* A disabled row ALWAYS carries its reason — a greyed-out row
-                                    with no explanation is a swallowed error. */}
                                 {rowState.reason && (
                                   <span className="mt-1 block text-xs text-slate-400">
                                     {rowState.reason}
                                   </span>
                                 )}
-                                {/* A SELECTABLE row's caveat (today: a serving endpoint, which
-                                    registers for inventory but cannot be governed yet). Amber,
-                                    not grey: without it the operator's first signal is a failed
-                                    provision on a record they already created. */}
                                 {rowState.warning && (
                                   <span className="mt-1 block text-xs text-amber-600">
                                     {rowState.warning}
@@ -816,7 +703,6 @@ export default function AgentRegistrationWizard() {
                 </select>
               </div>
 
-              {/* Invocation sub-group — how callers reach this agent */}
               <div className="pt-2 border-t border-slate-200/70 space-y-5">
                 <div>
                   <h3 className="text-sm font-semibold text-slate-800">
@@ -836,14 +722,6 @@ export default function AgentRegistrationWizard() {
                     className={INPUT}
                   />
                 </div>
-                {/* Authentication. On a Databricks tenant WITH A RUNTIME BOUND, `buildPayload`
-                    FORCES this to Entra — `is_databricks_governed` requires it before any
-                    identity work happens, so a Databricks agent left on "None" is a record that
-                    looks governed and provisions nothing. The condition reads the payload rather
-                    than the platform, so the two cannot disagree: a Databricks registration with
-                    no runtime yet is metadata-only and keeps the operator's choice, exactly as
-                    the posted body does. Read-only rather than silently overridden — a control
-                    whose value the payload ignores is worse than no control. */}
                 {preview.auth_type === 'entra' && draft.auth_type !== 'entra' ? (
                   <div>
                     <span className={LABEL}>Authentication</span>
@@ -863,7 +741,7 @@ export default function AgentRegistrationWizard() {
                     <select
                       id="auth-type"
                       value={draft.auth_type}
-                      onChange={(e) => set('auth_type', e.target.value as AuthType)}
+                      onChange={(e) => set('auth_type', e.target.value as AgentAuthType)}
                       aria-label="Authentication type"
                       className={INPUT}
                     >
@@ -876,10 +754,32 @@ export default function AgentRegistrationWizard() {
                   </div>
                 )}
               </div>
+
+              {supportsAutoTraceDelivery(tenantPlatform) && (
+                <div className="pt-2 border-t border-slate-200/70">
+                  <label htmlFor="trace-delivery" className="flex items-start gap-2 cursor-pointer">
+                    <input
+                      id="trace-delivery"
+                      type="checkbox"
+                      checked={draft.trace_delivery === 'auto'}
+                      onChange={(e) => set('trace_delivery', e.target.checked ? 'auto' : 'manual')}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-slate-800">
+                        Deliver traces to Langfuse automatically
+                      </span>
+                      <span className="mt-0.5 block text-xs text-slate-400">
+                        AGP injects the OpenTelemetry endpoint on the runtime it manages. Uncheck to
+                        wire delivery yourself — the Langfuse project is provisioned either way.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
             </div>
           )}
 
-          {/* Step 5 — Confirm */}
           {step === 5 && (
             <div className="space-y-5">
               <h2 className="text-lg font-semibold text-slate-900">Confirm</h2>
@@ -928,9 +828,6 @@ export default function AgentRegistrationWizard() {
                 <Summary label="Endpoint URL" full>
                   {draft.endpoint_url.trim() || <span className="text-slate-400">Not set</span>}
                 </Summary>
-                {/* Every field below is read off the PAYLOAD, not the draft: what the operator
-                    confirms must be what gets posted. `runtime_handle` and `agent_arn` are
-                    mutually exclusive by platform (C-4), so exactly one row carries a value. */}
                 <Summary label="Authentication">
                   {AUTH_TYPE_LABEL[preview.auth_type ?? 'none']}
                 </Summary>
@@ -947,7 +844,7 @@ export default function AgentRegistrationWizard() {
                   </>
                 ) : (
                   <Summary label="Agent ARN" full>
-                    {preview.agent_arn ?? <span className="text-slate-400">Not set</span>}
+                    {preview.agent_arn ? maskArn(preview.agent_arn) : <span className="text-slate-400">Not set</span>}
                   </Summary>
                 )}
               </dl>
@@ -955,52 +852,50 @@ export default function AgentRegistrationWizard() {
           )}
         </div>
 
-        {/* Submit error — OUTSIDE the step blocks, deliberately. It used to live inside step 5,
-            which meant every `setError(...)` paired with a `setStep(...)` away from 5 set a
-            message nothing rendered: the wizard jumped to another step with no explanation and
-            the operator saw only a Create button that had stopped working. An error that can be
-            set from any step must be visible from any step. */}
         {error && (
           <p role="alert" className="mt-4 text-sm text-red-600">
             {error}
           </p>
         )}
 
-        {/* Nav buttons */}
         <div className="mt-6 flex items-center justify-between">
           <button
             onClick={back}
             disabled={step === 1 || creating}
             className="px-4 py-2 rounded-lg bg-white border border-slate-300 text-slate-700 text-sm font-medium hover:bg-slate-50 transition-colors disabled:opacity-40"
+            data-testid="wizard-back"
           >
             Back
           </button>
           {step < 5 ? (
             <button
               onClick={next}
-              disabled={step === 1 && !nameValid}
+              disabled={(step === 1 && !nameValid) || (step === 4 && platformStepInvalid)}
               className="px-5 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+              data-testid="wizard-next"
             >
               Next
             </button>
           ) : (
-            <button
-              onClick={handleCreate}
-              disabled={creating || !submitOk}
-              className="px-5 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
-            >
-              {creating ? 'Creating…' : 'Create'}
-            </button>
+            <span className="flex flex-col items-end gap-1">
+              <button
+                onClick={handleCreate}
+                disabled={creating || !submitOk}
+                className="px-5 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+                data-testid="wizard-create"
+              >
+                {creating ? 'Creating…' : 'Create'}
+              </button>
+              {!creating && blockedReason && (
+                <span className="text-xs text-red-600">{blockedReason}</span>
+              )}
+            </span>
           )}
         </div>
       </div>
     </div>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Confirm-step summary field
-// ---------------------------------------------------------------------------
 
 function Summary({
   label,

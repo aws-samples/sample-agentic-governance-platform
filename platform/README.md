@@ -39,7 +39,7 @@ graph TB
         end
 
         subgraph Observability["Observability"]
-            Langfuse[Langfuse v3<br/>Tracing + Evals]
+            Langfuse[Langfuse v4<br/>Tracing + Evals]
             OTEL[OpenTelemetry<br/>Collector]
             CW[CloudWatch<br/>Logs + Alarms]
         end
@@ -73,7 +73,7 @@ The React + FastAPI web UI for registering, governing, observing, and paying for
 |-----------|-------------|
 | [Backend](control_plane/backend/) | FastAPI API — agent registry, MCP server registry, access grants (Entra app-role assignments), Cedar per-tool policies, governance graph aggregation, marketplace, Microsoft Graph integration, Langfuse provisioning. |
 | [Frontend](control_plane/frontend/) | React + TypeScript UI — agent registry, registration wizard, access tabs, Cedar policy editor, governance graph (`@xyflow/react` + dagre), marketplace, observability, MSAL Entra sign-in. |
-| [Infrastructure](control_plane/infrastructure/) | Terraform modules — full control plane stack: ECS, API Gateway, CloudFront, DynamoDB, **Secrets Manager** (Entra Graph client secret), `agent_registry`, CodeBuild, and the Langfuse v3 observability stack (`modules/langfuse/`). |
+| [Infrastructure](control_plane/infrastructure/) | Terraform modules — full control plane stack: ECS, API Gateway, CloudFront, DynamoDB, **Secrets Manager** (Entra Graph client secret), `agent_registry`, CodeBuild, and the Langfuse v4 observability stack (`modules/langfuse/`). |
 | [Agent templates](control_plane/agent-templates/) | Scaffolding templates for new governed agent repositories (Strands-on-AgentCore), used by the platform's repo-creation flow. |
 
 ### Governance model
@@ -114,7 +114,7 @@ runtime from ECS.
 
 First-class Langfuse + OpenTelemetry integration.
 
-- The **`modules/langfuse/`** Terraform module provisions Langfuse v3 on ECS Fargate with managed PostgreSQL
+- The **`modules/langfuse/`** Terraform module provisions Langfuse v4 on ECS Fargate with managed PostgreSQL
   (Aurora), Redis (ElastiCache), and ClickHouse — along with the networking required to support it. It is
   applied as part of the root `terraform apply`.
 - The control plane provisions per-agent Langfuse projects, stores their API keys in Secrets Manager, and surfaces
@@ -135,37 +135,31 @@ First-class Langfuse + OpenTelemetry integration.
 **The setup path lives in the [root README](../README.md), and only there.** Read
 [Prerequisites](../README.md#prerequisites) and [Bootstrapping](../README.md#bootstrapping) and follow them
 in order: the two Entra app registrations you create **by hand** (nothing in this repo provisions your
-tenant), `terraform.tfvars` and `secrets.auto.tfvars` from their `.example` files, the frontend `.env`, one
-`terraform apply`, then the redirect-URI loop that cannot be closed until AWS has handed you a CloudFront
-domain. Those steps are deliberately not repeated here — a third copy is a third thing to drift.
+tenant), the environment's `infrastructure/env/<ENV_NAME>.tfvars` plus the two `TF_VAR_*` secrets, the
+first deploy, then the redirect-URI loop that cannot be closed until AWS has handed
+you a CloudFront domain. Those steps are deliberately not repeated here — a third copy is a third thing to drift.
 
 What follows is what the root README forwards here for: the deploy options, the Langfuse observability
 setup, and cross-account deployment. For the Terraform-level runbook — module reference, post-apply steps,
-remote state migration, teardown, troubleshooting — see
+remote state layout, teardown, troubleshooting — see
 [`control_plane/infrastructure/README.md`](control_plane/infrastructure/README.md).
 
 ### Deploy options
 
-Every script below lives in `control_plane/infrastructure/scripts/` and is safe to run from any working
-directory; each one `cd`s to the infrastructure root before invoking Terraform.
+How a deploy is run — the commands, the environment's files and the teardown — is in [`control_plane/infrastructure/DEPLOYING.md`](control_plane/infrastructure/DEPLOYING.md). The two scripts below sit beside it in `control_plane/infrastructure/scripts/` and are safe to run from any working directory.
 
 | Command | What it does | When to reach for it |
 |---|---|---|
-| `./deploy-full.sh` | Five stages: Terraform, backend image build + push to ECR, ECS rolling deploy, frontend build, frontend deploy to S3 + CloudFront. Preflights AWS credentials, the container engine, Terraform and Node before touching anything, and pauses after `terraform plan` for a typed `yes`. | The first deploy, and after pulling new code. Add `--finch` to force finch over docker. |
-| `terraform apply` from `control_plane/infrastructure` | Infrastructure only. | Reviewing or iterating on infra alone. Expect the backend ECS service to sit at **0 running tasks** afterwards: the task definition points at an ECR repo with no image yet, the deployment circuit breaker rolls it back, and the apply still reports success. Pushing the image converges it. |
-| `./deploy-container.sh` | Backend image only — builds `linux/amd64`, pushes to ECR, then forces a new ECS deployment. Assumes Terraform has already provisioned ECR + ECS. | Backend code changed. |
-| `./deploy-frontend.sh` | Frontend only — builds the UI **as-is** from whatever `frontend/.env*` files are present, syncs to S3, invalidates CloudFront. It generates no env files. | Frontend code changed, and after editing `frontend/.env` to close the redirect-URI loop. |
 | `./setup-dockerhub-auth.sh` | Stores Docker Hub credentials in Secrets Manager so the Langfuse image mirror is not subject to anonymous pull rate limits. | Optional, before the first apply. |
 | `./import-existing.sh` | Imports pre-existing AWS resources into Terraform state. | Recovering from a partial failure, or adopting manually-created resources. |
-| `./destroy.sh` | Tears down everything this Terraform state owns, emptying S3 buckets first so the destroy does not stall on them. Double-confirms. | Resetting a dev environment. Teardown still needs supervision and can leave resources behind on the first pass. |
 
-`deploy-full.sh`, `destroy.sh`, `import-existing.sh` and `setup-dockerhub-auth.sh` are documented in full —
+The scripts are documented in full —
 modes, environment variables, troubleshooting — in
 [`control_plane/infrastructure/scripts/README.md`](control_plane/infrastructure/scripts/README.md).
 
 ### Langfuse observability setup
 
-**There is nothing separate to deploy.** Langfuse v3 is a base Terraform module applied by the root
+**There is nothing separate to deploy.** Langfuse v4 is a base Terraform module applied by the root
 `terraform apply`: `modules/langfuse/` stands it up on ECS Fargate with Aurora PostgreSQL, ElastiCache
 Redis, ClickHouse, an ALB and a CloudFront distribution, plus the networking they require. It is not a
 separately-provisioned stack and there is no second apply.
@@ -174,10 +168,12 @@ Three things about it are worth knowing before the first apply:
 
 - **It needs a running container engine with Docker Hub egress on the apply host.** The module mirrors its
   upstream images into your own ECR *during* the apply (`modules/langfuse/mirror-image.sh`), so with no
-  engine reachable `terraform apply` fails partway through rather than up front. Force the engine with
-  `CONTAINER_ENGINE=finch terraform apply`, or `deploy-full.sh --finch`.
-- **The seed admin login comes from your tfvars** — `langfuse_admin_email` and `langfuse_admin_password`
-  in `secrets.auto.tfvars` (the password needs letters, numbers, and at least one special character).
+  engine reachable `terraform apply` fails partway through rather than up front. `CONTAINER_ENGINE=finch`
+  in front of `deploy-full.sh` forces finch.
+- **The seed admin login is split between the environment file and a secret** — `langfuse_admin_email` in
+  `infrastructure/env/<ENV_NAME>.tfvars`; `langfuse_admin_password` only as the environment variable
+  `TF_VAR_langfuse_admin_password` (it needs letters, numbers, and at least one special character). It is
+  never written to a file in the repo.
 - **The image tags are pinned, so bump them on a schedule.** `modules/langfuse/ecr.tf` pins
   `langfuse_version` and `clickhouse_version`. This is a long-lived internet-facing service, so a
   pinned-and-forgotten image is exposed rather than merely stale; the mirror step is a no-op when the tag
@@ -214,7 +210,7 @@ The control plane itself always runs in one admin/tooling account. What can move
   to replicate agent images into the tenant account. It is deliberately unset for a single-account
   deploy, because ECR rejects a same-account, same-region replication rule at apply time. Note that this
   is a *module* input with no root variable behind it: the root's `module "agent_ecr"` block passes no
-  replication argument, so turning it on means editing `main.tf`, not adding a line to `terraform.tfvars`.
+  replication argument, so turning it on means editing `main.tf`, not adding a line to `env/<ENV_NAME>.tfvars`.
 
 ---
 

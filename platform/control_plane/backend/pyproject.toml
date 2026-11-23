@@ -28,3 +28,107 @@ license = "Apache-2.0"
 # out of 3498 collected as of the close of E36 (adding this file did not change what gets
 # collected, and nothing configured here ever may).
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["venv", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "S", "BLE", "RUF", "C901", "TID", "PGH004", "PLC0415"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/fixtures/iam/**/*.py" = ["TID251"]
+"tests/**" = ["S101", "S105", "S106", "S603", "S607", "PLC0415"]
+"scripts/**" = ["PLC0415"]
+# inline imports by design: boto3 is imported inside the functions so the module imports without it
+# and the scripts' tests can swap it, and the registry double loads only under REGISTRY_IN_MEMORY
+# (docs/adr/backend-aws-clients-one-factory.md, docs/adr/backend-registry-in-memory-behind-the-provider.md);
+# its TID251 is permanent too
+"src/core/aws_clients.py" = ["TID251", "PLC0415"]
+# the directory double loads only under GRAPH_IN_MEMORY, so importing the adapter never imports it
+# (docs/adr/backend-graph-in-memory-behind-the-adapter.md)
+"src/services/graph_service.py" = ["PLC0415"]
+# inline imports not yet hoisted; this list only shrinks
+"src/api/routes/agents.py" = ["PLC0415"]
+"src/api/routes/builds.py" = ["PLC0415"]
+"src/api/routes/connections.py" = ["PLC0415"]
+"src/api/routes/evals.py" = ["PLC0415"]
+"src/api/routes/github_link.py" = ["PLC0415"]
+"src/api/routes/governance_graph.py" = ["PLC0415"]
+"src/api/routes/grants.py" = ["PLC0415"]
+"src/api/routes/guardrails.py" = ["PLC0415"]
+"src/api/routes/marketplace.py" = ["PLC0415"]
+"src/api/routes/mcp_cedar.py" = ["PLC0415"]
+"src/api/routes/mcp_server_grants.py" = ["PLC0415"]
+"src/api/routes/mcp_servers.py" = ["PLC0415"]
+"src/api/routes/observability.py" = ["PLC0415"]
+"src/api/routes/projects.py" = ["PLC0415"]
+"src/api/routes/repositories.py" = ["PLC0415"]
+"src/api/routes/studio.py" = ["PLC0415"]
+"src/api/routes/tenants.py" = ["PLC0415"]
+"src/api/routes/users.py" = ["PLC0415"]
+"src/api/routes/users_admin.py" = ["PLC0415"]
+"src/core/rbac.py" = ["PLC0415"]
+"src/core/secrets_loader.py" = ["PLC0415"]
+"src/core/security_entra.py" = ["PLC0415"]
+"src/core/security_github_oidc.py" = ["PLC0415"]
+"src/main.py" = ["PLC0415"]
+"src/services/agent_identity_service.py" = ["PLC0415"]
+"src/services/agent_mcp_env.py" = ["PLC0415"]
+"src/services/agent_mcp_grant.py" = ["PLC0415"]
+"src/services/agent_user_grant.py" = ["PLC0415"]
+"src/services/containment_monitor.py" = ["PLC0415"]
+"src/services/containment_service.py" = ["PLC0415"]
+"src/services/databricks_invoke.py" = ["PLC0415"]
+"src/services/eval_runner.py" = ["PLC0415"]
+"src/services/grant_mirror_service.py" = ["PLC0415"]
+"src/services/mcp_teardown.py" = ["PLC0415"]
+"src/services/platform_adapters/aws.py" = ["PLC0415"]
+"src/services/platform_adapters/databricks.py" = ["PLC0415"]
+"src/services/project_materialize.py" = ["PLC0415"]
+"src/services/runtime_build_service.py" = ["PLC0415"]
+"src/services/studio_proposal.py" = ["PLC0415"]
+"src/services/tenant_service.py" = ["PLC0415"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+  "fastapi.Depends",
+  "fastapi.Query",
+  "fastapi.Body",
+  "fastapi.Form",
+  "fastapi.File",
+  "fastapi.Header",
+  "fastapi.Path",
+  "core.rbac.require_role",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["api", "core", "models", "services"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"boto3.client".msg = "construct it through `core.aws_clients`; one module reaches AWS"
+"boto3.resource".msg = "construct it through `core.aws_clients`; one module reaches AWS"
+"boto3.Session".msg = "construct it through `core.aws_clients`; one module reaches AWS"
+"boto3.session.Session".msg = "construct it through `core.aws_clients`; one module reaches AWS"
+"requests".msg = "use httpx, the one HTTP client in `src/`; `requests` fell out of `requirements.txt` once and crashed the runtime image"
+"services.github_repo_service.GitHubRepoConflictError".msg = "import it from `services.github_repo_errors`; the hub binds the name only for its own raises"
+"services.github_repo_service.GitHubRepoError".msg = "import it from `services.github_repo_errors`; the hub binds the name only for its own raises"
+"services.graph_service.GraphError".msg = "import it from `services.graph_errors`; the hub binds the name only for its own raises"
+"services.graph_service.NotAssignedError".msg = "import it from `services.graph_errors`; the hub binds the name only for its own raises"
+"services.graph_service.OboConfigError".msg = "import it from `services.graph_errors`; the hub binds the name only for its own raises"
+"services.marketplace_service.MarketplaceError".msg = "import it from `services.marketplace_errors`; the hub binds the name only for its own raises"
+"services.project_service.ProjectError".msg = "import it from `services.project_errors`; the hub binds the name only for its own raises"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.pyright]
+include = ["src", "scripts", "tests"]
+exclude = ["venv", ".venv"]
+extraPaths = ["src"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"

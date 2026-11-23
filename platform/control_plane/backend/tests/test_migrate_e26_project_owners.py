@@ -1,11 +1,11 @@
-"""Offline tests for ``scripts/migrate_e26_project_owners.py`` (E27/T6).
+"""Offline tests for ``scripts/migrate_e26_project_owners.py``.
 
 Pure-logic tests via injected collaborators (NO moto, NO boto3, NO live AWS, NO live
 Graph): ``migrate()`` takes ``projects``/``roles``/``graph`` as parameters, so no client
 is ever constructed here. ``graph`` is an ``AsyncMock`` because
 ``GraphService.resolve_user_by_email`` is ``async``; ``projects``/``roles`` are
-``MagicMock``s. Mirrors ``test_seed_default_tenant.py`` / ``test_migrate_to_e25b.py``'s
-``sys.path`` shim that makes ``scripts.<mod>`` importable.
+``MagicMock``s. The backend dir goes on ``sys.path`` so ``scripts.<mod>`` is importable,
+as in ``test_seed_default_tenant.py`` / ``test_migrate_to_e25b.py``.
 
 Creator resolution goes through ``GraphService.resolve_user_by_email`` — the EXACT
 ``$filter`` lookup — NOT ``search_principals``, which only ``$search``es ``displayName``
@@ -24,28 +24,32 @@ setting ``list_for_project.return_value`` alone, exactly as the pinned tests do.
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from botocore.exceptions import NoCredentialsError
 
-# Backend dir on sys.path makes `scripts` importable as a namespace package (same shim
-# as test_seed_default_tenant.py / test_migrate_to_e25b.py).
+from models.project import Project
+from models.project_role import ProjectRoleRecord
+
 _BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from models.project import Project  # noqa: E402 — after sys.path shim
-from models.project_role import ProjectRoleRecord  # noqa: E402
-from scripts.migrate_e26_project_owners import migrate  # noqa: E402
+mig = importlib.import_module("scripts.migrate_e26_project_owners")
+migrate = mig.migrate
 
 PROJECT_ID = "proj-1"
 CREATOR_EMAIL = "a@example.com"
 
 
 def _project(**overrides) -> Project:
-    data = {
+    data: dict[str, Any] = {
         "id": PROJECT_ID,
         "name": "Claims",
         "connection_id": "conn-1",
@@ -88,9 +92,7 @@ def roles():
     """
     svc = MagicMock(name="ProjectRoleService")
     svc.list_for_project.return_value = []
-    svc.has_role_rows.side_effect = lambda project_id: bool(
-        svc.list_for_project(project_id)
-    )
+    svc.has_role_rows.side_effect = lambda project_id: bool(svc.list_for_project(project_id))
     return svc
 
 
@@ -116,16 +118,19 @@ async def test_dry_run_grants_nothing(projects, roles, graph):
 
 @pytest.mark.asyncio
 async def test_apply_grants_owner_from_resolved_email(projects, roles, graph):
+    """The written row carries the migration as ``granted_by`` (a machine backfill is never
+    recorded as a human grant) and ``principal_type="user"`` (a group oid here would grant
+    OWNER to every member — see the group-hit test)."""
     graph.resolve_user_by_email.return_value = {
-        "id": "oid-1", "mail": "a@example.com", "type": "user", "displayName": "Alex"
+        "id": "oid-1",
+        "mail": "a@example.com",
+        "type": "user",
+        "displayName": "Alex",
     }
     result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
     assert roles.grant.call_args.args[1].principal_id == "oid-1"
     assert roles.grant.call_args.args[1].role == "owner"
     assert result.granted == 1
-    # MINOR-1/2: pin the provenance and the principal type on the written row. A machine
-    # backfill must never be recorded as a human grant, and the row must say "user"
-    # (a group oid here would grant OWNER to every member — see the group-hit test).
     assert roles.grant.call_args.kwargs["granted_by"] == "migration:e26-project-owners"
     assert roles.grant.call_args.args[1].principal_type == "user"
 
@@ -135,7 +140,7 @@ async def test_already_governed_project_is_skipped(projects, roles, graph):
     roles.list_for_project.return_value = [_governed_row()]
     result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
     roles.grant.assert_not_called()
-    graph.resolve_user_by_email.assert_not_awaited()  # no Graph call for a governed project
+    graph.resolve_user_by_email.assert_not_awaited()
     assert result.skipped_governed == 1
 
 
@@ -162,7 +167,9 @@ async def test_unresolvable_email_is_reported(projects, roles, graph):
 async def test_non_exact_match_is_not_accepted(projects, roles, graph):
     """A $search hit on a DIFFERENT address must never be treated as the creator."""
     graph.resolve_user_by_email.return_value = {
-        "id": "oid-9", "mail": "alex.other@example.com", "type": "user"
+        "id": "oid-9",
+        "mail": "alex.other@example.com",
+        "type": "user",
     }
     result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
     roles.grant.assert_not_called()
@@ -178,11 +185,6 @@ async def test_rerun_after_apply_is_idempotent(projects, roles, graph):
     assert second.granted == 0
 
 
-# ---------------------------------------------------------------------------
-# Beyond the pinned set — the two decisions the brief pinned for this task.
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_lookup_uses_the_exact_email_resolver(projects, roles, graph):
     """The creator's ADDRESS is resolved by the exact ``$filter`` lookup.
@@ -191,12 +193,10 @@ async def test_lookup_uses_the_exact_email_resolver(projects, roles, graph):
     address — using it would leave essentially every project unresolved. The address is
     passed through verbatim.
     """
-    graph.resolve_user_by_email.return_value = {
-        "id": "oid-1", "mail": "a@example.com", "type": "user"
-    }
+    graph.resolve_user_by_email.return_value = {"id": "oid-1", "mail": "a@example.com", "type": "user"}
     await migrate(projects=projects, roles=roles, graph=graph, apply=True)
     assert graph.resolve_user_by_email.await_args.args[0] == CREATOR_EMAIL
-    graph.search_principals.assert_not_awaited()      # the fuzzy picker is NOT the resolver
+    graph.search_principals.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -208,9 +208,7 @@ async def test_group_typed_hit_is_never_granted_owner(projects, roles, graph):
     radius. The refusal must be the script's own, not a side effect of what the resolver
     happens to return.
     """
-    graph.resolve_user_by_email.return_value = {
-        "id": "grp-1", "mail": "a@example.com", "type": "group"
-    }
+    graph.resolve_user_by_email.return_value = {"id": "grp-1", "mail": "a@example.com", "type": "group"}
     result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
     roles.grant.assert_not_called()
     assert result.granted == 0
@@ -236,7 +234,7 @@ async def test_blank_created_by_is_unresolved_not_a_crash(projects, roles, graph
     projects.list_projects.return_value = [_project(created_by="")]
     result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
     roles.grant.assert_not_called()
-    graph.resolve_user_by_email.assert_not_awaited()  # nothing to look up
+    graph.resolve_user_by_email.assert_not_awaited()
     assert result.unresolved == ["(blank)"]
     assert result.granted == 0
 
@@ -247,10 +245,22 @@ async def test_created_by_already_an_oid_is_used_directly(projects, roles, graph
     oid = "11111111-2222-3333-4444-555555555555"
     projects.list_projects.return_value = [_project(created_by=oid)]
     result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
-    graph.resolve_user_by_email.assert_not_awaited()  # already an oid — no lookup needed
+    graph.resolve_user_by_email.assert_not_awaited()
     assert roles.grant.call_args.args[1].principal_id == oid
     assert result.granted == 1
-    assert result.used_oid_directly == [oid]           # ...and the summary says so
+    assert result.used_oid_directly == [oid]
+
+
+@pytest.mark.asyncio
+async def test_a_braced_uuid_created_by_goes_to_the_email_path(projects, roles, graph):
+    """Only the canonical 8-4-4-4-12 shape is an oid; a braced UUID is looked up like an
+    address and, unresolved, reported rather than written as a principal id."""
+    projects.list_projects.return_value = [_project(created_by="{11111111-2222-3333-4444-555555555555}")]
+    result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
+    graph.resolve_user_by_email.assert_awaited_once()
+    roles.grant.assert_not_called()
+    assert result.used_oid_directly == []
+    assert result.unresolved == ["{11111111-2222-3333-4444-555555555555}"]
 
 
 @pytest.mark.asyncio
@@ -261,9 +271,7 @@ async def test_unverifiable_governance_never_grants(projects, roles, graph):
     roles.has_role_rows.side_effect = ProjectRoleError(
         "Could not verify project ownership", kind="ownership_unverified"
     )
-    graph.resolve_user_by_email.return_value = {
-        "id": "oid-1", "mail": "a@example.com", "type": "user"
-    }
+    graph.resolve_user_by_email.return_value = {"id": "oid-1", "mail": "a@example.com", "type": "user"}
     result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
     roles.grant.assert_not_called()
     graph.resolve_user_by_email.assert_not_awaited()
@@ -274,12 +282,8 @@ async def test_unverifiable_governance_never_grants(projects, roles, graph):
 @pytest.mark.asyncio
 async def test_project_filter_limits_the_pass_to_one_project(projects, roles, graph):
     projects.list_projects.return_value = [_project(), _project(id="proj-2")]
-    graph.resolve_user_by_email.return_value = {
-        "id": "oid-1", "mail": "a@example.com", "type": "user"
-    }
-    result = await migrate(
-        projects=projects, roles=roles, graph=graph, apply=True, project_id="proj-2"
-    )
+    graph.resolve_user_by_email.return_value = {"id": "oid-1", "mail": "a@example.com", "type": "user"}
+    result = await migrate(projects=projects, roles=roles, graph=graph, apply=True, project_id="proj-2")
     assert result.granted == 1
     assert roles.grant.call_args.args[0] == "proj-2"
 
@@ -287,11 +291,34 @@ async def test_project_filter_limits_the_pass_to_one_project(projects, roles, gr
 @pytest.mark.asyncio
 async def test_a_failed_grant_is_counted_and_does_not_abort(projects, roles, graph):
     projects.list_projects.return_value = [_project(), _project(id="proj-2")]
-    graph.resolve_user_by_email.return_value = {
-        "id": "oid-1", "mail": "a@example.com", "type": "user"
-    }
+    graph.resolve_user_by_email.return_value = {"id": "oid-1", "mail": "a@example.com", "type": "user"}
     roles.grant.side_effect = [RuntimeError("ddb down"), MagicMock()]
     result = await migrate(projects=projects, roles=roles, graph=graph, apply=True)
-    assert roles.grant.call_count == 2      # the second project still ran
+    assert roles.grant.call_count == 2
     assert result.granted == 1
     assert result.failures == 1
+
+
+def test_projects_table_resolution_needs_the_real_account_even_for_a_plan(tmp_path, monkeypatch):
+    """The migration reads DynamoDB in a dry run too, so the account is resolved for real
+    (the seed's dry-run placeholder would derive a table that does not exist): with STS
+    unreachable and no --account-id the resolution fails and names the flag."""
+
+    class _UnreachableBoto3:
+        def client(self, service, **kwargs):
+            raise NoCredentialsError()
+
+    monkeypatch.setitem(sys.modules, "boto3", _UnreachableBoto3())
+    infra = tmp_path / "infrastructure"
+    infra.mkdir()
+    (infra / "terraform.tfvars").write_text(
+        'aws_region = "us-east-1"\nproject_name = "agp"\nenvironment = "dev"\n'
+    )
+    args = SimpleNamespace(
+        infra_dir=str(infra), region=None, account_id=None, projects_table=None, dry_run=True
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        mig._resolve_projects_table(args)
+
+    assert "--account-id" in str(exc.value)

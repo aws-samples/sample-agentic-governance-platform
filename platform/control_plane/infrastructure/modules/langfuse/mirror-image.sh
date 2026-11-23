@@ -13,6 +13,29 @@ set -euo pipefail
 SRC="$1"; TAG="$2"; TARGET_REPO="$3"; ECR_REGISTRY="$4"; REGION="$5"; REPO_NAME="$6"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Already mirrored? Nothing to do — this is what makes a version bump / re-apply cheap.
+#
+# This check runs BEFORE the container engine is resolved, and that ordering is load-bearing.
+# The demo pipeline (.gitlab-ci.yml) applies Terraform on a runner that has NO container engine
+# and states outright that images are not built there. Resolving the engine first made a
+# tag change fatal in CI even when the image was already in ECR and nothing needed building.
+# An already-mirrored tag needs the AWS CLI and nothing else.
+#
+# Since the mirror now applies base-OS updates (see below), what sits in ECR for a given tag is
+# "upstream $TAG as patched on the day we built it". New advisories land continuously, so a pin
+# left untouched for a quarter goes stale without the tag changing. Bumping the pin creates a new
+# tag and therefore a fresh build. To refresh WITHOUT a version bump, Terraform must also be told
+# to re-run this resource (its triggers are unchanged, so it would otherwise be skipped entirely):
+#   MIRROR_FORCE_REBUILD=1 terraform apply \
+#     -replace='module.langfuse.null_resource.push_images["clickhouse"]'
+if [ "${MIRROR_FORCE_REBUILD:-0}" != "1" ] \
+  && aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$TAG" --region "$REGION" >/dev/null 2>&1; then
+  echo "Image already exists in ECR: $TARGET_REPO:$TAG — skipping pull (MIRROR_FORCE_REBUILD=1 to rebuild)"
+  exit 0
+fi
+
+# Something must actually be built, so we need an engine from here on.
 # container-engine.sh tests $CONTAINER_ENGINE unquoted, which trips `set -u` when it is
 # unset — default it to empty first (empty = "no explicit override", so auto-detect runs).
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"
@@ -23,11 +46,6 @@ CE="$CONTAINER_ENGINE"
 export CONTAINER_ENGINE   # ecr-login.sh must use the engine we resolved, not re-detect its own
 echo "Container engine: $CE"
 
-# Already mirrored? Nothing to do — this is what makes a version bump / re-apply cheap.
-if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$TAG" --region "$REGION" >/dev/null 2>&1; then
-  echo "Image already exists in ECR: $TARGET_REPO:$TAG — skipping pull"
-  exit 0
-fi
 
 # ECR auth. null_resource.ecr_login (ecr.tf) already ran this ONCE for the whole apply, before
 # any mirror started — that is what keeps the three parallel copies of this script from racing
@@ -64,7 +82,26 @@ if [ "$PULLED" = "false" ]; then
   exit 1
 fi
 
-"$CE" tag "$SRC:$TAG" "$TARGET_REPO:$TAG"
+# Not a plain `tag`: build a thin layer on top of the pulled image that applies the base-OS
+# security updates upstream left behind. See patch-base.Dockerfile for the measurements — the
+# short version is that a version bump does NOT carry base-layer package updates, so mirroring
+# upstream verbatim ships known-vulnerable openssl/glibc/perl no matter which tag we pin.
+# Upstream's runtime user is preserved (empty Config.User means root).
+ORIG_USER="$("$CE" inspect -f '{{.Config.User}}' "$SRC:$TAG" 2>/dev/null | tr -d '\n')"
+# An image with an rpm database is patched from a UBI stage: UBI micro, which Langfuse v4 ships
+# on, has no package manager to upgrade itself with.
+PATCH_FILE="patch-base.Dockerfile"
+if "$CE" run --rm --platform linux/amd64 --entrypoint sh "$SRC:$TAG" -c 'test -d /var/lib/rpm' >/dev/null 2>&1; then
+  PATCH_FILE="patch-base.rpm.Dockerfile"
+fi
+echo "Applying base-OS security updates on top of $SRC:$TAG with $PATCH_FILE (runtime user: ${ORIG_USER:-root})"
+"$CE" build \
+  --platform linux/amd64 \
+  --build-arg "BASE=$SRC:$TAG" \
+  --build-arg "ORIG_USER=${ORIG_USER:-root}" \
+  --tag "$TARGET_REPO:$TAG" \
+  --file "$SCRIPT_DIR/$PATCH_FILE" \
+  "$SCRIPT_DIR"
 
 # --platform is REQUIRED for finch/nerdctl, not just cosmetic: without it nerdctl tries to
 # build a "-tmp-reduced-platform" single-platform image from the multi-arch manifest and

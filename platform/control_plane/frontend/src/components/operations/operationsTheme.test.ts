@@ -26,6 +26,10 @@ describe('SECTION_THEME', () => {
   it('has an entry for both sections', () => {
     expect(Object.keys(SECTION_THEME).sort()).toEqual(['governance', 'operations']);
   });
+  it('switch label asymmetry: operations bakes its leading ← into the label, governance carries no arrow because the JSX adds its trailing →', () => {
+    expect(SECTION_THEME.operations.switchLabel.startsWith('← ')).toBe(true);
+    expect(SECTION_THEME.governance.switchLabel).not.toMatch(/[←→]/);
+  });
   it('switch link points each section at the other', () => {
     expect(SECTION_THEME.governance.switchTo).toBe('/ops');
     expect(SECTION_THEME.operations.switchTo).toBe('/');

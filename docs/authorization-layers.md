@@ -25,10 +25,22 @@ Three platform roles, in a ladder: **Viewer**, then **Operator**, then **Admin**
 it. Viewer reads. Operator authors and publishes. Admin destroys, and administers tenants. Every gated
 endpoint names a minimum, and the gate compares along the ladder.
 
-Assignments live in the identity provider, not in the platform. Microsoft Entra ID is the provider supported
-today, and the gate is not specific to it. The platform reads the role the token carries and matches it
-against the three names it expects. The provider stays the system of record: the Admin console's Users tab
-writes assignments back to it rather than storing them here. See [Microsoft Entra ID setup](entra-setup.md).
+Assignments live in the identity provider, not in the platform. The platform reads the role the token carries
+and matches it against the three names it expects, and **that match alone is genuinely provider-neutral**: the
+gate reads a `roles` claim, resolves the highest name it recognises, and defaults the rest to Viewer — it
+never looks at *which* directory issued the token. The provider stays the system of record: the Admin
+console's Users tab writes assignments back to it rather than storing them here. See
+[Microsoft Entra ID setup](entra-setup.md).
+
+**Gate-neutrality is not platform-neutrality, and that distinction is the honest limit.** Microsoft Entra ID
+is the only provider wired today, and everything the platform does *below* gate 1 is built on it directly.
+The directory reads and writes go through Microsoft Graph (`graph_service.py`), and every access primitive the
+platform mints is an Entra mechanism with no abstraction over it: the per-agent and per-MCP app registrations,
+the `appRole` assignments that carry every grant, and the on-behalf-of consents that let one identity spend a
+token for another (see [token propagation](token-propagation.md) and [the data model](data-model.md)). There
+is no provider seam here — no third axis alongside the platform adapter and the runtime catalog — so swapping
+Entra for another IdP would be a rewrite of the identity layer, not a configuration switch. The gate would
+accept another issuer's token; nothing underneath it would know what to do with the caller.
 
 **An unrecognised role means Viewer, not rejection.** A token carrying no role the platform recognises — or no
 role at all — resolves to Viewer, never to a refusal. That is least privilege by design: an unmapped role must

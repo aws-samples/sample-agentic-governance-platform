@@ -1,11 +1,12 @@
-"""Build-trigger route tests (E22/T6).
+"""Build-trigger route tests.
 
-Uses a FastAPI dependency-override for `verify_github_oidc` (so no live GitHub JWKS), and
-patches the module-level `_conn_svc`/`_build_svc` singletons with fakes (no live AWS).
-Covers: happy path (202 + build_id), org mismatch → 403, unknown connection → 404, and a
-StartBuild failure → 502.
+A FastAPI dependency override replaces ``verify_github_oidc`` (no live GitHub JWKS) and the
+module-level ``_conn_svc`` / ``_build_svc`` / ``_project_svc`` singletons are patched with fakes
+(no live AWS). The ``AppError`` handler is mounted so the service tables render as they do on the
+real app.
 """
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,30 +14,31 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from core.security_github_oidc import GitHubActionsClaims
-from models.connection import AuthType, Connection, ConnStatus, Provider
+from models.connection import Connection, ConnectionAuthType, ConnStatus, Provider
 from services.connection_service import ConnectionError
 from services.runtime_build_service import RuntimeBuildError
 
-
-@pytest.fixture(autouse=True)
-def reset_modules():
-    import sys
-    for mod in ["api.routes.builds", "core.config"]:
-        sys.modules.pop(mod, None)
-    yield
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
 
 def _conn(org="acme-org"):
     return Connection(
-        id="conn-1", provider=Provider.GITHUB, org=org, base_url=None,
-        auth_type=AuthType.PAT, status=ConnStatus.CONNECTED,
+        id="conn-1",
+        provider=Provider.GITHUB,
+        org=org,
+        base_url=None,
+        auth_type=ConnectionAuthType.PAT,
+        status=ConnStatus.CONNECTED,
         secret_arn="arn:aws:secretsmanager:us-east-1:111:secret:agp/git/conn-1",
-        has_secret=True, created_by="a@b.com", created_at="t", updated_at="t",
+        has_secret=True,
+        created_by="a@b.com",
+        created_at="t",
+        updated_at="t",
     )
 
 
 def _proj_svc(*, repo_name="some-agent", project_conn_id="conn-1", found=True):
-    """Fake ProjectService for the E25/I1 agent_id↔token.repository binding. Returns a repo
+    """Fake ProjectService for the agent_id↔token.repository binding. Returns a repo
     (name + project_id) for find_repository_by_agent_id, and a project (connection_id) for
     get_project. `found=False` simulates an unknown agent_id (no owning repo)."""
     svc = MagicMock()
@@ -51,35 +53,48 @@ def _proj_svc(*, repo_name="some-agent", project_conn_id="conn-1", found=True):
 
 
 def _build_client(*, conn_svc, build_svc, claims, proj_svc=None):
+    """The dependency override is keyed off the SAME function object the route's Depends resolved:
+    the builds module re-imports it fresh after module cache resets, so a top-level import here
+    would be a different object and the override would silently miss."""
     import api.routes.builds as builds_module
+    from core.errors import install_error_handlers
 
     builds_module._conn_svc = conn_svc
     builds_module._build_svc = build_svc
-    # E25/I1: the builds route resolves the repo owning the POSTed agent_id via the project
-    # service to bind it to the token's proven `repository`. Default fake passes the binding.
     builds_module._project_svc = proj_svc if proj_svc is not None else _proj_svc()
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(builds_module.router, prefix="/api/v1")
-    # Key the override off the SAME function object the route's Depends resolved (the
-    # builds module re-imports it fresh after module cache resets, so a top-level import
-    # here would be a different object and the override would silently miss → 403).
     app.dependency_overrides[builds_module.verify_github_oidc] = lambda: claims
     return TestClient(app)
 
 
-def _claims(owner="acme-org", repo="some-agent", ref="refs/heads/main", sha="abc",
-            actor="merging-human", event_name="push"):
+def _claims(
+    owner="acme-org",
+    repo="some-agent",
+    ref="refs/heads/main",
+    sha="abc",
+    actor="merging-human",
+    event_name="push",
+):
     return GitHubActionsClaims(
-        repository=f"{owner}/{repo}", repository_owner=owner,
-        sub="repo:x", ref=ref, sha=sha, workflow="build",
-        actor=actor, event_name=event_name,
+        repository=f"{owner}/{repo}",
+        repository_owner=owner,
+        sub="repo:x",
+        ref=ref,
+        sha=sha,
+        workflow="build",
+        actor=actor,
+        event_name=event_name,
     )
 
 
-_BODY = {
-    "agent_id": "agent-42", "image_tag": "agent-42-abc",
-    "ecr_repo": "123.dkr.ecr.us-east-1.amazonaws.com/agp", "connection_id": "conn-1",
+_BODY: dict[str, Any] = {
+    "agent_id": "agent-42",
+    "image_tag": "agent-42-abc",
+    "ecr_repo": "123.dkr.ecr.us-east-1.amazonaws.com/agp",
+    "connection_id": "conn-1",
     "stage": "dev",
 }
 
@@ -96,12 +111,11 @@ def test_happy_path_starts_build():
     assert resp.status_code == 202
     assert resp.json() == {"build_id": "rt-build:1", "status": "started"}
     build_svc.start_runtime_build.assert_called_once_with(
-        agent_id="agent-42", image_tag="agent-42-abc",
-        ecr_repo="123.dkr.ecr.us-east-1.amazonaws.com/agp", connection_id="conn-1",
+        agent_id="agent-42",
+        image_tag="agent-42-abc",
+        ecr_repo="123.dkr.ecr.us-east-1.amazonaws.com/agp",
+        connection_id="conn-1",
         stage="dev",
-        # E28B/T4: `_BODY` carries no digest, so the legacy tag-only path passes "" — asserted
-        # explicitly rather than dropped, because an ABSENT kwarg and an empty one reach the
-        # buildspec identically and only one of them is intentional.
         image_digest="",
     )
 
@@ -111,11 +125,14 @@ def test_org_mismatch_returns_403():
     conn_svc.get_connection.return_value = _conn(org="acme-org")
     build_svc = MagicMock()
 
-    # Token minted for a different org than the resolved connection.
     client = _build_client(conn_svc=conn_svc, build_svc=build_svc, claims=_claims(owner="evil-org"))
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
     assert resp.status_code == 403
+    assert resp.json() == {
+        "detail": "Token repository_owner does not match connection org",
+        "code": "runtime_build.token_org_mismatch",
+    }
     build_svc.start_runtime_build.assert_not_called()
 
 
@@ -128,6 +145,8 @@ def test_unknown_connection_returns_404():
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
     assert resp.status_code == 404
+    assert resp.json() == {"detail": "Connection not found", "code": "connection.not_found"}
+    assert "nope" not in resp.text
     build_svc.start_runtime_build.assert_not_called()
 
 
@@ -135,13 +154,68 @@ def test_start_build_failure_returns_502():
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn()
     build_svc = MagicMock()
-    build_svc.start_runtime_build.side_effect = RuntimeBuildError("start failed")
+    build_svc.start_runtime_build.side_effect = RuntimeBuildError("start failed", kind="start_failed")
+    proj_svc = _proj_svc()
 
-    client = _build_client(conn_svc=conn_svc, build_svc=build_svc, claims=_claims())
+    client = _build_client(conn_svc=conn_svc, build_svc=build_svc, claims=_claims(), proj_svc=proj_svc)
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
     assert resp.status_code == 502
-    assert resp.json()["detail"]["status"] == "failed_to_start"
+    assert resp.json() == {"detail": {"status": "failed_to_start"}, "code": "runtime_build.start_failed"}
+    assert "start failed" not in resp.text
+    kw = proj_svc.append_deployment.call_args.kwargs
+    assert (kw["build_id"], kw["outcome"].value, kw["error"]) == (
+        None,
+        "failed",
+        "failed to start the runtime build",
+    )
+    proj_svc.record_prod_candidate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "kind", ["not_found", "unsupported", "build_kind_mismatch", "credential_staging_failed"]
+)
+def test_every_other_refusal_renders_the_failed_to_start_body_and_records_the_attempt(kind):
+    conn_svc = MagicMock()
+    conn_svc.get_connection.return_value = _conn()
+    build_svc = MagicMock()
+    build_svc.start_runtime_build.side_effect = RuntimeBuildError("store internals", kind=kind)
+    proj_svc = _proj_svc()
+
+    client = _build_client(conn_svc=conn_svc, build_svc=build_svc, claims=_claims(), proj_svc=proj_svc)
+    resp = client.post("/api/v1/builds/runtime", json=_BODY)
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": {"status": "failed_to_start"}, "code": f"runtime_build.{kind}"}
+    assert proj_svc.append_deployment.call_args.kwargs["outcome"].value == "failed"
+
+
+def test_start_build_in_flight_conflict_returns_409_not_502():
+    """A build already running for this agent+stage maps to 409, not the generic 502, so the
+    GitHub trigger job's retry loop backs off and retries instead of failing the workflow outright;
+    the body carries the service's message under ``detail.message``, the shape the frontend reads,
+    and no delivery row is written for a push that is simply waiting its turn."""
+    conn_svc = MagicMock()
+    conn_svc.get_connection.return_value = _conn()
+    build_svc = MagicMock()
+    build_svc.start_runtime_build.side_effect = RuntimeBuildError(
+        "a build for agent_id=agent-42 stage=dev is already in progress",
+        kind="conflict",
+    )
+    proj_svc = _proj_svc()
+
+    client = _build_client(conn_svc=conn_svc, build_svc=build_svc, claims=_claims(), proj_svc=proj_svc)
+    resp = client.post("/api/v1/builds/runtime", json=_BODY)
+
+    assert resp.status_code == 409
+    assert resp.json() == {
+        "detail": {
+            "status": "build_in_progress",
+            "message": "a build for agent_id=agent-42 stage=dev is already in progress",
+        },
+        "code": "runtime_build.conflict",
+    }
+    proj_svc.append_deployment.assert_not_called()
 
 
 def test_builds_runtime_rejects_bad_stage():
@@ -154,30 +228,36 @@ def test_builds_runtime_rejects_bad_stage():
     resp = client.post("/api/v1/builds/runtime", json={**_BODY, "stage": "staging"})
 
     assert resp.status_code == 422
+    assert resp.json() == {"detail": "Invalid stage", "code": "runtime_build.invalid_stage"}
     build_svc.start_runtime_build.assert_not_called()
 
 
 def test_builds_runtime_rejects_agent_not_owned_by_token_repo():
-    """E25/I1: token.repository="acme-org/repo-A" but the POSTed agent_id belongs to
+    """token.repository="acme-org/repo-A" but the POSTed agent_id belongs to
     "acme-org/repo-B" → 403 (a token cannot build another repo's agent within its own org)."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn(org="acme-org")
     build_svc = MagicMock()
-    # The agent_id's owning repo is "repo-B", but the token was minted for "repo-A".
     proj_svc = _proj_svc(repo_name="repo-B")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=build_svc,
-        claims=_claims(owner="acme-org", repo="repo-A"), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(owner="acme-org", repo="repo-A"),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
     assert resp.status_code == 403
+    assert resp.json() == {
+        "detail": "Token repository does not own this agent",
+        "code": "runtime_build.token_not_agent_owner",
+    }
     build_svc.start_runtime_build.assert_not_called()
 
 
 def test_builds_runtime_allows_matching_repo():
-    """E25/I1: token.repository="acme-org/my-agent" and the agent_id's owning repo is
+    """token.repository="acme-org/my-agent" and the agent_id's owning repo is
     "my-agent" in org "acme-org" → the binding passes and the build proceeds (202)."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn(org="acme-org")
@@ -186,8 +266,10 @@ def test_builds_runtime_allows_matching_repo():
     proj_svc = _proj_svc(repo_name="my-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=build_svc,
-        claims=_claims(owner="acme-org", repo="my-agent"), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(owner="acme-org", repo="my-agent"),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
@@ -196,20 +278,21 @@ def test_builds_runtime_allows_matching_repo():
 
 
 def test_builds_runtime_allows_case_mismatched_repo():
-    """M1: GitHub org/repo logins are case-insensitive. The OIDC token carries canonical
+    """GitHub org/repo logins are case-insensitive. The OIDC token carries canonical
     case ("Acme/My-Agent") while our store may hold a divergent case ("acme/my-agent").
-    Both the org-match and the E25/I1 binding must case-fold so a legitimate build is not
+    Both the org-match and the binding must case-fold so a legitimate build is not
     spuriously 403'd (availability; never a false-accept — both operands are trusted)."""
     conn_svc = MagicMock()
-    conn_svc.get_connection.return_value = _conn(org="acme")  # stored lowercase
+    conn_svc.get_connection.return_value = _conn(org="acme")
     build_svc = MagicMock()
     build_svc.start_runtime_build.return_value = "rt-build:4"
-    proj_svc = _proj_svc(repo_name="my-agent")  # stored lowercase
+    proj_svc = _proj_svc(repo_name="my-agent")
 
-    # Token minted with GitHub's canonical (differing) case.
     client = _build_client(
-        conn_svc=conn_svc, build_svc=build_svc,
-        claims=_claims(owner="Acme", repo="My-Agent"), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(owner="Acme", repo="My-Agent"),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
@@ -218,15 +301,18 @@ def test_builds_runtime_allows_case_mismatched_repo():
 
 
 def test_builds_runtime_unknown_agent_returns_403():
-    """M2 (fail-closed): the POSTed agent_id has no owning repo in our store
+    """Fail-closed: the POSTed agent_id has no owning repo in our store
     (find_repository_by_agent_id → None) → 403, and the build service is never called."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn(org="acme-org")
     build_svc = MagicMock()
-    proj_svc = _proj_svc(found=False)  # unknown agent → no owning repo
+    proj_svc = _proj_svc(found=False)
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=build_svc, claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
@@ -235,7 +321,7 @@ def test_builds_runtime_unknown_agent_returns_403():
 
 
 def test_builds_runtime_missing_project_returns_403():
-    """M2 (fail-closed): the owning repo exists but its project has vanished
+    """Fail-closed: the owning repo exists but its project has vanished
     (get_project → None) → repo_org stays None → 403, service not called."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn(org="acme-org")
@@ -244,7 +330,10 @@ def test_builds_runtime_missing_project_returns_403():
     proj_svc.get_project.return_value = None
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=build_svc, claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
@@ -253,10 +342,9 @@ def test_builds_runtime_missing_project_returns_403():
 
 
 def test_builds_runtime_repo_connection_error_returns_403():
-    """M2 (fail-closed): resolving the repo's own project connection raises ConnectionError
+    """Fail-closed: resolving the repo's own project connection raises ConnectionError
     (e.g. connection removed) → repo_org stays None → 403 (not 500), service not called."""
     conn_svc = MagicMock()
-    # First call (body.connection_id) succeeds; the repo's own connection lookup fails.
     conn_svc.get_connection.side_effect = [
         _conn(org="acme-org"),
         ConnectionError("gone", kind="not_found"),
@@ -265,7 +353,10 @@ def test_builds_runtime_repo_connection_error_returns_403():
     proj_svc = _proj_svc(repo_name="some-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=build_svc, claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/runtime", json=_BODY)
 
@@ -274,7 +365,7 @@ def test_builds_runtime_repo_connection_error_returns_403():
 
 
 def test_oidc_prod_stage_is_refused():
-    """E27/T9: the OIDC path has NO human principal, so an OWNER check is impossible here.
+    """The OIDC path has NO human principal, so an OWNER check is impossible here.
     Refusing `stage="prod"` is what makes the promote route's OWNER gate real rather than
     advisory — otherwise anyone who can push a workflow bypasses it entirely."""
     conn_svc = MagicMock()
@@ -285,12 +376,15 @@ def test_oidc_prod_stage_is_refused():
     resp = client.post("/api/v1/builds/runtime", json={**_BODY, "stage": "prod"})
 
     assert resp.status_code == 403
-    assert resp.json()["detail"] == "prod deploys must be initiated from AGP"
+    assert resp.json() == {
+        "detail": "prod deploys must be initiated from AGP",
+        "code": "runtime_build.prod_from_agp_only",
+    }
     build_svc.start_runtime_build.assert_not_called()
 
 
 def test_oidc_dev_stage_still_works():
-    """E27/T9: dev behaviour is UNTOUCHED by the prod refusal."""
+    """Dev behaviour is UNTOUCHED by the prod refusal."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn()
     build_svc = MagicMock()
@@ -304,18 +398,19 @@ def test_oidc_dev_stage_still_works():
 
 
 def test_prod_refusal_happens_after_binding_checks():
-    """E27/T9 ordering: a foreign-repo token must still get the BINDING 403, not the stage
+    """Ordering: a foreign-repo token must still get the BINDING 403, not the stage
     message. The refusal sits AFTER the binding checks so an attacker probing with a foreign
     token learns nothing about stage handling from the ordering."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn(org="acme-org")
-    # The agent_id's owning repo is "repo-B" but the token was minted for "repo-A".
     proj_svc = _proj_svc(repo_name="repo-B")
     build_svc = MagicMock()
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=build_svc,
-        claims=_claims(owner="acme-org", repo="repo-A"), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(owner="acme-org", repo="repo-A"),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/runtime", json={**_BODY, "stage": "prod"})
 
@@ -326,46 +421,58 @@ def test_prod_refusal_happens_after_binding_checks():
 
 
 _CANDIDATE_BODY = {
-    "agent_id": "agent-42", "image_tag": "agent-42-1a2b3c4",
-    "ecr_repo": "some.dkr.ecr.us-east-1.amazonaws.com/agp", "connection_id": "conn-1",
+    "agent_id": "agent-42",
+    "image_tag": "agent-42-1a2b3c4",
+    "ecr_repo": "some.dkr.ecr.us-east-1.amazonaws.com/agp",
+    "connection_id": "conn-1",
 }
 
 
 def test_prod_candidate_happy_path_records_oidc_proven_actor_and_sha():
-    """E27A/T6: a merge to `main` registers the candidate — 202 + the tag from the BODY but
+    """A merge to `main` registers the candidate — 202 + the tag from the BODY but
     the actor and sha from the VALIDATED TOKEN (never body-asserted)."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn()
     proj_svc = _proj_svc(repo_name="some-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(),
-        claims=_claims(actor="merging-human", sha="deadbeefcafe"), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(actor="merging-human", sha="deadbeefcafe"),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/prod-candidate", json=_CANDIDATE_BODY)
 
     assert resp.status_code == 202
     assert resp.json() == {"status": "registered"}
     proj_svc.record_prod_candidate.assert_called_once_with(
-        "agent-42", image_tag="agent-42-1a2b3c4", sha="deadbeefcafe", actor="merging-human",
+        "agent-42",
+        image_tag="agent-42-1a2b3c4",
+        sha="deadbeefcafe",
+        actor="merging-human",
     )
 
 
 def test_prod_candidate_rejects_non_main_ref():
-    """`main` IS the prod candidate (design §1) — a dev-branch token gets 403 and nothing
+    """`main` IS the prod candidate — a dev-branch token gets 403 and nothing
     is recorded."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn()
     proj_svc = _proj_svc(repo_name="some-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(),
-        claims=_claims(ref="refs/heads/dev"), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(ref="refs/heads/dev"),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/prod-candidate", json=_CANDIDATE_BODY)
 
     assert resp.status_code == 403
-    assert resp.json()["detail"] == "prod candidates come from main only"
+    assert resp.json() == {
+        "detail": "prod candidates come from main only",
+        "code": "runtime_build.prod_candidate_not_main",
+    }
     proj_svc.record_prod_candidate.assert_not_called()
 
 
@@ -379,11 +486,11 @@ def test_prod_candidate_branch_check_happens_after_binding_checks():
     `test_prod_refusal_happens_after_binding_checks`, including its negative assertion."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn(org="acme-org")
-    # The agent_id's owning repo is "repo-B" but the token was minted for "repo-A".
     proj_svc = _proj_svc(repo_name="repo-B")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(),
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
         claims=_claims(owner="acme-org", repo="repo-A", ref="refs/heads/dev"),
         proj_svc=proj_svc,
     )
@@ -401,7 +508,10 @@ def test_prod_candidate_unknown_connection_returns_404():
     proj_svc = _proj_svc()
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(), claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/prod-candidate", json=_CANDIDATE_BODY)
 
@@ -418,7 +528,10 @@ def test_prod_candidate_unknown_agent_returns_403():
     proj_svc = _proj_svc(found=False)
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(), claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/prod-candidate", json=_CANDIDATE_BODY)
 
@@ -435,8 +548,10 @@ def test_prod_candidate_ignores_body_supplied_actor_and_sha():
     proj_svc = _proj_svc(repo_name="some-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(),
-        claims=_claims(actor="real-human", sha="realsha"), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(actor="real-human", sha="realsha"),
+        proj_svc=proj_svc,
     )
     resp = client.post(
         "/api/v1/builds/prod-candidate",
@@ -445,7 +560,10 @@ def test_prod_candidate_ignores_body_supplied_actor_and_sha():
 
     assert resp.status_code == 202
     proj_svc.record_prod_candidate.assert_called_once_with(
-        "agent-42", image_tag="agent-42-1a2b3c4", sha="realsha", actor="real-human",
+        "agent-42",
+        image_tag="agent-42-1a2b3c4",
+        sha="realsha",
+        actor="real-human",
     )
 
 
@@ -457,7 +575,10 @@ def test_prod_candidate_rejects_tag_not_prefixed_with_the_proven_agent_id():
     proj_svc = _proj_svc(repo_name="some-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(), claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post(
         "/api/v1/builds/prod-candidate",
@@ -465,8 +586,11 @@ def test_prod_candidate_rejects_tag_not_prefixed_with_the_proven_agent_id():
     )
 
     assert resp.status_code == 403
-    assert resp.json()["detail"] == "Image tag does not belong to this agent"
-    assert "latest" not in resp.text  # the offending tag is never echoed back
+    assert resp.json() == {
+        "detail": "Image tag does not belong to this agent",
+        "code": "runtime_build.tag_not_owned",
+    }
+    assert "latest" not in resp.text
     proj_svc.record_prod_candidate.assert_not_called()
 
 
@@ -481,9 +605,11 @@ def test_prod_candidate_rejects_another_agents_image_tag():
     proj_svc = _proj_svc(repo_name="some-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(), claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
-    # A wholly valid token/repo/agent/ref for agent-42, but the tag names agent-99.
     resp = client.post(
         "/api/v1/builds/prod-candidate",
         json={**_CANDIDATE_BODY, "image_tag": "agent-99-abc1234"},
@@ -497,10 +623,10 @@ def test_prod_candidate_rejects_another_agents_image_tag():
 @pytest.mark.parametrize(
     "bad_tag",
     [
-        "agent-42-../../etc/passwd",   # path traversal flavour
-        "agent-42- abc1234",           # whitespace (would word-split in the buildspec's shell)
-        "agent-42-abc$(id)",           # shell metacharacters
-        "agent-42-" + "a" * 200,       # beyond ECR's 128-char limit
+        "agent-42-../../etc/passwd",  # path traversal flavour
+        "agent-42- abc1234",  # whitespace (would word-split in the buildspec's shell)
+        "agent-42-abc$(id)",  # shell metacharacters
+        "agent-42-" + "a" * 200,  # beyond ECR's 128-char limit
     ],
 )
 def test_prod_candidate_rejects_illegal_tag_charset(bad_tag):
@@ -512,10 +638,14 @@ def test_prod_candidate_rejects_illegal_tag_charset(bad_tag):
     proj_svc = _proj_svc(repo_name="some-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(), claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post(
-        "/api/v1/builds/prod-candidate", json={**_CANDIDATE_BODY, "image_tag": bad_tag},
+        "/api/v1/builds/prod-candidate",
+        json={**_CANDIDATE_BODY, "image_tag": bad_tag},
     )
 
     assert resp.status_code == 403
@@ -532,7 +662,10 @@ def test_prod_candidate_accepts_the_workflows_real_tag_shape():
     proj_svc = _proj_svc(repo_name="some-agent")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(), claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post(
         "/api/v1/builds/prod-candidate",
@@ -544,29 +677,30 @@ def test_prod_candidate_accepts_the_workflows_real_tag_shape():
 
 
 def test_prod_candidate_store_not_found_returns_404():
-    """The store's own `not_found` (the agent vanished between the binding read and the
-    write) maps to 404 with a FIXED detail — never `str(err)`."""
-    from services.project_service import ProjectError
+    """The store's own `agent_not_found` (the agent vanished between the binding read and the
+    write) renders the project table's 404 with its fixed detail — never `str(err)`."""
+    from services.project_errors import ProjectError
 
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn()
     proj_svc = _proj_svc(repo_name="some-agent")
-    proj_svc.record_prod_candidate.side_effect = ProjectError(
-        "store internals leak", kind="not_found"
-    )
+    proj_svc.record_prod_candidate.side_effect = ProjectError("store internals leak", kind="agent_not_found")
 
     client = _build_client(
-        conn_svc=conn_svc, build_svc=MagicMock(), claims=_claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/prod-candidate", json=_CANDIDATE_BODY)
 
     assert resp.status_code == 404
-    assert resp.json()["detail"] == "Agent not found"
+    assert resp.json() == {"detail": "Agent not found", "code": "project.agent_not_found"}
     assert "store internals leak" not in resp.text
 
 
 def test_prod_candidate_route_does_not_relax_the_runtime_prod_refusal():
-    """E27A regression on the E27/T9 invariant: adding the candidate route must NOT make
+    """Adding the candidate route must NOT make
     `/builds/runtime` accept `stage="prod"`."""
     conn_svc = MagicMock()
     conn_svc.get_connection.return_value = _conn()
@@ -576,7 +710,10 @@ def test_prod_candidate_route_does_not_relax_the_runtime_prod_refusal():
     resp = client.post("/api/v1/builds/runtime", json={**_BODY, "stage": "prod"})
 
     assert resp.status_code == 403
-    assert resp.json()["detail"] == "prod deploys must be initiated from AGP"
+    assert resp.json() == {
+        "detail": "prod deploys must be initiated from AGP",
+        "code": "runtime_build.prod_from_agp_only",
+    }
     build_svc.start_runtime_build.assert_not_called()
 
 
@@ -592,32 +729,14 @@ def test_builds_runtime_passes_stage_to_service():
 
     assert resp.status_code == 202
     build_svc.start_runtime_build.assert_called_once_with(
-        agent_id="agent-42", image_tag="agent-42-abc",
-        ecr_repo="123.dkr.ecr.us-east-1.amazonaws.com/agp", connection_id="conn-1",
-        stage="dev", image_digest="",
+        agent_id="agent-42",
+        image_tag="agent-42-abc",
+        ecr_repo="123.dkr.ecr.us-east-1.amazonaws.com/agp",
+        connection_id="conn-1",
+        stage="dev",
+        image_digest="",
     )
 
-
-# --------------------------------------------------------------------------- #
-# E28B/T4 (D-B3) — `image_digest` on the body, and TRUNK-GATED candidate registration
-# --------------------------------------------------------------------------- #
-#
-# Two separate defects close here.
-#
-# 1. `RuntimeBuildRequest` had no `image_digest` field. The template workflow already POSTed one and
-#    pydantic ignores unknown keys, so the digest was accepted with a 202 and DISCARDED — no error
-#    on either side while the whole digest contract was a no-op end to end.
-#
-# 2. E28B deleted the workflow's `candidate` job, which was the ONLY caller of
-#    `/builds/prod-candidate`. That left NOTHING writing the candidate block, so `promote_repo`
-#    refused every promotion with `no_prod_candidate` permanently. This route is now the registrar:
-#    it already proves, from the same validated OIDC token, which artifact, who merged and which
-#    commit.
-#
-# The TRUNK GATE is the governance control. A live probe found a bare template tree on `main`
-# arriving `prod_candidate_status: pending` — promotable to production with no human-reviewed
-# content. Registering on every build would reopen that from any branch, so only the owning
-# project's own trunk (D-B5 — a project setting, never a `main` literal) may produce a candidate.
 
 _GOOD_DIGEST = "sha256:" + "ab" * 32
 
@@ -637,8 +756,10 @@ def _post(body_extra=None, *, claims=None, proj_svc=None):
     build_svc.start_runtime_build.return_value = "rt-build:9"
     proj_svc = proj_svc if proj_svc is not None else _proj_svc_with_trunk()
     client = _build_client(
-        conn_svc=conn_svc, build_svc=build_svc,
-        claims=claims if claims is not None else _claims(), proj_svc=proj_svc,
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=claims if claims is not None else _claims(),
+        proj_svc=proj_svc,
     )
     resp = client.post("/api/v1/builds/runtime", json={**_BODY, **(body_extra or {})})
     return resp, proj_svc, build_svc
@@ -666,17 +787,25 @@ def test_the_digest_is_not_silently_dropped_by_the_model():
 @pytest.mark.parametrize(
     "digest",
     [
-        "sha256:" + "a" * 63,           # truncated
-        "sha256:" + "a" * 65,           # too long
-        "sha256:" + "AB" * 32,          # uppercase — registries emit lowercase
-        "ab" * 32,                      # no algorithm prefix
-        "sha512:" + "a" * 64,           # wrong algorithm
-        "None",                         # what the AWS CLI prints for a missing image
-        _GOOD_DIGEST + "x",             # trailing junk
-        _GOOD_DIGEST + "; echo hi",     # a shell metacharacter, bound for a docker reference
+        "sha256:" + "a" * 63,  # truncated
+        "sha256:" + "a" * 65,  # too long
+        "sha256:" + "AB" * 32,  # uppercase — registries emit lowercase
+        "ab" * 32,  # no algorithm prefix
+        "sha512:" + "a" * 64,  # wrong algorithm
+        "None",  # what the AWS CLI prints for a missing image
+        _GOOD_DIGEST + "x",  # trailing junk
+        _GOOD_DIGEST + "; echo hi",  # a shell metacharacter, bound for a docker reference
     ],
-    ids=["truncated", "too-long", "uppercase", "no-prefix", "wrong-algo", "literal-None",
-         "trailing-junk", "metachar"],
+    ids=[
+        "truncated",
+        "too-long",
+        "uppercase",
+        "no-prefix",
+        "wrong-algo",
+        "literal-None",
+        "trailing-junk",
+        "metachar",
+    ],
 )
 def test_a_malformed_digest_is_a_422(digest):
     """A malformed digest is a template/CI bug the workflow author must SEE, so it is a 422 rather
@@ -708,8 +837,8 @@ def test_a_trunk_push_registers_the_prod_candidate_with_its_digest():
         "agent-42",
         image_tag="agent-42-abc",
         image_digest=_GOOD_DIGEST,
-        sha="abc",              # from the TOKEN
-        actor="merging-human",  # from the TOKEN
+        sha="abc",
+        actor="merging-human",
     )
 
 
@@ -718,7 +847,7 @@ def test_a_trunk_push_registers_the_prod_candidate_with_its_digest():
     [
         ("main", "refs/heads/feature/x"),
         ("main", "refs/heads/dev"),
-        ("release", "refs/heads/main"),   # `main` is NOT the trunk here
+        ("release", "refs/heads/main"),  # `main` is NOT the trunk here
         ("main", "refs/tags/v1.0.0"),
         ("main", "refs/heads/main-ish"),  # a prefix match must not count
     ],
@@ -740,7 +869,7 @@ def test_a_NON_TRUNK_ref_registers_NO_candidate(trunk, ref):
         proj_svc=_proj_svc_with_trunk(trunk),
     )
     assert resp.status_code == 202
-    build_svc.start_runtime_build.assert_called_once()  # the dev deploy is unaffected
+    build_svc.start_runtime_build.assert_called_once()
     proj_svc.record_prod_candidate.assert_not_called()
 
 
@@ -761,10 +890,6 @@ def test_a_project_predating_the_trunk_setting_falls_back_to_main():
     """A pre-D-B5 project row carries no `trunk_branch`. It must still register on `main` rather
     than becoming silently unpromotable."""
     proj_svc = _proj_svc()
-    # A spec listing ONLY `connection_id` — the attribute the binding check needs — so
-    # `getattr(..., "trunk_branch", None)` genuinely misses. A plain MagicMock would auto-create
-    # `trunk_branch` and return a truthy mock, making this test pass for the wrong reason (it would
-    # compare the ref against a mock's repr and never exercise the fallback at all).
     project = MagicMock(spec=["connection_id"])
     project.connection_id = "conn-1"
     proj_svc.get_project.return_value.project = project
@@ -791,9 +916,7 @@ def test_a_foreign_tag_STARTS_NO_BUILD_and_writes_NO_HISTORY():
     "refused" about a build already in motion, with history recording it. `assert_not_called()` on
     BOTH side effects is what distinguishes "refused" from "refused, but did it anyway"; the
     status-code check above passes in either world."""
-    resp, proj_svc, build_svc = _post(
-        {"image_tag": "agent-OTHER-abc", "image_digest": _GOOD_DIGEST}
-    )
+    resp, proj_svc, build_svc = _post({"image_tag": "agent-OTHER-abc", "image_digest": _GOOD_DIGEST})
     assert resp.status_code == 403
     build_svc.start_runtime_build.assert_not_called()
     proj_svc.append_deployment.assert_not_called()
@@ -814,8 +937,6 @@ def test_every_refusal_precedes_every_side_effect():
     ):
         resp, proj_svc, build_svc = _post(body_extra, claims=claims)
         assert resp.status_code == expected, label
-        # `assert_not_called()` RAISES on failure, so it needs no `assert` and must not be written
-        # as `... , label` — a bare expression with a comma is a tuple that evaluates and discards.
         build_svc.start_runtime_build.assert_not_called()
         proj_svc.append_deployment.assert_not_called()
         proj_svc.record_prod_candidate.assert_not_called()
@@ -836,10 +957,307 @@ def test_a_registration_failure_does_not_fail_the_running_build():
 
 def test_a_refused_build_registers_no_candidate():
     """Registration sits AFTER every refusal, so a rejected stage leaves no approvable artifact
-    behind. A prod-stage POST is refused over OIDC (E27/T9) — it must not register either."""
-    resp, proj_svc, build_svc = _post(
-        {"stage": "prod", "image_digest": _GOOD_DIGEST}
-    )
+    behind. A prod-stage POST is refused over OIDC — it must not register either."""
+    resp, proj_svc, build_svc = _post({"stage": "prod", "image_digest": _GOOD_DIGEST})
     assert resp.status_code == 403
     build_svc.start_runtime_build.assert_not_called()
     proj_svc.record_prod_candidate.assert_not_called()
+
+
+_SHA40 = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _post_with_kind(build_kind, body_extra=None, *, claims=None):
+    """POST /builds/runtime with the build service reporting a resolved `build_kind`.
+
+    `build_kind=None` means the chain resolved to nothing (an agent with no chain) — which must behave
+    exactly like `"container"`."""
+    conn_svc = MagicMock()
+    conn_svc.get_connection.return_value = _conn()
+    build_svc = MagicMock()
+    build_svc.start_runtime_build.return_value = "rt-build:9"
+    if build_kind is None:
+        build_svc.resolve_infra_template.return_value = None
+    else:
+        resolved = MagicMock(spec=["build_kind", "iac_type"])
+        resolved.build_kind = build_kind
+        resolved.iac_type = "agentcore_harness" if build_kind == "config" else "agentcore_runtime"
+        build_svc.resolve_infra_template.return_value = resolved
+    proj_svc = _proj_svc_with_trunk()
+    client = _build_client(
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=claims if claims is not None else _claims(),
+        proj_svc=proj_svc,
+    )
+    resp = client.post("/api/v1/builds/runtime", json={**_BODY, **(body_extra or {})})
+    return resp, proj_svc, build_svc
+
+
+def test_a_config_build_accepts_the_harness_workflows_bare_sha_tag():
+    """The exact tag the harness workflow posts must reach the build."""
+    resp, _, build_svc = _post_with_kind("config", {"image_tag": _SHA40, "ecr_repo": ""})
+    assert resp.status_code == 202
+    build_svc.start_runtime_build.assert_called_once()
+    assert build_svc.start_runtime_build.call_args.kwargs["image_tag"] == _SHA40
+
+
+@pytest.mark.parametrize(
+    "bad_tag",
+    [
+        pytest.param(_SHA40[:39], id="too_short"),
+        pytest.param(_SHA40 + "0", id="too_long"),
+        pytest.param(_SHA40[:-1] + "Z", id="not_hex"),
+        pytest.param(_SHA40.upper(), id="uppercase"),
+        pytest.param("agent-42-abc1234", id="the_container_tag_shape"),
+        pytest.param(f" {_SHA40}", id="leading_whitespace"),
+    ],
+)
+def test_a_config_build_still_refuses_a_tag_that_is_not_a_bare_sha(bad_tag):
+    """The config branch is a DIFFERENT rule, not an absent one. Anything but 40 lowercase hex is
+    refused — including the container path's own tag shape, since accepting both would make the
+    gate a union and reopen the cross-agent hole on whichever path is weaker."""
+    resp, proj_svc, build_svc = _post_with_kind("config", {"image_tag": bad_tag, "ecr_repo": ""})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Image tag does not belong to this agent"
+    assert bad_tag.strip() not in resp.text
+    build_svc.start_runtime_build.assert_not_called()
+    proj_svc.append_deployment.assert_not_called()
+    proj_svc.record_prod_candidate.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["container", None])
+def test_the_container_prefix_rule_is_unchanged(kind):
+    """REGRESSION PIN, over both the resolved-container case and the unresolvable one. The prefix
+    rule is the only agent-identity boundary in a shared tenant registry, so it must survive this
+    generalisation byte for byte — a foreign tag stays a 403 and a bare sha is NOT accepted here."""
+    resp, _, build_svc = _post_with_kind(kind, {"image_tag": "agent-42-abc1234"})
+    assert resp.status_code == 202
+
+    resp, proj_svc, build_svc = _post_with_kind(kind, {"image_tag": "agent-OTHER-abc1234"})
+    assert resp.status_code == 403
+    build_svc.start_runtime_build.assert_not_called()
+
+    resp, proj_svc, build_svc = _post_with_kind(kind, {"image_tag": _SHA40})
+    assert resp.status_code == 403
+    build_svc.start_runtime_build.assert_not_called()
+    proj_svc.append_deployment.assert_not_called()
+
+
+def test_a_body_supplied_iac_type_is_dropped_by_the_model():
+    """`iac_type` is resolved from the CHAIN, never accepted from the caller.
+
+    The model declares no such field and pydantic ignores extras, so a sent value is discarded —
+    asserted here rather than assumed, because "the model happens not to declare it" is exactly
+    the silence that regresses the moment someone adds a passthrough field. The route-level half
+    is that the resolved kind still decides the gate: the body below claims `agentcore_harness`
+    while the chain says container, and the container prefix rule still applies."""
+    import api.routes.builds as builds_module
+
+    dumped = builds_module.RuntimeBuildRequest.model_validate(
+        {**_BODY, "iac_type": "agentcore_harness", "build_kind": "config"}
+    ).model_dump()
+    assert "iac_type" not in dumped
+    assert "build_kind" not in dumped
+
+    resp, _, build_svc = _post_with_kind(
+        "container",
+        {"image_tag": _SHA40, "iac_type": "agentcore_harness", "build_kind": "config"},
+    )
+    assert resp.status_code == 403
+    build_svc.start_runtime_build.assert_not_called()
+
+
+def test_a_resolver_fault_does_not_fail_the_build_and_keeps_the_container_rule():
+    """The resolver reads three catalog rows, and a store fault there must not 500 the deploy
+    path. It degrades to the CONTAINER rule — the strictest of the two and the one every
+    chainless agent needs — rather than to "no rule at all", which would turn a transient DDB
+    blip into an open tag gate."""
+    conn_svc = MagicMock()
+    conn_svc.get_connection.return_value = _conn()
+    build_svc = MagicMock()
+    build_svc.start_runtime_build.return_value = "rt-build:9"
+    build_svc.resolve_infra_template.side_effect = RuntimeError("ddb is having a day")
+    proj_svc = _proj_svc_with_trunk()
+    client = _build_client(
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(),
+        proj_svc=proj_svc,
+    )
+
+    ok = client.post("/api/v1/builds/runtime", json={**_BODY, "image_tag": "agent-42-abc1234"})
+    assert ok.status_code == 202
+
+    refused = client.post("/api/v1/builds/runtime", json={**_BODY, "image_tag": _SHA40})
+    assert refused.status_code == 403
+
+
+def test_prod_candidate_keeps_the_container_rule_unconditionally():
+    """`/prod-candidate` is byte-unchanged. A config agent has no image, so it can never have a
+    prod candidate — the route keeps the container default rather than growing a branch for a
+    path that cannot reach it."""
+    conn_svc = MagicMock()
+    conn_svc.get_connection.return_value = _conn()
+    proj_svc = _proj_svc(repo_name="some-agent")
+    client = _build_client(
+        conn_svc=conn_svc,
+        build_svc=MagicMock(),
+        claims=_claims(),
+        proj_svc=proj_svc,
+    )
+    resp = client.post(
+        "/api/v1/builds/prod-candidate",
+        json={**_CANDIDATE_BODY, "image_tag": _SHA40},
+    )
+    assert resp.status_code == 403
+    proj_svc.record_prod_candidate.assert_not_called()
+
+
+_MCP_BODY = {
+    "mcp_server_id": "mcp-1",
+    "image_tag": _SHA40,
+    "ecr_repo": "",
+    "connection_id": "conn-1",
+    "stage": "dev",
+}
+
+
+def _mcp_proj_svc(*, repo_name="claims-mcp", found=True):
+    svc = _proj_svc_with_trunk()
+    repo = MagicMock()
+    repo.name = repo_name
+    repo.id = "repo-mcp-1"
+    repo.project_id = "proj-1"
+    svc.find_repository_by_mcp_server_id.return_value = repo if found else None
+    return svc
+
+
+def _post_mcp(body=None, *, claims=None, proj_svc=None):
+    conn_svc = MagicMock()
+    conn_svc.get_connection.return_value = _conn()
+    build_svc = MagicMock()
+    build_svc.start_runtime_build.return_value = "gw-build:1"
+    proj_svc = proj_svc if proj_svc is not None else _mcp_proj_svc()
+    client = _build_client(
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=claims if claims is not None else _claims(repo="claims-mcp"),
+        proj_svc=proj_svc,
+    )
+    resp = client.post("/api/v1/builds/runtime", json=body if body is not None else _MCP_BODY)
+    return resp, proj_svc, build_svc
+
+
+def test_an_mcp_build_starts_with_the_mcp_server_id():
+    resp, proj_svc, build_svc = _post_mcp()
+    assert resp.status_code == 202
+    assert resp.json() == {"build_id": "gw-build:1", "status": "started"}
+    build_svc.start_runtime_build.assert_called_once_with(
+        mcp_server_id="mcp-1",
+        image_tag=_SHA40,
+        ecr_repo="",
+        connection_id="conn-1",
+        stage="dev",
+        image_digest="",
+        expected_build_kind="config",
+    )
+    proj_svc.find_repository_by_mcp_server_id.assert_called_with("mcp-1")
+    import inspect
+
+    from services.project_service import ProjectService
+
+    kw = proj_svc.append_deployment.call_args.kwargs
+    inspect.signature(ProjectService.append_deployment).bind(None, **kw)
+    assert kw["repo_id"] == "repo-mcp-1" and kw["mcp_server_id"] == "mcp-1"
+    assert "agent_id" not in kw
+    proj_svc.record_prod_candidate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [{}, {"agent_id": "agent-42", "mcp_server_id": "mcp-1"}],
+    ids=["neither", "both"],
+)
+def test_the_body_must_name_exactly_one_artifact(ids):
+    body = {k: v for k, v in _MCP_BODY.items() if k != "mcp_server_id"}
+    resp, _, build_svc = _post_mcp({**body, **ids})
+    assert resp.status_code == 422
+    build_svc.start_runtime_build.assert_not_called()
+
+
+def test_an_mcp_build_refuses_a_token_whose_repo_does_not_own_the_mcp():
+    resp, _, build_svc = _post_mcp(proj_svc=_mcp_proj_svc(repo_name="other-repo"))
+    assert resp.status_code == 403
+    assert resp.json() == {
+        "detail": "Token repository does not own this MCP server",
+        "code": "runtime_build.token_not_mcp_owner",
+    }
+    build_svc.start_runtime_build.assert_not_called()
+
+
+def test_an_mcp_build_for_an_unknown_mcp_is_403():
+    resp, _, build_svc = _post_mcp(proj_svc=_mcp_proj_svc(found=False))
+    assert resp.status_code == 403
+    build_svc.start_runtime_build.assert_not_called()
+
+
+def test_an_mcp_build_requires_a_bare_commit_sha_tag():
+    resp, _, build_svc = _post_mcp({**_MCP_BODY, "image_tag": "mcp-1-abc1234"})
+    assert resp.status_code == 403
+    build_svc.start_runtime_build.assert_not_called()
+
+
+def test_an_mcp_prod_build_is_refused_over_oidc():
+    resp, _, build_svc = _post_mcp({**_MCP_BODY, "stage": "prod"})
+    assert resp.status_code == 403
+    assert resp.json() == {
+        "detail": "prod deploys must be initiated from AGP",
+        "code": "runtime_build.prod_from_agp_only",
+    }
+    build_svc.start_runtime_build.assert_not_called()
+
+
+def test_an_in_flight_mcp_build_is_409():
+    conn_svc = MagicMock()
+    conn_svc.get_connection.return_value = _conn()
+    build_svc = MagicMock()
+    build_svc.start_runtime_build.side_effect = RuntimeBuildError("busy", kind="conflict")
+    client = _build_client(
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(repo="claims-mcp"),
+        proj_svc=_mcp_proj_svc(),
+    )
+    resp = client.post("/api/v1/builds/runtime", json=_MCP_BODY)
+    assert resp.status_code == 409
+
+
+def test_an_agent_build_history_row_binds_to_the_real_signature():
+    import inspect
+
+    from services.project_service import ProjectService
+
+    resp, proj_svc, _ = _post()
+    assert resp.status_code == 202
+    kw = proj_svc.append_deployment.call_args.kwargs
+    inspect.signature(ProjectService.append_deployment).bind(None, **kw)
+    assert kw["agent_id"] == "agent-42" and "mcp_server_id" not in kw
+
+
+def test_an_unbuildable_mcp_name_is_a_422_with_no_history_row():
+    conn_svc = MagicMock()
+    conn_svc.get_connection.return_value = _conn()
+    build_svc = MagicMock()
+    build_svc.start_runtime_build.side_effect = RuntimeBuildError("bad name", kind="invalid_name")
+    proj_svc = _mcp_proj_svc()
+    client = _build_client(
+        conn_svc=conn_svc,
+        build_svc=build_svc,
+        claims=_claims(repo="claims-mcp"),
+        proj_svc=proj_svc,
+    )
+    resp = client.post("/api/v1/builds/runtime", json=_MCP_BODY)
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "MCP server name is not buildable", "code": "runtime_build.invalid_name"}
+    proj_svc.append_deployment.assert_not_called()

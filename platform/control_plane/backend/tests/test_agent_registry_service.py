@@ -1,36 +1,30 @@
-"""Tests for AgentRegistryService (Epic 4, Task 2).
+"""Tests for AgentRegistryService.
 
-Strategy (research §10): no moto — inject ``unittest.mock.MagicMock`` boto3 clients
+Strategy: no moto — inject ``unittest.mock.MagicMock`` boto3 clients
 via the service constructor. Fixtures live in ``conftest.py``.
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import RECORD_ID, REGISTRY_ID
 
-from datetime import datetime, timezone
-from types import SimpleNamespace
-
-from models.agent import Agent, AgentCreate, AuthType, AgentUpdate, LifecycleState, Platform
+from models.agent import Agent, AgentAuthType, AgentCreate, AgentUpdate, LifecycleState, Platform
 from services.agent_registry_service import (
-    AgentRegistryService,
     NameTakenError,
     apply_creator_sponsor,
 )
 
-from conftest import REGISTRY_ID, RECORD_ID
-
 
 def _not_found(op: str = "GetRegistryRecord") -> ClientError:
-    return ClientError(
-        {"Error": {"Code": "ResourceNotFoundException", "Message": "x"}}, op
-    )
+    return ClientError({"Error": {"Code": "ResourceNotFoundException", "Message": "x"}}, op)
 
-
-# --- apply_creator_sponsor (E22/T3 shared back-fill) -----------------------
 
 def _principal(oid: str, email: str) -> SimpleNamespace:
     """A minimal stand-in for core.rbac.Principal (only .oid / .email are read)."""
@@ -52,8 +46,6 @@ def test_apply_creator_sponsor_preserves_explicit():
     )
     assert out.sponsor_oid == "EXPLICIT" and out.sponsor_email == "owner@x"
 
-
-# --- create ----------------------------------------------------------------
 
 def test_create_calls_create_registry_record_with_custom_descriptor(service, mock_registry_clients):
     ctl, _ = mock_registry_clients
@@ -84,9 +76,7 @@ def test_create_calls_create_registry_record_with_custom_descriptor(service, moc
     assert envelope["created_by"] == "maria.bauer@example.com"
     assert envelope["schema_version"] == 1
 
-    # recordId parsed from recordArn (create output has NO recordId — research §6).
     assert agent.id == RECORD_ID
-    # DRAFT -> PROPOSED.
     assert agent.lifecycle_state == LifecycleState.PROPOSED
     assert agent.created_by == "maria.bauer@example.com"
 
@@ -106,41 +96,38 @@ def test_create_without_purpose_sends_nonempty_description(service, mock_registr
 
 def test_create_name_precheck_raises_name_taken(service, mock_registry_clients):
     ctl, _ = mock_registry_clients
-    # Name pre-check finds an existing record with that name.
     ctl.list_registry_records.return_value = {
-        "registryRecords": [
-            {"recordId": "rec-existing", "name": "claims-triage-de", "status": "DRAFT"}
-        ],
+        "registryRecords": [{"recordId": "rec-existing", "name": "claims-triage-de", "status": "DRAFT"}],
         "nextToken": None,
     }
 
     with pytest.raises(NameTakenError):
         service.create(AgentCreate(name="claims-triage-de", tenant_id="default"))
 
-    # Must NOT have attempted to create the record.
     ctl.create_registry_record.assert_not_called()
 
 
 def test_create_name_precheck_queries_by_name(service, mock_registry_clients):
     ctl, _ = mock_registry_clients
     service.create(AgentCreate(name="fraud-watch-eu", tenant_id="default"))
-    # The pre-check narrowed by name via the structured `filters` list (E32: the discrete
-    # name= query param is gone).
     precheck = ctl.list_registry_records.call_args_list[0]
-    assert precheck.kwargs["filters"] == [{"name": "name", "values": ["fraud-watch-eu"]}]
+    assert precheck.kwargs["filters"] == [
+        {"name": "name", "values": ["fraud-watch-eu"]},
+        {"name": "recordType", "values": ["CUSTOM"]},
+    ]
 
 
 def test_create_polls_to_draft_before_returning(service, mock_registry_clients, sample_record, monkeypatch):
     """create() must poll the freshly-created (CREATING) record to DRAFT before
     returning, and derive lifecycle from the freshly-observed DRAFT status (→ PROPOSED),
     NOT the stale CREATING create response. Mirrors the MCP service's poll."""
-    # Don't actually sleep between the CREATING and DRAFT polls.
-    monkeypatch.setattr("services.agent_registry_service.time.sleep", lambda _s: None)
+    monkeypatch.setattr("services.registry_writer._sleep", lambda _s: None)
 
     ctl, _ = mock_registry_clients
-    # create returns CREATING (override the fixture's DRAFT default for the create resp).
-    ctl.create_registry_record.return_value = {"recordArn": ctl.create_registry_record.return_value["recordArn"], "status": "CREATING"}
-    # Poll sees CREATING first, then DRAFT.
+    ctl.create_registry_record.return_value = {
+        "recordArn": ctl.create_registry_record.return_value["recordArn"],
+        "status": "CREATING",
+    }
     ctl.get_registry_record.side_effect = [
         sample_record(status="CREATING"),
         sample_record(status="DRAFT"),
@@ -148,9 +135,7 @@ def test_create_polls_to_draft_before_returning(service, mock_registry_clients, 
 
     agent = service.create(AgentCreate(name="claims-triage-de", tenant_id="default"))
 
-    # The poll ran (get_registry_record called at least twice: CREATING then DRAFT).
     assert ctl.get_registry_record.call_count >= 2
-    # Lifecycle derived from the freshly-observed DRAFT status, not the stale CREATING.
     assert agent.lifecycle_state == LifecycleState.PROPOSED
 
 
@@ -160,12 +145,11 @@ def test_create_stamps_pending_identity_status_for_agentcore_agent(service, mock
     update-after-create). A metadata agent (no arn) → envelope identity_status='none'."""
     ctl, _ = mock_registry_clients
 
-    # --- agentcore agent: identity_status stamped 'pending' in the create envelope ---
     service.create(
         AgentCreate(
             name="claims-triage-de",
             platform=Platform.AWS_BEDROCK,
-            auth_type=AuthType.ENTRA,
+            auth_type=AgentAuthType.ENTRA,
             agent_arn="arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/agent-abc123",
             tenant_id="default",
         )
@@ -174,7 +158,6 @@ def test_create_stamps_pending_identity_status_for_agentcore_agent(service, mock
     envelope = json.loads(inline)
     assert envelope["identity_status"] == "pending"
 
-    # --- metadata agent (no arn): identity_status stays 'none' ---
     ctl.create_registry_record.reset_mock()
     service.create(AgentCreate(name="metadata-only-agent", tenant_id="default"))
     inline = ctl.create_registry_record.call_args.kwargs["descriptors"]["custom"]["data"]
@@ -182,7 +165,9 @@ def test_create_stamps_pending_identity_status_for_agentcore_agent(service, mock
     assert envelope["identity_status"] == "none"
 
 
-def test_agent_poll_conflict_during_creating_keeps_polling(service, mock_registry_clients, sample_record):
+def test_agent_poll_conflict_during_creating_keeps_polling(
+    service, mock_registry_clients, sample_record, fake_clock
+):
     """A ConflictException while the record is still CREATING is expected — the poll
     swallows it and keeps polling until DRAFT (mirror the MCP service)."""
     ctl, _ = mock_registry_clients
@@ -191,20 +176,17 @@ def test_agent_poll_conflict_during_creating_keeps_polling(service, mock_registr
         "GetRegistryRecord",
     )
     ctl.get_registry_record.side_effect = [conflict, sample_record(status="DRAFT")]
-    status = service._poll_record_to_draft(RECORD_ID, attempts=3, delay=0)
-    assert status == "DRAFT"
+    agent = service.create(AgentCreate(name="claims-triage-de", tenant_id="default"))
+    assert agent.lifecycle_state == LifecycleState.PROPOSED
     assert ctl.get_registry_record.call_count == 2
 
 
-def test_agent_poll_times_out_raises(service, mock_registry_clients, sample_record):
-    """Never reaches DRAFT -> the bounded loop exhausts and raises RuntimeError."""
+def test_agent_poll_times_out_raises(service, mock_registry_clients, sample_record, fake_clock):
     ctl, _ = mock_registry_clients
     ctl.get_registry_record.return_value = sample_record(status="CREATING")
     with pytest.raises(RuntimeError):
-        service._poll_record_to_draft(RECORD_ID, attempts=2, delay=0)
+        service.create(AgentCreate(name="claims-triage-de", tenant_id="default"))
 
-
-# --- get -------------------------------------------------------------------
 
 def test_get_parses_envelope_and_maps_status(service, mock_registry_clients, sample_record):
     ctl, _ = mock_registry_clients
@@ -247,9 +229,9 @@ def test_get_reraises_non_not_found_client_error(service, mock_registry_clients)
         service.get(RECORD_ID)
 
 
-# --- list ------------------------------------------------------------------
-
-def test_list_fans_out_and_filters_by_business_unit(service, mock_registry_clients, sample_record, sample_envelope):
+def test_list_fans_out_and_filters_by_business_unit(
+    service, mock_registry_clients, sample_record, sample_envelope
+):
     ctl, _ = mock_registry_clients
     ctl.list_registry_records.return_value = {
         "registryRecords": [
@@ -266,18 +248,16 @@ def test_list_fans_out_and_filters_by_business_unit(service, mock_registry_clien
 
     ctl.get_registry_record.side_effect = _get
 
-    # N+1 fan-out: one GetRegistryRecord per summary.
     all_agents = service.list()
     assert len(all_agents) == 2
     assert ctl.get_registry_record.call_count == 2
 
-    # Client-side business_unit filter narrows the set.
     claims = service.list(business_unit="Claims")
     assert [a.id for a in claims] == ["rec-1"]
 
 
 def test_list_passes_record_type_custom(service, mock_registry_clients):
-    """Agents are CUSTOM records, narrowed by the structured recordType filter (E32)."""
+    """Agents are CUSTOM records, narrowed by the structured recordType filter."""
     ctl, _ = mock_registry_clients
     service.list()
     kwargs = ctl.list_registry_records.call_args.kwargs
@@ -301,7 +281,9 @@ def test_list_proposed_is_client_side_not_server_filtered(service, mock_registry
     assert [f["name"] for f in kwargs["filters"]] == ["recordType"]
 
 
-def test_list_skips_malformed_record_and_continues(service, mock_registry_clients, sample_record, sample_envelope):
+def test_list_skips_malformed_record_and_continues(
+    service, mock_registry_clients, sample_record, sample_envelope
+):
     """A record with a malformed/missing envelope must NOT abort the whole fan-out."""
     ctl, _ = mock_registry_clients
     ctl.list_registry_records.return_value = {
@@ -314,7 +296,6 @@ def test_list_skips_malformed_record_and_continues(service, mock_registry_client
 
     def _get(registryId, recordId):
         if recordId == "rec-bad":
-            # Missing the custom envelope entirely.
             return sample_record(recordId="rec-bad", descriptors={})
         return sample_record(recordId="rec-good")
 
@@ -327,7 +308,7 @@ def test_list_skips_malformed_record_and_continues(service, mock_registry_client
 def test_list_skips_record_with_malformed_marketplace_block(
     service, mock_registry_clients, sample_record, sample_envelope
 ):
-    """E33: a well-formed JSON envelope can still hold a structurally invalid ``marketplace``
+    """A well-formed JSON envelope can still hold a structurally invalid ``marketplace``
     block, which ``from_record`` parses with ``MarketplacePublication.model_validate``. That
     pydantic ``ValidationError`` must reach ``list()`` as ``MalformedAgentRecordError`` —
     otherwise ONE bad record 500s the whole catalog (``/agents``, the marketplace product list
@@ -343,7 +324,6 @@ def test_list_skips_record_with_malformed_marketplace_block(
 
     def _get(registryId, recordId):
         if recordId == "rec-bad":
-            # Envelope parses as JSON; the marketplace block does not validate.
             return sample_record(
                 recordId="rec-bad",
                 _envelope=sample_envelope(marketplace={"published": True}),
@@ -385,8 +365,6 @@ def test_list_paginates_across_pages(service, mock_registry_clients, sample_reco
     assert ctl.list_registry_records.call_count == 2
 
 
-# --- update ----------------------------------------------------------------
-
 def test_update_read_modify_write(service, mock_registry_clients, sample_record):
     ctl, _ = mock_registry_clients
     ctl.get_registry_record.return_value = sample_record(status="DRAFT")
@@ -397,14 +375,14 @@ def test_update_read_modify_write(service, mock_registry_clients, sample_record)
     assert updated.business_unit == "Finance"
     assert ctl.update_registry_record.called
     kwargs = ctl.update_registry_record.call_args.kwargs
-    # UpdateRegistryRecord is a PATCH API: descriptors are wrapped in the
-    # optionalValue envelope (custom nests two levels). See test_registry_update_param_shape.
     inline = kwargs["descriptors"]["optionalValue"]["custom"]["optionalValue"]["data"]["optionalValue"]
     envelope = json.loads(inline)
     assert envelope["business_unit"] == "Finance"
 
 
-def test_update_preserves_untouched_fields_and_sends_description(service, mock_registry_clients, sample_record):
+def test_update_preserves_untouched_fields_and_sends_description(
+    service, mock_registry_clients, sample_record
+):
     """Read-modify-write must not drop untouched fields, and must send the
     (record) description from purpose."""
     ctl, _ = mock_registry_clients
@@ -413,12 +391,8 @@ def test_update_preserves_untouched_fields_and_sends_description(service, mock_r
     service.update(RECORD_ID, AgentUpdate(business_unit="Finance"))
 
     kwargs = ctl.update_registry_record.call_args.kwargs
-    # description sent from the existing purpose, wrapped in the PATCH optionalValue
-    # envelope (UpdateRegistryRecord is a PATCH API; create sends it flat).
     assert kwargs["description"] == {"optionalValue": "Triage inbound motor claims for the DE market"}
-    # name preserved — and sent as a plain string (NOT wrapped).
     assert kwargs["name"] == "claims-triage-de"
-    # untouched governance fields survive in the regenerated envelope.
     inline = kwargs["descriptors"]["optionalValue"]["custom"]["optionalValue"]["data"]["optionalValue"]
     envelope = json.loads(inline)
     assert envelope["sponsor_oid"] == "maria-oid"
@@ -440,13 +414,15 @@ def test_update_without_purpose_sends_name_as_description(service, mock_registry
     assert kwargs["description"] == {"optionalValue": "claims-triage-de"}
 
 
-def test_persist_identity_without_purpose_sends_name_as_description(service, mock_registry_clients, sample_record, sample_envelope):
+def test_persist_identity_without_purpose_sends_name_as_description(
+    service, mock_registry_clients, sample_record, sample_envelope
+):
     """The same guard on the second update call site. Tested separately from ``update()``
     because they are two independent literals: fixing one and not the other leaves the
     provisioning hook — the path with no ``except`` at all — still 500-ing."""
     ctl, _ = mock_registry_clients
     agent = Agent.from_record(sample_record(status="DRAFT", description=""), sample_envelope())
-    assert agent.purpose == ""  # the precondition this test exists for
+    assert agent.purpose == ""
 
     service.persist_identity(agent)
 
@@ -465,7 +441,7 @@ def test_update_with_empty_purpose_falls_back_to_name_for_description(
 ):
     """UpdateRegistryRecord rejects an empty description (min length 1), so a
     purpose-less agent must PATCH the same name fallback create() writes —
-    the E29 live-test failure: {"optionalValue": ""} → ParamValidationError."""
+    the live-test failure: {"optionalValue": ""} → ParamValidationError."""
     ctl, _ = mock_registry_clients
     ctl.get_registry_record.return_value = sample_record(description="")
 
@@ -481,11 +457,11 @@ def test_persist_identity_with_empty_purpose_falls_back_to_name_for_description(
     """The provisioning orchestrator hands persist_identity the IN-MEMORY agent
     from the create request, whose purpose can be "" even though create() wrote
     the name fallback into the record — the empty PATCH killed provisioning AND
-    the failed-status persist (agent stuck 'pending'). E29 live fix."""
+    the failed-status persist (agent stuck 'pending'). Live fix."""
     ctl, _ = mock_registry_clients
     ctl.get_registry_record.return_value = sample_record(description="")
     agent = service.get(RECORD_ID)
-    assert agent.purpose == ""  # the shape the live incident produced
+    assert agent.purpose == ""
 
     service.persist_identity(agent)
 
@@ -493,7 +469,79 @@ def test_persist_identity_with_empty_purpose_falls_back_to_name_for_description(
     assert kwargs["description"] == {"optionalValue": "claims-triage-de"}
 
 
-# --- delete ----------------------------------------------------------------
+def _update_conflict() -> ClientError:
+    """The registry refusing a write while the record is still UPDATING from the previous one."""
+    return ClientError(
+        {
+            "Error": {
+                "Code": "ConflictException",
+                "Message": "Registry record cannot be modified while in UPDATING state.",
+            }
+        },
+        "UpdateRegistryRecord",
+    )
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Drive the registry writer's clock: sleeps advance time instantly."""
+    import services.registry_writer as mod
+
+    t = {"now": 0.0}
+    monkeypatch.setattr(mod, "_monotonic", lambda: t["now"])
+    monkeypatch.setattr(mod, "_sleep", lambda s: t.__setitem__("now", t["now"] + s))
+    return t
+
+
+def test_persist_identity_retries_a_conflict_from_the_previous_write(
+    service, mock_registry_clients, sample_record, fake_clock
+):
+    """A write that lands while the record is still UPDATING from a previous one gets
+    ConflictException (the live first-grant 502 whose retry passed). Retry it."""
+    ctl, _ = mock_registry_clients
+    agent = service.get(RECORD_ID)
+    ctl.update_registry_record.side_effect = [
+        _update_conflict(),
+        _update_conflict(),
+        {"recordArn": RECORD_ID, "status": "DRAFT"},
+    ]
+
+    assert service.persist_identity(agent) is agent
+    assert ctl.update_registry_record.call_count == 3
+
+
+def test_persist_identity_does_not_retry_a_non_conflict_error(
+    service, mock_registry_clients, sample_record, fake_clock
+):
+    ctl, _ = mock_registry_clients
+    agent = service.get(RECORD_ID)
+    ctl.update_registry_record.side_effect = ClientError(
+        {"Error": {"Code": "ValidationException", "Message": "bad"}}, "UpdateRegistryRecord"
+    )
+
+    with pytest.raises(ClientError):
+        service.persist_identity(agent)
+    assert ctl.update_registry_record.call_count == 1
+
+
+def test_persist_identity_conflict_retry_shares_the_reapproval_deadline(
+    service, mock_registry_clients, sample_record, fake_clock
+):
+    """The Conflict retry spends the SAME budget as the pre-read and the
+    re-assert (one deadline per persist), not a budget of its own — so a record that never
+    leaves UPDATING surfaces the ConflictException within that one budget."""
+    from services.registry_writer import REAPPROVAL_BUDGET_S
+
+    ctl, _ = mock_registry_clients
+    agent = service.get(RECORD_ID)
+    ctl.update_registry_record.side_effect = _update_conflict()
+
+    with pytest.raises(ClientError) as exc:
+        service.persist_identity(agent)
+    assert exc.value.response["Error"]["Code"] == "ConflictException"
+    assert ctl.update_registry_record.call_count > 1
+    assert fake_clock["now"] <= REAPPROVAL_BUDGET_S
+
 
 def test_delete_returns_prior_agent(service, mock_registry_clients, sample_record):
     ctl, _ = mock_registry_clients
@@ -510,15 +558,11 @@ def test_delete_returns_none_when_missing(service, mock_registry_clients):
     ctl.delete_registry_record.assert_not_called()
 
 
-# --- submit_for_approval ----------------------------------------------------
-
 def test_submit_for_approval_calls_submit(service, mock_registry_clients, sample_record):
     ctl, _ = mock_registry_clients
     ctl.get_registry_record.return_value = sample_record(status="PENDING_APPROVAL")
     agent = service.submit_for_approval(RECORD_ID)
-    ctl.submit_registry_record_for_approval.assert_called_with(
-        registryId=REGISTRY_ID, recordId=RECORD_ID
-    )
+    ctl.submit_registry_record_for_approval.assert_called_with(registryId=REGISTRY_ID, recordId=RECORD_ID)
     assert agent is not None
     assert agent.lifecycle_state == LifecycleState.PENDING_APPROVAL
 
@@ -528,8 +572,6 @@ def test_submit_for_approval_returns_none_when_missing(service, mock_registry_cl
     ctl.submit_registry_record_for_approval.side_effect = _not_found("SubmitRegistryRecordForApproval")
     assert service.submit_for_approval("rec-missing") is None
 
-
-# --- transition -------------------------------------------------------------
 
 def test_transition_approve_calls_update_status(service, mock_registry_clients, sample_record):
     ctl, _ = mock_registry_clients
@@ -542,14 +584,28 @@ def test_transition_approve_calls_update_status(service, mock_registry_clients, 
     assert agent.lifecycle_state == LifecycleState.APPROVED
 
 
-def test_transition_bad_action_raises_value_error(service):
-    with pytest.raises(ValueError):
+def test_transition_bad_action_is_the_unknown_action_kind(service, mock_registry_clients):
+    from services.agent_registry_service import IllegalTransitionError
+
+    ctl, _ = mock_registry_clients
+    with pytest.raises(IllegalTransitionError) as exc:
         service.transition(RECORD_ID, "bogus", reason="x")
+    assert (exc.value.kind, exc.value.status_code) == ("unknown_action", 400)
+    assert exc.value.detail == (
+        "Unknown transition action 'bogus'; valid actions: ['approve', 'deprecate', 'reject']"
+    )
+    ctl.update_registry_record_status.assert_not_called()
 
 
-def test_transition_empty_reason_raises_value_error(service):
-    with pytest.raises(ValueError):
+def test_transition_empty_reason_is_the_missing_reason_kind(service, mock_registry_clients):
+    from services.agent_registry_service import IllegalTransitionError
+
+    ctl, _ = mock_registry_clients
+    with pytest.raises(IllegalTransitionError) as exc:
         service.transition(RECORD_ID, "approve", reason="")
+    assert (exc.value.kind, exc.value.status_code) == ("missing_reason", 400)
+    assert exc.value.detail == "A non-empty reason is required for a status transition"
+    ctl.update_registry_record_status.assert_not_called()
 
 
 def test_transition_returns_none_when_missing(service, mock_registry_clients):
@@ -560,7 +616,7 @@ def test_transition_returns_none_when_missing(service, mock_registry_clients):
 
 def test_transition_illegal_edge_raises_illegal_transition_error(service, mock_registry_clients):
     """A boto3 ValidationException for an illegal status edge (e.g. DRAFT->APPROVED,
-    the live bug) is mapped to IllegalTransitionError, not a raw ClientError (research §5)."""
+    the live bug) is mapped to IllegalTransitionError, not a raw ClientError."""
     from services.agent_registry_service import IllegalTransitionError
 
     ctl, _ = mock_registry_clients
@@ -575,7 +631,11 @@ def test_transition_illegal_edge_raises_illegal_transition_error(service, mock_r
 
     with pytest.raises(IllegalTransitionError) as exc:
         service.transition("rec-1", "approve", "ok")
-    assert "Invalid status transition" in str(exc.value)
+    assert (exc.value.kind, exc.value.status_code) == ("illegal_transition", 409)
+    assert exc.value.detail == (
+        "Invalid status transition: 'approve' is not allowed from the agent's current state"
+    )
+    assert "Valid transitions" not in exc.value.detail
 
 
 def test_transition_reraises_other_client_errors(service, mock_registry_clients):
@@ -588,8 +648,6 @@ def test_transition_reraises_other_client_errors(service, mock_registry_clients)
     with pytest.raises(ClientError):
         service.transition("rec-1", "approve", "ok")
 
-
-# --- envelope round-trip guard (Epic 12, Task 2) ---------------------------
 
 def test_mcp_server_ids_round_trips_through_envelope():
     """A mutated ``mcp_server_ids`` survives ``to_envelope()`` -> ``from_record()``.
@@ -630,7 +688,7 @@ def test_mcp_server_ids_round_trips_through_envelope():
 
 
 def test_model_id_round_trips_through_envelope():
-    """model_id (E21) survives ``to_envelope()`` -> ``from_record()`` so the runtime
+    """model_id survives ``to_envelope()`` -> ``from_record()`` so the runtime
     build reads a non-empty model from the record envelope."""
     from datetime import datetime
 
@@ -663,7 +721,7 @@ def test_model_id_round_trips_through_envelope():
 
 
 def test_from_record_tolerates_pre_e21_envelope_without_model_id():
-    """A pre-E21 envelope lacking model_id hydrates as None (purely additive)."""
+    """An older envelope lacking model_id hydrates as None (purely additive)."""
     from datetime import datetime
 
     from models.agent import Agent
@@ -677,15 +735,13 @@ def test_from_record_tolerates_pre_e21_envelope_without_model_id():
             "createdAt": dt,
             "updatedAt": dt,
         },
-        {},  # legacy envelope: no model_id key
+        {},
     )
     assert rebuilt.model_id is None
 
 
-# --- tenant fields round-trip (Epic 24, Task 4) -----------------------------
-
 def test_tenant_fields_round_trip_through_envelope():
-    """tenant_id + published (E24) survive ``to_envelope()`` -> ``from_record()``."""
+    """tenant_id + published survive ``to_envelope()`` -> ``from_record()``."""
     from datetime import datetime
 
     from models.agent import Agent
@@ -720,7 +776,7 @@ def test_tenant_fields_round_trip_through_envelope():
 
 
 def test_from_record_tolerates_pre_e23_envelope_without_tenant_fields():
-    """A pre-E24 envelope lacking tenant_id/published hydrates to None/False
+    """An older envelope lacking tenant_id/published hydrates to None/False
     (migration tolerance — ENVELOPE_SCHEMA_VERSION stays 1)."""
     from datetime import datetime
 
@@ -735,7 +791,7 @@ def test_from_record_tolerates_pre_e23_envelope_without_tenant_fields():
             "createdAt": dt,
             "updatedAt": dt,
         },
-        {},  # legacy envelope: no tenant keys
+        {},
     )
     assert rebuilt.tenant_id is None
     assert rebuilt.published is False
@@ -753,7 +809,7 @@ def test_create_envelope_carries_tenant_fields(service, mock_registry_clients):
 
 
 def test_create_envelope_carries_databricks_fields(service, mock_registry_clients):
-    """E29/T5, C-4: the CREATE envelope's inlineContent carries the caller-picked
+    """The CREATE envelope's inlineContent carries the caller-picked
     Databricks runtime fields (AgentCreate → Agent → to_envelope). This is the write
     side of the additive fence — a registration that names a Databricks app must not
     lose its handle between the request body and the stored record."""
@@ -763,7 +819,7 @@ def test_create_envelope_carries_databricks_fields(service, mock_registry_client
             tenant_id="ten-claims",
             name="claims-triage-db",
             platform=Platform.DATABRICKS,
-            auth_type=AuthType.ENTRA,
+            auth_type=AgentAuthType.ENTRA,
             runtime_handle="https://dbc-test.cloud.databricks.com/apps/claims-triage",
             runtime_kind="app",
             binding_mode="federation",
@@ -774,20 +830,10 @@ def test_create_envelope_carries_databricks_fields(service, mock_registry_client
     assert envelope["runtime_handle"] == "https://dbc-test.cloud.databricks.com/apps/claims-triage"
     assert envelope["runtime_kind"] == "app"
     assert envelope["binding_mode"] == "federation"
-    # the sp_secret-mode fields are SERVICE-written (T6), so a create leaves them null
     assert envelope["databricks_sp_id"] is None
     assert envelope["databricks_sp_secret_arn"] is None
     assert envelope["oauth2_app_client_id"] is None
 
-
-# --- create-hook provisioning dispatch (E29/T5, contract C-4) ----------------
-#
-# The route's `if is_agentcore / elif is_databricks_governed / else nothing` dispatch.
-# Exercised by calling the `create_agent` coroutine DIRECTLY with a real
-# `BackgroundTasks()` and inspecting what got SCHEDULED — "schedule provision" is
-# literally a `background_tasks.add_task` entry, and asserting on it needs no HTTP
-# scaffolding. (The TestClient-driven agentcore-path test lives in
-# tests/test_grants_routes.py and stays as it is.)
 
 def _dispatch_agent(**overrides):
     """A registry-shaped Agent for the create hook to dispatch on."""
@@ -796,7 +842,7 @@ def _dispatch_agent(**overrides):
     from models.agent import Agent, Origin
 
     now = datetime.now(timezone.utc)
-    base = dict(
+    base: dict[str, Any] = dict(
         id="rec-dispatch",
         name="claims-triage",
         purpose="Triage claims",
@@ -814,7 +860,7 @@ def _dispatch_agent(**overrides):
 def _agentcore_agent():
     return _dispatch_agent(
         platform=Platform.AWS_BEDROCK,
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         agent_arn="arn:aws:bedrock-agentcore:eu-central-1:123456789012:runtime/claims-triage",
     )
 
@@ -822,7 +868,7 @@ def _agentcore_agent():
 def _databricks_agent():
     return _dispatch_agent(
         platform=Platform.DATABRICKS,
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         runtime_handle="https://dbc-test.cloud.databricks.com/apps/claims-triage",
         runtime_kind="app",
         binding_mode="federation",
@@ -854,14 +900,14 @@ async def _run_create_hook(created_agent):
 
     tenants_module._svc = SimpleNamespace(get=lambda tid: SimpleNamespace(id=tid))
     tasks = BackgroundTasks()
-    principal = Principal(
-        oid="oid-1", email="maria.bauer@example.com", role=Role.OPERATOR, raw_claims={}
-    )
+    principal = Principal(oid="oid-1", email="maria.bauer@example.com", role=Role.OPERATOR, raw_claims={})
     ctx = TenantContext(is_global=True, tenant_ids=frozenset(), tenants=())
 
-    with patch.object(agents_module, "_svc", registry), \
-            patch.object(agents_module, "_identity_svc", identity), \
-            patch.object(agents_module, "_langfuse_svc", langfuse):
+    with (
+        patch.object(agents_module, "_svc", registry),
+        patch.object(agents_module, "_identity_svc", identity),
+        patch.object(agents_module, "_langfuse_svc", langfuse),
+    ):
         returned = await agents_module.create_agent(
             AgentCreate(name=created_agent.name, tenant_id="ten-1"),
             tasks,
@@ -891,9 +937,9 @@ async def test_create_hook_schedules_provision_for_agentcore_agent():
 
 @pytest.mark.asyncio
 async def test_create_hook_schedules_provision_for_databricks_governed_agent():
-    """E29/T5: a Databricks-governed agent (handle + ENTRA + DATABRICKS) gets the SAME
+    """A Databricks-governed agent (handle + ENTRA + DATABRICKS) gets the SAME
     background provision call shape. provision() runs the platform-neutral
-    provision_identity first; T6 adds the Databricks runtime half behind it."""
+    provision_identity first; the Databricks runtime half follows behind it."""
     agent = _databricks_agent()
     tasks, identity = await _run_create_hook(agent)
     calls = _scheduled_provision_calls(tasks, identity)
@@ -907,25 +953,20 @@ async def test_create_hook_schedules_no_provision_for_ungoverned_agent():
     A Databricks record with no runtime_handle, and an AWS record with no ARN, both
     land here — being on a governed PLATFORM is not itself a licence to provision."""
     for agent in (
-        _dispatch_agent(),  # no platform, no auth, no handle
-        _dispatch_agent(platform=Platform.DATABRICKS, auth_type=AuthType.ENTRA),  # no handle
-        _dispatch_agent(platform=Platform.AWS_BEDROCK, auth_type=AuthType.ENTRA),  # no arn
-        _databricks_agent().model_copy(update={"auth_type": AuthType.API_KEY}),  # not Entra
+        _dispatch_agent(),
+        _dispatch_agent(platform=Platform.DATABRICKS, auth_type=AgentAuthType.ENTRA),
+        _dispatch_agent(platform=Platform.AWS_BEDROCK, auth_type=AgentAuthType.ENTRA),
+        _databricks_agent().model_copy(update={"auth_type": AgentAuthType.API_KEY}),
     ):
         tasks, identity = await _run_create_hook(agent)
         assert _scheduled_provision_calls(tasks, identity) == []
         identity.provision.assert_not_called()
 
-# ---------------------------------------------------------------------------
-# E32 — agent-registry namespace + record-schema migration
-# ---------------------------------------------------------------------------
 
 def test_create_sends_new_namespace_shape(service, mock_registry_clients):
-    """CreateRegistryRecord uses recordType + descriptors.custom.data (E32)."""
+    """CreateRegistryRecord uses recordType + descriptors.custom.data."""
     ctl, _ = mock_registry_clients
-    service.create(
-        AgentCreate(name="a1", purpose="p", platform=Platform.AWS_BEDROCK, tenant_id="default")
-    )
+    service.create(AgentCreate(name="a1", purpose="p", platform=Platform.AWS_BEDROCK, tenant_id="default"))
 
     kwargs = ctl.create_registry_record.call_args.kwargs
     assert kwargs["recordType"] == "CUSTOM"
@@ -938,9 +979,9 @@ def test_create_sends_new_namespace_shape(service, mock_registry_clients):
 
 
 def test_list_uses_structured_filters(service, mock_registry_clients):
-    """ListRegistryRecords filters via filters=[{name,values}] (E32)."""
+    """ListRegistryRecords filters via filters=[{name,values}]."""
     ctl, _ = mock_registry_clients
-    list(service._iter_record_summaries(status="APPROVED"))
+    service.list(lifecycle_state=LifecycleState.APPROVED)
 
     kwargs = ctl.list_registry_records.call_args.kwargs
     assert kwargs["filters"] == [
@@ -952,14 +993,14 @@ def test_list_uses_structured_filters(service, mock_registry_clients):
 
 
 def test_from_record_reads_display_name(sample_record, sample_envelope):
-    """Native displayName WINS over the record's name (E32).
+    """Native displayName WINS over the record's name.
 
     The two values must DIFFER here or the test is a tautology: the shared conftest
     record sets ``name == displayName``, so an assertion against that fixture passes
     whether ``from_record`` reads ``displayName`` or ``name`` — it would not have failed
     had the feature never been implemented. Overridden per-test rather than in
     ``conftest`` because the ``name == displayName`` record is the realistic post-create
-    shape that the rest of the suite (and Task 3) relies on.
+    shape that the rest of the suite relies on.
 
     ``name`` is the registry's unique dedup key; ``displayName`` is the human-facing
     label. The fall-back direction (no ``displayName`` at all → use ``name``, for records
@@ -970,7 +1011,7 @@ def test_from_record_reads_display_name(sample_record, sample_envelope):
 
 
 def test_update_sends_display_name(service, mock_registry_clients, sample_record):
-    """A rename must patch displayName too, or reads silently resolve the stale one (E32).
+    """A rename must patch displayName too, or reads silently resolve the stale one.
 
     Regression guard: reads prefer displayName, so updating `name` alone makes a
     rename revert on the next read.
@@ -981,15 +1022,12 @@ def test_update_sends_display_name(service, mock_registry_clients, sample_record
     service.update(RECORD_ID, AgentUpdate(name="new-name"))
 
     kwargs = ctl.update_registry_record.call_args.kwargs
-    # name stays a PLAIN string; displayName takes the one-level PATCH envelope.
     assert kwargs["name"] == "new-name"
     assert kwargs["displayName"] == {"optionalValue": "new-name"}
 
 
-def test_persist_identity_sends_display_name(
-    service, mock_registry_clients, sample_record, sample_envelope
-):
-    """persist_identity envelope-writes the whole agent, so it owns displayName too (E32)."""
+def test_persist_identity_sends_display_name(service, mock_registry_clients, sample_record, sample_envelope):
+    """persist_identity envelope-writes the whole agent, so it owns displayName too."""
     ctl, _ = mock_registry_clients
     agent = Agent.from_record(sample_record(status="DRAFT"), sample_envelope())
 
@@ -999,10 +1037,6 @@ def test_persist_identity_sends_display_name(
     assert kwargs["name"] == agent.name
     assert kwargs["displayName"] == {"optionalValue": agent.name}
 
-
-# ---------------------------------------------------------------------------
-# E33 — marketplace publication block (contract C2)
-# ---------------------------------------------------------------------------
 
 DECLARED_AT = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -1039,7 +1073,7 @@ def _envelope_from_update(ctl) -> dict:
 
 
 def test_marketplace_block_round_trips_through_envelope():
-    """The declared publication (E33) survives ``to_envelope()`` -> ``from_record()``,
+    """The declared publication survives ``to_envelope()`` -> ``from_record()``,
     nested datasheet and attestation fields included."""
     dt = datetime(2026, 6, 1, 10, 0, 0)
     a = Agent(
@@ -1052,12 +1086,11 @@ def test_marketplace_block_round_trips_through_envelope():
     )
 
     env = a.to_envelope()
-    # Serialized JSON-safe (mode="json"), so the nested datetime is a string.
     assert env["marketplace"]["published"] is True
     assert env["marketplace"]["datasheet"]["owner_team"] == "Claims Automation"
     assert env["marketplace"]["declared_by"] == "admin@acme.com"
     assert isinstance(env["marketplace"]["declared_at"], str)
-    json.dumps(env)  # the envelope must stay json.dumps-able
+    json.dumps(env)
 
     rebuilt = Agent.from_record(
         {
@@ -1077,7 +1110,7 @@ def test_marketplace_block_round_trips_through_envelope():
 
 
 def test_from_record_tolerates_pre_e33_envelope_without_marketplace():
-    """A pre-E33 envelope lacking the key hydrates to None (migration tolerance —
+    """An older envelope lacking the key hydrates to None (migration tolerance —
     ENVELOPE_SCHEMA_VERSION stays 1). An explicit stored ``null`` is tolerated too."""
     dt = datetime(2026, 6, 1, 10, 0, 0)
     record = {
@@ -1110,9 +1143,7 @@ def test_update_preserves_marketplace_block(service, mock_registry_clients, samp
     re-serializes the whole envelope, so the marketplace key must survive it. A key absent
     from ``to_envelope()`` would be discarded here with no error at all."""
     ctl, _ = mock_registry_clients
-    env = sample_envelope(
-        marketplace=json.loads(_publication().model_dump_json())
-    )
+    env = sample_envelope(marketplace=json.loads(_publication().model_dump_json()))
     ctl.get_registry_record.return_value = sample_record(status="DRAFT", _envelope=env)
 
     updated = service.update(RECORD_ID, AgentUpdate(business_unit="Finance"))
@@ -1136,16 +1167,12 @@ def test_persist_marketplace_writes_block_through_patch_envelope(
 
     assert result.marketplace is not None and result.marketplace.published is True
     kwargs = ctl.update_registry_record.call_args.kwargs
-    # name stays a PLAIN string; displayName + description take the one-level wrap.
     assert kwargs["name"] == "claims-triage-de"
     assert kwargs["displayName"] == {"optionalValue": "claims-triage-de"}
-    assert kwargs["description"] == {
-        "optionalValue": "Triage inbound motor claims for the DE market"
-    }
+    assert kwargs["description"] == {"optionalValue": "Triage inbound motor claims for the DE market"}
     envelope = _envelope_from_update(ctl)
     assert envelope["marketplace"]["published"] is True
     assert envelope["marketplace"]["datasheet"]["support_contact"] == "claims-automation@acme.com"
-    # Untouched governance fields survive the regenerated envelope.
     assert envelope["sponsor_oid"] == "maria-oid"
     assert envelope["region"] == "DE"
 
@@ -1209,10 +1236,6 @@ def test_persist_marketplace_bumps_updated_at(service, mock_registry_clients, sa
     assert result.updated_at > before
 
 
-# ---------------------------------------------------------------------------
-# E33 Amendment 2 — deprecate ⇒ unlist (contract C12)
-# ---------------------------------------------------------------------------
-
 def _method_call_names(ctl) -> list[str]:
     """The ordered method names called on the control client (for ordering pins)."""
     return [call[0] for call in ctl.method_calls]
@@ -1221,7 +1244,7 @@ def _method_call_names(ctl) -> list[str]:
 def test_transition_deprecate_unlists_a_published_marketplace_product(
     service, mock_registry_clients, sample_record, sample_envelope
 ):
-    """C12: deprecating a PUBLISHED product unlists it — one write per concern, lifecycle
+    """Deprecating a PUBLISHED product unlists it — one write per concern, lifecycle
     status FIRST and the unlist SECOND, with the declared datasheet kept as history."""
     ctl, _ = mock_registry_clients
     env = sample_envelope(marketplace=json.loads(_publication().model_dump_json()))
@@ -1235,20 +1258,17 @@ def test_transition_deprecate_unlists_a_published_marketplace_product(
         status="DEPRECATED",
         statusReason="superseded by v2",
     )
-    # Ordering pin: the lifecycle write lands BEFORE the unlist envelope write.
     names = _method_call_names(ctl)
     assert names.index("update_registry_record_status") < names.index("update_registry_record")
 
     envelope = _envelope_from_update(ctl)
     assert envelope["marketplace"]["published"] is False
-    # The declared datasheet is HISTORY: the block is kept, never cleared to None.
     assert envelope["marketplace"]["datasheet"]["owner_team"] == "Claims Automation"
     assert envelope["marketplace"]["datasheet"]["support_contact"] == "claims-automation@acme.com"
     assert envelope["marketplace"]["datasheet"]["compliance"] == ["GDPR", "BaFin"]
     assert envelope["marketplace"]["declared_by"] == "admin@acme.com"
     assert envelope["marketplace"]["declared_at"] is not None
 
-    # The returned record reflects the unlist (the route hands this straight back).
     assert agent is not None
     assert agent.lifecycle_state == LifecycleState.DEPRECATED
     assert agent.marketplace is not None and agent.marketplace.published is False
@@ -1274,9 +1294,7 @@ def test_transition_deprecate_already_unpublished_writes_no_marketplace_block(
 ):
     """Already ``published=False`` → idempotent no-op: the unlist is skipped entirely."""
     ctl, _ = mock_registry_clients
-    env = sample_envelope(
-        marketplace=json.loads(_publication(published=False).model_dump_json())
-    )
+    env = sample_envelope(marketplace=json.loads(_publication(published=False).model_dump_json()))
     ctl.get_registry_record.return_value = sample_record(status="DEPRECATED", _envelope=env)
 
     agent = service.transition(RECORD_ID, "deprecate", reason="eol")
@@ -1294,9 +1312,7 @@ def test_transition_approve_and_reject_never_touch_the_marketplace_block(
     later lifecycle re-approve must NOT re-list the product — only a fresh publish
     request can."""
     ctl, _ = mock_registry_clients
-    env = sample_envelope(
-        marketplace=json.loads(_publication(published=False).model_dump_json())
-    )
+    env = sample_envelope(marketplace=json.loads(_publication(published=False).model_dump_json()))
     ctl.get_registry_record.return_value = sample_record(status=status, _envelope=env)
 
     agent = service.transition(RECORD_ID, action, reason="ok")
@@ -1328,11 +1344,9 @@ def test_transition_deprecate_raises_when_the_unlist_write_fails(
     ctl.update_registry_record.assert_called_once()
 
 
-def test_transition_deprecate_returns_none_when_the_record_vanished(
-    service, mock_registry_clients
-):
-    """The status write succeeded but the re-read 404s: still ``None`` (the pre-C12
-    contract), and no unlist is attempted on a record we could not hydrate."""
+def test_transition_deprecate_returns_none_when_the_record_vanished(service, mock_registry_clients):
+    """The status write succeeded but the re-read 404s: still ``None``, and no unlist is
+    attempted on a record we could not hydrate."""
     ctl, _ = mock_registry_clients
     ctl.get_registry_record.side_effect = _not_found()
 

@@ -1,4 +1,4 @@
-"""RBAC + behavior tests for the Agent Registry routes (Epic 4, Task 3).
+"""RBAC + behavior tests for the Agent Registry routes.
 
 These exercise the REAL `require_role` + `current_principal` dependency path
 (`AUTH_PROVIDER=entra`) against a mocked `verify_entra_token` (so no live Entra)
@@ -10,36 +10,18 @@ whole app's import chain.
 """
 
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+pytestmark = pytest.mark.usefixtures("reset_modules")
 
-@pytest.fixture(autouse=True)
-def reset_modules():
-    """Drop cached auth/config/route modules so monkeypatched env is honored."""
-    import sys
-    for mod in [
-        "core.rbac",
-        "core.security_entra",
-        "core.config",
-        "api.routes.agents",
-    ]:
-        sys.modules.pop(mod, None)
-    yield
-
-
-@pytest.fixture
-def entra_settings(monkeypatch):
-    monkeypatch.setenv("AUTH_PROVIDER", "entra")
-    monkeypatch.setenv("USE_DEV_AUTH", "False")
-    monkeypatch.setenv("ENTRA_TENANT_ID", "00000000-0000-0000-0000-000000000001")
-    monkeypatch.setenv("ENTRA_AUDIENCE", "api://agp")
-    monkeypatch.setenv("ENTRA_ROLE_ADMIN", "Platform.Admin")
-    monkeypatch.setenv("ENTRA_ROLE_OPERATOR", "Platform.Operator")
-    monkeypatch.setenv("ENTRA_ROLE_VIEWER", "Platform.Viewer")
+_FAKE_TOKEN = "ghs_" + "a" * 36
 
 
 def _make_agent(**overrides):
@@ -47,7 +29,7 @@ def _make_agent(**overrides):
     from models.agent import Agent, LifecycleState, Origin
 
     now = datetime.now(timezone.utc)
-    base = dict(
+    base: dict[str, Any] = dict(
         id="rec-123",
         name="claims-triage-de",
         purpose="Triage claims",
@@ -66,18 +48,19 @@ def _build_client(mock_svc):
 
     Must be called AFTER the entra env fixture so the route module imports with
     the right settings. Patches the route module's `get_service` to return the
-    mock so no real AWS is touched. Also pre-seeds the E24 tenant-resolver
+    mock so no real AWS is touched. Also pre-seeds the tenant-resolver
     singleton (via `api.routes.users._tenant_resolver`) with an always-global
     stub, and `api.routes.tenants._svc` with a fake `.get` that accepts ANY
     tenant_id — this file predates tenant scoping and its fixtures carry a
     fixed "default" tenant_id with no real Tenant record backing it; global
     admin (bypasses all filtering) + an always-known tenant preserve the
-    pre-E24 behavior. Tenant-scoping itself is covered by
+    earlier behavior. Tenant-scoping itself is covered by
     `test_registry_tenant_scoping.py`.
     """
     import api.routes.agents as agents_module
     import api.routes.tenants as tenants_module
     import api.routes.users as users_module
+    from core.errors import install_error_handlers
     from services.tenant_resolver import TenantContext
 
     agents_module._svc = mock_svc
@@ -97,8 +80,22 @@ def _build_client(mock_svc):
     tenants_module._svc = _AnyTenantService()
 
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(agents_module.router, prefix="/api/v1")
     return TestClient(app), agents_module
+
+
+def _real_registry(ctl):
+    """The real ``AgentRegistryService`` over a MagicMock control client, for tests that pin what the
+    service's own errors put on the wire."""
+    from services.agent_registry_service import AgentRegistryService
+
+    return AgentRegistryService(registry_id="reg-test", control_client=ctl)
+
+
+def _transition(client, body):
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
+        return client.post("/api/v1/agents/rec-123/transitions", json=body, headers=_headers())
 
 
 def _claims_for(role: str):
@@ -118,8 +115,6 @@ def _claims_for(role: str):
 def _headers():
     return {"Authorization": "Bearer fake-token"}
 
-
-# --- VIEWER ---------------------------------------------------------------
 
 def test_viewer_can_list(entra_settings):
     mock_svc = MagicMock()
@@ -158,8 +153,6 @@ def test_viewer_cannot_transition(entra_settings):
     assert resp.status_code == 403
 
 
-# --- OPERATOR -------------------------------------------------------------
-
 def test_operator_can_create(entra_settings):
     mock_svc = MagicMock()
     mock_svc.create.return_value = _make_agent()
@@ -180,9 +173,7 @@ def test_operator_can_submit(entra_settings):
     from models.agent import LifecycleState
 
     mock_svc = MagicMock()
-    mock_svc.submit_for_approval.return_value = _make_agent(
-        lifecycle_state=LifecycleState.PENDING_APPROVAL
-    )
+    mock_svc.submit_for_approval.return_value = _make_agent(lifecycle_state=LifecycleState.PENDING_APPROVAL)
     client, _ = _build_client(mock_svc)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
@@ -206,15 +197,11 @@ def test_operator_cannot_transition(entra_settings):
     assert resp.status_code == 403
 
 
-# --- ADMIN ----------------------------------------------------------------
-
 def test_admin_can_transition(entra_settings):
     from models.agent import LifecycleState
 
     mock_svc = MagicMock()
-    mock_svc.transition.return_value = _make_agent(
-        lifecycle_state=LifecycleState.APPROVED
-    )
+    mock_svc.transition.return_value = _make_agent(lifecycle_state=LifecycleState.APPROVED)
     client, _ = _build_client(mock_svc)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
@@ -229,26 +216,39 @@ def test_admin_can_transition(entra_settings):
     mock_svc.transition.assert_called_once_with("rec-123", "approve", "looks good")
 
 
-def test_admin_bad_action_returns_400(entra_settings):
+def test_agents_unknown_action_is_400(entra_settings):
+    """The service refuses an action outside ``TRANSITION_TO_STATUS`` before any registry call;
+    the detail names the caller's own action and the valid ones."""
+    ctl = MagicMock()
     mock_svc = MagicMock()
-    mock_svc.transition.side_effect = ValueError("Unknown transition action 'frobnicate'")
+    mock_svc.get.return_value = _make_agent()
+    mock_svc.transition.side_effect = _real_registry(ctl).transition
     client, _ = _build_client(mock_svc)
 
-    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
-        resp = client.post(
-            "/api/v1/agents/rec-123/transitions",
-            json={"action": "frobnicate", "reason": "x"},
-            headers=_headers(),
-        )
+    resp = _transition(client, {"action": "frobnicate", "reason": "x"})
 
     assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "Unknown transition action 'frobnicate'; valid actions: ['approve', 'deprecate', 'reject']"
+    )
+    ctl.update_registry_record_status.assert_not_called()
 
 
-def test_admin_illegal_transition_returns_409(entra_settings):
-    """An illegal status edge (the live DRAFT->APPROVED bug) maps to 409, not 400/500.
+def test_agents_missing_reason_is_400(entra_settings):
+    ctl = MagicMock()
+    mock_svc = MagicMock()
+    mock_svc.get.return_value = _make_agent()
+    mock_svc.transition.side_effect = _real_registry(ctl).transition
+    client, _ = _build_client(mock_svc)
 
-    IllegalTransitionError subclasses ValueError, so the 409 handler must be
-    ordered BEFORE the generic ValueError->400 handler."""
+    resp = _transition(client, {"action": "approve", "reason": "  "})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "A non-empty reason is required for a status transition"
+    ctl.update_registry_record_status.assert_not_called()
+
+
+def test_agents_illegal_transition_is_409(entra_settings):
     from services.agent_registry_service import IllegalTransitionError
 
     msg = (
@@ -259,20 +259,41 @@ def test_admin_illegal_transition_returns_409(entra_settings):
     mock_svc.transition.side_effect = IllegalTransitionError(msg)
     client, _ = _build_client(mock_svc)
 
-    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("admin")):
-        resp = client.post(
-            "/api/v1/agents/rec-123/transitions",
-            json={"action": "approve", "reason": "ok"},
-            headers=_headers(),
-        )
+    resp = _transition(client, {"action": "approve", "reason": "ok"})
 
     assert resp.status_code == 409
-    assert "Invalid status transition" in resp.json()["detail"]
+    assert resp.json()["detail"] == msg
 
 
-# --- Error mapping --------------------------------------------------------
+def test_agent_error_detail_for_illegal_transition_carries_no_upstream_body(entra_settings):
+    """The registry's ValidationException message is logged, never sent: the detail is composed
+    from the validated action alone."""
+    ctl = MagicMock()
+    ctl.update_registry_record_status.side_effect = ClientError(
+        {
+            "Error": {
+                "Code": "ValidationException",
+                "Message": f"Invalid status transition from DRAFT to APPROVED by {_FAKE_TOKEN}",
+            }
+        },
+        "UpdateRegistryRecordStatus",
+    )
+    mock_svc = MagicMock()
+    mock_svc.get.return_value = _make_agent()
+    mock_svc.transition.side_effect = _real_registry(ctl).transition
+    client, _ = _build_client(mock_svc)
 
-def test_create_duplicate_name_returns_409(entra_settings):
+    resp = _transition(client, {"action": "approve", "reason": "ok"})
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == (
+        "Invalid status transition: 'approve' is not allowed from the agent's current state"
+    )
+    assert _FAKE_TOKEN not in resp.text
+    assert "DRAFT" not in resp.text
+
+
+def test_agents_name_taken_is_409(entra_settings):
     from services.agent_registry_service import NameTakenError
 
     mock_svc = MagicMock()
@@ -280,11 +301,49 @@ def test_create_duplicate_name_returns_409(entra_settings):
     client, _ = _build_client(mock_svc)
 
     with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
-        resp = client.post(
-            "/api/v1/agents", json={"name": "dup", "tenant_id": "default"}, headers=_headers()
-        )
+        resp = client.post("/api/v1/agents", json={"name": "dup", "tenant_id": "default"}, headers=_headers())
 
     assert resp.status_code == 409
+    assert resp.json()["detail"] == "Agent name 'dup' is already in use"
+
+
+def test_agent_error_detail_for_name_taken_carries_no_upstream_body(entra_settings):
+    """The name pre-check's registry listing never reaches the detail; only the requested name does."""
+    ctl = MagicMock()
+    ctl.list_registry_records.return_value = {
+        "registryRecords": [{"recordId": "rec-dup", "name": "dup", "description": _FAKE_TOKEN}]
+    }
+    client, _ = _build_client(_real_registry(ctl))
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
+        resp = client.post("/api/v1/agents", json={"name": "dup", "tenant_id": "default"}, headers=_headers())
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "Agent name 'dup' is already in use"
+    assert _FAKE_TOKEN not in resp.text
+    ctl.create_registry_record.assert_not_called()
+
+
+def test_agents_malformed_record_is_502(entra_settings):
+    """A record whose envelope cannot be parsed is a fixed 502, never the parse error and never a
+    generic 500."""
+    from services.agent_registry_service import MalformedAgentRecordError
+
+    mock_svc = MagicMock()
+    mock_svc.get.side_effect = MalformedAgentRecordError(
+        f"Registry record 'rec-123' has no well-formed governance envelope: {_FAKE_TOKEN}"
+    )
+    client, _ = _build_client(mock_svc)
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        resp = client.get("/api/v1/agents/rec-123", headers=_headers())
+
+    assert resp.status_code == 502
+    assert resp.json() == {
+        "detail": "the agent's registry record could not be read",
+        "code": "agent.malformed_record",
+    }
+    assert _FAKE_TOKEN not in resp.text
 
 
 def test_get_missing_returns_404(entra_settings):
@@ -296,9 +355,134 @@ def test_get_missing_returns_404(entra_settings):
         resp = client.get("/api/v1/agents/rec-missing", headers=_headers())
 
     assert resp.status_code == 404
+    assert resp.json() == {"detail": "Agent not found", "code": "agent.not_found"}
 
 
-# --- created_by from principal -------------------------------------------
+@pytest.mark.parametrize(
+    ("method", "path", "body", "role", "write"),
+    [
+        ("put", "/api/v1/agents/rec-123", {"purpose": "x"}, "operator", "update"),
+        ("post", "/api/v1/agents/rec-123/submit", None, "operator", "submit_for_approval"),
+        (
+            "post",
+            "/api/v1/agents/rec-123/transitions",
+            {"action": "approve", "reason": "ok"},
+            "admin",
+            "transition",
+        ),
+        ("put", "/api/v1/agents/rec-123/publish", {"published": True}, "operator", "set_published"),
+    ],
+)
+def test_a_write_that_finds_no_record_is_the_agent_404(entra_settings, method, path, body, role, write):
+    """The record vanished between the visibility load and the write: the missing agent's 404."""
+    mock_svc = MagicMock()
+    mock_svc.get.return_value = _make_agent()
+    getattr(mock_svc, write).return_value = None
+    client, _ = _build_client(mock_svc)
+    _seed_project_resolver()
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for(role)):
+        resp = client.request(method, path, json=body, headers=_headers())
+
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Agent not found", "code": "agent.not_found"}
+
+
+@pytest.mark.parametrize("query", ["lifecycle_state=bogus", "platform=bogus"])
+def test_an_unknown_list_filter_is_fastapis_422(entra_settings, query):
+    mock_svc = MagicMock()
+    client, _ = _build_client(mock_svc)
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        resp = client.get(f"/api/v1/agents?{query}", headers=_headers())
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert set(body) == {"detail"}
+    assert body["detail"][0]["loc"] == ["query", query.partition("=")[0]]
+    assert body["detail"][0]["type"] == "enum"
+    mock_svc.list.assert_not_called()
+
+
+def test_a_known_list_filter_reaches_the_service_as_its_enum(entra_settings):
+    from models.agent import LifecycleState, Platform
+
+    mock_svc = MagicMock()
+    mock_svc.list.return_value = []
+    client, _ = _build_client(mock_svc)
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("viewer")):
+        resp = client.get("/api/v1/agents?lifecycle_state=approved&platform=aws_bedrock", headers=_headers())
+
+    assert resp.status_code == 200
+    mock_svc.list.assert_called_once_with(
+        lifecycle_state=LifecycleState.APPROVED,
+        sponsor_oid=None,
+        business_unit=None,
+        region=None,
+        platform=Platform.AWS_BEDROCK,
+    )
+
+
+def test_create_under_a_tenant_outside_the_callers_memberships_is_403(entra_settings):
+    import api.routes.users as users_module
+    from services.tenant_resolver import TenantContext
+
+    mock_svc = MagicMock()
+    client, _ = _build_client(mock_svc)
+
+    class _MemberResolver:
+        async def resolve(self, principal):
+            return TenantContext(is_global=False, tenant_ids=frozenset({"ten-mine"}), tenants=())
+
+    users_module._tenant_resolver = _MemberResolver()
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
+        resp = client.post("/api/v1/agents", json={"name": "x", "tenant_id": "ten-other"}, headers=_headers())
+
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "tenant not permitted", "code": "tenant.not_permitted"}
+    mock_svc.create.assert_not_called()
+
+
+def test_create_with_a_platform_its_tenant_does_not_run_is_409(entra_settings):
+    import api.routes.tenants as tenants_module
+    from models.tenant import TenantPlatform
+
+    mock_svc = MagicMock()
+    client, _ = _build_client(mock_svc)
+    tenants_module._svc = MagicMock(
+        get=MagicMock(return_value=MagicMock(id="ten-dbx", platform=TenantPlatform.DATABRICKS))
+    )
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
+        resp = client.post(
+            "/api/v1/agents",
+            json={"name": "x", "tenant_id": "ten-dbx", "platform": "aws_bedrock"},
+            headers=_headers(),
+        )
+
+    assert resp.status_code == 409
+    assert resp.json() == {
+        "detail": "agent platform does not match the tenant's platform",
+        "code": "agent.platform_tenant_mismatch",
+    }
+    mock_svc.create.assert_not_called()
+
+
+def test_reprovision_of_an_ungoverned_agent_is_409(entra_settings):
+    mock_svc = MagicMock()
+    mock_svc.get.return_value = _make_agent()
+    client, _ = _build_client(mock_svc)
+    _seed_project_resolver()
+
+    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")):
+        resp = client.post("/api/v1/agents/rec-123/reprovision", headers=_headers())
+
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "not a governed agent", "code": "agent.not_governed"}
+    mock_svc.persist_identity.assert_not_called()
+
 
 def test_create_uses_principal_as_created_by(entra_settings):
     """POST /agents as operator must pass created_by == the principal's email,
@@ -349,34 +533,23 @@ def test_create_defaults_sponsor_to_principal(entra_settings):
     assert req.sponsor_oid == "maria-oid"
 
 
-# ===========================================================================
-# E36/T16 — DELETE /agents/{id} tears down what a REGISTERED-EXTERNAL agent owns.
-#
-# Every teardown in the platform hung off the repo-delete cascade, which an agent registered
-# through POST /agents never has — so deleting its record orphaned its Entra app/SP, its
-# `agp-agent-obo-{id}` Token Vault entry and its Langfuse project + secret, permanently
-# (followup-lanes research Q2 §3, the registered-external orphan table).
-#
-# The contract pinned here: the cascade runs BEFORE the record delete (the ids live on the
-# record), an agent a REPOSITORY owns is untouched (the repo cascade owns it — asked of the
-# repository partition, because `project_id is None` also matches a pre-E27 envelope), every
-# leg is best-effort and reported per resource, and no leg can block the record delete.
-# ===========================================================================
 def _no_repo_owner():
     """Patch context: no repository owns the agent ⇒ it really is registered-external.
 
-    Every path through ``_teardown_registered_agent`` asks ``find_repository_by_agent_id``
-    (fix round 1), so an unpatched test would build a live ``ProjectService`` (DynamoDB)."""
+     Every path through ``_teardown_registered_agent`` asks ``find_repository_by_agent_id``
+    , so an unpatched test would build a live ``ProjectService`` (DynamoDB)."""
     import api.routes.projects as projects_module
 
     project_svc = MagicMock(name="ProjectService")
     project_svc.find_repository_by_agent_id.return_value = None
     return patch.object(projects_module, "get_project_service", return_value=project_svc)
+
+
 def _seed_project_resolver():
     """Seed the ONE project-resolver singleton with a global stub.
 
     The DELETE route resolves ``project_ctx`` per request; unseeded it would build a real
-    resolver (DynamoDB + Graph). ``is_global`` keeps the E27/T5 gate a pass so these tests
+    resolver (DynamoDB + Graph). ``is_global`` keeps the project-role gate a pass so these tests
     exercise the cascade, not the gate (gating has its own suite)."""
     import api.routes.users as users_module
     from services.project_resolver import ProjectContext
@@ -391,11 +564,11 @@ def _seed_project_resolver():
 def _registered_agent(**overrides):
     """A registered-external agent: no ``project_id`` (``AgentCreate`` carries none), with
     every artifact the orphan table names."""
-    from models.agent import AuthType, Platform
+    from models.agent import AgentAuthType, Platform
 
-    base = dict(
+    base: dict[str, Any] = dict(
         platform=Platform.AWS_BEDROCK,
-        auth_type=AuthType.ENTRA,
+        auth_type=AgentAuthType.ENTRA,
         agent_arn="arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rec-123",
         entra_app_id="agent-app-guid",
         entra_sp_id="agent-sp-objid",
@@ -429,8 +602,8 @@ def test_delete_registered_agent_tears_down_identity_and_langfuse(entra_settings
     client, agents_module = _build_client(mock_svc)
     _seed_project_resolver()
     identity, langfuse = _cascade_doubles()
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "https://lf.example.com")
 
     manager = MagicMock()
@@ -438,14 +611,13 @@ def test_delete_registered_agent_tears_down_identity_and_langfuse(entra_settings
     manager.attach_mock(identity.delete_identity, "delete_identity")
     manager.attach_mock(mock_svc.delete, "delete_record")
 
-    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")), \
-         _no_repo_owner():
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")),
+        _no_repo_owner(),
+    ):
         resp = client.delete("/api/v1/agents/rec-123", headers=_headers())
 
     assert resp.status_code == 200
-    # The Token Vault entry is its OWN leg and goes FIRST — the Entra app is the thing whose
-    # disappearance makes it dangling — and `include_obo_provider=False` stops the identity
-    # leg issuing a second delete for the resource this leg already reported.
     identity.delete_obo_provider.assert_awaited_once_with("rec-123")
     identity.delete_identity.assert_awaited_once_with(agent, include_obo_provider=False)
     assert [c[0] for c in manager.mock_calls] == [
@@ -453,9 +625,7 @@ def test_delete_registered_agent_tears_down_identity_and_langfuse(entra_settings
         "delete_identity",
         "delete_record",
     ]
-    # Langfuse: project + the per-agent secret, account-resolved inside the provisioner.
     langfuse.delete_agent_project.assert_called_once_with(agent)
-    # ...and the record still goes, last.
     mock_svc.delete.assert_called_once_with("rec-123")
 
 
@@ -465,10 +635,10 @@ def test_delete_project_owned_agent_keeps_todays_record_only_behaviour(entra_set
     Running this cascade as well would double-delete and split the report."""
     import asyncio
 
-    client, agents_module = _build_client(MagicMock())
+    _client, agents_module = _build_client(MagicMock())
     identity, langfuse = _cascade_doubles()
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "https://lf.example.com")
 
     agent = _registered_agent(project_id="proj-1")
@@ -485,11 +655,9 @@ def test_delete_project_owned_agent_keeps_todays_record_only_behaviour(entra_set
     langfuse.delete_agent_project.assert_not_called()
 
 
-def test_teardown_skips_an_agent_a_REPOSITORY_owns_even_with_no_project_id(
-    entra_settings, monkeypatch
-):
-    """``project_id is None`` is NOT "registered-external" (fix round 1): it also matches every
-    pre-E27 envelope, whose repo, runtime and image are alive. Tearing that agent's identity and
+def test_teardown_skips_an_agent_a_REPOSITORY_owns_even_with_no_project_id(entra_settings, monkeypatch):
+    """``project_id is None`` is NOT "registered-external": it also matches every
+    project-less envelope, whose repo, runtime and image are alive. Tearing that agent's identity and
     observability down from this MAINTAINER-gated route would leave a live agent without an
     Entra app while bypassing the OWNER gate its other resources sit behind. So the repository
     partition is asked, and it — not the envelope field — decides."""
@@ -497,16 +665,16 @@ def test_teardown_skips_an_agent_a_REPOSITORY_owns_even_with_no_project_id(
 
     import api.routes.projects as projects_module
 
-    client, agents_module = _build_client(MagicMock())
+    _client, agents_module = _build_client(MagicMock())
     identity, langfuse = _cascade_doubles()
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "https://lf.example.com")
 
     project_svc = MagicMock(name="ProjectService")
     project_svc.find_repository_by_agent_id.return_value = MagicMock(name="Repository")
 
-    agent = _registered_agent()  # project_id is None — the pre-E27 shape
+    agent = _registered_agent()
     with patch.object(projects_module, "get_project_service", return_value=project_svc):
         items = asyncio.run(agents_module._teardown_registered_agent(agent))
 
@@ -531,10 +699,10 @@ def test_teardown_skips_every_leg_when_repository_ownership_cannot_be_establishe
 
     import api.routes.projects as projects_module
 
-    client, agents_module = _build_client(MagicMock())
+    _client, agents_module = _build_client(MagicMock())
     identity, langfuse = _cascade_doubles()
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "https://lf.example.com")
 
     project_svc = MagicMock(name="ProjectService")
@@ -563,16 +731,17 @@ def test_delete_registered_agent_reports_each_leg_and_never_blocks_the_record(en
     identity.delete_obo_provider.side_effect = RuntimeError("agentcore 500")
     identity.delete_identity.side_effect = RuntimeError("graph 403")
     langfuse.delete_agent_project.side_effect = ValueError("langfuse unreachable")
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "https://lf.example.com")
 
-    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")), \
-         _no_repo_owner():
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")),
+        _no_repo_owner(),
+    ):
         resp = client.delete("/api/v1/agents/rec-123", headers=_headers())
 
     assert resp.status_code == 200
-    # EVERY leg was attempted — one failure must not skip the next resource.
     identity.delete_obo_provider.assert_awaited_once()
     identity.delete_identity.assert_awaited_once()
     langfuse.delete_agent_project.assert_called_once()
@@ -584,22 +753,18 @@ def test_teardown_report_uses_the_cascade_vocabulary(entra_settings, monkeypatch
 
     from services.langfuse_provisioning import LangfuseAccountUnresolvedError
 
-    client, agents_module = _build_client(MagicMock())
+    _client, agents_module = _build_client(MagicMock())
     identity, langfuse = _cascade_doubles()
     langfuse.delete_agent_project.side_effect = LangfuseAccountUnresolvedError(
         "no tenant stage owns the account holding the runtime"
     )
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "https://lf.example.com")
 
     with _no_repo_owner():
         items = asyncio.run(agents_module._teardown_registered_agent(_registered_agent()))
 
-    # T8's honest vocabulary: an unresolvable owning account is reported FAILED, never
-    # "deleted", and it carries the `stage_unresolved:` PREFIX plus the safe reason the
-    # provisioner built — `LangfuseAccountUnresolvedError` IS a `StageUnresolvedError`, so one
-    # `except` arm renders it identically here and in the repo cascade. Never an account id.
     assert [(i.item, i.outcome, i.reason) for i in items] == [
         ("obo_provider", "deleted", None),
         ("identity", "deleted", None),
@@ -620,11 +785,11 @@ def test_teardown_reports_the_vault_entry_as_its_own_item(entra_settings, monkey
     survived. Nothing is blocking here, so it gets its own honest line-item."""
     import asyncio
 
-    client, agents_module = _build_client(MagicMock())
+    _client, agents_module = _build_client(MagicMock())
     identity, langfuse = _cascade_doubles()
     identity.delete_obo_provider.side_effect = RuntimeError("agentcore 500")
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "")
 
     with _no_repo_owner():
@@ -637,9 +802,7 @@ def test_teardown_reports_the_vault_entry_as_its_own_item(entra_settings, monkey
     ]
 
 
-def test_teardown_reports_a_cross_account_assume_failure_with_T8s_prefix(
-    entra_settings, monkeypatch
-):
+def test_teardown_reports_a_cross_account_assume_failure_with_T8s_prefix(entra_settings, monkeypatch):
     """The langfuse leg PROPAGATES `TenantCredentialsError` by design (falling back to ambient
     is the defect), so the identical failure must read `assume_role_failed: <role>` here and on
     the repo path — the bare type name names neither the role nor the hop."""
@@ -647,13 +810,11 @@ def test_teardown_reports_a_cross_account_assume_failure_with_T8s_prefix(
 
     from services.tenant_credentials import TenantCredentialsError
 
-    client, agents_module = _build_client(MagicMock())
+    _client, agents_module = _build_client(MagicMock())
     identity, langfuse = _cascade_doubles()
-    langfuse.delete_agent_project.side_effect = TenantCredentialsError(
-        "agp-deployment-acme-prod"
-    )
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    langfuse.delete_agent_project.side_effect = TenantCredentialsError("agp-deployment-acme-prod")
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "https://lf.example.com")
 
     with _no_repo_owner():
@@ -671,13 +832,13 @@ def test_teardown_skips_every_leg_for_a_metadata_only_agent(entra_settings, monk
     ⇒ three explicit ``skipped`` items and not a single AWS/Graph call."""
     import asyncio
 
-    client, agents_module = _build_client(MagicMock())
+    _client, agents_module = _build_client(MagicMock())
     identity, langfuse = _cascade_doubles()
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "")
 
-    agent = _make_agent()  # no identity fields at all
+    agent = _make_agent()
     with _no_repo_owner():
         items = asyncio.run(agents_module._teardown_registered_agent(agent))
 
@@ -691,6 +852,41 @@ def test_teardown_skips_every_leg_for_a_metadata_only_agent(entra_settings, monk
     langfuse.delete_agent_project.assert_not_called()
 
 
+def test_delete_refuses_a_blocking_artifact_no_adapter_can_remove_500(entra_settings, monkeypatch):
+    """A Databricks record naming a federation audience on a deployment with no Databricks
+    collaborator: nothing can withdraw the audience, so the delete is refused and the record,
+    the only pointer to that audience, survives."""
+    from models.agent import AgentAuthType, Platform
+
+    agent = _make_agent(
+        platform=Platform.DATABRICKS,
+        auth_type=AgentAuthType.ENTRA,
+        binding_mode="federation",
+        runtime_handle="https://claims.example.databricksapps.com",
+        runtime_kind="app",
+        entra_app_id="agent-app-guid",
+        entra_app_audience="api://agp-agent-rec-123",
+    )
+    mock_svc = MagicMock()
+    mock_svc.get.return_value = agent
+    client, agents_module = _build_client(mock_svc)
+    _seed_project_resolver()
+    monkeypatch.setattr(agents_module, "_identity_svc", MagicMock())
+    monkeypatch.setattr(agents_module.settings, "TENANTS_TABLE_NAME", "")
+
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")),
+        _no_repo_owner(),
+    ):
+        resp = client.delete("/api/v1/agents/rec-123", headers=_headers())
+
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == (
+        "the agent's Databricks bindings cannot be removed on this deployment, so it was not deleted"
+    )
+    mock_svc.delete.assert_not_called()
+
+
 def test_delete_missing_agent_has_no_teardown_side_effects(entra_settings, monkeypatch):
     """The visibility gate runs FIRST: a missing (or foreign-tenant) agent 404s without
     touching Graph, the Token Vault or Langfuse."""
@@ -699,16 +895,72 @@ def test_delete_missing_agent_has_no_teardown_side_effects(entra_settings, monke
     client, agents_module = _build_client(mock_svc)
     _seed_project_resolver()
     identity, langfuse = _cascade_doubles()
-    agents_module._identity_svc = identity
-    agents_module._langfuse_svc = langfuse
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
     monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "https://lf.example.com")
 
-    with patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")), \
-         _no_repo_owner():
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")),
+        _no_repo_owner(),
+    ):
         resp = client.delete("/api/v1/agents/rec-missing", headers=_headers())
 
     assert resp.status_code == 404
+    assert resp.json() == {"detail": "Agent not found", "code": "agent.not_found"}
     identity.delete_obo_provider.assert_not_awaited()
     identity.delete_identity.assert_not_awaited()
     langfuse.delete_agent_project.assert_not_called()
     mock_svc.delete.assert_not_called()
+
+
+def test_delete_whose_record_is_gone_after_teardown_is_the_agent_404(entra_settings, monkeypatch):
+    mock_svc = MagicMock()
+    mock_svc.get.return_value = _make_agent()
+    mock_svc.delete.return_value = None
+    client, agents_module = _build_client(mock_svc)
+    _seed_project_resolver()
+    identity, langfuse = _cascade_doubles()
+    monkeypatch.setattr(agents_module, "_identity_svc", identity)
+    monkeypatch.setattr(agents_module, "_langfuse_svc", langfuse)
+    monkeypatch.setattr(agents_module.settings, "LANGFUSE_HOST", "")
+
+    with (
+        patch("core.security_entra.verify_entra_token", return_value=_claims_for("operator")),
+        _no_repo_owner(),
+    ):
+        resp = client.delete("/api/v1/agents/rec-123", headers=_headers())
+
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Agent not found", "code": "agent.not_found"}
+    mock_svc.delete.assert_called_once_with("rec-123")
+
+
+def test_the_five_per_agent_reads_declare_their_response_models(entra_settings):
+    import api.routes.agents as agents_module
+    from models.eval import EvalRuns
+    from models.repository import AgentRepositoryView
+    from services.langfuse_metrics_service import AgentMetrics, TracePage
+
+    def declared(suffix):
+        route = next(r for r in agents_module.router.routes if getattr(r, "path", "").endswith(suffix))
+        assert isinstance(route, APIRoute)
+        return route.response_model
+
+    assert declared("/{agent_id}/evals/runs") is EvalRuns
+    assert declared("/{agent_id}/invoke") is agents_module.InvokeResult
+    assert declared("/{agent_id}/metrics") is AgentMetrics
+    assert declared("/{agent_id}/repository") is AgentRepositoryView
+    assert declared("/{agent_id}/traces") is TracePage
+
+
+def test_the_route_bodies_reach_the_document_under_their_own_names(entra_settings):
+    from main import app
+
+    schemas = app.openapi()["components"]["schemas"]
+    assert "api__routes__agents__TransitionRequest" not in schemas
+    assert "models__transition__TransitionRequest" not in schemas
+    assert sorted(schemas["TransitionRequest"]["properties"]) == ["action", "reason"]
+    assert "PublishRequest-Input" not in schemas and "PublishRequest-Output" not in schemas
+    assert sorted(schemas["PublishToggle"]["properties"]) == ["published"]
+    assert "PublishRequest" in schemas
+    assert [name for name in schemas if "__" in name] == []

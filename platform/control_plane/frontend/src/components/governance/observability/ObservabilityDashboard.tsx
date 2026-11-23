@@ -1,23 +1,13 @@
-// ObservabilityDashboard — Tab 1 of the Observability page (Epic 26 / Task 8).
-// Renders the platform's OWN dashboards from the Langfuse-backed metrics API
-// (observabilityApi.getMetrics) rather than embedding the Langfuse UI. Scope is
-// role-derived: ADMINs default to platform-wide (with a My-Tenant toggle),
-// everyone else is tenant-scoped (the backend enforces the boundary regardless).
-//
-// House style: mirrors govern/FinOps.tsx — the glass card token, the shared
-// Recharts CHART_COLORS/tooltipStyle, `.card` KPI tiles, the uppercase-header
-// tabular-nums table. All snake_case→series shaping is the PURE
-// observabilityMetrics helper (unit-tested); this file stays a thin composition.
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   ResponsiveContainer, ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   PieChart, Pie, Cell,
 } from 'recharts';
 import { observabilityApi } from '../../../api/client';
-import type { ScopeMetrics } from '../../../types';
-import { useUser } from '../../../contexts/UserContext';
-import { tooltipStyle } from '../../govern/mockData';
+import { useLoad } from '../../../api/useLoad';
+import { useUser } from '../../../contexts/useUser';
+import { tooltipStyle } from '../../shared/chartTheme';
 import { useTenantDirectory } from '../useTenantDirectory';
 import { resolveTenantName } from '../tenantUi';
 import { ObsEmptyCard } from '../agent-tabs/ObsEmptyCard';
@@ -37,27 +27,18 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
 
   const [scope, setScope] = useState<Scope>(isAdmin ? 'platform' : 'tenant');
   const [range, setRange] = useState(() => defaultDateRange());
-  const [metrics, setMetrics] = useState<ScopeMetrics | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const { dateFrom, dateTo } = range;
+  const { state } = useLoad(
+    () => (configured ? observabilityApi.getMetrics(scope, { dateFrom, dateTo }) : Promise.resolve(null)),
+    [configured, scope, dateFrom, dateTo],
+    'Failed to load metrics',
+  );
+  const metrics = state.data;
+  const loading = state.kind === 'loading';
+  const error = state.kind === 'error' ? state.message : '';
 
-  useEffect(() => {
-    if (!configured) { setLoading(false); return; }
-    let cancelled = false;
-    setLoading(true);
-    setError('');
-    observabilityApi
-      .getMetrics(scope, { dateFrom: range.dateFrom, dateTo: range.dateTo })
-      .then((m) => { if (!cancelled) setMetrics(m); })
-      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load metrics'); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [configured, scope, range.dateFrom, range.dateTo]);
+  const series = useMemo(() => buildDashboardSeries(metrics, range), [metrics, range]);
 
-  const series = useMemo(() => buildDashboardSeries(metrics), [metrics]);
-
-  // Not-configured: a calm card, not an error. The Langfuse tab explains the
-  // base-infra story; here we just say the dashboard has nothing to draw yet.
   if (!configured) {
     return (
       <ObsEmptyCard
@@ -69,7 +50,6 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
 
   return (
     <div className="space-y-4">
-      {/* Controls: scope (admin) + date range */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="flex items-end gap-4">
           {isAdmin && (
@@ -128,14 +108,12 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
         />
       ) : (
         <>
-          {/* KPI tiles */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <Kpi label="Total Traces" value={fmtInt(series.totals.traces)} sub="agent invocations" color="#3b82f6" />
             <Kpi label="Total Cost" value={fmtUsd(series.totals.cost)} sub="model spend (USD)" color="#f59e0b" />
             <Kpi label="Total Tokens" value={fmtInt(series.totals.tokens)} sub="input + output" color="#6366f1" />
           </div>
 
-          {/* Row: cost & traces timeseries + cost by model */}
           <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4">
             <div className={CARD}>
               <div className="text-sm font-semibold text-slate-900 mb-3">Cost &amp; Traces</div>
@@ -194,7 +172,6 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
             </div>
           </div>
 
-          {/* Per-agent breakdown table (rows → AgentDetail) */}
           <div className={CARD}>
             <div className="text-sm font-semibold text-slate-900 mb-3">By Agent</div>
             {series.byAgent.length > 0 ? (
